@@ -1,5 +1,4 @@
 import asyncio
-
 from datetime import datetime, timezone
 
 from tg_messenger.core.events import EventBus
