@@ -13,6 +13,9 @@ See `PLAN.md` for the full design and the TDD build sequence.
 ## Quickstart
 
 ```bash
-python -m venv .venv && ./.venv/bin/pip install -e ".[dev,cli,tui,web]"
+python -m venv .venv && ./.venv/bin/pip install -e ".[dev]"
 ./.venv/bin/tg-messenger --help
 ```
+
+All three interfaces (CLI / TUI / Web) ship in the base install — no extras needed.
+`[dev]` only adds the test/lint toolchain.

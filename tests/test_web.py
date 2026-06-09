@@ -31,6 +31,11 @@ class WebStubClient:
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
+    async def send_media(self, peer, file_path, caption=None):
+        self.sent.append((peer, "media", caption))
+        return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption or "<media>",
+                       date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
     async def listen(self):
         async for ev in self.bus.subscribe():
             yield ev
@@ -74,6 +79,18 @@ async def test_send_returns_fragment(client_app):
     assert r.status_code == 200
     assert "hello" in r.text
     assert stub.sent == [(7, "hello")]
+
+
+async def test_media_upload_calls_send_media(client_app):
+    ac, stub = client_app
+    r = await ac.post(
+        "/dialogs/7/media",
+        files={"file": ("pic.jpg", b"binarydata", "image/jpeg")},
+        data={"caption": "look"},
+    )
+    assert r.status_code == 200
+    assert stub.sent == [(7, "media", "look")]
+    assert "look" in r.text
 
 
 async def test_stream_yields_sse_frame():

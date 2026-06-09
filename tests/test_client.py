@@ -53,6 +53,8 @@ async def test_dialogs_dm_only(fake_client):
     ann = next(d for d in dialogs if d.id == 7)
     assert ann.title == "Ann"
     assert ann.unread == 2
+    assert ann.last_text == "hey"
+    assert ann.last_message_at is not None
 
 
 async def test_history_maps_messages(fake_client):
@@ -97,6 +99,16 @@ async def test_listen_yields_incoming(fake_client):
     assert isinstance(received[0], IncomingEvent)
     assert received[0].message.text == "ping"
     assert received[0].dialog_id == 7
+
+
+async def test_download_message_media_by_id(fake_client, tmp_path):
+    fake_client.messages[7] = [FakeMessage(id=42, sender_id=7, text=None, media=object())]
+    client = _build(fake_client)
+    await client.connect()
+    dest = tmp_path / "out.bin"
+    result = await client.download_message_media(7, 42, dest)
+    assert result == str(dest)
+    assert fake_client.downloads[-1]["message_id"] == 42
 
 
 async def test_external_session_writes_no_files(fake_client, session_dir):

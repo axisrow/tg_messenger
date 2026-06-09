@@ -1,15 +1,27 @@
 import stat
 
 import pytest
+from telethon.crypto import AuthKey
+from telethon.sessions import StringSession
 
 from tg_messenger.core import auth
 from tg_messenger.core.auth import SessionStore
 
 
+def _make_session() -> str:
+    s = StringSession()
+    s.set_dc(2, "149.154.167.51", 443)
+    s.auth_key = AuthKey(b"\x00" * 256)
+    return s.save()
+
+
+VALID_SESSION = _make_session()
+
+
 def test_save_load_round_trip(session_dir):
     store = SessionStore(session_dir)
-    store.save("default", "MY_SESSION_STRING")
-    assert store.load("default") == "MY_SESSION_STRING"
+    store.save("default", VALID_SESSION)
+    assert store.load("default") == VALID_SESSION
 
 
 def test_load_missing_returns_none(session_dir):
@@ -36,9 +48,22 @@ def test_name_is_sanitized(session_dir):
 
 def test_from_external_does_not_write(session_dir):
     store = SessionStore(session_dir)
-    wrapped = store.from_external("EXTERNAL")
-    assert wrapped == "EXTERNAL"
+    wrapped = store.from_external(VALID_SESSION)
+    assert wrapped == VALID_SESSION
     assert list(session_dir.iterdir()) == []
+
+
+def test_from_external_rejects_garbage(session_dir):
+    store = SessionStore(session_dir)
+    with pytest.raises(ValueError):
+        store.from_external("not-a-real-session")
+
+
+def test_load_rejects_corrupt_session(session_dir):
+    store = SessionStore(session_dir)
+    store.path_for("default").write_text("garbage", encoding="utf-8")
+    with pytest.raises(ValueError):
+        store.load("default")
 
 
 async def test_send_code_and_sign_in(fake_client):

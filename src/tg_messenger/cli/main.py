@@ -87,16 +87,24 @@ def dialogs(session: str) -> None:
 @cli.command()
 @click.argument("dialog_id", type=int)
 @click.option("--limit", default=50)
+@click.option("--download", "download_dir", default=None,
+              help="Download media of each message into this directory.")
 @click.option("--session", default="default")
-def read(dialog_id: int, limit: int, session: str) -> None:
-    """Print the message history of a dialog."""
+def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> None:
+    """Print the message history of a dialog (and optionally download media)."""
 
     async def _do(client):
-        return await client.history(dialog_id, limit=limit)
+        messages = await client.history(dialog_id, limit=limit)
+        for m in messages:
+            who = "→" if m.out else "←"
+            click.echo(f"{who} [{m.id}] {m.text or '<media>'}")
+            if download_dir and m.media is not None and m.media.downloadable:
+                dest = os.path.join(download_dir, f"{dialog_id}_{m.id}")
+                saved = await client.download_message_media(dialog_id, m.id, dest)
+                if saved:
+                    click.echo(f"  saved: {saved}")
 
-    for m in _run(_with_client(session, _do)):
-        who = "→" if m.out else "←"
-        click.echo(f"{who} [{m.id}] {m.text or '<media>'}")
+    _run(_with_client(session, _do))
 
 
 @cli.command()
@@ -161,7 +169,7 @@ def chat(dialog_id: int, session: str) -> None:
 
 @cli.command()
 @click.option("--host", default="127.0.0.1")
-@click.option("--port", default=8080)
+@click.option("--port", default=lambda: int(os.environ.get("TG_WEB_PORT", "8090")), type=int)
 @click.option("--session", default="default")
 def serve(host: str, port: int, session: str) -> None:
     """Launch the web interface."""

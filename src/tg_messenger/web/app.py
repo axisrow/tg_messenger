@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from html import escape
 from pathlib import Path
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
@@ -80,6 +81,23 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
     @app.post("/send", response_class=HTMLResponse)
     async def send(request: Request, dialog_id: int = Form(...), text: str = Form(...)):
         msg = await request.app.state.client.send_text(dialog_id, text)
+        return HTMLResponse(_message_div(msg))
+
+    @app.post("/dialogs/{dialog_id}/media", response_class=HTMLResponse)
+    async def upload_media(
+        request: Request,
+        dialog_id: int,
+        file: UploadFile = File(...),
+        caption: str | None = Form(None),
+    ):
+        suffix = Path(file.filename or "").suffix
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+        try:
+            msg = await request.app.state.client.send_media(dialog_id, tmp_path, caption=caption)
+        finally:
+            os.unlink(tmp_path)
         return HTMLResponse(_message_div(msg))
 
     @app.get("/stream/{dialog_id}")

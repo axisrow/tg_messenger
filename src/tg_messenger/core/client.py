@@ -84,13 +84,15 @@ class StandaloneTelegramClient:
             entity = d.entity
             if dm_only and not _is_dm_entity(entity):
                 continue
+            last_msg = getattr(d, "message", None)
             result.append(
                 Dialog(
                     id=entity.id,
                     title=_entity_title(entity),
                     username=getattr(entity, "username", None),
                     unread=getattr(d, "unread_count", 0) or 0,
-                    last_text=getattr(getattr(d, "message", None), "text", None),
+                    last_text=getattr(last_msg, "text", None),
+                    last_message_at=getattr(last_msg, "date", None),
                 )
             )
         return result
@@ -126,6 +128,21 @@ class StandaloneTelegramClient:
             lambda: self._client.download_media(message, str(dest)), operation="download_media"
         )
 
+    async def download_message_media(self, peer: int, message_id: int, dest: str | Path) -> str | None:
+        """Fetch the raw message by id and download its media to ``dest``.
+
+        Returns the saved path, or ``None`` if the message carries no media.
+        """
+        raw = await run_with_flood_wait_retry(
+            lambda: self._collect_history_ids(peer, message_id), operation="download_message_media"
+        )
+        if not raw or getattr(raw[0], "media", None) is None:
+            return None
+        return await self.download_media(raw[0], dest)
+
+    async def _collect_history_ids(self, peer, message_id) -> list:
+        return [m async for m in self._client.iter_messages(peer, ids=message_id)]
+
     # --- realtime ---
     def _ensure_handler(self) -> None:
         if self._handler_registered:
@@ -144,10 +161,26 @@ class StandaloneTelegramClient:
 
     # --- mapping ---
     @staticmethod
+    def _to_media_ref(raw) -> MediaRef | None:
+        if getattr(raw, "media", None) is None:
+            return None
+        if getattr(raw, "photo", None) is not None:
+            kind = "photo"
+        elif getattr(raw, "document", None) is not None:
+            kind = "document"
+        else:
+            kind = "other"
+        file = getattr(raw, "file", None)
+        return MediaRef(
+            kind=kind,
+            file_name=getattr(file, "file_name", None) or getattr(file, "name", None),
+            size=getattr(file, "size", None),
+            downloadable=True,
+        )
+
+    @staticmethod
     def _to_message(raw, *, dialog_id: int) -> Message:
-        media = None
-        if getattr(raw, "media", None) is not None:
-            media = MediaRef(kind="other", downloadable=True)
+        media = StandaloneTelegramClient._to_media_ref(raw)
         return Message(
             id=getattr(raw, "id", 0),
             dialog_id=dialog_id,

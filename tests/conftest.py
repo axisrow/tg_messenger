@@ -23,15 +23,28 @@ class FakeChannel:
         self.username = username
 
 
+class FakeDocument:
+    def __init__(self, file_name=None, size=None):
+        self.file_name = file_name
+        self.size = size
+
+
 class FakeMessage:
-    def __init__(self, id, sender_id, text=None, out=False, date=None, media=None, peer_id=None):
+    def __init__(
+        self, id, sender_id, text=None, out=False, date=None, media=None, peer_id=None,
+        photo=None, document=None, file=None,
+    ):
         self.id = id
         self.sender_id = sender_id
         self.message = text
         self.text = text
         self.out = out
         self.date = date or datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
-        self.media = media
+        # Telethon exposes .media plus convenience .photo/.document/.file
+        self.media = media if media is not None else (photo or document)
+        self.photo = photo
+        self.document = document
+        self.file = file
         self.peer_id = peer_id
 
 
@@ -99,9 +112,16 @@ class FakeTelethonClient:
 
         return gen()
 
-    def iter_messages(self, peer, limit=50, **k):
+    def iter_messages(self, peer, limit=50, ids=None, **k):
+        items = self.messages.get(int(peer), [])
+        if ids is not None:
+            wanted = ids if isinstance(ids, (list, tuple)) else [ids]
+            items = [m for m in items if m.id in wanted]
+        else:
+            items = items[:limit]
+
         async def gen():
-            for m in self.messages.get(int(peer), [])[:limit]:
+            for m in items:
                 yield m
 
         return gen()

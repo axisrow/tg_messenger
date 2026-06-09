@@ -5,12 +5,14 @@ from click.testing import CliRunner
 
 from tg_messenger.cli import main as cli_main
 from tg_messenger.core.flood import HandledFloodWaitError
-from tg_messenger.core.models import Dialog, Message
+from tg_messenger.core.models import Dialog, MediaRef, Message
 
 
 class StubClient:
     def __init__(self, **kw):
         self.sent = []
+        self.downloaded = []
+        self.history_items = None
 
     async def connect(self):
         pass
@@ -22,10 +24,16 @@ class StubClient:
         return [Dialog(id=7, title="Ann", username="ann", unread=2)]
 
     async def history(self, peer, limit=50, offset_id=0):
+        if self.history_items is not None:
+            return self.history_items
         return [
             Message(id=1, dialog_id=peer, sender_id=peer, out=False, text="hi",
                     date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
         ]
+
+    async def download_message_media(self, peer, message_id, dest):
+        self.downloaded.append((message_id, str(dest)))
+        return str(dest)
 
     async def send_text(self, peer, text):
         self.sent.append((peer, text))
@@ -85,6 +93,50 @@ def test_flood_wait_friendly_message(runner, monkeypatch):
     monkeypatch.setattr(stub, "send_text", boom)
     result = r.invoke(cli_main.cli, ["send", "7", "hi"])
     assert result.exit_code != 0 or "flood" in result.output.lower()
+
+
+@pytest.fixture
+def serve_spy(monkeypatch):
+    calls = []
+    monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls.append(kw))
+    monkeypatch.setattr("tg_messenger.web.app.build_app", lambda **kw: object())
+    return calls
+
+
+def test_serve_defaults_to_8090(serve_spy, monkeypatch):
+    monkeypatch.delenv("TG_WEB_PORT", raising=False)
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code == 0
+    assert serve_spy[0]["port"] == 8090
+
+
+def test_serve_reads_env_port(serve_spy, monkeypatch):
+    monkeypatch.setenv("TG_WEB_PORT", "9099")
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code == 0
+    assert serve_spy[0]["port"] == 9099
+
+
+def test_serve_flag_overrides_env(serve_spy, monkeypatch):
+    monkeypatch.setenv("TG_WEB_PORT", "9099")
+    result = CliRunner().invoke(cli_main.cli, ["serve", "--port", "1234"])
+    assert result.exit_code == 0
+    assert serve_spy[0]["port"] == 1234
+
+
+def test_read_download_saves_media(runner, tmp_path):
+    r, stub = runner
+    stub.history_items = [
+        Message(id=1, dialog_id=7, sender_id=7, out=False, text="hi",
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+        Message(id=2, dialog_id=7, sender_id=7, out=False, text=None,
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                media=MediaRef(kind="other", downloadable=True)),
+    ]
+    result = r.invoke(cli_main.cli, ["read", "7", "--download", str(tmp_path)])
+    assert result.exit_code == 0
+    # only the media message (id=2) is downloaded
+    assert [mid for mid, _ in stub.downloaded] == [2]
 
 
 def test_help_lists_commands():

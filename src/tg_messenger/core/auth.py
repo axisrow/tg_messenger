@@ -11,6 +11,8 @@ import os
 import re
 from pathlib import Path
 
+from telethon.sessions import StringSession
+
 DEFAULT_SESSION_DIR = Path.home() / ".tg_messenger" / "sessions"
 
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -19,6 +21,15 @@ _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 def _sanitize(name: str) -> str:
     cleaned = _SAFE.sub("_", name).strip("._") or "default"
     return cleaned
+
+
+def _validate_session_string(session_string: str) -> str:
+    """Ensure a StringSession parses (auth_key/dc_id present); raise ValueError if not."""
+    try:
+        StringSession(session_string)
+    except Exception as exc:  # telethon raises ValueError/binascii errors on garbage
+        raise ValueError("invalid StringSession") from exc
+    return session_string
 
 
 class SessionStore:
@@ -34,7 +45,10 @@ class SessionStore:
         path = self.path_for(name)
         if not path.exists():
             return None
-        return path.read_text(encoding="utf-8").strip() or None
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        return _validate_session_string(raw)
 
     def save(self, name: str, session_string: str) -> Path:
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -44,8 +58,8 @@ class SessionStore:
         return path
 
     def from_external(self, session_string: str) -> str:
-        """Return the session string verbatim — never written to disk."""
-        return session_string
+        """Validate and return the session string verbatim — never written to disk."""
+        return _validate_session_string(session_string)
 
 
 class LoginFlow:

@@ -1,6 +1,6 @@
 from telethon.sessions import StringSession
 
-from tests.conftest import FakeMessage
+from tests.conftest import FakeDocument, FakeMessage
 from tg_messenger.core.client import StandaloneTelegramClient
 from tg_messenger.core.models import MediaRef, Message
 
@@ -42,3 +42,22 @@ async def test_history_marks_media_messages(fake_client):
     msgs = await client.history(7)
     assert isinstance(msgs[0].media, MediaRef)
     assert msgs[0].media.downloadable is True
+
+
+async def test_history_detects_photo_kind(fake_client):
+    fake_client.messages[7] = [FakeMessage(id=1, sender_id=7, photo=object())]
+    client = _build(fake_client)
+    await client.connect()
+    msgs = await client.history(7)
+    assert msgs[0].media.kind == "photo"
+
+
+async def test_history_detects_document_kind(fake_client):
+    doc = FakeDocument(file_name="report.pdf", size=2048)
+    fake_client.messages[7] = [FakeMessage(id=1, sender_id=7, document=doc, file=doc)]
+    client = _build(fake_client)
+    await client.connect()
+    msgs = await client.history(7)
+    assert msgs[0].media.kind == "document"
+    assert msgs[0].media.file_name == "report.pdf"
+    assert msgs[0].media.size == 2048
