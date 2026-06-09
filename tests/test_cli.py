@@ -32,6 +32,11 @@ class StubClient:
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
+    async def send_media(self, peer, file_path, caption=None):
+        self.sent.append((peer, "file", str(file_path), caption))
+        return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption,
+                       date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
 
 @pytest.fixture
 def runner(monkeypatch):
@@ -60,6 +65,15 @@ def test_send_calls_client(runner):
     result = r.invoke(cli_main.cli, ["send", "7", "hello"])
     assert result.exit_code == 0
     assert stub.sent == [(7, "hello")]
+
+
+def test_send_file_uses_send_media(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "caption", "--file", str(f)])
+    assert result.exit_code == 0
+    assert stub.sent[-1] == (7, "file", str(f), "caption")
 
 
 def test_flood_wait_friendly_message(runner, monkeypatch):
