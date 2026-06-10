@@ -33,7 +33,7 @@ pytest is configured for `asyncio_mode = auto` (no `@pytest.mark.asyncio` needed
 
 ## Architecture
 
-A single UI-agnostic core wrapped by three interchangeable front-ends, plus an optional agent layer. `PLAN.md` holds the full design and the TDD build sequence (cycles 0–8 core/UI, 9–14 agent); the project is built test-first.
+A single UI-agnostic core wrapped by three interchangeable front-ends, plus an optional agent layer. `PLAN.md` holds the full design and the TDD build sequence (cycles 0–8 core/UI, 9–17 agent); the project is built test-first.
 
 ```
 core/   ← all Telegram logic, no UI imports
@@ -57,7 +57,7 @@ agent/  ← LangGraph intent orchestrator over core (optional [agent] extra); co
 - **`tui/app.py`**: Textual app, `MessengerTUI(session_name=...)`. Two non-obvious constraints: `on_mount` resets the loop's task factory **before** the client exists — Textual's `eager_task_factory` (py3.12+) breaks Telethon, see the comment in `on_mount`; don't remove or move that line. And all network work goes through `self.run_worker(...)`, never `await` in handlers — awaiting stalls the message pump.
 
 ### Agent (`src/tg_messenger/agent/`)
-`tg-messenger agent` auto-replies to incoming DMs: a LangGraph router classifies each message as **chat** (single `init_chat_model` call) or **task** (a `deepagents.create_deep_agent` with Telegram tools + web search), then replies via `client.send_text`. Configured entirely from env: `TG_AGENT_MODEL` (`provider:model`), `TG_AGENT_ALLOWLIST` (`*` or ids/@usernames — empty is a startup error by design, `*` cannot be mixed with other entries), `TG_AGENT_SEARCH` (duckduckgo/tavily/exa/brave, lazy-imported in `search.py`). **Accepted v1 risk**: the allowlist controls who can *trigger* the agent, not what it can do — an allowlisted user can have the agent read/send in ANY dialog (full-trust model, documented in `.env.example`).
+`tg-messenger agent` auto-replies to incoming DMs: a LangGraph router classifies each message as **chat** (single `init_chat_model` call) or **task** (a `deepagents.create_deep_agent` with Telegram tools + web search), then replies via `client.send_text`. Configured entirely from env: `TG_AGENT_MODEL` (`provider:model`), `TG_AGENT_ALLOWLIST` (`*` or ids/@usernames — empty is a startup error by design, `*` cannot be mixed with other entries), `TG_AGENT_SEARCH` (duckduckgo/tavily/exa/brave, lazy-imported in `search.py`). LangSmith tracing is env-only — `LANGSMITH_TRACING`/`_API_KEY`/`_PROJECT`; langchain/langgraph pick them up themselves, no graph code involved. `langsmith_tracing_enabled` (`config.py`) makes the `agent` command fail fast when tracing is on without a key and echo the status when on. **Accepted v1 risk**: the allowlist controls who can *trigger* the agent, not what it can do — an allowlisted user can have the agent read/send in ANY dialog (full-trust model, documented in `.env.example`).
 
 - **`orchestrator.py` — `Orchestrator`**: the real LangGraph graph (classify → chat | task) with per-dialog memory (`InMemorySaver`, `thread_id` = dialog id). It never calls a model itself — `classify_fn`/`chat_fn`/`task_agent` are injected; only the deep agent's **final** answer is appended to dialog state (tool chatter never leaks).
 - **`factory.py`** is the ONLY module importing the LLM stack (`init_chat_model`, `create_deep_agent`) — keep it that way; deepagents API drift stays contained here. `runner.py`/`tools.py`/`config.py`/`search.py` are stdlib+core only.

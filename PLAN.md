@@ -185,7 +185,7 @@ client = StandaloneTelegramClient(api_id, api_hash, external_session=existing_st
   `GET /stream/{id}` отдаёт один SSE-кадр когда `bus.publish`.
 - **TUI** проверяется smoke-тестом монтирования (Textual `run_test`/pilot) — без живого Telegram.
 
-## Циклы 9–14 — агентный слой (`tg-messenger agent`, LangGraph + deepagents)
+## Циклы 9–17 — агентный слой (`tg-messenger agent`, LangGraph + deepagents)
 
 Поверх ядра — авто-ответчик на входящие лички: LangGraph-роутер классифицирует намерение
 (**chat** → одиночный вызов модели через `init_chat_model`; **task** → deep-агент
@@ -236,6 +236,14 @@ client = StandaloneTelegramClient(api_id, api_hash, external_session=existing_st
   ленивый генератор ddgs исчерпывается внутри worker-потока (`list()` в `to_thread`), не в
   event loop; фейк brave-клиента стал одноразовым (нет утечки состояния между тестами).
   Refactor: ответ графа — в выделенном ключе `reply` состояния, не `messages[-1]`.
+
+- **Цикл 17 — трассировка LangSmith.** Кода в графе нет: langchain/langgraph трассируются
+  сами по env `LANGSMITH_TRACING`/`_API_KEY`/`_PROJECT` (`langsmith` уже в зависимостях
+  langchain), `thread_id` группирует трейсы по диалогам. `test_agent_config.py`:
+  `langsmith_tracing_enabled` — off по умолчанию, on с ключом, on без ключа → ValueError
+  (иначе фоновые ошибки на каждый трейс). `test_agent_cli.py`: команда `agent` печатает
+  `LangSmith tracing: on (project=...)` при включённой трассировке, падает с подсказкой
+  про `LANGSMITH_API_KEY` без ключа, молчит при выключенной.
 
 Принятые компромиссы v1: полное доверие allowlist'у — разрешённый собеседник может через
 задание читать/отправлять в любые диалоги (зафиксировано в `.env.example`); последовательная обработка (долгий task может вытеснить старые

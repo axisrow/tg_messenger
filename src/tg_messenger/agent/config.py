@@ -13,6 +13,24 @@ from dataclasses import dataclass, field
 SEARCH_PROVIDERS = ("duckduckgo", "tavily", "exa", "brave")
 
 
+def langsmith_tracing_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """LangSmith-трассировка включена? langchain/langgraph читают эти же env сами.
+
+    Включено без ключа — ValueError: иначе langsmith молча сыпал бы фоновые
+    ошибки на каждый трейс.
+    """
+    if env is None:
+        env = os.environ
+    if (env.get("LANGSMITH_TRACING") or "").strip().lower() not in ("1", "true", "yes"):
+        return False
+    if not (env.get("LANGSMITH_API_KEY") or "").strip():
+        raise ValueError(
+            "LANGSMITH_TRACING is on, but LANGSMITH_API_KEY is not set —"
+            " add a key from https://smith.langchain.com or disable tracing."
+        )
+    return True
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     model: str

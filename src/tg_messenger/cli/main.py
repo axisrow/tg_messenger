@@ -14,6 +14,7 @@ from pathlib import Path
 import click
 from telethon.errors import UnauthorizedError
 
+from tg_messenger.agent.config import langsmith_tracing_enabled
 from tg_messenger.core.auth import LOGIN_HINT
 from tg_messenger.core.client import StandaloneTelegramClient
 from tg_messenger.core.flood import HandledFloodWaitError
@@ -332,6 +333,14 @@ def chat(dialog_id: int, session: str) -> None:
               help="Reply with a short notice when processing a message fails.")
 def agent(session: str, notify_errors: bool) -> None:
     """AI assistant: auto-reply to incoming DMs, route tasks to a deep agent."""
+    # langchain/langgraph трассируются в LangSmith сами по LANGSMITH_* env —
+    # здесь только fail-fast (включено без ключа) и видимый статус
+    try:
+        if langsmith_tracing_enabled():
+            project = os.environ.get("LANGSMITH_PROJECT", "default")
+            click.echo(f"LangSmith tracing: on (project={project})")
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     async def _do():
         client = make_client(session_name=session)
