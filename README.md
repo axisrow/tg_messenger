@@ -143,3 +143,44 @@ Two ways to share one login across both projects (single sign-on):
   or inject directly as a library: `StandaloneTelegramClient(..., external_session=STRING)`.
 
 Session strings are never written to logs.
+
+## Interop with tg_content_factory (worker + agent tools)
+
+Two cooperating projects, split by role: **tg_messenger is the hands** (it reads
+and sends messages through your account) and **[tg_content_factory](https://github.com/axisrow/tg_content_factory)
+is the memory + search** (it indexes conversations and holds a task queue). They
+talk over HTTP — and httpx lives **only** in `tg_messenger/interop/`, never in the
+core.
+
+Install the extra:
+
+```bash
+pip install 'tg-messenger[interop]'
+```
+
+Run the worker — it claims tasks from the factory, executes them and reports back:
+
+```bash
+tg-messenger worker --factory-url http://127.0.0.1:8000 \
+    --types dm_reply,chat_answer,fetch_history --interval 5
+```
+
+Task types: `dm_reply`/`chat_answer` (`{peer, text}` → send a message; with
+`{peer, prompt}` the optional `[agent]` answers first), `fetch_history` and
+`fetch_dialogs` (read and return serialized models). Auth to the factory is HTTP
+Basic (empty username + `TG_FACTORY_PASSWORD`).
+
+When `TG_FACTORY_URL` is set, the AI agent also gains two tools — `factory_search`
+(recall from the factory's archive, beyond Telegram's recent history) and
+`factory_create_task` (enqueue background work).
+
+**Worked example — "where to go in St. Petersburg":** you DM the agent *"посоветуй,
+куда сходить на экскурсию в Питере"*; it calls `factory_search` to pull what your
+chats already said about СПб excursions from the factory's index, optionally
+`factory_create_task` to have the factory compile a richer answer, and replies with
+a grounded recommendation — memory (factory) plus hands (messenger).
+
+**Accepted risk (v1, full trust):** tasks from the factory run on your account with
+no source authorization beyond the shared password — whoever can enqueue tasks
+drives your "hands". Trust the factory as you trust yourself; keep the password in
+env only, never in logs or the repo.

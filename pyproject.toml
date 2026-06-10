@@ -37,8 +37,12 @@ agent = [
     "ddgs>=9.0",        # дефолтный веб-поиск без API-ключа
     "httpx>=0.27",      # brave search REST
 ]
+interop = [
+    # the ONLY place talking HTTP to tg_content_factory (#20); core stays httpx-free
+    "httpx>=0.27",
+]
 all = [
-    "tg-messenger[web,tui,crypto,agent]",
+    "tg-messenger[web,tui,crypto,agent,interop]",
 ]
 dev = [
     # тесты web/tui/crypto должны бежать локально → dev тянет эти extras

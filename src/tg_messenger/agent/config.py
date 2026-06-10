@@ -114,6 +114,8 @@ class AgentConfig:
     vision_model: str | None = None  # None — картинки идут в основную модель
     intents: tuple[IntentSpec, ...] = ()  # кастомные интенты из agent.json
     suggest_history_limit: int = 30  # сколько сообщений диалога уходит суфлёру (#17)
+    factory_url: str | None = None  # tg_content_factory base URL (#20) — None отключает factory-инструменты
+    factory_password: str | None = None  # пароль к фабрике (Basic auth)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> AgentConfig:
@@ -177,6 +179,9 @@ class AgentConfig:
         if suggest_history_limit < 1:
             raise ValueError("TG_SUGGEST_HISTORY must be a positive integer.")
 
+        factory_url = (env.get("TG_FACTORY_URL") or "").strip() or None
+        factory_password = (env.get("TG_FACTORY_PASSWORD") or "").strip() or None
+
         config_path = (env.get("TG_AGENT_CONFIG") or "").strip()
         if config_path:
             intents = load_intents(config_path)  # явно указанный файл обязан существовать
@@ -194,4 +199,6 @@ class AgentConfig:
             vision_model=vision_model,
             intents=intents,
             suggest_history_limit=suggest_history_limit,
+            factory_url=factory_url,
+            factory_password=factory_password,
         )

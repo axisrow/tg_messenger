@@ -85,3 +85,79 @@ async def test_dialogs_listed_with_id_title_username(client, tools):
 async def test_empty_dialogs_says_so(client, tools):
     result = await tools["list_telegram_dialogs"]()
     assert "no dialogs" in result.lower()
+
+
+# --- Цикл 110: factory-инструменты (interop) регистрируются только при TG_FACTORY_URL ---
+
+
+class FakeFactory:
+    """Stand-in FactoryClient — records calls, no httpx."""
+
+    def __init__(self, base_url=None, password=None, **kw):
+        self.base_url = base_url
+        self.password = password
+        self.searches = []
+        self.created = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def search_messages(self, identifier, query, limit=50, **kw):
+        self.searches.append((identifier, query, limit, kw))
+        return [{"id": 1, "text": f"{query}!"}]
+
+    async def create_task(self, type, payload):
+        self.created.append((type, payload))
+        return "task-xyz"
+
+
+def test_factory_tools_absent_without_url(client):
+    tools = {fn.__name__: fn for fn in make_telegram_tools(client, factory_url=None)}
+    assert "factory_search" not in tools
+    assert "factory_create_task" not in tools
+
+
+def test_factory_tools_present_with_url(client):
+    tools = {fn.__name__: fn for fn in make_telegram_tools(
+        client, factory_url="http://factory.local", factory_password="pw")}
+    assert "factory_search" in tools
+    assert "factory_create_task" in tools
+
+
+async def test_factory_search_forwards_params(client, monkeypatch):
+    import tg_messenger.agent.tools as tools_mod
+
+    fakes = []
+
+    def _factory(base_url, password, **kw):
+        f = FakeFactory(base_url=base_url, password=password)
+        fakes.append(f)
+        return f
+
+    monkeypatch.setattr(tools_mod, "_make_factory_client", _factory)
+    tools = {fn.__name__: fn for fn in make_telegram_tools(
+        client, factory_url="http://factory.local", factory_password="pw")}
+    result = await tools["factory_search"](query="спб", identifier="@chan", limit=5)
+    assert "спб" in result
+    (f,) = fakes
+    assert f.base_url == "http://factory.local"
+    assert f.searches[0][0] == "@chan"
+    assert f.searches[0][1] == "спб"
+    assert f.searches[0][2] == 5
+
+
+async def test_factory_create_task_forwards(client, monkeypatch):
+    import tg_messenger.agent.tools as tools_mod
+
+    fakes = []
+    monkeypatch.setattr(tools_mod, "_make_factory_client",
+                        lambda base_url, password, **kw: fakes.append(FakeFactory(base_url=base_url)) or fakes[-1])
+    tools = {fn.__name__: fn for fn in make_telegram_tools(
+        client, factory_url="http://f", factory_password="pw")}
+    result = await tools["factory_create_task"](type="dm_reply", payload={"peer": 7, "text": "hi"})
+    assert "task-xyz" in result
+    (f,) = fakes
+    assert f.created[0][0] == "dm_reply"

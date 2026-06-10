@@ -56,6 +56,21 @@ def make_client(**kwargs) -> StandaloneTelegramClient:
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
 
 
+def make_factory_client(*, base_url: str, password: str | None = None):
+    """Build the interop FactoryClient; the seam worker tests patch.
+
+    Lazy import: httpx (the [interop] extra) lives only inside interop/ — a base
+    install without the extra raises a friendly ClickException pointing at it.
+    """
+    try:
+        from tg_messenger.interop.factory_client import FactoryClient
+    except ImportError as exc:
+        raise click.ClickException(
+            "interop requires: pip install 'tg-messenger[interop]'"
+        ) from exc
+    return FactoryClient(base_url=base_url, password=password or "")
+
+
 def make_storage(profile: str = "default"):
     """Build the per-profile SQLite Storage; the seam moderation tests patch."""
     from tg_messenger.core.storage import Storage, default_db_path
@@ -755,6 +770,60 @@ def agent(session: str, notify_errors: bool) -> None:
             await _ensure_authorized(client, session)
             click.echo("Agent is listening for incoming messages (Ctrl+C to stop)...")
             await runner.run()
+        finally:
+            await client.disconnect()
+
+    try:
+        _run(_do(), session=session)
+    except KeyboardInterrupt:
+        click.echo("stopped.")
+
+
+@cli.command()
+@click.option("--session", default="default")
+@click.option("--factory-url", "factory_url", default=lambda: os.environ.get("TG_FACTORY_URL"),
+              help="tg_content_factory base URL (env TG_FACTORY_URL).")
+@click.option("--types", "types", default="dm_reply,chat_answer",
+              help="Comma-separated task types to claim.")
+@click.option("--interval", "interval", type=float, default=5.0,
+              help="Seconds to wait between empty polls.")
+def worker(session: str, factory_url: str | None, types: str, interval: float) -> None:
+    """Run a worker for tg_content_factory: claim tasks, execute them, report back.
+
+    The factory is the agent's memory + search; this worker is its hands —
+    dm_reply/chat_answer send messages, fetch_history/fetch_dialogs read them.
+    """
+    if not factory_url:
+        raise click.ClickException(
+            "--factory-url is required (or set TG_FACTORY_URL)."
+        )
+    try:
+        from tg_messenger.interop.worker import Worker
+    except ImportError as exc:
+        raise click.ClickException(
+            "interop requires: pip install 'tg-messenger[interop]'"
+        ) from exc
+
+    task_types = [t.strip() for t in types.split(",") if t.strip()]
+    factory = make_factory_client(
+        base_url=factory_url, password=os.environ.get("TG_FACTORY_PASSWORD")
+    )
+
+    async def _sleep(seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+    async def _do():
+        client = make_client(session_name=session)
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            click.echo(
+                f"Worker polling {factory_url} for {', '.join(task_types)} "
+                "(Ctrl+C to stop)..."
+            )
+            await Worker(
+                client, factory, types=task_types, sleep=_sleep, idle_sleep=interval
+            ).run()
         finally:
             await client.disconnect()
 
