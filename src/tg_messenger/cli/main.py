@@ -57,6 +57,12 @@ def _delivery_message(delivery) -> str:
         if delivery.timeout:
             msg += f" (available in ~{delivery.timeout}s)"
         msg += "."
+    elif delivery.kind == "app":
+        msg += (
+            " This is the only delivery channel for this number — check the 'Telegram'"
+            " service chat (sender 777000) on your logged-in devices."
+            " Press Enter to send the code again."
+        )
     return msg
 
 
@@ -137,9 +143,17 @@ def login(session: str, phone: str) -> None:
                 if code.strip():
                     break
                 try:
-                    delivery = await flow.resend_code()
+                    if delivery.next_kind:
+                        delivery = await flow.resend_code()
+                    else:
+                        # no alternative channel (next_type=None): a fresh send_code
+                        # repeats the same channel — like the web's "send again" button
+                        delivery = await flow.send_code(phone)
                 except RPCError as exc:
-                    raise click.ClickException(f"Could not resend code: {exc}") from exc
+                    # the original code is still valid — keep the login alive
+                    logger.warning("code resend failed: %s", exc)
+                    click.echo(f"Could not resend code: {exc}", err=True)
+                    continue
                 click.echo(_delivery_message(delivery))
             try:
                 await flow.sign_in(code=code)

@@ -191,19 +191,29 @@ def test_chat_sends_and_disconnects_on_eof(runner):
 class FakeInnerLoginClient:
     """Stands in for the raw Telethon client used by LoginFlow."""
 
-    def __init__(self, sign_in_error=None, send_code_error=None):
+    def __init__(self, sign_in_error=None, send_code_error=None,
+                 with_next_type=True, resend_error=None):
         self.sign_in_error = sign_in_error
         self.send_code_error = send_code_error
+        self.resend_error = resend_error
+        self.with_next_type = with_next_type  # Telegram offered a fallback channel?
         self.signed_in = []
+        self.code_requests = []
         self.resends = 0
 
     async def send_code_request(self, phone):
+        self.code_requests.append(phone)
         if self.send_code_error is not None:
             raise self.send_code_error
         sent_type = type("SentCodeTypeApp", (), {})()
-        return type("Sent", (), {"phone_code_hash": "h", "type": sent_type})()
+        attrs = {"phone_code_hash": "h", "type": sent_type}
+        if self.with_next_type:
+            attrs["next_type"] = type("CodeTypeSms", (), {})()
+        return type("Sent", (), attrs)()
 
     async def __call__(self, request):
+        if self.resend_error is not None:
+            raise self.resend_error
         self.resends += 1
         sent_type = type("SentCodeTypeSms", (), {})()
         return type("Sent", (), {"phone_code_hash": "h2", "type": sent_type})()
@@ -274,6 +284,46 @@ def test_login_empty_code_resends_via_next_channel(monkeypatch):
     assert result.exit_code == 0
     assert inner.resends == 1
     assert "SMS" in result.output  # resent code went via SMS
+    assert inner.signed_in[-1]["code"] == "123"
+    assert stub.saved is True
+
+
+def test_login_empty_code_without_fallback_resends_same_channel(monkeypatch):
+    # Telegram offered no next_type (e.g. +86 numbers): empty Enter must do a
+    # fresh send_code (same channel) — mirroring tg_content_factory's web
+    # "Отправить код повторно" — and must NOT call ResendCodeRequest.
+    inner = FakeInnerLoginClient(with_next_type=False)
+    stub = LoginStubClient(inner)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["login"], input="+10000000000\n\n123\n")
+    assert result.exit_code == 0
+    assert inner.resends == 0
+    assert len(inner.code_requests) == 2
+    assert inner.signed_in[-1]["code"] == "123"
+    assert stub.saved is True
+
+
+def test_login_app_without_fallback_mentions_service_chat(monkeypatch):
+    inner = FakeInnerLoginClient(with_next_type=False)
+    stub = LoginStubClient(inner)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["login"], input="+10000000000\n123\n")
+    assert result.exit_code == 0
+    assert "service chat" in result.output
+    assert "777000" in result.output
+
+
+def test_login_resend_failure_does_not_abort(monkeypatch):
+    from telethon.errors import SendCodeUnavailableError
+
+    inner = FakeInnerLoginClient(resend_error=SendCodeUnavailableError(None))
+    stub = LoginStubClient(inner)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    # empty Enter -> resend fails -> login keeps waiting for the original code
+    result = CliRunner().invoke(cli_main.cli, ["login"], input="+10000000000\n\n123\n")
+    assert result.exit_code == 0
+    assert "Could not resend code" in result.output
+    assert "Traceback" not in result.output
     assert inner.signed_in[-1]["code"] == "123"
     assert stub.saved is True
 
