@@ -31,7 +31,7 @@ pytest is configured for `asyncio_mode = auto` (no `@pytest.mark.asyncio` needed
 
 ## Architecture
 
-A single UI-agnostic core wrapped by three interchangeable front-ends. `PLAN.md` holds the full design and the TDD build sequence (cycles 1–8); the project is built test-first.
+A single UI-agnostic core wrapped by three interchangeable front-ends. `PLAN.md` holds the full design and the TDD build sequence (cycles 0–8); the project is built test-first.
 
 ```
 core/   ← all Telegram logic, no UI imports
@@ -51,11 +51,12 @@ web/    ┘
 ### Interfaces
 - **`cli/main.py`**: click group. `make_client(**kwargs)` builds the client from env.
 - **`web/app.py`**: FastAPI + server-rendered HTMX fragments + SSE for live messages (`sse_event_stream`). `build_app(client=..., session_name=...)`. The client connects/disconnects in the FastAPI lifespan.
-- **`tui/app.py`**: Textual app, `MessengerTUI(session_name=...)`.
+- **`tui/app.py`**: Textual app, `MessengerTUI(session_name=...)`. Two non-obvious constraints: `on_mount` resets the loop's task factory **before** the client exists — Textual's `eager_task_factory` (py3.12+) breaks Telethon, see the comment in `on_mount`; don't remove or move that line. And all network work goes through `self.run_worker(...)`, never `await` in handlers — awaiting stalls the message pump.
 
 ### Test seams (how the network is faked)
 Tests inject a fake Telethon client — never hit the network. Mirror these patterns when adding tests:
 - **Core**: pass `client_factory=lambda session, api_id, api_hash: fake_client` to `StandaloneTelegramClient`.
 - **Web**: `build_app(client=stub)`.
 - **CLI**: `monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)`.
+- **TUI**: `MessengerTUI(client=stub)`.
 - `tests/conftest.py` provides `FakeTelethonClient` (records `sent`/`downloads`, can `push_event` into registered handlers) and a `session_dir` tmp fixture.
