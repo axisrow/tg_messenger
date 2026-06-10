@@ -30,6 +30,11 @@ class HandledFloodWaitError(RuntimeError):
         self.operation = operation
         self.wait_seconds = wait_seconds
 
+    @property
+    def user_message(self) -> str:
+        """One user-facing phrasing for every UI."""
+        return f"Telegram flood wait {self.wait_seconds}s — try again later."
+
 
 def coerce_flood_wait_seconds(value: object) -> int:
     return max(1, int(value or 0))

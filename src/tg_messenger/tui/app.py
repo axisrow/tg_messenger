@@ -13,6 +13,8 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, ListItem, ListView, Static
 
+from tg_messenger.core.auth import LOGIN_HINT
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,7 +67,7 @@ class MessengerTUI(App):
         try:
             await self._client.connect()
             if not await self._client.is_authorized():
-                self.exit(return_code=1, message="Not logged in. Run: tg-messenger login")
+                self.exit(return_code=1, message=LOGIN_HINT)
                 return
             await self._load_dialogs()
         except Exception as exc:

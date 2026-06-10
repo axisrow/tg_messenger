@@ -58,6 +58,15 @@ class FakeDialog:
         self.message = message
 
 
+def make_sent_code(kind: str = "App", phone_code_hash: str = "hash123",
+                   next_kind: str | None = None):
+    """Fake auth.SentCode: type/next_type class names mimic telethon's (SentCodeTypeApp...)."""
+    attrs = {"phone_code_hash": phone_code_hash, "type": type(f"SentCodeType{kind}", (), {})()}
+    if next_kind is not None:
+        attrs["next_type"] = type(f"CodeType{next_kind}", (), {})()
+    return type("Sent", (), attrs)()
+
+
 class FakeTelethonClient:
     """Drop-in stand-in for telethon.TelegramClient — no network.
 
@@ -93,14 +102,12 @@ class FakeTelethonClient:
     async def send_code_request(self, phone):
         self.code_requests.append(phone)
         # mimic telethon: SentCode.type tells where the code went (SentCodeTypeApp etc.)
-        sent_type = type("SentCodeTypeApp", (), {})()
-        return type("Sent", (), {"phone_code_hash": "hash123", "type": sent_type})()
+        return make_sent_code("App", "hash123")
 
     async def __call__(self, request):
         # raw RPC path; LoginFlow uses it for auth.ResendCodeRequest
         self.resend_requests.append(request)
-        sent_type = type("SentCodeTypeSms", (), {})()
-        return type("Sent", (), {"phone_code_hash": "hash456", "type": sent_type})()
+        return make_sent_code("Sms", "hash456")
 
     async def sign_in(self, phone=None, code=None, password=None, **kw):
         self.signed_in_with.append({"phone": phone, "code": code, "password": password})

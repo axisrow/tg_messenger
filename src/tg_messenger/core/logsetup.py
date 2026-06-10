@@ -1,9 +1,10 @@
 """Logging setup: rotating file log plus an optional stderr handler.
 
 Every entrypoint calls ``setup_logging`` once; the file always records INFO+
-(DEBUG with verbose). The console only shows ERROR+ and skips ``tg_messenger.cli``
-records entirely — the CLI talks to the user via click, log noise belongs to the
-file. ``--verbose`` lifts both restrictions. The TUI passes ``console=False`` —
+(DEBUG with verbose). The console only shows ERROR+, and a caller that talks to
+the user itself (the CLI does, via click) passes its logger prefixes in
+``console_skip_prefixes`` so its records never duplicate on stderr.
+``--verbose`` lifts both restrictions. The TUI passes ``console=False`` —
 stderr would corrupt the alternate screen. Log content policy: operations, ids
 and error text — never message bodies or credentials.
 """
@@ -50,6 +51,7 @@ def setup_logging(
     *,
     verbose: bool = False,
     console: bool = True,
+    console_skip_prefixes: tuple[str, ...] = (),
     log_dir: Path | str | None = None,
 ) -> Path:
     """Configure root logging; returns the log file path.
@@ -82,10 +84,10 @@ def setup_logging(
         console_handler = logging.StreamHandler(sys.stderr)
         console_handler.setLevel(logging.DEBUG if verbose else logging.ERROR)
         console_handler.setFormatter(_ConsoleFormatter(_CONSOLE_FORMAT))
-        if not verbose:
-            # the CLI already reports its errors via click — no stderr duplicates
+        if not verbose and console_skip_prefixes:
+            # the caller reports these itself (e.g. CLI via click) — no stderr duplicates
             console_handler.addFilter(
-                lambda record: not record.name.startswith("tg_messenger.cli")
+                lambda record: not record.name.startswith(console_skip_prefixes)
             )
         setattr(console_handler, _MARKER, True)
         root.addHandler(console_handler)

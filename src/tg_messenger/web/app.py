@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
+from tg_messenger.core.auth import LOGIN_HINT
 from tg_messenger.core.flood import HandledFloodWaitError
 
 logger = logging.getLogger(__name__)
@@ -77,18 +78,12 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
 
     @app.exception_handler(UnauthorizedError)
     async def unauthorized(request: Request, exc: UnauthorizedError):
-        return HTMLResponse(
-            '<div class="error">Not logged in — run: tg-messenger login</div>',
-            status_code=401,
-        )
+        return HTMLResponse(f'<div class="error">{LOGIN_HINT}</div>', status_code=401)
 
     @app.exception_handler(HandledFloodWaitError)
     async def flood_wait(request: Request, exc: HandledFloodWaitError):
         logger.warning("%s: flood wait %ss", exc.operation, exc.wait_seconds)
-        return HTMLResponse(
-            f'<div class="error">Telegram flood wait {exc.wait_seconds}s — try again later.</div>',
-            status_code=503,
-        )
+        return HTMLResponse(f'<div class="error">{exc.user_message}</div>', status_code=503)
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception):

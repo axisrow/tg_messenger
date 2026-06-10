@@ -14,6 +14,7 @@ from pathlib import Path
 import click
 from telethon.errors import UnauthorizedError
 
+from tg_messenger.core.auth import LOGIN_HINT
 from tg_messenger.core.client import StandaloneTelegramClient
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.logsetup import log_file_path, setup_logging
@@ -21,20 +22,27 @@ from tg_messenger.core.logsetup import log_file_path, setup_logging
 logger = logging.getLogger(__name__)
 
 
-def _load_dotenv(path: Path | str = ".env") -> None:
-    """Load KEY=VALUE pairs from a .env file in cwd; real env always wins."""
+def _parse_dotenv(path: Path | str = ".env") -> dict[str, str]:
+    """Parse KEY=VALUE pairs from a .env file (quotes stripped); missing file -> {}."""
     path = Path(path)
+    pairs: dict[str, str] = {}
     if not path.exists():
-        return
+        return pairs
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip().strip("'\"")
         if key:
-            os.environ.setdefault(key, value)
+            pairs[key] = value.strip().strip("'\"")
+    return pairs
+
+
+def _load_dotenv(path: Path | str = ".env") -> None:
+    """Load a .env from cwd into the environment; real env always wins."""
+    for key, value in _parse_dotenv(path).items():
+        os.environ.setdefault(key, value)
 
 
 def make_client(**kwargs) -> StandaloneTelegramClient:
@@ -67,7 +75,7 @@ def _delivery_message(delivery) -> str:
 
 
 def _login_hint(session: str = "default") -> str:
-    hint = "Not logged in. Run: tg-messenger login"
+    hint = LOGIN_HINT
     if session != "default":
         hint += f" --session {session}"
     return hint
@@ -80,9 +88,7 @@ def _run(coro, session: str = "default"):
         raise  # already user-friendly
     except HandledFloodWaitError as exc:
         logger.warning("%s: flood wait %ss", exc.operation, exc.wait_seconds)
-        raise click.ClickException(
-            f"Telegram flood wait {exc.wait_seconds}s — try again later."
-        ) from exc
+        raise click.ClickException(exc.user_message) from exc
     except UnauthorizedError as exc:
         # session missing or revoked mid-command
         raise click.ClickException(_login_hint(session)) from exc
@@ -116,7 +122,8 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     _load_dotenv()
-    setup_logging(verbose=verbose)
+    # the CLI reports its own errors via click — keep its log records off stderr
+    setup_logging(verbose=verbose, console_skip_prefixes=("tg_messenger.cli",))
 
 
 @cli.command()
@@ -323,7 +330,7 @@ def tui(ctx: click.Context, session: str) -> None:
     from tg_messenger.tui.app import MessengerTUI
 
     # stderr handler would corrupt the alternate screen — file log only
-    setup_logging(verbose=ctx.obj.get("verbose", False), console=False)
+    setup_logging(verbose=ctx.obj["verbose"], console=False)
     MessengerTUI(session_name=session).run()
 
 

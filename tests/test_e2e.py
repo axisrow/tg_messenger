@@ -17,25 +17,12 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tg_messenger.cli.main import _parse_dotenv
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SESSION_FILE = Path.home() / ".tg_messenger" / "sessions" / "default.session"
 
-
-def _load_dotenv() -> dict[str, str]:
-    env_path = PROJECT_ROOT / ".env"
-    if not env_path.exists():
-        return {}
-    out = {}
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        out[key.strip()] = value.strip()
-    return out
-
-
-DOTENV = _load_dotenv()
+DOTENV = _parse_dotenv(PROJECT_ROOT / ".env")
 
 
 def _cred_env() -> dict[str, str]:

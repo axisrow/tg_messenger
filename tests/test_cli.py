@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import pytest
 from click.testing import CliRunner
 
+from tests.conftest import make_sent_code
 from tg_messenger.cli import main as cli_main
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.models import Dialog, IncomingEvent, MediaRef, Message
@@ -205,18 +206,13 @@ class FakeInnerLoginClient:
         self.code_requests.append(phone)
         if self.send_code_error is not None:
             raise self.send_code_error
-        sent_type = type("SentCodeTypeApp", (), {})()
-        attrs = {"phone_code_hash": "h", "type": sent_type}
-        if self.with_next_type:
-            attrs["next_type"] = type("CodeTypeSms", (), {})()
-        return type("Sent", (), attrs)()
+        return make_sent_code("App", "h", next_kind="Sms" if self.with_next_type else None)
 
     async def __call__(self, request):
         if self.resend_error is not None:
             raise self.resend_error
         self.resends += 1
-        sent_type = type("SentCodeTypeSms", (), {})()
-        return type("Sent", (), {"phone_code_hash": "h2", "type": sent_type})()
+        return make_sent_code("Sms", "h2")
 
     async def sign_in(self, phone=None, code=None, password=None, **kw):
         if code is not None and self.sign_in_error is not None:

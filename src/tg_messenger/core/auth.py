@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SESSION_DIR = Path.home() / ".tg_messenger" / "sessions"
 
+# single source for the "you need to log in" UX hint, shared by all three UIs
+LOGIN_HINT = "Not logged in. Run: tg-messenger login"
+
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 

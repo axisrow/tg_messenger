@@ -80,9 +80,10 @@ def test_console_handler_error_only_by_default(tmp_path):
     assert handlers[0].stream is sys.stderr
 
 
-def test_console_skips_cli_logger_records(tmp_path, capsys):
+def test_console_skips_requested_logger_prefixes(tmp_path, capsys):
     # the CLI talks to the user via click; its log records must not duplicate on stderr
-    log_file = setup_logging(log_dir=tmp_path / "logs")
+    log_file = setup_logging(console_skip_prefixes=("tg_messenger.cli",),
+                             log_dir=tmp_path / "logs")
     logging.getLogger("tg_messenger.cli.main").error("boom-cli-marker")
     logging.getLogger("tg_messenger.core.client").error("boom-core-marker")
     err = capsys.readouterr().err
