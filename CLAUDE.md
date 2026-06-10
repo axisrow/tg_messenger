@@ -31,6 +31,49 @@ Runtime requires `TG_API_ID` and `TG_API_HASH` (Telegram API credentials) — fr
 
 pytest is configured for `asyncio_mode = auto` (no `@pytest.mark.asyncio` needed), a 30s per-test timeout, and `filterwarnings = ["error"]` — **any warning fails the test**.
 
+## Project-wide invariants
+
+- **No silent failures — project-level rule.** Every caught-and-suppressed exception MUST be logged (`logger.exception`, or `logger.warning` for expected drops). A bare `except: pass` is a review bug. This applies to every module, not just the examples listed under logsetup below.
+- Every network call goes through `run_with_flood_wait_retry`; never `get_entity('@username')` in loops (~50 resolves in a row → flood).
+- UIs render Pydantic models from core — never raw Telethon objects.
+- Tests: fakes from conftest only — no network, no real LLM, no real `sleep` (inject `clock`/`rng`); `filterwarnings=error`.
+- **Every PR must contain a closing keyword (`Closes #N`)** for its issue; one issue = one closing PR.
+- Secrets, session strings, phone numbers and login codes never reach logs or the repository.
+
+## Target structure (roadmap)
+
+Issues #8–#26 (decomposition of umbrella #6, see its table-of-contents comments) add the modules below. **Placement rules — agents must not improvise locations:**
+- Services that sit *above* the client (listen + act loops) live in `core/` next to `watch.py` — NOT inside `client.py`, which stays a thin wrapper.
+- LLM calls exist ONLY behind `agent/factory.py` injection; new agent features (e.g. suggest) receive callables, never import langchain/deepagents themselves.
+- HTTP to tg_content_factory lives ONLY in `interop/` (httpx, optional extra); `core/` never imports httpx.
+
+```
+src/tg_messenger/
+├── core/                  # all Telegram logic; no UI/LLM/httpx imports
+│   ├── client.py          # thin client (issue hooks: #8 cache, #15 actions, #25 acquire)
+│   ├── auth.py            # SessionStore, LoginFlow; + LoginSession (#26)
+│   ├── session_cipher.py  # NEW #10 — Fernet enc:v2:, byte-compatible with tg_content_factory
+│   ├── cache.py           # NEW #8 — TTLCache + single-flight
+│   ├── ratelimit.py       # NEW #25 — outgoing token-bucket
+│   ├── storage.py         # NEW #13 — SQLite (migrations, kv)
+│   ├── search.py          # NEW #12 — dialog filtering (pure functions)
+│   ├── usernames.py       # NEW #22 — username generate/check/set
+│   ├── moderation.py      # NEW #16 — ModerationEngine (service, watch.py pattern)
+│   ├── heartbeat.py       # NEW #19 — HeartbeatService (service)
+│   └── watch.py / events.py / models.py / flood.py / logsetup.py   # existing (#14 extends events/models)
+├── agent/
+│   ├── suggest.py         # NEW #17 — Suggester (LLM injected via factory.py)
+│   └── orchestrator.py / runner.py / factory.py / tools.py / config.py / search.py / media.py
+├── interop/               # NEW #20 — the ONLY place talking HTTP to tg_content_factory
+│   ├── factory_client.py
+│   └── worker.py
+├── cli/main.py            # new commands: profiles(#11) search(#12) moderate(#16) heartbeat(#19)
+│                          #   worker(#20) username(#22) suggest(#17)
+├── web/                   # + auth middleware(#24), /tg-login wizard(#26)
+└── tui/app.py             # + profile screen(#11), login screen(#26), @file send(#21)
+.github/workflows/ci.yml   # NEW #23
+```
+
 ## Architecture
 
 A single UI-agnostic core wrapped by three interchangeable front-ends, plus an optional agent layer. `PLAN.md` holds the full design and the TDD build sequence (cycles 0–8 core/UI, 9–25 agent, 26–30 deletion watch, 31–38 DM/groups tabs); the project is built test-first.
