@@ -39,6 +39,13 @@ def make_client(**kwargs) -> StandaloneTelegramClient:
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
 
 
+_CODE_DELIVERY_HINTS = {
+    "app": "Code sent to your Telegram app — check devices where you are already logged in.",
+    "sms": "Code sent via SMS.",
+    "call": "You will get a phone call with the code.",
+}
+
+
 def _login_hint(session: str = "default") -> str:
     hint = "Not logged in. Run: tg-messenger login"
     if session != "default":
@@ -93,7 +100,13 @@ def login(session: str, phone: str) -> None:
         await client.connect()
         try:
             flow = LoginFlow(client._client)
-            await flow.send_code(phone)
+            try:
+                delivery = await flow.send_code(phone)
+            except RPCError as exc:
+                raise click.ClickException(f"Could not send code: {exc}") from exc
+            click.echo(_CODE_DELIVERY_HINTS.get(
+                delivery, "Code sent — check your Telegram app and SMS."
+            ))
             code = click.prompt("Code")
             try:
                 await flow.sign_in(code=code)

@@ -74,6 +74,12 @@ def test_load_rejects_corrupt_session(session_dir):
         store.load("default")
 
 
+async def test_send_code_reports_delivery_channel(fake_client):
+    flow = auth.LoginFlow(fake_client)
+    kind = await flow.send_code("+10000000000")
+    assert kind == "app"  # fake SentCode.type is SentCodeTypeApp
+
+
 async def test_send_code_and_sign_in(fake_client):
     flow = auth.LoginFlow(fake_client)
     await flow.send_code("+10000000000")

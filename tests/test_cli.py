@@ -191,12 +191,16 @@ def test_chat_sends_and_disconnects_on_eof(runner):
 class FakeInnerLoginClient:
     """Stands in for the raw Telethon client used by LoginFlow."""
 
-    def __init__(self, sign_in_error=None):
+    def __init__(self, sign_in_error=None, send_code_error=None):
         self.sign_in_error = sign_in_error
+        self.send_code_error = send_code_error
         self.signed_in = []
 
     async def send_code_request(self, phone):
-        return type("Sent", (), {"phone_code_hash": "h"})()
+        if self.send_code_error is not None:
+            raise self.send_code_error
+        sent_type = type("SentCodeTypeApp", (), {})()
+        return type("Sent", (), {"phone_code_hash": "h", "type": sent_type})()
 
     async def sign_in(self, phone=None, code=None, password=None, **kw):
         if code is not None and self.sign_in_error is not None:
@@ -231,6 +235,28 @@ def test_login_wrong_code_fails_without_2fa_prompt(monkeypatch):
     assert result.exit_code != 0
     assert "2FA" not in result.output
     assert stub.saved is False
+
+
+def test_login_says_where_code_was_sent(monkeypatch):
+    inner = FakeInnerLoginClient()
+    stub = LoginStubClient(inner)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["login"], input="+10000000000\n123\n")
+    assert result.exit_code == 0
+    assert "Telegram app" in result.output  # код ушёл в приложение, не по SMS
+
+
+def test_login_invalid_phone_friendly_error(monkeypatch):
+    from telethon.errors.rpcerrorlist import PhoneNumberInvalidError
+
+    inner = FakeInnerLoginClient(send_code_error=PhoneNumberInvalidError(None))
+    stub = LoginStubClient(inner)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["login"], input="+999\n")
+    assert result.exit_code != 0
+    assert "Could not send code" in result.output
+    assert "Traceback" not in result.output
+    assert stub.connected is False
 
 
 def test_login_2fa_prompts_password(monkeypatch):

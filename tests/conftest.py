@@ -91,7 +91,9 @@ class FakeTelethonClient:
 
     async def send_code_request(self, phone):
         self.code_requests.append(phone)
-        return type("Sent", (), {"phone_code_hash": "hash123"})()
+        # mimic telethon: SentCode.type tells where the code went (SentCodeTypeApp etc.)
+        sent_type = type("SentCodeTypeApp", (), {})()
+        return type("Sent", (), {"phone_code_hash": "hash123", "type": sent_type})()
 
     async def sign_in(self, phone=None, code=None, password=None, **kw):
         self.signed_in_with.append({"phone": phone, "code": code, "password": password})

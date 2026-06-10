@@ -13,6 +13,8 @@ from pathlib import Path
 
 from telethon.sessions import StringSession
 
+from tg_messenger.core.flood import run_with_flood_wait_retry
+
 DEFAULT_SESSION_DIR = Path.home() / ".tg_messenger" / "sessions"
 
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -75,10 +77,22 @@ class LoginFlow:
         self._phone: str | None = None
         self._code_hash: str | None = None
 
-    async def send_code(self, phone: str) -> None:
-        sent = await self._client.send_code_request(phone)
+    async def send_code(self, phone: str) -> str:
+        """Request a login code; return the delivery channel: app / sms / call / unknown.
+
+        Telegram prefers delivering the code to an already-logged-in Telegram app
+        (SentCodeTypeApp) over SMS — callers should surface this to the user.
+        """
+        sent = await run_with_flood_wait_retry(
+            lambda: self._client.send_code_request(phone), operation="send_code"
+        )
         self._phone = phone
         self._code_hash = getattr(sent, "phone_code_hash", None)
+        type_name = type(getattr(sent, "type", None)).__name__.lower()
+        for kind in ("app", "sms", "call"):
+            if kind in type_name:
+                return kind
+        return "unknown"
 
     async def sign_in(self, code: str):
         if self._phone is None:
