@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 
+import pytest
 from textual.widgets import Input, ListView, Tabs
 
 from tg_messenger.core.models import Dialog, IncomingEvent, Message
@@ -185,6 +186,10 @@ def hangs_forever(entered: asyncio.Event):
     return hung
 
 
+@pytest.mark.skipif(
+    not hasattr(asyncio, "eager_task_factory"),
+    reason="eager_task_factory is py3.12+; the regression it guards can't occur on 3.11",
+)
 async def test_tui_loads_dialogs_under_eager_task_factory():
     # the real App.run() installs eager_task_factory on the loop; run_test()
     # does not, which is why this regression was invisible to every other test

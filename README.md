@@ -1,5 +1,7 @@
 # tg_messenger
 
+[![CI](https://github.com/axisrow/tg_messenger/actions/workflows/ci.yml/badge.svg)](https://github.com/axisrow/tg_messenger/actions/workflows/ci.yml)
+
 Standalone, reusable Telegram messenger client for manual chatting in DMs.
 Three interfaces (CLI / TUI / Web) over a shared UI-agnostic core, built on Telethon.
 
