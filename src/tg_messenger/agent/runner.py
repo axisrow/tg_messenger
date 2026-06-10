@@ -1,7 +1,8 @@
 """Agent runner: the listen → filter → orchestrate → reply loop.
 
 No LLM imports here — the orchestrator is any object with
-``async handle(dialog_id, text) -> str``. One message failing must never
+``async handle(dialog_id, text) -> str`` (called with an ``image=`` keyword
+only when a photo is being routed). One message failing must never
 kill the loop: errors are logged (never swallowed) and, optionally, a short
 notice is sent back to the dialog.
 """
@@ -11,6 +12,7 @@ from __future__ import annotations
 import logging
 
 from tg_messenger.agent.config import AgentConfig
+from tg_messenger.agent.media import download_image
 from tg_messenger.core.models import IncomingEvent
 
 logger = logging.getLogger(__name__)
@@ -57,16 +59,33 @@ class AgentRunner:
             # defence in depth: core subscribes with NewMessage(incoming=True),
             # so our own replies never reach listen() in the first place
             return
-        if not message.text:
-            logger.debug("skip message %s in dialog %s: no text", message.id, event.dialog_id)
-            return
+        # allowlist before any media work: strangers must not cost downloads
         if allowed is not None and message.sender_id not in allowed:
             logger.debug("skip message from %s: not in allowlist", message.sender_id)
+            return
+        media_kind = message.media.kind if message.media else None
+        if media_kind == "voice":
+            logger.info(
+                "skip voice message %s in dialog %s: voice is not handled yet",
+                message.id, event.dialog_id,
+            )
+            return
+        is_photo = media_kind == "photo"
+        if not is_photo and not message.text:
+            logger.debug("skip message %s in dialog %s: no text", message.id, event.dialog_id)
             return
         try:
             # client.typing never raises by contract (core logs its own failures)
             async with self._client.typing(event.dialog_id):
-                reply = await self._orchestrator.handle(event.dialog_id, message.text)
+                if is_photo:
+                    image = await download_image(self._client, event.dialog_id, message)
+                    if image is None:
+                        return  # the reason is already logged by agent.media
+                    reply = await self._orchestrator.handle(
+                        event.dialog_id, message.text or "", image=image
+                    )
+                else:
+                    reply = await self._orchestrator.handle(event.dialog_id, message.text)
                 await self._client.send_text(event.dialog_id, reply)
         except Exception:
             logger.exception("agent failed on message %s in dialog %s", message.id, event.dialog_id)

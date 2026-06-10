@@ -1,14 +1,28 @@
 """Цикл 9: AgentConfig.from_env — чтение и валидация настроек агента (stdlib-only)."""
 
+import json
+
 import pytest
 
-from tg_messenger.agent.config import SEARCH_PROVIDERS, AgentConfig, langsmith_tracing_enabled
+from tg_messenger.agent.config import (
+    SEARCH_PROVIDERS,
+    AgentConfig,
+    IntentSpec,
+    langsmith_tracing_enabled,
+    load_intents,
+)
 
 VALID_ENV = {
     "TG_AGENT_MODEL": "anthropic:claude-sonnet-4-6",
     "TG_AGENT_ALLOWLIST": "123, @Ann, bob",
     "TG_AGENT_SEARCH": "tavily",
 }
+
+
+@pytest.fixture(autouse=True)
+def _isolated_cwd(monkeypatch, tmp_path):
+    # from_env подхватывает ./agent.json из cwd — тесты не должны видеть файл разработчика
+    monkeypatch.chdir(tmp_path)
 
 
 def test_valid_env_parses_all_fields():
@@ -111,3 +125,104 @@ def test_langsmith_tracing_defaults_to_os_environ(monkeypatch):
     monkeypatch.setenv("LANGSMITH_TRACING", "true")
     monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2-key")
     assert langsmith_tracing_enabled() is True
+
+
+# --- Цикл 22: TG_AGENT_VISION_MODEL ---
+
+
+def test_vision_model_unset_is_none():
+    assert AgentConfig.from_env(VALID_ENV).vision_model is None
+
+
+def test_vision_model_parsed():
+    cfg = AgentConfig.from_env({**VALID_ENV, "TG_AGENT_VISION_MODEL": "openai:gpt-5-vision"})
+    assert cfg.vision_model == "openai:gpt-5-vision"
+
+
+def test_vision_model_without_colon_raises_with_format_example():
+    with pytest.raises(ValueError, match=r"TG_AGENT_VISION_MODEL.*provider:model"):
+        AgentConfig.from_env({**VALID_ENV, "TG_AGENT_VISION_MODEL": "gpt-5-vision"})
+
+
+# --- Цикл 23: кастомные интенты из agent.json ---
+
+TRANSLATE = {
+    "name": "translate",
+    "description": "просит перевести текст",
+    "pipeline": "chat",
+    "system_prompt": "Ты переводчик.",
+}
+
+
+def write_intents(path, intents):
+    path.write_text(json.dumps({"intents": intents}, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_no_config_file_means_builtin_intents_only():
+    assert AgentConfig.from_env(VALID_ENV).intents == ()
+
+
+def test_agent_json_in_cwd_is_picked_up(tmp_path):
+    write_intents(tmp_path / "agent.json", [TRANSLATE])
+    cfg = AgentConfig.from_env(VALID_ENV)
+    assert cfg.intents == (
+        IntentSpec(name="translate", description="просит перевести текст",
+                   pipeline="chat", system_prompt="Ты переводчик."),
+    )
+
+
+def test_explicit_config_path_wins_over_cwd(tmp_path):
+    write_intents(tmp_path / "agent.json", [TRANSLATE])
+    other = write_intents(tmp_path / "other.json",
+                          [{"name": "recipe", "description": "просит рецепт", "pipeline": "task"}])
+    cfg = AgentConfig.from_env({**VALID_ENV, "TG_AGENT_CONFIG": str(other)})
+    assert [i.name for i in cfg.intents] == ["recipe"]
+    assert cfg.intents[0].system_prompt is None  # опционален
+
+
+def test_explicit_missing_config_path_raises(tmp_path):
+    missing = tmp_path / "nope.json"
+    with pytest.raises(ValueError, match="nope.json"):
+        AgentConfig.from_env({**VALID_ENV, "TG_AGENT_CONFIG": str(missing)})
+
+
+def test_broken_json_raises_with_path(tmp_path):
+    path = tmp_path / "agent.json"
+    path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"agent\.json"):
+        load_intents(path)
+
+
+@pytest.mark.parametrize("payload", [
+    ["not", "an", "object"],          # корень — не объект
+    {"intents": {"name": "x"}},        # intents — не список
+    {"intents": ["строка"]},           # элемент — не объект
+])
+def test_wrong_top_level_shape_raises(tmp_path, payload):
+    path = tmp_path / "agent.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"agent\.json"):
+        load_intents(path)
+
+
+@pytest.mark.parametrize("bad,why", [
+    ({**TRANSLATE, "name": "chat"}, "встроенное имя"),
+    ({**TRANSLATE, "name": "vision"}, "служебное имя узла"),
+    ({**TRANSLATE, "name": "Two Words"}, "имя — не одно слово в нижнем регистре"),
+    ({**TRANSLATE, "name": ""}, "пустое имя"),
+    ({**TRANSLATE, "pipeline": "workflow"}, "неизвестный pipeline"),
+    ({**TRANSLATE, "description": "  "}, "пустое описание"),
+    ({**TRANSLATE, "extra_key": 1}, "опечатка в ключе — fail-fast"),
+    ({**TRANSLATE, "system_prompt": 42}, "system_prompt — не строка"),
+])
+def test_invalid_intent_raises(tmp_path, bad, why):
+    path = write_intents(tmp_path / "agent.json", [bad])
+    with pytest.raises(ValueError, match=r"agent\.json"):
+        load_intents(path)
+
+
+def test_duplicate_intent_names_raise(tmp_path):
+    path = write_intents(tmp_path / "agent.json", [TRANSLATE, TRANSLATE])
+    with pytest.raises(ValueError, match="translate"):
+        load_intents(path)

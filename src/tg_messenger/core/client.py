@@ -223,6 +223,9 @@ class StandaloneTelegramClient:
             return None
         if getattr(raw, "photo", None) is not None:
             kind = "photo"
+        elif getattr(raw, "voice", None) is not None:
+            # a voice note IS a document in Telethon — check .voice first
+            kind = "voice"
         elif getattr(raw, "document", None) is not None:
             kind = "document"
         else:
@@ -232,6 +235,7 @@ class StandaloneTelegramClient:
             kind=kind,
             file_name=getattr(file, "file_name", None) or getattr(file, "name", None),
             size=getattr(file, "size", None),
+            mime_type=getattr(file, "mime_type", None),
             downloadable=True,
         )
 

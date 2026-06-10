@@ -51,6 +51,16 @@ def test_media_kind_constrained():
         MediaRef(kind="banana", downloadable=False)
 
 
+def test_media_ref_voice_kind_and_mime():
+    media = MediaRef(kind="voice", mime_type="audio/ogg")
+    assert media.kind == "voice"
+    assert media.mime_type == "audio/ogg"
+
+
+def test_media_ref_mime_defaults_to_none():
+    assert MediaRef(kind="photo").mime_type is None
+
+
 def test_incoming_event_wraps_message():
     msg = Message(id=3, dialog_id=7, sender_id=42, out=False, text="yo", date=_now())
     event = IncomingEvent(dialog_id=7, message=msg)

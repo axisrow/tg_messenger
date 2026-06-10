@@ -3,7 +3,7 @@ import logging
 
 from telethon.sessions import StringSession
 
-from tests.conftest import FakeChannel, FakeDialog, FakeMessage, FakeUser
+from tests.conftest import FakeChannel, FakeDialog, FakeDocument, FakeMessage, FakeUser
 from tg_messenger.core.client import StandaloneTelegramClient
 from tg_messenger.core.models import Dialog, IncomingEvent, Message
 
@@ -68,6 +68,31 @@ async def test_history_maps_messages(fake_client):
     # chronological order (oldest first), regardless of Telethon's newest-first
     assert [m.text for m in msgs] == ["hi", "yo"]
     assert msgs[1].out is True
+
+
+def test_media_ref_voice_wins_over_document():
+    # Telethon: a voice note is a document with voice=True — .voice must be checked first
+    doc = FakeDocument(file_name="note.ogg", size=2048)
+    raw = FakeMessage(id=1, sender_id=7, voice=doc,
+                      file=FakeDocument(file_name="note.ogg", size=2048, mime_type="audio/ogg"))
+    ref = StandaloneTelegramClient._to_media_ref(raw)
+    assert ref.kind == "voice"
+    assert ref.mime_type == "audio/ogg"
+
+
+def test_media_ref_photo_carries_mime_type():
+    raw = FakeMessage(id=1, sender_id=7, photo=object(),
+                      file=FakeDocument(mime_type="image/jpeg"))
+    ref = StandaloneTelegramClient._to_media_ref(raw)
+    assert ref.kind == "photo"
+    assert ref.mime_type == "image/jpeg"
+
+
+def test_media_ref_without_file_has_no_mime_type():
+    raw = FakeMessage(id=1, sender_id=7, photo=object())
+    ref = StandaloneTelegramClient._to_media_ref(raw)
+    assert ref.kind == "photo"
+    assert ref.mime_type is None
 
 
 async def test_send_text_records_and_returns_message(fake_client):

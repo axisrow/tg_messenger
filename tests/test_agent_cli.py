@@ -18,7 +18,7 @@ from tg_messenger.cli import main as cli_main
 deepagents = pytest.importorskip("deepagents")
 
 from tg_messenger.agent import factory  # noqa: E402
-from tg_messenger.agent.config import AgentConfig  # noqa: E402
+from tg_messenger.agent.config import AgentConfig, IntentSpec  # noqa: E402
 from tg_messenger.agent.orchestrator import Orchestrator  # noqa: E402
 
 
@@ -92,6 +92,88 @@ async def test_chat_fn_returns_content_and_keeps_history():
     assert await chat(history) == "ответ"
     (messages,) = model.calls
     assert messages[-2:] == history  # история ушла модели целиком, в конце
+
+
+# --- Цикл 22: vision-функция и vision-модель ---
+
+
+async def test_vision_fn_uses_vision_prompt_and_returns_content():
+    model = FakeModel(reply="на фото кот")
+    vision = factory.make_vision_fn(model)
+    history = [SimpleNamespace(content="что тут?")]
+    assert await vision(history) == "на фото кот"
+    (messages,) = model.calls
+    assert messages[0].content == factory.VISION_SYSTEM_PROMPT
+    assert messages[-1:] == history
+
+
+def test_build_orchestrator_with_dedicated_vision_model(monkeypatch):
+    init_calls = []
+    monkeypatch.setattr(factory, "init_chat_model", lambda spec: init_calls.append(spec) or FakeModel())
+    monkeypatch.setattr(factory, "create_deep_agent", lambda **kw: SimpleNamespace(ainvoke=None))
+    orch = factory.build_orchestrator(
+        client=SimpleNamespace(), cfg=make_cfg(vision_model="openai:gpt-5-vision"),
+    )
+    assert init_calls == ["anthropic:claude-x", "openai:gpt-5-vision"]
+    assert orch._vision_fn is not None
+
+
+def test_build_orchestrator_reuses_main_model_for_vision(monkeypatch):
+    init_calls = []
+    monkeypatch.setattr(factory, "init_chat_model", lambda spec: init_calls.append(spec) or FakeModel())
+    monkeypatch.setattr(factory, "create_deep_agent", lambda **kw: SimpleNamespace(ainvoke=None))
+    orch = factory.build_orchestrator(client=SimpleNamespace(), cfg=make_cfg())
+    assert init_calls == ["anthropic:claude-x"]  # одна модель на всё
+    assert orch._vision_fn is not None  # vision работает и без отдельной модели
+
+
+# --- Цикл 25: классификатор по списку интентов + видимость конфига в CLI ---
+
+RECIPE = IntentSpec(name="recipe", description="просит рецепт блюда", pipeline="chat",
+                    system_prompt="Ты повар.")
+
+
+def test_build_classify_prompt_includes_custom_intents():
+    prompt = factory.build_classify_prompt((RECIPE,))
+    assert "recipe" in prompt and "просит рецепт блюда" in prompt
+    assert "task" in prompt and "chat" in prompt  # встроенные остаются
+
+
+async def test_classifier_accepts_custom_intent_name():
+    classify = factory.make_classifier(FakeModel(reply=" Recipe.\n"), intents=(RECIPE,))
+    assert await classify("как сварить борщ") == "recipe"
+
+
+async def test_classifier_unknown_word_falls_back_to_chat_with_intents(caplog):
+    classify = factory.make_classifier(FakeModel(reply="pizza"), intents=(RECIPE,))
+    with caplog.at_level(logging.WARNING, logger="tg_messenger.agent.factory"):
+        assert await classify("что-нибудь") == "chat"
+    assert any("chat" in r.message for r in caplog.records)
+
+
+def test_build_orchestrator_passes_intents(monkeypatch):
+    monkeypatch.setattr(factory, "init_chat_model", lambda spec: FakeModel())
+    monkeypatch.setattr(factory, "create_deep_agent", lambda **kw: SimpleNamespace(ainvoke=None))
+    orch = factory.build_orchestrator(client=SimpleNamespace(), cfg=make_cfg(intents=(RECIPE,)))
+    assert "recipe" in orch._routes  # узел кастомного интента есть в графе
+
+
+def test_make_agent_runner_announces_intents_and_vision(monkeypatch, tmp_path, capsys):
+    import json
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agent.json").write_text(json.dumps({"intents": [
+        {"name": "recipe", "description": "просит рецепт", "pipeline": "chat"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("TG_AGENT_MODEL", "anthropic:claude-x")
+    monkeypatch.setenv("TG_AGENT_ALLOWLIST", "*")
+    monkeypatch.setenv("TG_AGENT_VISION_MODEL", "openai:gpt-5-vision")
+    monkeypatch.setattr("tg_messenger.agent.factory.build_orchestrator",
+                        lambda client, cfg: SimpleNamespace())
+    cli_main.make_agent_runner(SimpleNamespace())
+    out = capsys.readouterr().out
+    assert "openai:gpt-5-vision" in out  # vision-модель видна на старте
+    assert "recipe" in out  # и загруженные кастомные интенты тоже
 
 
 # --- CLI-команда agent ---

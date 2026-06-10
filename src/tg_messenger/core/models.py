@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-MediaKind = Literal["photo", "document", "other"]
+MediaKind = Literal["photo", "voice", "document", "other"]
 
 
 class User(BaseModel):
@@ -21,6 +21,7 @@ class MediaRef(BaseModel):
     kind: MediaKind
     file_name: str | None = None
     size: int | None = None
+    mime_type: str | None = None
     downloadable: bool = False
 
 

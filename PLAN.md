@@ -185,7 +185,7 @@ client = StandaloneTelegramClient(api_id, api_hash, external_session=existing_st
   `GET /stream/{id}` отдаёт один SSE-кадр когда `bus.publish`.
 - **TUI** проверяется smoke-тестом монтирования (Textual `run_test`/pilot) — без живого Telegram.
 
-## Циклы 9–17 — агентный слой (`tg-messenger agent`, LangGraph + deepagents)
+## Циклы 9–25 — агентный слой (`tg-messenger agent`, LangGraph + deepagents)
 
 Поверх ядра — авто-ответчик на входящие лички: LangGraph-роутер классифицирует намерение
 (**chat** → одиночный вызов модели через `init_chat_model`; **task** → deep-агент
@@ -245,11 +245,43 @@ client = StandaloneTelegramClient(api_id, api_hash, external_session=existing_st
   `LangSmith tracing: on (project=...)` при включённой трассировке, падает с подсказкой
   про `LANGSMITH_API_KEY` без ключа, молчит при выключенной.
 
+- **Циклы 18–25 — конфигурируемые интенты: vision, голосовые, agent.json.**
+  - **18 — core: честные медиа-типы.** `MediaKind` + `"voice"` (Telethon: `.voice` проверяется
+    ДО `.document` — голосовое И есть document), `MediaRef.mime_type` из `file.mime_type`.
+  - **19 — `agent/media.py`** (stdlib+core): `download_image(client, dialog_id, message)` →
+    `ImageInput(base64_data, mime_type)`; `MAX_IMAGE_BYTES` проверяется по заявленному size
+    ДО скачивания и по реальным байтам после; tmp-каталог чистится даже при ошибке;
+    mime-фолбэк `image/jpeg`.
+  - **20 — runner: диспетчеризация.** Порядок: out → allowlist (до любого скачивания) →
+    voice (`logger.info` + skip) → photo (download → `handle(..., image=)`, подпись =
+    `message.text`) → no-text skip → текст. Ошибка скачивания — `logger.exception`, цикл жив.
+  - **21 — orchestrator: vision-узел.** Условный вход `START → vision | classify` по
+    `has_image` (handle пишет его явно на каждом ходе). Картинка НЕ в state: мультимодальное
+    сообщение уходит в `vision_fn` через `_pending_images` (валидно при последовательном
+    runner'е), в checkpointed-истории — текстовый плейсхолдер `[изображение] <подпись>` +
+    ответ — следующий текстовый ход не-vision модели не ломается о base64.
+  - **22 — factory: vision-модель.** `TG_AGENT_VISION_MODEL` (provider:model), фолбэк на
+    основную (тогда она должна быть мультимодальной); `make_vision_fn` с `VISION_SYSTEM_PROMPT`.
+  - **23 — config: agent.json.** `load_intents` → `IntentSpec(name, description, pipeline,
+    system_prompt?)`; путь: `TG_AGENT_CONFIG` (явный — обязан существовать) или `./agent.json`;
+    валидация fail-fast: имя — одно слово не из `RESERVED_INTENT_NAMES`, pipeline ∈ {chat, task},
+    description непустой, неизвестные ключи — ошибка; все ValueError с путём файла.
+  - **24 — orchestrator: кастомные узлы.** Узел на интент строится из конфига при сборке графа;
+    `system_prompt` интента префиксуется к user-сообщению ТОЛЬКО в payload вызова
+    (`_prefix_instruction`) — история хранит оригинал; неизвестный интент от классификатора
+    клампится в `chat` с warning (нет KeyError в conditional edge).
+  - **25 — factory+CLI.** Промпт классификатора генерируется из списка интентов
+    (`build_classify_prompt`); `make_agent_runner` печатает vision-модель и имена
+    загруженных интентов; `agent.json.example` — образец конфига.
+
 Принятые компромиссы v1: полное доверие allowlist'у — разрешённый собеседник может через
 задание читать/отправлять в любые диалоги (зафиксировано в `.env.example`); последовательная обработка (долгий task может вытеснить старые
 события из очереди EventBus — drop-oldest уже логируется); история в `InMemorySaver` живёт до
 рестарта процесса и не ограничена; @username-allowlist матчится только по существующим
-диалогам (надёжнее числовой id).
+диалогам (надёжнее числовой id); инструкция кастомного интента уходит user-текстом, не
+системной ролью (SystemMessage посреди списка ломается у части провайдеров); картинка-как-
+документ (без сжатия) не обрабатывается — только telegram-«photo»; голосовые определяются,
+но не обрабатываются (v1).
 
 ## Финальная верификация (после зелёных циклов)
 

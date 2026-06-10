@@ -69,6 +69,11 @@ def make_agent_runner(client, *, notify_errors: bool = False):
         orchestrator = build_orchestrator(client, cfg)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+    # конфиг, влияющий на поведение агента, виден на старте
+    if cfg.vision_model:
+        click.echo(f"Vision model: {cfg.vision_model}")
+    if cfg.intents:
+        click.echo("Custom intents: " + ", ".join(spec.name for spec in cfg.intents))
     return AgentRunner(client, orchestrator, config=cfg, notify_errors=notify_errors)
 
 
