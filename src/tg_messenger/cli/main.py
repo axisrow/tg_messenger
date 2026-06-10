@@ -18,6 +18,7 @@ from tg_messenger.core.auth import LOGIN_HINT
 from tg_messenger.core.client import StandaloneTelegramClient
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.logsetup import log_file_path, setup_logging
+from tg_messenger.core.models import message_line
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,25 @@ def make_client(**kwargs) -> StandaloneTelegramClient:
     api_id = int(os.environ.get("TG_API_ID", "0"))
     api_hash = os.environ.get("TG_API_HASH", "")
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
+
+
+def make_agent_runner(client, *, notify_errors: bool = False):
+    """Build the AI agent runner; the second seam tests patch (next to ``make_client``)."""
+    try:
+        from tg_messenger.agent.factory import build_orchestrator
+    except ImportError as exc:
+        raise click.ClickException(
+            'Agent dependencies are not installed — pip install "tg-messenger[agent]"'
+        ) from exc
+    from tg_messenger.agent.config import AgentConfig
+    from tg_messenger.agent.runner import AgentRunner
+
+    try:
+        cfg = AgentConfig.from_env()
+        orchestrator = build_orchestrator(client, cfg)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return AgentRunner(client, orchestrator, config=cfg, notify_errors=notify_errors)
 
 
 _CODE_DELIVERY_HINTS = {
@@ -214,8 +234,7 @@ def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> 
             os.makedirs(download_dir, exist_ok=True)
         messages = await client.history(dialog_id, limit=limit)
         for m in messages:
-            who = "→" if m.out else "←"
-            click.echo(f"{who} [{m.id}] {m.text or '<media>'}")
+            click.echo(message_line(m))
             if download_dir and m.media is not None and m.media.downloadable:
                 dest = os.path.join(download_dir, f"{dialog_id}_{m.id}")
                 saved = await client.download_message_media(dialog_id, m.id, dest)
@@ -298,6 +317,31 @@ def chat(dialog_id: int, session: str) -> None:
                     if isinstance(r, Exception):
                         logger.error("chat listener failed", exc_info=r)
                         click.echo(f"listener failed: {r}", err=True)
+        finally:
+            await client.disconnect()
+
+    try:
+        _run(_do(), session=session)
+    except KeyboardInterrupt:
+        click.echo("stopped.")
+
+
+@cli.command()
+@click.option("--session", default="default")
+@click.option("--notify-errors", is_flag=True,
+              help="Reply with a short notice when processing a message fails.")
+def agent(session: str, notify_errors: bool) -> None:
+    """AI assistant: auto-reply to incoming DMs, route tasks to a deep agent."""
+
+    async def _do():
+        client = make_client(session_name=session)
+        # конфиг и LLM-стек собираем до сети — ошибки настроек видны сразу
+        runner = make_agent_runner(client, notify_errors=notify_errors)
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            click.echo("Agent is listening for incoming messages (Ctrl+C to stop)...")
+            await runner.run()
         finally:
             await client.disconnect()
 
