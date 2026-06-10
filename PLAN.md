@@ -434,6 +434,29 @@ titles сам). Дисциплина username-резолва: дорогой (~5
 - **56**: pyproject `[crypto]` (в `[all]`/`[dev]`); `.env.example` (`SESSION_ENCRYPTION_KEY`);
   README «Session encryption & SSO»; CLAUDE.md/PLAN.md.
 
+## Циклы 57–61 — мультилогин / профили (#11, сделано)
+
+`--profile` сквозной во всех интерфейсах; профиль = сохранённый session-файл.
+- **57** (`test_auth.py`): `SessionStore.list_profiles()` — отсортированные имена `*.session`
+  без расширения; нет каталога → `[]`.
+- **58** (`test_cli.py`): глобальная опция `--profile` → `session_name`; команда `profiles`;
+  helpers `_session_store()`/`_is_interactive()`/`_resolve_profile()`/`_effective_session()`;
+  `_with_client` резолвит профиль через `click.get_current_context(silent=True)`;
+  `login` чтит глобальный `--profile`, но без меню (создаёт/заменяет профиль).
+- **59** (`test_cli.py`): >1 профиля без флага → интерактивное меню (выбор по номеру);
+  неинтерактивный stdin → ошибка `pass --profile NAME`; 0/1 профиля резолвится молча.
+- **60** (`test_tui.py`): `ProfileItem`, `ProfileScreen(ModalScreen[str])`,
+  `MessengerTUI(profiles=, client_factory=)` — стартовый экран выбора при >1 профиле.
+- **61** (финал):
+  - **изоляция логов** (`test_logsetup.py`): `setup_logging(profile=)`/`log_file_path(profile=)` →
+    `tg_messenger_<profile>.log` для не-default (default = общий файл); CLI прокидывает
+    глобальный `--profile`.
+  - **web `/profiles`** (`test_web.py`): read-only список профилей + пометка активного
+    (`session_name` из `build_app`); каталог сессий через `TG_SESSION_DIR`.
+  - **serve/tui `--profile`** (`test_cli.py`): оба чтут глобальный `--profile` как `session_name`
+    (через `_effective_session`).
+  - доки: CLAUDE.md (Interfaces), README («Multiple accounts (profiles)»), PLAN.md.
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.

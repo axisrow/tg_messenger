@@ -5,7 +5,7 @@ import pytest
 from textual.widgets import Input, ListView, Tabs
 
 from tg_messenger.core.models import Dialog, IncomingEvent, Message
-from tg_messenger.tui.app import DialogItem, MessageBubble, MessengerTUI
+from tg_messenger.tui.app import DialogItem, MessageBubble, MessengerTUI, ProfileItem
 
 
 class TuiStubClient:
@@ -465,3 +465,46 @@ class TwoDmClient(TuiStubClient):
         if dm_only:
             return dms
         return dms + [Dialog(id=-100200, title="Devs", kind="group")]
+
+
+# --- цикл 60: TUI выбор профиля (мультилогин) ---
+
+async def test_tui_profile_screen_picks_and_builds_client():
+    captured = {}
+
+    def factory(session_name):
+        captured["session_name"] = session_name
+        return TuiStubClient()
+
+    app = MessengerTUI(profiles=["alice", "bob"], client_factory=factory)
+    async with app.run_test() as pilot:
+        # wait for the pushed profile screen to mount (it's a modal — query the screen)
+        for _ in range(20):
+            await pilot.pause()
+            if app.screen.query(ProfileItem):
+                break
+        assert len(list(app.screen.query(ProfileItem))) == 2
+        # select the second profile (alice, bob -> bob)
+        lv = app.screen.query_one("#profiles", ListView)
+        lv.index = 1
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause()
+            if captured.get("session_name"):
+                break
+    assert captured.get("session_name") == "bob"
+
+
+async def test_tui_single_profile_skips_screen():
+    captured = {}
+
+    def factory(session_name):
+        captured["session_name"] = session_name
+        return TuiStubClient()
+
+    app = MessengerTUI(profiles=["solo"], client_factory=factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert list(app.query(ProfileItem)) == []  # no selection screen
+        assert list(app.query(DialogItem))  # went straight to dialogs
+    assert captured.get("session_name") == "solo"

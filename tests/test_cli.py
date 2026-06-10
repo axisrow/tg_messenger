@@ -696,3 +696,107 @@ def _valid_session_for_import():
     s.set_dc(2, "149.154.167.51", 443)
     s.auth_key = AuthKey(b"\x00" * 256)
     return s.save()
+
+
+# --- циклы 58–59: мультилогин --profile + меню ---
+
+class ProfileSpyClient(StubClient):
+    """StubClient that records the session_name it was built with."""
+
+    last_kwargs = {}
+
+
+@pytest.fixture
+def profile_spy(monkeypatch):
+    captured = {}
+
+    def fake_make_client(**kw):
+        captured.update(kw)
+        return StubClient()
+
+    monkeypatch.setattr(cli_main, "make_client", fake_make_client)
+    return captured
+
+
+def test_global_profile_sets_session_name(profile_spy):
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "dialogs"])
+    assert result.exit_code == 0, result.output
+    assert profile_spy.get("session_name") == "work"
+
+
+def test_profiles_command_lists_saved(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    store = SessionStore(tmp_path)
+    store.save("alice", _valid_session_for_import())
+    store.save("bob", _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    result = CliRunner().invoke(cli_main.cli, ["profiles"])
+    assert result.exit_code == 0, result.output
+    assert "alice" in result.output
+    assert "bob" in result.output
+
+
+def test_multiple_profiles_non_interactive_errors(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(tmp_path)
+    store.save("alice", _valid_session_for_import())
+    store.save("bob", _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    # CliRunner is non-interactive (stdin not a tty) → ambiguous profile must error
+    result = CliRunner().invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code != 0
+    assert "--profile" in result.output
+
+
+def test_profile_menu_picks_second(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    captured = {}
+
+    def fake_make_client(**kw):
+        captured.update(kw)
+        return StubClient()
+
+    store = SessionStore(tmp_path)
+    for name in ("alice", "bob", "carol"):
+        store.save(name, _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    monkeypatch.setattr(cli_main, "make_client", fake_make_client)
+    # force interactive so the menu shows; feed "2" to pick the second profile
+    monkeypatch.setattr(cli_main, "_is_interactive", lambda: True)
+    result = CliRunner().invoke(cli_main.cli, ["dialogs"], input="2\n")
+    assert result.exit_code == 0, result.output
+    assert captured.get("session_name") == "bob"  # sorted: alice, bob, carol → #2
+
+
+# --- цикл 61: serve/tui учитывают глобальный --profile ---
+
+def test_serve_uses_global_profile_as_session(monkeypatch):
+    captured = {}
+    monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
+    monkeypatch.setattr(
+        "tg_messenger.web.app.build_app",
+        lambda **kw: captured.update(kw) or object(),
+    )
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "serve"])
+    assert result.exit_code == 0, result.output
+    assert captured.get("session_name") == "work"
+
+
+def test_tui_uses_global_profile_as_session(monkeypatch):
+    captured = {}
+
+    class FakeTUI:
+        def __init__(self, *, session_name="default"):
+            captured["session_name"] = session_name
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr("tg_messenger.tui.app.MessengerTUI", FakeTUI)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "tui"])
+    assert result.exit_code == 0, result.output
+    assert captured.get("session_name") == "work"

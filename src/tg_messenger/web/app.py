@@ -19,7 +19,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
-from tg_messenger.core.auth import LOGIN_HINT
+from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT, SessionStore
 from tg_messenger.core.flood import HandledFloodWaitError
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,17 @@ def _dialog_li(d) -> str:
         f'<li hx-get="/dialogs/{d.id}/messages" hx-target="#messages" data-kind="{d.kind}">'
         f"{d.id} — {escape(d.title)}{uname}{unread}</li>"
     )
+
+
+def _session_store() -> SessionStore:
+    """SessionStore over the configured session dir (env override for tests/ops)."""
+    return SessionStore(os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
+
+
+def _profile_li(name: str, *, active: bool) -> str:
+    cls = ' class="active"' if active else ""
+    marker = " (active)" if active else ""
+    return f'<li{cls} data-profile="{escape(name)}">{escape(name)}{marker}</li>'
 
 
 def _message_div(m) -> str:
@@ -98,6 +109,15 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request):
         return TEMPLATES.TemplateResponse(request, "chat.html", {})
+
+    @app.get("/profiles", response_class=HTMLResponse)
+    async def profiles(request: Request):
+        # read-only: the saved sessions on disk, with the served one flagged active.
+        # One process = one profile, so the active profile is fixed at build_app time.
+        names = _session_store().list_profiles()
+        return HTMLResponse(
+            "".join(_profile_li(n, active=(n == session_name)) for n in names)
+        )
 
     @app.get("/dialogs", response_class=HTMLResponse)
     async def dialogs(request: Request, tab: str = "dm"):

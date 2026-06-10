@@ -13,7 +13,8 @@ import os
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Input, ListItem, ListView, Static, Tab, Tabs
+from textual.screen import ModalScreen
+from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 
 from tg_messenger.core.auth import LOGIN_HINT
 
@@ -28,6 +29,42 @@ def _make_real_client(session_name: str):
         api_hash=os.environ.get("TG_API_HASH", ""),
         session_name=session_name,
     )
+
+
+class ProfileItem(ListItem):
+    """One selectable account profile on the startup screen."""
+
+    def __init__(self, profile: str):
+        super().__init__(Static(profile, markup=False))
+        self.profile = profile
+
+
+class ProfileScreen(ModalScreen[str]):
+    """Startup account picker — dismisses with the chosen profile name.
+
+    Only shown when >1 profile exists and none was preselected; selecting a row
+    returns its name to the caller (which then builds the client for it).
+    """
+
+    def __init__(self, profiles: list[str]):
+        super().__init__()
+        self._profiles = profiles
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="profile-box"):
+            yield Label("Select account profile:")
+            yield ListView(*(ProfileItem(p) for p in self._profiles), id="profiles")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#profiles", ListView)
+        lv.focus()
+        if len(self._profiles) > 0:
+            lv.index = 0
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item = event.item
+        if isinstance(item, ProfileItem):
+            self.dismiss(item.profile)
 
 
 class SidebarTabs(Tabs):
@@ -95,10 +132,14 @@ class MessengerTUI(App):
     #composer { dock: bottom; }
     """
 
-    def __init__(self, *, client=None, session_name: str = "default"):
+    def __init__(self, *, client=None, session_name: str = "default",
+                 profiles: list[str] | None = None, client_factory=None):
         super().__init__()
         self._client = client
         self._session_name = session_name
+        self._profiles = profiles or []
+        # how a client is built once a profile is chosen (injectable for tests)
+        self._client_factory = client_factory or _make_real_client
         self._current: int | None = None
         self._tab = "dm"
         self._started = False  # gates tab events until _startup finished
@@ -127,7 +168,16 @@ class MessengerTUI(App):
 
     async def _startup(self) -> None:
         if self._client is None:
-            self._client = _make_real_client(self._session_name)
+            if len(self._profiles) > 1:
+                # >1 account and none preselected → ask which one, then build it
+                chosen = await self.push_screen_wait(ProfileScreen(self._profiles))
+                self._session_name = chosen
+                self._client = self._client_factory(chosen)
+            elif len(self._profiles) == 1:
+                self._session_name = self._profiles[0]
+                self._client = self._client_factory(self._profiles[0])
+            else:
+                self._client = self._client_factory(self._session_name)
         try:
             await self._client.connect()
             if not await self._client.is_authorized():

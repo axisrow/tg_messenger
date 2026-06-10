@@ -186,3 +186,25 @@ def test_encrypted_file_without_key_errors_with_hint(session_dir):
     no_key = SessionStore(session_dir)
     with pytest.raises(ValueError, match="SESSION_ENCRYPTION_KEY"):
         no_key.load("default")
+
+
+# --- цикл 57: список профилей (мультилогин) ---
+
+def test_list_profiles_empty(session_dir):
+    assert SessionStore(session_dir).list_profiles() == []
+
+
+def test_list_profiles_sorted(session_dir):
+    store = SessionStore(session_dir)
+    store.save("work", VALID_SESSION)
+    store.save("alice", VALID_SESSION)
+    assert store.list_profiles() == ["alice", "work"]
+
+
+def test_list_profiles_ignores_non_session_files(session_dir):
+    store = SessionStore(session_dir)
+    store.save("real", VALID_SESSION)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "notes.txt").write_text("junk", encoding="utf-8")
+    (session_dir / "subdir").mkdir()
+    assert store.list_profiles() == ["real"]
