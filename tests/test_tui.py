@@ -414,3 +414,46 @@ async def test_down_focuses_first_dialog_so_it_is_navigable():
         await pilot.pause()
         lv = app.query_one("#dialogs", ListView)
         assert lv.index == 0  # списком сразу можно листать
+
+
+# --- UX: стрелка-вверх на первом диалоге → обратно на вкладки DM/Группы ---
+
+
+async def test_up_on_first_dialog_returns_focus_to_tabs():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = 0  # первый элемент
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        assert app.focused is app.query_one(Tabs)
+
+
+async def test_up_on_non_first_dialog_scrolls_list_not_tabs():
+    """Со второго диалога ↑ листает список вверх, фокус остаётся на списке."""
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = 1  # второй элемент
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        assert app.focused is lv  # фокус не ушёл на вкладки
+        assert lv.index == 0  # поднялись на первый
+
+
+class TwoDmClient(TuiStubClient):
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        dms = [
+            Dialog(id=7, title="Ann", username="ann", unread=0),
+            Dialog(id=8, title="Bob", username="bob", unread=0),
+        ]
+        if dm_only:
+            return dms
+        return dms + [Dialog(id=-100200, title="Devs", kind="group")]

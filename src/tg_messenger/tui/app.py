@@ -49,6 +49,25 @@ class SidebarTabs(Tabs):
             lv.index = 0  # land on the first dialog so arrows scroll immediately
 
 
+class DialogListView(ListView):
+    """Dialog list that returns focus to the tabs when Up is pressed at the top.
+
+    Up from the first item (or an empty selection) jumps back to #tabs — the
+    symmetric counterpart to SidebarTabs' Down/Enter. Anywhere else, Up scrolls
+    the list as usual (defers to ListView's own cursor_up).
+    """
+
+    BINDINGS = [
+        Binding("up", "cursor_up_or_tabs", "Up", show=False),
+    ]
+
+    def action_cursor_up_or_tabs(self) -> None:
+        if self.index in (None, 0):
+            self.app.query_one("#tabs", SidebarTabs).focus()
+        else:
+            self.action_cursor_up()
+
+
 class DialogItem(ListItem):
     def __init__(self, dialog_id: int, title: str):
         # markup=False: titles/messages are untrusted text, [brackets] must render literally
@@ -83,8 +102,8 @@ class MessengerTUI(App):
     def compose(self) -> ComposeResult:
         with Horizontal():
             with Vertical(id="sidebar"):
-                yield SidebarTabs(Tab("DM", id="dm"), Tab("Группы", id="groups"))
-                yield ListView(id="dialogs")
+                yield SidebarTabs(Tab("DM", id="dm"), Tab("Группы", id="groups"), id="tabs")
+                yield DialogListView(id="dialogs")
             with Vertical():
                 yield Vertical(id="messages")
                 yield Input(placeholder="Message…", id="composer")
