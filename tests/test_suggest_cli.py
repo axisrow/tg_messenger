@@ -110,6 +110,9 @@ def test_suggest_requires_login(suggest_cli):
 
 def test_make_suggester_requires_model(monkeypatch, tmp_path):
     """Без TG_AGENT_MODEL make_suggester падает дружелюбной ClickException."""
+    # this asserts the *model-missing* error, which only surfaces when the agent
+    # stack IS installed (otherwise the [agent]-extra ImportError fires first)
+    pytest.importorskip("langchain")
     import click
 
     monkeypatch.chdir(tmp_path)
@@ -121,6 +124,7 @@ def test_make_suggester_requires_model(monkeypatch, tmp_path):
 
 
 def test_suggest_missing_model_friendly_error(monkeypatch, tmp_path):
+    pytest.importorskip("langchain")  # see test_make_suggester_requires_model
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: StubClient())
     monkeypatch.delenv("TG_AGENT_MODEL", raising=False)
