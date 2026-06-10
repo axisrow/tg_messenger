@@ -124,6 +124,24 @@ class StubClient:
         )
         await asyncio.Event().wait()
 
+    admin = True  # default: we can moderate every chat
+
+    async def is_admin(self, peer):
+        return self.admin
+
+    async def moderation_rights(self, peer):
+        return {"delete_messages": self.admin, "ban_users": self.admin}
+
+    async def listen_all(self):
+        if False:  # pragma: no cover — empty async generator, then idle
+            yield None
+        raise KeyboardInterrupt  # эмуляция Ctrl+C (паттерн listen_interrupt)
+
+    async def listen_chat_actions(self):
+        if False:  # pragma: no cover
+            yield None
+        await asyncio.Event().wait()
+
     async def listen_deleted(self):
         for _ in range(10):
             await asyncio.sleep(0)  # дать outgoing-потоку закэшировать сообщение
@@ -588,6 +606,137 @@ def test_watch_without_login_gives_hint(runner):
     assert result.exit_code != 0
     assert "tg-messenger login" in result.output
     assert stub.connected is False
+
+
+# --- Цикл 89: команда moderate + moderate-rules ---
+
+
+@pytest.fixture
+def mod_runner(monkeypatch, tmp_path):
+    """CLI runner whose moderation storage is a fresh tmp SQLite db."""
+    from tg_messenger.core.moderation import register_moderation_migrations
+    from tg_messenger.core.storage import Storage
+
+    stub = StubClient()
+    seen: dict[str, list[str]] = {"clients": [], "storages": []}
+
+    def _make_client(**kw):
+        seen["clients"].append(kw.get("session_name", "default"))
+        return stub
+
+    def _make_storage(profile="default"):
+        seen["storages"].append(profile)
+        return Storage(tmp_path / f"{profile}.db")
+
+    monkeypatch.setattr(cli_main, "make_client", _make_client)
+    # register_moderation_migrations is called by the CLI; bare Storage is fine
+    monkeypatch.setattr(cli_main, "make_storage", _make_storage)
+    return CliRunner(), stub, tmp_path, register_moderation_migrations, seen
+
+
+_RULE_JSON = """{
+  "chat_id": -100200,
+  "name": "no-spam",
+  "conditions": {"pattern": "spam"},
+  "actions": {"delete": true}
+}"""
+
+
+def test_moderate_rules_add_list_remove(mod_runner, tmp_path):
+    r, stub, _tp, _, _seen = mod_runner
+    rule_file = tmp_path / "rule.json"
+    rule_file.write_text(_RULE_JSON, encoding="utf-8")
+
+    add = r.invoke(cli_main.cli, ["moderate-rules", "add", str(rule_file)])
+    assert add.exit_code == 0, add.output
+    assert "no-spam" in add.output
+
+    lst = r.invoke(cli_main.cli, ["moderate-rules", "list"])
+    assert lst.exit_code == 0
+    assert "no-spam" in lst.output and "-100200" in lst.output
+
+    rm = r.invoke(cli_main.cli, ["moderate-rules", "remove", "--", "-100200", "no-spam"])
+    assert rm.exit_code == 0
+
+    lst2 = r.invoke(cli_main.cli, ["moderate-rules", "list"])
+    assert "No rules." in lst2.output
+
+
+def test_moderate_rules_remove_missing_errors(mod_runner):
+    r, _stub, _tp, _, _seen = mod_runner
+    result = r.invoke(cli_main.cli, ["moderate-rules", "remove", "--", "-100200", "missing"])
+    assert result.exit_code != 0
+    assert "not found" in result.output
+
+
+def test_moderate_rules_add_rejects_bad_json(mod_runner, tmp_path):
+    r, _stub, _tp, _, _seen = mod_runner
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    result = r.invoke(cli_main.cli, ["moderate-rules", "add", str(bad)])
+    assert result.exit_code != 0
+    assert "invalid rule JSON" in result.output
+
+
+def test_moderate_runs_and_stops_on_ctrl_c(mod_runner):
+    r, stub, _tp, _, _seen = mod_runner
+    result = r.invoke(cli_main.cli, ["moderate"])
+    assert result.exit_code == 0
+    assert "dry-run" in result.output
+    assert "stopped." in result.output
+    assert stub.connected is False
+
+
+def test_moderate_enforce_flag_shown(mod_runner):
+    r, _stub, _tp, _, _seen = mod_runner
+    result = r.invoke(cli_main.cli, ["moderate", "--enforce"])
+    assert result.exit_code == 0
+    assert "ENFORCING" in result.output
+
+
+def test_moderate_uses_global_profile(mod_runner):
+    r, _stub, _tp, _, seen = mod_runner
+    result = r.invoke(cli_main.cli, ["--profile", "work", "moderate"])
+    assert result.exit_code == 0
+    assert seen["clients"][-1] == "work"
+    assert seen["storages"][-1] == "work"
+
+
+def test_moderate_without_admin_warns(mod_runner, tmp_path):
+    r, stub, _tp, _, _seen = mod_runner
+    stub.admin = False  # no rights anywhere
+    rule_file = tmp_path / "rule.json"
+    rule_file.write_text(_RULE_JSON, encoding="utf-8")
+    r.invoke(cli_main.cli, ["moderate-rules", "add", str(rule_file)])
+    result = r.invoke(cli_main.cli, ["moderate"])
+    assert result.exit_code == 0
+    assert "no admin rights" in result.output
+
+
+def test_moderate_without_login_gives_hint(mod_runner):
+    r, stub, _tp, _, _seen = mod_runner
+    stub.authorized = False
+    result = r.invoke(cli_main.cli, ["moderate"])
+    assert result.exit_code != 0
+    assert "tg-messenger login" in result.output
+
+
+def test_moderate_rules_use_global_profile(mod_runner, tmp_path):
+    r, _stub, _tp, _, seen = mod_runner
+    rule_file = tmp_path / "rule.json"
+    rule_file.write_text(_RULE_JSON, encoding="utf-8")
+
+    add = r.invoke(cli_main.cli, ["--profile", "work", "moderate-rules", "add", str(rule_file)])
+    assert add.exit_code == 0, add.output
+    assert seen["storages"][-1] == "work"
+
+    default_list = r.invoke(cli_main.cli, ["moderate-rules", "list"])
+    assert default_list.exit_code == 0
+    assert "No rules." in default_list.output
+
+    work_list = r.invoke(cli_main.cli, ["--profile", "work", "moderate-rules", "list"])
+    assert work_list.exit_code == 0
+    assert "no-spam" in work_list.output
 
 
 def test_revoked_session_mid_command_gives_hint(runner, monkeypatch):

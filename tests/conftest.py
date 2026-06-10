@@ -194,6 +194,7 @@ class FakeTelethonClient:
         self.edited: list[dict] = []
         self.deleted: list[dict] = []
         self.read_acks: list[dict] = []
+        self.permissions: list[dict] = []  # edit_permissions calls (mute/ban)
         self.downloads: list[dict] = []
         self.actions_active: list[tuple] = []
         self.actions_log: list[tuple] = []
@@ -310,6 +311,14 @@ class FakeTelethonClient:
     async def send_read_acknowledge(self, peer, max_id=None):
         self.read_acks.append({"peer": int(peer), "max_id": max_id})
         return True
+
+    # --- moderation: restrict/ban via edit_permissions ---
+    async def edit_permissions(self, entity, user=None, until_date=None, **rights):
+        self.permissions.append(
+            {"entity": int(entity), "user": int(user) if user is not None else None,
+             "until_date": until_date, "rights": rights}
+        )
+        return None
 
     async def download_media(self, message, file):
         self.downloads.append({"message_id": getattr(message, "id", None), "dest": str(file)})

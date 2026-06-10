@@ -566,6 +566,39 @@ v1-компромиссы (в рамках плана): в TUI нет выбор
 из интерфейса не делаются — только авто-`mark_read` при открытии и бейджи непрочитанного; сами
 действия доступны через CLI. `unread` — снапшот из `dialogs()` (без live-обновления бейджей).
 
+## Циклы 83–90 — режим модератора (#16, сделано)
+
+Сервис `core/moderation.py` поверх клиента (паттерн `watch.py`): слушает `listen_all()` +
+`listen_chat_actions()`, применяет первое сматчившееся правило на чат, журналирует решения в
+SQLite. Деструктивен по природе → **dry-run по умолчанию** (`--enforce` — боевой).
+
+- **83**: Pydantic-модели + матчинг — `RuleConditions`/`RuleActions`/`ModerationRule`,
+  `rule_matches(...)` с AND-семантикой; regex валидируется fail-fast.
+- **84**: хранение правил поверх `Storage` — миграции `moderation_rules` (PK `chat_id,name`)
+  и `moderation_log`, `add_rule`/`list_rules`/`remove_rule` (conditions/actions как JSON).
+- **85**: `ModerationEngine` — кэш новичков (`OrderedDict`, join-время по `ChatActionEvent`)
+  и скользящее 60с-окно частоты на `(chat_id, sender_id)`; `clock` инжектится, без реального
+  sleep.
+- **86**: dry-run — при `enforce=False` клиент НЕ зовётся, `logger.info("would …")`,
+  запись в журнал `dry_run=1`.
+- **87**: enforce — delete/mute/ban/warn зовут методы клиента; ошибка одного действия
+  `logger.exception` и движок жив; журнал `dry_run=0`; первое сматчившееся правило выигрывает.
+- **88**: тонкие обёртки в `client.py` — `mute_user`/`ban_user` поверх `edit_permissions`
+  (через `run_with_flood_wait_retry`), плюс `moderation_rights(peer)` поверх
+  `get_permissions(peer, me)` (`delete_messages`/`ban_users`, best-effort → false) и
+  совместимый boolean `is_admin(peer)`.
+- **89**: CLI — `moderate [--enforce]` (паттерн `watch`, Ctrl+C чисто; на старте
+  `check_admin_rights` проверяет права по actions правил: delete требует `delete_messages`,
+  mute/ban требуют `ban_users`, warn-only не требует admin; чаты без нужных прав отключаются
+  предупреждением) и группа
+  `moderate-rules list/add/remove` (`add` читает JSON-файл; отрицательный chat_id — через `--`).
+  `moderation.json.example` в корне.
+- **90**: CLAUDE.md (core: `moderation.py` + обёртки клиента) + PLAN.md этот блок.
+
+v1-компромиссы: `is_forward` всегда `False` (флаг события пока не прокинут в
+`process_message`); журнал/правила — per-profile SQLite; admin-проверка best-effort
+(чат без прав молча пропускается в рантайме, не валит сервис).
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.

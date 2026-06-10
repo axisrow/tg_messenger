@@ -1447,3 +1447,123 @@ async def test_dialog_unread_mapped_from_telethon(fake_client):
     dialogs = await client.dialogs()
     ann = next(d for d in dialogs if d.id == 7)
     assert ann.unread == 2
+
+
+# --- Цикл 88: mute_user / ban_user (edit_permissions обёртки) ---
+
+async def test_mute_user_restricts_send_messages(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await client.mute_user(-100200, 7, 300)
+    call = fake_client.permissions[-1]
+    assert call["entity"] == -100200 and call["user"] == 7
+    assert call["rights"] == {
+        "send_messages": False,
+        "send_media": False,
+        "send_stickers": False,
+        "send_gifs": False,
+        "send_games": False,
+        "send_inline": False,
+        "send_polls": False,
+        "embed_link_previews": False,
+    }
+    assert call["until_date"] is not None  # muted until a future time
+
+
+async def test_ban_user_revokes_view_messages(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await client.ban_user(-100200, 7)
+    call = fake_client.permissions[-1]
+    assert call["entity"] == -100200 and call["user"] == 7
+    assert call["rights"].get("view_messages") is False
+
+
+async def test_mute_user_flood_is_handled(fake_client, monkeypatch):
+    from tg_messenger.core.flood import HandledFloodWaitError
+    flood_error = _flood_patch(monkeypatch)
+    client = _build(fake_client)
+    await client.connect()
+
+    async def boom(entity, user=None, until_date=None, **rights):
+        raise flood_error(9999)
+
+    fake_client.edit_permissions = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.mute_user(-100200, 7, 300)
+
+
+async def test_ban_user_flood_is_handled(fake_client, monkeypatch):
+    from tg_messenger.core.flood import HandledFloodWaitError
+    flood_error = _flood_patch(monkeypatch)
+    client = _build(fake_client)
+    await client.connect()
+
+    async def boom(entity, user=None, until_date=None, **rights):
+        raise flood_error(9999)
+
+    fake_client.edit_permissions = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.ban_user(-100200, 7)
+
+
+# --- Цикл 89: is_admin (проверка прав модератора на старте) ---
+
+async def test_is_admin_true_when_can_delete(fake_client):
+    class Perms:
+        is_admin = True
+        delete_messages = True
+
+    seen = {}
+
+    async def perms(entity, user=None):
+        seen["entity"] = entity
+        seen["user"] = user
+        return Perms()
+
+    fake_client.get_permissions = perms
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.is_admin(-100200) is True
+    assert seen["entity"] == -100200
+    assert getattr(seen["user"], "id", None) == 1
+
+
+async def test_is_admin_false_when_not_admin(fake_client):
+    class Perms:
+        is_admin = True
+        delete_messages = False
+        ban_users = False
+
+    async def perms(entity, user=None):
+        return Perms()
+
+    fake_client.get_permissions = perms
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.is_admin(-100200) is False
+
+
+async def test_is_admin_true_when_can_ban(fake_client):
+    class Perms:
+        is_admin = True
+        delete_messages = False
+        ban_users = True
+
+    async def perms(entity, user=None):
+        return Perms()
+
+    fake_client.get_permissions = perms
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.is_admin(-100200) is True
+
+
+async def test_is_admin_false_on_error(fake_client):
+    async def boom(entity, user=None):
+        raise RuntimeError("not a participant")
+
+    fake_client.get_permissions = boom
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.is_admin(-100200) is False

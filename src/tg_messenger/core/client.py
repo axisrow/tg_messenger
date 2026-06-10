@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon import TelegramClient, events
@@ -376,6 +377,67 @@ class StandaloneTelegramClient:
     async def _collect_messages_by_ids(self, peer, message_ids) -> list:
         return [m async for m in self._client.iter_messages(peer, ids=message_ids)]
 
+    async def mute_user(self, peer: int, user_id: int, until_sec: int) -> None:
+        """Restrict a user from sending messages in ``peer`` for ``until_sec`` seconds.
+
+        Thin wrapper over Telethon ``edit_permissions``; omitted boolean permissions
+        mean "do not restrict", so every send-related permission is explicitly
+        revoked for the future ``until_date``. The moderator engine calls it.
+        Flood-wait retried.
+        """
+        until_date = datetime.now(timezone.utc) + timedelta(seconds=int(until_sec))
+        await run_with_flood_wait_retry(
+            lambda: self._client.edit_permissions(
+                peer,
+                int(user_id),
+                until_date,
+                send_messages=False,
+                send_media=False,
+                send_stickers=False,
+                send_gifs=False,
+                send_games=False,
+                send_inline=False,
+                send_polls=False,
+                embed_link_previews=False,
+            ),
+            operation="mute_user",
+        )
+
+    async def ban_user(self, peer: int, user_id: int) -> None:
+        """Ban a user from ``peer`` (revoke view_messages — kicks and blocks re-entry)."""
+        await run_with_flood_wait_retry(
+            lambda: self._client.edit_permissions(peer, int(user_id), view_messages=False),
+            operation="ban_user",
+        )
+
+    async def moderation_rights(self, peer: int) -> dict[str, bool]:
+        """Moderation-capable rights for OUR account in ``peer``.
+
+        Best-effort: any failure (not a participant, not a group, network) → False,
+        logged — never raises. The moderator uses it to disable rules in chats we
+        can't act on instead of crashing.
+        """
+        try:
+            me = await run_with_flood_wait_retry(lambda: self._client.get_me(), operation="is_admin_me")
+            perms = await run_with_flood_wait_retry(
+                lambda: self._client.get_permissions(peer, me), operation="is_admin"
+            )
+        except Exception:
+            logger.warning("could not read permissions for chat %s — assuming not admin",
+                           peer, exc_info=True)
+            return {"delete_messages": False, "ban_users": False}
+        if perms is None:
+            return {"delete_messages": False, "ban_users": False}
+        return {
+            "delete_messages": bool(getattr(perms, "delete_messages", False)),
+            "ban_users": bool(getattr(perms, "ban_users", False)),
+        }
+
+    async def is_admin(self, peer: int) -> bool:
+        """Whether OUR account has any moderation-capable right in ``peer``."""
+        rights = await self.moderation_rights(peer)
+        return rights["delete_messages"] or rights["ban_users"]
+
     async def mark_read(self, peer: int, max_id: int | None = None) -> None:
         """Mark a dialog read (clears its unread counter), routed through flood retry."""
         await run_with_flood_wait_retry(
@@ -654,4 +716,5 @@ class StandaloneTelegramClient:
             text=getattr(raw, "text", None) or getattr(raw, "message", None),
             media=media,
             reply_to_id=int(reply_to_id) if reply_to_id is not None else None,
+            is_forward=getattr(raw, "forward", None) is not None,
         )

@@ -133,14 +133,15 @@ class Storage:
                 lambda: self._require_conn().execute("PRAGMA user_version").fetchone()[0]
             )
 
-    async def execute(self, sql: str, params: tuple = ()) -> None:
+    async def execute(self, sql: str, params: tuple = ()) -> int:
         async with self._lock:
-            await asyncio.to_thread(self._execute_sync, sql, params)
+            return await asyncio.to_thread(self._execute_sync, sql, params)
 
-    def _execute_sync(self, sql: str, params: tuple) -> None:
+    def _execute_sync(self, sql: str, params: tuple) -> int:
         conn = self._require_conn()
-        conn.execute(sql, params)
+        cursor = conn.execute(sql, params)
         conn.commit()
+        return cursor.rowcount
 
     async def fetchone(self, sql: str, params: tuple = ()):
         async with self._lock:
