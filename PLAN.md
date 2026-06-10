@@ -484,6 +484,20 @@ titles сам). Дисциплина username-резолва: дорогой (~5
     без сети). Поиск сообщений внутри диалога в TUI отложен как v1-компромисс.
   - доки: CLAUDE.md (core + Interfaces), README («Search»), PLAN.md.
 
+## Циклы 67–70 — SQLite storage layer (#13, сделано)
+
+`core/storage.py` — `Storage`: фундамент персистентности для #16/#17/#19 (правила
+модератора, стилевые профили суфлёра, расписание хартбита, журналы). Кэш сюда НЕ
+переезжает (in-memory из #8). `tests/test_storage.py`:
+- **67**: connect/close создаёт файл; kv-roundtrip (str/dict/list); get отсутствующего→None;
+  context manager закрывает и данные персистятся.
+- **68**: миграции через `PRAGMA user_version` (растёт по числу зарегистрированных);
+  повторный connect не перенакатывает; две пачки от разных потребителей по порядку;
+  ошибка в миграции → rollback всего батча, version не растёт.
+- **69**: `asyncio.gather` из 20 set/get без потерь (один conn + `asyncio.Lock` +
+  `asyncio.to_thread`, `check_same_thread=False`); execute/fetchone/fetchall параметризованы.
+- **70**: `default_db_path(profile)` = `~/.tg_messenger/<profile>.db`; CLAUDE.md/PLAN.md.
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.
