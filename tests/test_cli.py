@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 from datetime import datetime, timezone
 
 import pytest
@@ -578,3 +579,45 @@ def test_help_lists_commands():
     assert result.exit_code == 0
     for cmd in ("login", "dialogs", "read", "send", "listen", "watch", "serve", "tui"):
         assert cmd in result.output
+
+
+# --- цикл 48: понятные ошибки без установленного extra ---
+
+def _block_imports(monkeypatch, *blocked: str):
+    """Make `import <name>` raise ImportError for the given packages.
+
+    Also evicts the already-imported interface modules from ``sys.modules`` so the
+    command's lazy import actually re-executes and hits the block — other tests may
+    have cached ``tg_messenger.tui``/``textual`` etc. already.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def matches(name: str) -> bool:
+        return name in blocked or any(name.startswith(b + ".") for b in blocked)
+
+    for mod in [m for m in sys.modules if matches(m)]:
+        monkeypatch.delitem(sys.modules, mod, raising=False)
+
+    def fake_import(name, *args, **kwargs):
+        if matches(name):
+            raise ImportError(f"No module named '{name}'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+def test_serve_without_web_extra_hints_install(monkeypatch):
+    # simulate `pip install tg-messenger` without the [web] extra
+    _block_imports(monkeypatch, "uvicorn", "fastapi", "tg_messenger.web")
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code != 0
+    assert "tg-messenger[web]" in result.output
+
+
+def test_tui_without_tui_extra_hints_install(monkeypatch):
+    _block_imports(monkeypatch, "textual", "tg_messenger.tui")
+    result = CliRunner().invoke(cli_main.cli, ["tui"])
+    assert result.exit_code != 0
+    assert "tg-messenger[tui]" in result.output

@@ -395,9 +395,13 @@ def agent(session: str, notify_errors: bool) -> None:
 @click.option("--session", default="default")
 def serve(host: str, port: int, session: str) -> None:
     """Launch the web interface."""
-    import uvicorn
+    try:
+        import uvicorn
 
-    from tg_messenger.web.app import build_app
+        from tg_messenger.web.app import build_app
+    except ImportError as exc:
+        # base install omits the web stack — point at the extra instead of a raw ImportError
+        raise click.ClickException("web UI requires: pip install 'tg-messenger[web]'") from exc
 
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
     click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
@@ -409,7 +413,10 @@ def serve(host: str, port: int, session: str) -> None:
 @click.pass_context
 def tui(ctx: click.Context, session: str) -> None:
     """Launch the TUI interface."""
-    from tg_messenger.tui.app import MessengerTUI
+    try:
+        from tg_messenger.tui.app import MessengerTUI
+    except ImportError as exc:
+        raise click.ClickException("TUI requires: pip install 'tg-messenger[tui]'") from exc
 
     # stderr handler would corrupt the alternate screen — file log only
     setup_logging(verbose=ctx.obj["verbose"], console=False)
