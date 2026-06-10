@@ -5,27 +5,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Install (editable) into the project venv — all three UIs ship in the base install; [dev] adds test/lint tools
-python -m venv .venv && ./.venv/bin/pip install -e ".[dev]"
+# Install
+pip install -e ".[dev]"
 
 # Run the full test suite
-./.venv/bin/pytest
+pytest
 
 # Single file / single test
-./.venv/bin/pytest tests/test_client.py
-./.venv/bin/pytest tests/test_client.py::test_name -x
+pytest tests/test_client.py
+pytest tests/test_client.py::test_name -x
 
 # Lint (ruff: E, F, I, N, W; line-length 120)
-./.venv/bin/ruff check . && ./.venv/bin/ruff check --fix .
+ruff check . && ruff check --fix .
 
 # Run the app
-./.venv/bin/tg-messenger --help         # CLI entrypoint (login, dialogs, read, send, listen, chat, serve, tui)
-./.venv/bin/tg-messenger -v <cmd>        # DEBUG logging; file log: ~/.tg_messenger/logs/tg_messenger.log (env TG_LOG_DIR)
-./.venv/bin/tg-messenger serve           # web (FastAPI/uvicorn), default port 8090 (env TG_WEB_PORT; --port overrides)
-./.venv/bin/tg-messenger tui             # Textual TUI
+tg-messenger --help         # CLI entrypoint (login, dialogs, read, send, listen, chat, serve, tui)
+tg-messenger -v <cmd>        # DEBUG logging; file log: ~/.tg_messenger/logs/tg_messenger.log (env TG_LOG_DIR)
+tg-messenger serve           # web (FastAPI/uvicorn), default port 8090 (env TG_WEB_PORT; --port overrides)
+tg-messenger tui             # Textual TUI
 ```
 
-Runtime requires `TG_API_ID` and `TG_API_HASH` (Telegram API credentials) — from the environment or from a `.env` in the cwd, which the CLI entrypoint auto-loads (`_load_dotenv` in `cli/main.py`; real env wins, see `.env.example`). Unit tests never need them — they patch the network seams (see below). `tests/test_e2e.py` launches the real app as a subprocess and skips its credentialed tests when no creds are available.
+Runtime requires `TG_API_ID` and `TG_API_HASH` (Telegram API credentials) — from the environment or from a `.env` in the cwd, which the CLI entrypoint auto-loads (`_load_dotenv` in `cli/main.py`; real env wins, see `.env.example`). Unit tests never need them — they patch the network seams (see below).
 
 pytest is configured for `asyncio_mode = auto` (no `@pytest.mark.asyncio` needed), a 30s per-test timeout, and `filterwarnings = ["error"]` — **any warning fails the test**.
 
