@@ -1226,6 +1226,64 @@ def heartbeat_run(session: str) -> None:
         click.echo("stopped.")
 
 
+@cli.group()
+def username() -> None:
+    """Generate / check / set this account's public @username (#22)."""
+
+
+@username.command("suggest")
+@click.argument("base")
+@click.option("--limit", default=10, help="Max number of available usernames to return.")
+@click.option("--session", default="default")
+def username_suggest(base: str, limit: int, session: str) -> None:
+    """Suggest available usernames derived from BASE (checks candidates sequentially)."""
+    from tg_messenger.core.usernames import find_available
+
+    async def _do(client):
+        return await find_available(client, base, limit=limit)
+
+    found = _run(_with_client(session, _do), session=session)
+    if not found:
+        click.echo("No available usernames found — try a different base.")
+        return
+    for name in found:
+        click.echo(name)
+
+
+@username.command("set")
+@click.argument("name")
+@click.option("--session", default="default")
+def username_set(name: str, session: str) -> None:
+    """Set this account's public username to NAME (fails if invalid or taken)."""
+
+    async def _do(client):
+        try:
+            available = await client.check_username(name)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if not available:
+            raise click.ClickException(f"username '{name}' is not available.")
+        try:
+            await client.set_username(name)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    _run(_with_client(session, _do), session=session)
+    click.echo(f"username set to @{name}.")
+
+
+@username.command("clear")
+@click.option("--session", default="default")
+def username_clear(session: str) -> None:
+    """Remove this account's public username."""
+
+    async def _do(client):
+        await client.clear_username()
+
+    _run(_with_client(session, _do), session=session)
+    click.echo("username cleared.")
+
+
 @cli.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=lambda: int(os.environ.get("TG_WEB_PORT", "8090")), type=int)

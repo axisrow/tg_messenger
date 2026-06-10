@@ -119,6 +119,22 @@ class StubClient:
     async def entity_title(self, peer):
         return "My Group"
 
+    # username (#22): override .occupied to mark names taken
+    occupied: set = frozenset()
+    set_username_to = None
+    cleared = False
+
+    async def check_username(self, username):
+        return username not in self.occupied
+
+    async def set_username(self, username):
+        if username in self.occupied:
+            raise ValueError(f"username already taken: {username}")
+        self.set_username_to = username
+
+    async def clear_username(self):
+        self.cleared = True
+
     async def listen_outgoing(self):
         yield OutgoingEvent(
             dialog_id=-100123,
@@ -1273,3 +1289,46 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
     result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "tui"])
     assert result.exit_code == 0, result.output
     assert captured.get("session_name") == "work"
+
+
+# --- Цикл 122: username suggest / set / clear ---
+
+
+def test_username_suggest_prints_available(runner, monkeypatch):
+    cli, stub = runner
+    # generate a deterministic candidate list and mark some occupied
+    import random
+
+    from tg_messenger.core.usernames import generate_candidates
+
+    cands = generate_candidates("Ann", count=20, rng=random.Random(0))
+    stub.occupied = set(cands[:2])
+    result = cli.invoke(cli_main.cli, ["username", "suggest", "Ann", "--limit", "5"])
+    assert result.exit_code == 0, result.output
+    lines = [ln.strip() for ln in result.output.splitlines() if ln.strip()]
+    assert lines, "expected at least one suggested username"
+    for ln in lines:
+        assert ln not in stub.occupied
+
+
+def test_username_set_confirms(runner):
+    cli, stub = runner
+    result = cli.invoke(cli_main.cli, ["username", "set", "mynewhandle"])
+    assert result.exit_code == 0, result.output
+    assert stub.set_username_to == "mynewhandle"
+    assert "mynewhandle" in result.output
+
+
+def test_username_set_occupied_errors(runner):
+    cli, stub = runner
+    stub.occupied = {"takenname"}
+    result = cli.invoke(cli_main.cli, ["username", "set", "takenname"])
+    assert result.exit_code != 0
+    assert stub.set_username_to is None
+
+
+def test_username_clear_confirms(runner):
+    cli, stub = runner
+    result = cli.invoke(cli_main.cli, ["username", "clear"])
+    assert result.exit_code == 0, result.output
+    assert stub.cleared is True

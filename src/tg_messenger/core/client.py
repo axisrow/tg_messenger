@@ -16,7 +16,9 @@ from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon import utils as tl_utils
+from telethon.errors import UsernameInvalidError, UsernameOccupiedError
 from telethon.sessions import StringSession
+from telethon.tl.functions.account import CheckUsernameRequest, UpdateUsernameRequest
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
@@ -367,6 +369,45 @@ class StandaloneTelegramClient:
         """Mark a dialog read (clears its unread counter), routed through flood retry."""
         await run_with_flood_wait_retry(
             lambda: self._client.send_read_acknowledge(peer), operation="mark_read"
+        )
+
+    async def check_username(self, username: str) -> bool:
+        """Whether ``username`` is free for OUR account (True = available).
+
+        Telethon ``account.CheckUsernameRequest`` through flood-wait retry.
+        An invalid username maps to ``ValueError`` (clear message, not a raw
+        Telethon traceback); occupied/unavailable returns ``False``.
+        """
+        try:
+            return bool(
+                await run_with_flood_wait_retry(
+                    lambda: self._client(CheckUsernameRequest(username=username)),
+                    operation="check_username",
+                )
+            )
+        except UsernameInvalidError as exc:
+            raise ValueError(f"invalid username: {username}") from exc
+
+    async def set_username(self, username: str) -> None:
+        """Set OUR account's public username; flood-wait retried.
+
+        Occupied or invalid usernames map to ``ValueError`` with a clear message.
+        """
+        try:
+            await run_with_flood_wait_retry(
+                lambda: self._client(UpdateUsernameRequest(username=username)),
+                operation="set_username",
+            )
+        except UsernameOccupiedError as exc:
+            raise ValueError(f"username already taken: {username}") from exc
+        except UsernameInvalidError as exc:
+            raise ValueError(f"invalid username: {username}") from exc
+
+    async def clear_username(self) -> None:
+        """Remove OUR account's public username (sets it to empty), flood-wait retried."""
+        await run_with_flood_wait_retry(
+            lambda: self._client(UpdateUsernameRequest(username="")),
+            operation="clear_username",
         )
 
     async def send_media(

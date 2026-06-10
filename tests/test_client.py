@@ -1465,3 +1465,96 @@ async def test_is_admin_false_on_error(fake_client):
     client = _build(fake_client)
     await client.connect()
     assert await client.is_admin(-100200) is False
+
+
+# --- Цикл 120: check/set/clear username ---
+
+
+async def test_check_username_free_returns_true(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.check_username("freename1") is True
+
+
+async def test_check_username_occupied_returns_false(fake_client):
+    fake_client.occupied_usernames.add("takenname")
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.check_username("takenname") is False
+
+
+async def test_check_username_invalid_raises_value_error(fake_client):
+    fake_client.invalid_usernames.add("bad!")
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(ValueError):
+        await client.check_username("bad!")
+
+
+async def test_check_username_issues_request(fake_client):
+    from telethon.tl.functions.account import CheckUsernameRequest
+
+    client = _build(fake_client)
+    await client.connect()
+    await client.check_username("freename1")
+    reqs = [r for r in fake_client.requests if isinstance(r, CheckUsernameRequest)]
+    assert reqs and reqs[-1].username == "freename1"
+
+
+async def test_set_username_writes(fake_client):
+    from telethon.tl.functions.account import UpdateUsernameRequest
+
+    client = _build(fake_client)
+    await client.connect()
+    await client.set_username("mynewname")
+    assert fake_client.set_username_to == "mynewname"
+    reqs = [r for r in fake_client.requests if isinstance(r, UpdateUsernameRequest)]
+    assert reqs and reqs[-1].username == "mynewname"
+
+
+async def test_set_username_occupied_raises_value_error(fake_client):
+    fake_client.occupied_usernames.add("takenname")
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(ValueError):
+        await client.set_username("takenname")
+
+
+async def test_set_username_invalid_raises_value_error(fake_client):
+    fake_client.invalid_usernames.add("bad!")
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(ValueError):
+        await client.set_username("bad!")
+
+
+async def test_clear_username_sends_empty(fake_client):
+    from telethon.tl.functions.account import UpdateUsernameRequest
+
+    client = _build(fake_client)
+    await client.connect()
+    await client.clear_username()
+    reqs = [r for r in fake_client.requests if isinstance(r, UpdateUsernameRequest)]
+    assert reqs and reqs[-1].username == ""
+    assert fake_client.set_username_to == ""
+
+
+async def test_check_username_flood_is_handled(fake_client, monkeypatch):
+    import tg_messenger.core.flood as flood
+    from tg_messenger.core.flood import HandledFloodWaitError
+
+    class FakeFloodWaitError(Exception):
+        def __init__(self, seconds):
+            super().__init__(f"flood {seconds}s")
+            self.seconds = seconds
+
+    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    client = _build(fake_client)
+    await client.connect()
+
+    async def boom(request):
+        raise FakeFloodWaitError(9999)
+
+    monkeypatch.setattr(type(fake_client), "__call__", lambda self, req: boom(req))
+    with pytest.raises(HandledFloodWaitError):
+        await client.check_username("freename1")
