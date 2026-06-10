@@ -6,10 +6,12 @@ and appends incoming bubbles for the selected dialog.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, ListItem, ListView, Static
 
@@ -41,6 +43,9 @@ class MessageBubble(Static):
 
 
 class MessengerTUI(App):
+    # priority: quitting must work even while focus sits in the composer Input
+    BINDINGS = [Binding("ctrl+c", "quit", "Quit", priority=True)]
+
     CSS = """
     #dialogs { width: 32; border-right: solid $primary; }
     .out { color: $accent; text-align: right; }
@@ -62,6 +67,19 @@ class MessengerTUI(App):
                 yield Input(placeholder="Message…", id="composer")
 
     async def on_mount(self) -> None:
+        # Textual's real App.run() installs asyncio.eager_task_factory (py3.12+),
+        # which runs task bodies at create_task time. Telethon's MTProtoSender
+        # starts its send loop via create_task and sets _user_connected only
+        # afterwards — eagerly-started, the loop sees False and dies, so no
+        # request is ever sent (blank TUI, server drops the idle connection).
+        # Telethon needs lazy task scheduling; reset before the client exists.
+        asyncio.get_running_loop().set_task_factory(None)
+        # network work runs in a worker: awaiting it here would stall the app's
+        # message pump — blank screen, dead keys, no way to quit (seen live)
+        self.query_one("#dialogs", ListView).loading = True
+        self.run_worker(self._startup(), exclusive=False)
+
+    async def _startup(self) -> None:
         if self._client is None:
             self._client = _make_real_client(self._session_name)
         try:
@@ -74,6 +92,7 @@ class MessengerTUI(App):
             logger.exception("TUI startup failed")
             self.exit(return_code=1, message=f"Startup failed: {exc}")
             return
+        self.query_one("#dialogs", ListView).loading = False
         self.run_worker(self._drain_incoming(), exclusive=False)
 
     async def on_unmount(self) -> None:
@@ -89,26 +108,43 @@ class MessengerTUI(App):
         item = event.item
         if isinstance(item, DialogItem):
             self._current = item.dialog_id
-            await self._show_history(item.dialog_id)
+            # exclusive group: selecting another dialog cancels a still-loading history
+            self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
 
     async def _show_history(self, dialog_id: int) -> None:
         pane = self.query_one("#messages", Vertical)
         await pane.remove_children()
-        for m in await self._client.history(dialog_id, limit=50):
-            await pane.mount(MessageBubble(m.text or "<media>", m.out))
+        pane.loading = True
+        try:
+            messages = await self._client.history(dialog_id, limit=50)
+        except Exception as exc:
+            pane.loading = False
+            logger.exception("history load failed (dialog %s)", dialog_id)
+            self.notify(f"History failed: {exc}", severity="error")
+            return
+        pane.loading = False
+        await pane.mount(*(MessageBubble(m.text or "<media>", m.out) for m in messages))
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if self._current is None or not event.value.strip():
             return
+        text = event.value
+        event.input.value = ""  # clear optimistically; restored on failure
+        self.run_worker(self._send_text(self._current, text), exclusive=False)
+
+    async def _send_text(self, peer: int, text: str) -> None:
         try:
-            await self._client.send_text(self._current, event.value)
+            await self._client.send_text(peer, text)
         except Exception as exc:
-            logger.exception("send failed (dialog %s)", self._current)
+            logger.exception("send failed (dialog %s)", peer)
             self.notify(f"Send failed: {exc}", severity="error")
+            composer = self.query_one("#composer", Input)
+            if not composer.value:  # don't clobber a draft typed meanwhile
+                composer.value = text
             return
-        pane = self.query_one("#messages", Vertical)
-        await pane.mount(MessageBubble(event.value, out=True))
-        event.input.value = ""
+        if peer == self._current:  # user may have switched dialogs mid-send
+            pane = self.query_one("#messages", Vertical)
+            await pane.mount(MessageBubble(text, out=True))
 
     async def _drain_incoming(self) -> None:
         try:
