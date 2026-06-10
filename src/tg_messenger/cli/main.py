@@ -982,6 +982,162 @@ def ghostwrite_dialogs_resume(dialog_id: int, session: str) -> None:
     click.echo(f"ghostwrite resumed for dialog {dialog_id}.")
 
 
+# --- heartbeat (#19): scheduled pings with templates and safeties ---------------
+
+
+def _open_heartbeat_storage(session: str):
+    from tg_messenger.core.heartbeat import register_heartbeat_migrations
+
+    storage = make_storage(session)
+    register_heartbeat_migrations(storage)
+    return storage
+
+
+def _parse_at(at: str):
+    """Parse ``HH:MM`` into the next future local datetime (today, or tomorrow if past)."""
+    from datetime import datetime, timedelta
+
+    try:
+        hh, mm = (int(p) for p in at.split(":", 1))
+    except ValueError as exc:
+        raise click.ClickException(f"--at must be HH:MM, got {at!r}") from exc
+    now = datetime.now()
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
+@cli.group()
+def heartbeat() -> None:
+    """Scheduled pings: one-shot (--at) or recurring stored plans (--interval)."""
+
+
+@heartbeat.command("plan")
+@click.argument("peer", type=int)
+@click.option("--at", "at", default=None, help="One-shot HH:MM (server-side scheduled send).")
+@click.option("--interval", "interval_hours", type=float, default=None,
+              help="Recurring: hours between pings (stores a plan).")
+@click.option("--template", "templates", multiple=True, help="Ping text (repeatable).")
+@click.option("--jitter", "jitter_minutes", type=float, default=0.0,
+              help="Random +0..N minutes added to each interval.")
+@click.option("--quiet-start", type=int, default=None, help="Quiet window open hour (local).")
+@click.option("--quiet-end", type=int, default=None, help="Quiet window close hour (local).")
+@click.option("--max-per-day", type=int, default=1, help="Daily ping cap (recurring plans).")
+@click.option("--session", default="default")
+def heartbeat_plan(peer: int, at: str | None, interval_hours: float | None,
+                   templates: tuple[str, ...], jitter_minutes: float,
+                   quiet_start: int | None, quiet_end: int | None,
+                   max_per_day: int, session: str) -> None:
+    """Schedule pings to PEER: --at for a one-shot native send, --interval for a stored plan."""
+    if not templates:
+        raise click.ClickException("at least one --template is required.")
+    if at is None and interval_hours is None:
+        raise click.ClickException("provide --at (one-shot) or --interval (recurring plan).")
+    if at is not None and interval_hours is not None:
+        raise click.ClickException("--at and --interval are mutually exclusive.")
+
+    if at is not None:
+        # one-shot: native server-side scheduled send (no stored plan)
+        when = _parse_at(at)
+        text = templates[0]
+
+        async def _do_oneshot(client):
+            await client.send_text(peer, text, schedule=when)
+
+        _run(_with_client(session, _do_oneshot), session=session)
+        click.echo(f"scheduled one-shot ping to {peer} at {when:%Y-%m-%d %H:%M}.")
+        return
+
+    # recurring: store a plan
+    from tg_messenger.core.heartbeat import HeartbeatPlan, add_plan
+
+    plan = HeartbeatPlan(
+        peer=peer, templates=list(templates), interval_hours=interval_hours,
+        jitter_minutes=jitter_minutes, quiet_start=quiet_start, quiet_end=quiet_end,
+        max_per_day=max_per_day,
+    )
+
+    async def _do():
+        storage = _open_heartbeat_storage(session)
+        await storage.connect()
+        try:
+            await add_plan(storage, plan)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"heartbeat plan stored for peer {peer} (every {interval_hours}h).")
+
+
+@heartbeat.command("list")
+@click.option("--session", default="default")
+def heartbeat_list(session: str) -> None:
+    """List stored heartbeat plans."""
+    from tg_messenger.core.heartbeat import list_plans
+
+    async def _do():
+        storage = _open_heartbeat_storage(session)
+        await storage.connect()
+        try:
+            return await list_plans(storage)
+        finally:
+            await storage.close()
+
+    plans = _run(_do(), session=session)
+    if not plans:
+        click.echo("No plans.")
+        return
+    for p in plans:
+        state = "on" if p.enabled else "off"
+        click.echo(f"{p.peer}\tevery {p.interval_hours}h\t[{state}]\t{p.templates}")
+
+
+@heartbeat.command("remove")
+@click.argument("peer", type=int)
+@click.option("--session", default="default")
+def heartbeat_remove(peer: int, session: str) -> None:
+    """Remove a stored heartbeat plan by PEER."""
+    from tg_messenger.core.heartbeat import remove_plan
+
+    async def _do():
+        storage = _open_heartbeat_storage(session)
+        await storage.connect()
+        try:
+            await remove_plan(storage, peer)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"heartbeat plan removed for peer {peer}.")
+
+
+@heartbeat.command("run")
+@click.option("--session", default="default")
+def heartbeat_run(session: str) -> None:
+    """Run the heartbeat scheduler: send stored plans' pings on schedule (Ctrl+C to stop)."""
+    from tg_messenger.core.heartbeat import HeartbeatService, register_heartbeat_migrations
+
+    async def _do():
+        client = make_client(session_name=session)
+        storage = make_storage(session)
+        register_heartbeat_migrations(storage)
+        await storage.connect()
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            click.echo("Heartbeat scheduler running — Ctrl+C to stop...")
+            await HeartbeatService(client, storage).run()
+        finally:
+            await client.disconnect()
+            await storage.close()
+
+    try:
+        _run(_do(), session=session)
+    except KeyboardInterrupt:
+        click.echo("stopped.")
+
+
 @cli.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=lambda: int(os.environ.get("TG_WEB_PORT", "8090")), type=int)

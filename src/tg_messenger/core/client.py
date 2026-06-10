@@ -278,9 +278,16 @@ class StandaloneTelegramClient:
         return [m async for m in self._client.iter_messages(peer, search=query, limit=limit)]
 
     # --- sending ---
-    async def send_text(self, peer: int, text: str, reply_to: int | None = None) -> Message:
+    async def send_text(
+        self,
+        peer: int,
+        text: str,
+        reply_to: int | None = None,
+        schedule: timedelta | datetime | None = None,
+    ) -> Message:
+        """Send ``text`` to ``peer``; ``schedule`` (a delay or absolute time) defers it server-side."""
         msg = await run_with_flood_wait_retry(
-            lambda: self._client.send_message(peer, text, reply_to=reply_to),
+            lambda: self._client.send_message(peer, text, reply_to=reply_to, schedule=schedule),
             operation="send_text",
         )
         self._invalidate_history(peer)  # the new message must show on reopen

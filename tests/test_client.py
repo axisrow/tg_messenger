@@ -223,7 +223,8 @@ async def test_send_text_records_and_returns_message(fake_client):
     client = _build(fake_client)
     await client.connect()
     msg = await client.send_text(7, "hello")
-    assert fake_client.sent[-1] == {"peer": 7, "text": "hello", "reply_to": None}
+    assert fake_client.sent[-1] == {"peer": 7, "text": "hello", "reply_to": None,
+                                    "schedule": None}
     assert isinstance(msg, Message)
     assert msg.out is True
 
@@ -1164,6 +1165,26 @@ async def test_send_text_reply_invalidates_history(fake_client):
     await client.send_text(7, "re", reply_to=1)
     await client.history(7, limit=10)  # must refetch
     assert fake_client.iter_messages_calls == 2
+
+
+# --- цикл 99: schedule= в send_text (серверные отложенные) ---
+
+
+async def test_send_text_schedule_passed_to_telethon(fake_client):
+    from datetime import timedelta
+
+    client = _build(fake_client)
+    await client.connect()
+    delay = timedelta(hours=2)
+    await client.send_text(7, "later", schedule=delay)
+    assert fake_client.sent[-1]["schedule"] == delay
+
+
+async def test_send_text_no_schedule_by_default(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await client.send_text(7, "now")
+    assert fake_client.sent[-1]["schedule"] is None
 
 
 # --- Цикл 78: forward / edit / delete ---

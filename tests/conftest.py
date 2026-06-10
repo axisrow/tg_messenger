@@ -275,10 +275,11 @@ class FakeTelethonClient:
         return FakeUser(id=int(peer))
 
     # --- sending ---
-    async def send_message(self, peer, text, reply_to=None):
+    async def send_message(self, peer, text, reply_to=None, schedule=None):
         msg = FakeMessage(id=999, sender_id=1, text=text, out=True, peer_id=int(peer),
                           reply_to=reply_to)
-        self.sent.append({"peer": int(peer), "text": text, "reply_to": reply_to})
+        self.sent.append({"peer": int(peer), "text": text, "reply_to": reply_to,
+                          "schedule": schedule})
         return msg
 
     async def send_file(self, peer, file, caption=None):

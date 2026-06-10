@@ -84,8 +84,8 @@ class StubClient:
         self.downloaded.append((message_id, str(dest)))
         return str(dest)
 
-    async def send_text(self, peer, text, reply_to=None):
-        self.sent.append((peer, text, reply_to))
+    async def send_text(self, peer, text, reply_to=None, schedule=None):
+        self.sent.append((peer, text, reply_to, schedule))
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
@@ -233,7 +233,7 @@ def test_send_calls_client(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["send", "7", "hello"])
     assert result.exit_code == 0
-    assert stub.sent == [(7, "hello", None)]
+    assert stub.sent == [(7, "hello", None, None)]
 
 
 def test_send_file_uses_send_media(runner, tmp_path):
@@ -252,7 +252,7 @@ def test_send_reply_to_passed(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["send", "7", "re", "--reply-to", "42"])
     assert result.exit_code == 0, result.output
-    assert stub.sent == [(7, "re", 42)]
+    assert stub.sent == [(7, "re", 42, None)]
 
 
 def test_forward_command_calls_client(runner):
@@ -386,7 +386,7 @@ def test_chat_sends_and_disconnects_on_eof(runner):
     stub.listen_interrupt = False  # printer just idles; EOF on stdin ends the REPL
     result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
     assert result.exit_code == 0
-    assert (7, "hello", None) in stub.sent
+    assert (7, "hello", None, None) in stub.sent
     assert stub.connected is False
 
 
@@ -580,7 +580,7 @@ def test_watch_notifies_saved_messages(runner):
     result = r.invoke(cli_main.cli, ["watch"])
     assert result.exit_code == 0
     assert "Watching" in result.output
-    (peer, text, _reply), = stub.sent
+    (peer, text, _reply, _schedule), = stub.sent
     assert peer == 1  # Saved Messages = собственный id
     assert "удалят меня" in text
     assert "My Group" in text
@@ -788,6 +788,84 @@ def test_ghostwrite_without_login_gives_hint(gw_runner):
     assert "tg-messenger login" in result.output
 
 
+# --- Цикл 104 (#19): команды heartbeat + heartbeat plan/list/remove ---
+
+
+@pytest.fixture
+def hb_runner(monkeypatch, tmp_path):
+    """CLI runner whose heartbeat storage is a fresh tmp SQLite db; no LLM."""
+    from tg_messenger.core.storage import Storage
+
+    stub = StubClient()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    monkeypatch.setattr(cli_main, "make_storage", lambda profile="default": Storage(tmp_path / "hb.db"))
+    return CliRunner(), stub, tmp_path
+
+
+def test_heartbeat_plan_add_list_remove(hb_runner):
+    r, _stub, _tp = hb_runner
+    add = r.invoke(cli_main.cli, ["heartbeat", "plan", "7",
+                                  "--interval", "24", "--template", "ping",
+                                  "--template", "yo"])
+    assert add.exit_code == 0, add.output
+
+    lst = r.invoke(cli_main.cli, ["heartbeat", "list"])
+    assert lst.exit_code == 0
+    assert "7" in lst.output
+
+    rm = r.invoke(cli_main.cli, ["heartbeat", "remove", "7"])
+    assert rm.exit_code == 0
+
+    lst2 = r.invoke(cli_main.cli, ["heartbeat", "list"])
+    assert "No plans" in lst2.output
+
+
+def test_heartbeat_plan_at_sends_scheduled_one_shot(hb_runner):
+    r, stub, _tp = hb_runner
+    result = r.invoke(cli_main.cli, ["heartbeat", "plan", "7",
+                                     "--at", "18:00", "--template", "evening ping"])
+    assert result.exit_code == 0, result.output
+    # one-shot native schedule: a single send_text with a non-None schedule
+    assert len(stub.sent) == 1
+    peer, text, _reply, schedule = stub.sent[0]
+    assert peer == 7
+    assert text == "evening ping"
+    assert schedule is not None
+    # and it did NOT create a recurring stored plan
+    lst = r.invoke(cli_main.cli, ["heartbeat", "list"])
+    assert "No plans" in lst.output
+
+
+def test_heartbeat_plan_requires_at_or_interval(hb_runner):
+    r, _stub, _tp = hb_runner
+    result = r.invoke(cli_main.cli, ["heartbeat", "plan", "7", "--template", "x"])
+    assert result.exit_code != 0
+    assert "--at" in result.output or "--interval" in result.output
+
+
+def test_heartbeat_run_stops_on_ctrl_c(hb_runner, monkeypatch):
+    r, stub, _tp = hb_runner
+    # enable a plan so the tick has work; history raises Ctrl+C to break the loop
+    r.invoke(cli_main.cli, ["heartbeat", "plan", "7", "--interval", "24", "--template", "ping"])
+
+    async def boom(peer, limit=1):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(stub, "history", boom)
+    result = r.invoke(cli_main.cli, ["heartbeat", "run"])
+    assert result.exit_code == 0, result.output
+    assert "stopped." in result.output
+    assert stub.connected is False
+
+
+def test_heartbeat_run_without_login_gives_hint(hb_runner):
+    r, stub, _tp = hb_runner
+    stub.authorized = False
+    result = r.invoke(cli_main.cli, ["heartbeat", "run"])
+    assert result.exit_code != 0
+    assert "tg-messenger login" in result.output
+
+
 def test_dotenv_autoloaded_for_commands(runner, tmp_path, monkeypatch):
     # isolate os.environ so the test can't leak TG_API_ID into the session
     monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
@@ -869,7 +947,7 @@ def test_chat_listener_failure_is_reported(runner, monkeypatch, caplog):
     with caplog.at_level("ERROR", logger="tg_messenger.cli.main"):
         result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
     assert result.exit_code == 0  # the REPL itself still worked
-    assert (7, "hello", None) in stub.sent
+    assert (7, "hello", None, None) in stub.sent
     assert "listener failed" in result.output
     errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
     assert errors and errors[0].exc_info is not None
