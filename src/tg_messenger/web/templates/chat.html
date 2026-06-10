@@ -29,7 +29,7 @@
     <form id="composer" hx-post="/send" hx-target="#messages" hx-swap="beforeend"
           hx-on::after-request="this.reset()">
       <input type="hidden" name="dialog_id" id="dialog_id" value="">
-      <input type="text" name="text" placeholder="Message…" autocomplete="off">
+      <input type="text" name="text" placeholder="Message…" autocomplete="off" required>
     </form>
   </main>
   <script>

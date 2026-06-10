@@ -79,8 +79,12 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
         return HTMLResponse("".join(_message_div(m) for m in items))
 
     @app.post("/send", response_class=HTMLResponse)
-    async def send(request: Request, dialog_id: int = Form(...), text: str = Form(...)):
-        msg = await request.app.state.client.send_text(dialog_id, text)
+    async def send(request: Request, dialog_id: str = Form(""), text: str = Form("")):
+        if not dialog_id.strip().lstrip("-").isdigit():
+            return HTMLResponse('<div class="error">Select a dialog first.</div>', status_code=400)
+        if not text.strip():
+            return HTMLResponse('<div class="error">Cannot send an empty message.</div>', status_code=400)
+        msg = await request.app.state.client.send_text(int(dialog_id), text)
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/media", response_class=HTMLResponse)

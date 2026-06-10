@@ -37,6 +37,14 @@ def test_saved_file_is_private(session_dir):
     assert mode == 0o600
 
 
+def test_session_dir_is_private(session_dir):
+    nested = session_dir / "nested"
+    store = SessionStore(nested)
+    store.save("default", "S")
+    mode = stat.S_IMODE(nested.stat().st_mode)
+    assert mode == 0o700
+
+
 def test_name_is_sanitized(session_dir):
     store = SessionStore(session_dir)
     store.save("../../evil name", "S")

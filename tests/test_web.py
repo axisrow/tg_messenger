@@ -81,6 +81,20 @@ async def test_send_returns_fragment(client_app):
     assert stub.sent == [(7, "hello")]
 
 
+async def test_send_empty_text_returns_400(client_app):
+    ac, stub = client_app
+    r = await ac.post("/send", data={"dialog_id": "7", "text": "   "})
+    assert r.status_code == 400
+    assert stub.sent == []
+
+
+async def test_send_without_dialog_returns_400(client_app):
+    ac, stub = client_app
+    r = await ac.post("/send", data={"dialog_id": "", "text": "hi"})
+    assert r.status_code == 400
+    assert stub.sent == []
+
+
 async def test_media_upload_calls_send_media(client_app):
     ac, stub = client_app
     r = await ac.post(

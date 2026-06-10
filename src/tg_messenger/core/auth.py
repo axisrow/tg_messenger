@@ -52,6 +52,7 @@ class SessionStore:
 
     def save(self, name: str, session_string: str) -> Path:
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.session_dir, 0o700)
         path = self.path_for(name)
         path.write_text(session_string, encoding="utf-8")
         os.chmod(path, 0o600)

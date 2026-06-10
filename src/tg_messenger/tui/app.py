@@ -25,13 +25,14 @@ def _make_real_client(session_name: str):
 
 class DialogItem(ListItem):
     def __init__(self, dialog_id: int, title: str):
-        super().__init__(Static(f"{dialog_id} — {title}"))
+        # markup=False: titles/messages are untrusted text, [brackets] must render literally
+        super().__init__(Static(f"{dialog_id} — {title}", markup=False))
         self.dialog_id = dialog_id
 
 
 class MessageBubble(Static):
     def __init__(self, text: str, out: bool):
-        super().__init__(text, classes="out" if out else "in")
+        super().__init__(text, classes="out" if out else "in", markup=False)
 
 
 class MessengerTUI(App):
@@ -61,6 +62,10 @@ class MessengerTUI(App):
         await self._client.connect()
         await self._load_dialogs()
         self.run_worker(self._drain_incoming(), exclusive=False)
+
+    async def on_unmount(self) -> None:
+        if self._client is not None:
+            await self._client.disconnect()
 
     async def _load_dialogs(self) -> None:
         lv = self.query_one("#dialogs", ListView)
