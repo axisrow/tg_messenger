@@ -76,8 +76,24 @@ def test_load_rejects_corrupt_session(session_dir):
 
 async def test_send_code_reports_delivery_channel(fake_client):
     flow = auth.LoginFlow(fake_client)
-    kind = await flow.send_code("+10000000000")
-    assert kind == "app"  # fake SentCode.type is SentCodeTypeApp
+    delivery = await flow.send_code("+10000000000")
+    assert delivery.kind == "app"  # fake SentCode.type is SentCodeTypeApp
+
+
+async def test_resend_code_switches_channel_and_rebinds_hash(fake_client):
+    flow = auth.LoginFlow(fake_client)
+    await flow.send_code("+10000000000")
+    delivery = await flow.resend_code()
+    assert delivery.kind == "sms"  # next channel after the in-app code
+    assert len(fake_client.resend_requests) == 1
+    # the new phone_code_hash must be bound for the subsequent sign_in
+    assert flow._code_hash == "hash456"
+
+
+async def test_resend_before_send_code_raises(fake_client):
+    flow = auth.LoginFlow(fake_client)
+    with pytest.raises(RuntimeError):
+        await flow.resend_code()
 
 
 async def test_send_code_and_sign_in(fake_client):

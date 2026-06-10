@@ -195,12 +195,18 @@ class FakeInnerLoginClient:
         self.sign_in_error = sign_in_error
         self.send_code_error = send_code_error
         self.signed_in = []
+        self.resends = 0
 
     async def send_code_request(self, phone):
         if self.send_code_error is not None:
             raise self.send_code_error
         sent_type = type("SentCodeTypeApp", (), {})()
         return type("Sent", (), {"phone_code_hash": "h", "type": sent_type})()
+
+    async def __call__(self, request):
+        self.resends += 1
+        sent_type = type("SentCodeTypeSms", (), {})()
+        return type("Sent", (), {"phone_code_hash": "h2", "type": sent_type})()
 
     async def sign_in(self, phone=None, code=None, password=None, **kw):
         if code is not None and self.sign_in_error is not None:
@@ -257,6 +263,19 @@ def test_login_invalid_phone_friendly_error(monkeypatch):
     assert "Could not send code" in result.output
     assert "Traceback" not in result.output
     assert stub.connected is False
+
+
+def test_login_empty_code_resends_via_next_channel(monkeypatch):
+    inner = FakeInnerLoginClient()
+    stub = LoginStubClient(inner)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    # phone, empty code (= resend), then the real code
+    result = CliRunner().invoke(cli_main.cli, ["login"], input="+10000000000\n\n123\n")
+    assert result.exit_code == 0
+    assert inner.resends == 1
+    assert "SMS" in result.output  # resent code went via SMS
+    assert inner.signed_in[-1]["code"] == "123"
+    assert stub.saved is True
 
 
 def test_login_2fa_prompts_password(monkeypatch):

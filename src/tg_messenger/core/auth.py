@@ -10,8 +10,10 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 from telethon.sessions import StringSession
+from telethon.tl.functions.auth import ResendCodeRequest
 
 from tg_messenger.core.flood import run_with_flood_wait_retry
 
@@ -65,6 +67,22 @@ class SessionStore:
         return _validate_session_string(session_string)
 
 
+class CodeDelivery(NamedTuple):
+    """Where the login code went and what a resend would use."""
+
+    kind: str  # app / sms / call / unknown
+    next_kind: str | None = None
+    timeout: int | None = None  # seconds until resend is allowed, if Telegram said so
+
+
+def _kind_of(type_obj) -> str:
+    name = type(type_obj).__name__.lower()
+    for kind in ("app", "sms", "call"):
+        if kind in name:
+            return kind
+    return "unknown"
+
+
 class LoginFlow:
     """Two-step interactive sign-in over a connected Telethon client.
 
@@ -77,8 +95,17 @@ class LoginFlow:
         self._phone: str | None = None
         self._code_hash: str | None = None
 
-    async def send_code(self, phone: str) -> str:
-        """Request a login code; return the delivery channel: app / sms / call / unknown.
+    def _bind(self, sent) -> CodeDelivery:
+        self._code_hash = getattr(sent, "phone_code_hash", None) or self._code_hash
+        next_type = getattr(sent, "next_type", None)
+        return CodeDelivery(
+            kind=_kind_of(getattr(sent, "type", None)),
+            next_kind=_kind_of(next_type) if next_type is not None else None,
+            timeout=getattr(sent, "timeout", None),
+        )
+
+    async def send_code(self, phone: str) -> CodeDelivery:
+        """Request a login code.
 
         Telegram prefers delivering the code to an already-logged-in Telegram app
         (SentCodeTypeApp) over SMS — callers should surface this to the user.
@@ -87,12 +114,19 @@ class LoginFlow:
             lambda: self._client.send_code_request(phone), operation="send_code"
         )
         self._phone = phone
-        self._code_hash = getattr(sent, "phone_code_hash", None)
-        type_name = type(getattr(sent, "type", None)).__name__.lower()
-        for kind in ("app", "sms", "call"):
-            if kind in type_name:
-                return kind
-        return "unknown"
+        return self._bind(sent)
+
+    async def resend_code(self) -> CodeDelivery:
+        """Ask Telegram to resend the code via the next delivery channel."""
+        if self._phone is None or self._code_hash is None:
+            raise RuntimeError("send_code must be called before resend_code")
+        sent = await run_with_flood_wait_retry(
+            lambda: self._client(ResendCodeRequest(
+                phone_number=self._phone, phone_code_hash=self._code_hash,
+            )),
+            operation="resend_code",
+        )
+        return self._bind(sent)
 
     async def sign_in(self, code: str):
         if self._phone is None:

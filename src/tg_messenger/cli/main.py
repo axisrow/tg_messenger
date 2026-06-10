@@ -46,6 +46,16 @@ _CODE_DELIVERY_HINTS = {
 }
 
 
+def _delivery_message(delivery) -> str:
+    msg = _CODE_DELIVERY_HINTS.get(delivery.kind, "Code sent — check your Telegram app and SMS.")
+    if delivery.next_kind:
+        msg += f" No code? Press Enter at the prompt to resend via {delivery.next_kind}"
+        if delivery.timeout:
+            msg += f" (available in ~{delivery.timeout}s)"
+        msg += "."
+    return msg
+
+
 def _login_hint(session: str = "default") -> str:
     hint = "Not logged in. Run: tg-messenger login"
     if session != "default":
@@ -104,10 +114,16 @@ def login(session: str, phone: str) -> None:
                 delivery = await flow.send_code(phone)
             except RPCError as exc:
                 raise click.ClickException(f"Could not send code: {exc}") from exc
-            click.echo(_CODE_DELIVERY_HINTS.get(
-                delivery, "Code sent — check your Telegram app and SMS."
-            ))
-            code = click.prompt("Code")
+            click.echo(_delivery_message(delivery))
+            while True:
+                code = click.prompt("Code (Enter = resend)", default="", show_default=False)
+                if code.strip():
+                    break
+                try:
+                    delivery = await flow.resend_code()
+                except RPCError as exc:
+                    raise click.ClickException(f"Could not resend code: {exc}") from exc
+                click.echo(_delivery_message(delivery))
             try:
                 await flow.sign_in(code=code)
             except SessionPasswordNeededError:

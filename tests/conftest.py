@@ -74,6 +74,7 @@ class FakeTelethonClient:
         self.downloads: list[dict] = []
         self._handlers: list = []
         self.code_requests: list[str] = []
+        self.resend_requests: list = []
         self.signed_in_with: list = []
 
     # --- connection / auth ---
@@ -94,6 +95,12 @@ class FakeTelethonClient:
         # mimic telethon: SentCode.type tells where the code went (SentCodeTypeApp etc.)
         sent_type = type("SentCodeTypeApp", (), {})()
         return type("Sent", (), {"phone_code_hash": "hash123", "type": sent_type})()
+
+    async def __call__(self, request):
+        # raw RPC path; LoginFlow uses it for auth.ResendCodeRequest
+        self.resend_requests.append(request)
+        sent_type = type("SentCodeTypeSms", (), {})()
+        return type("Sent", (), {"phone_code_hash": "hash456", "type": sent_type})()
 
     async def sign_in(self, phone=None, code=None, password=None, **kw):
         self.signed_in_with.append({"phone": phone, "code": code, "password": password})
