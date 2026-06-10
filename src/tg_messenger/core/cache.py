@@ -33,7 +33,8 @@ class TTLCache(Generic[K, V]):
         self._maxsize = maxsize
         self._clock = clock
         self._store: OrderedDict[K, tuple[V, float]] = OrderedDict()
-        self._locks: dict[K, asyncio.Lock] = {}
+        # per-key (lock, in-flight waiter count); the last waiter out drops the entry
+        self._locks: dict[K, list] = {}
 
     def get(self, key: K, default=None):
         entry = self._store.get(key)
@@ -80,12 +81,14 @@ class TTLCache(Generic[K, V]):
         hit = self.get(key, _MISSING)
         if hit is not _MISSING:
             return hit  # type: ignore[return-value]
-        lock = self._locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[key] = lock
+        # an explicit [lock, waiters] pair owns cleanup — no peeking at asyncio.Lock
+        # internals: the last coroutine out of the finally drops the entry.
+        entry = self._locks.get(key)
+        if entry is None:
+            entry = self._locks[key] = [asyncio.Lock(), 0]
+        entry[1] += 1
         try:
-            async with lock:
+            async with entry[0]:
                 hit = self.get(key, _MISSING)
                 if hit is not _MISSING:
                     return hit  # type: ignore[return-value]
@@ -93,7 +96,6 @@ class TTLCache(Generic[K, V]):
                 self.set(key, value)
                 return value
         finally:
-            # drop the per-key lock once no one else is waiting on it, so the
-            # lock dict can't grow unboundedly; a failed fetch cleans up too.
-            if not lock.locked() and not getattr(lock, "_waiters", None):
-                self._locks.pop(key, None)
+            entry[1] -= 1
+            if entry[1] <= 0:
+                self._locks.pop(key, None)  # last one out — a failed fetch too
