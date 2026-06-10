@@ -3,15 +3,28 @@ import logging
 
 import pytest
 from telethon.sessions import StringSession
+from telethon.tl.types import PeerUser
 
-from tests.conftest import FakeChannel, FakeChat, FakeDialog, FakeDocument, FakeMessage, FakeUser
+from tests.conftest import (
+    FakeChannel,
+    FakeChat,
+    FakeChatActionEvent,
+    FakeDialog,
+    FakeDocument,
+    FakeMessage,
+    FakeMessageReadEvent,
+    FakeUser,
+)
 from tg_messenger.core.client import StandaloneTelegramClient, _dialog_kind
 from tg_messenger.core.models import (
+    ChatActionEvent,
     Dialog,
     IncomingEvent,
     Message,
+    MessageReadEvent,
     MessagesDeletedEvent,
     OutgoingEvent,
+    ReactionEvent,
     User,
 )
 
@@ -858,3 +871,250 @@ async def test_dialogs_flood_raises_handled_and_leaves_cache_empty(fake_client, 
     with pytest.raises(HandledFloodWaitError):
         await client.dialogs(dm_only=True)
     assert calls["n"] == 2
+
+
+# --- Цикл 72: поток chat-action (listen_chat_actions) ---
+
+
+async def _collect_one(coro_stream, push, event):
+    """Subscribe to a stream, push one event, return the first received item."""
+    received = []
+
+    async def consume():
+        async for ev in coro_stream():
+            received.append(ev)
+            return
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0)
+    await push(event)
+    await asyncio.wait_for(task, timeout=1)
+    return received[0]
+
+
+async def test_chat_action_join_carries_user(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    joiner = FakeUser(id=42, first_name="Joiner", username="joiner")
+    ev = FakeChatActionEvent(-100123, user_joined=True, user=joiner)
+    out = await _collect_one(client.listen_chat_actions, fake_client.push_event, ev)
+    assert isinstance(out, ChatActionEvent)
+    assert out.kind == "join"
+    assert out.dialog_id == -100123
+    assert out.user.id == 42 and out.user.username == "joiner"
+
+
+async def test_chat_action_user_added_is_join_with_actor(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    added = FakeUser(id=5, first_name="Newbie")
+    admin = FakeUser(id=1, first_name="Admin")
+    ev = FakeChatActionEvent(-100123, user_added=True, user=added, added_by=admin)
+    out = await _collect_one(client.listen_chat_actions, fake_client.push_event, ev)
+    assert out.kind == "join"
+    assert out.actor.id == 1
+
+
+async def test_chat_action_kick_and_leave(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    victim = FakeUser(id=9, first_name="Gone")
+    admin = FakeUser(id=1, first_name="Admin")
+    kick = FakeChatActionEvent(-100123, user_kicked=True, user=victim, kicked_by=admin)
+    out_kick = await _collect_one(client.listen_chat_actions, fake_client.push_event, kick)
+    assert out_kick.kind == "kick"
+    assert out_kick.actor.id == 1
+
+    leave = FakeChatActionEvent(-100123, user_left=True, user=victim)
+    out_leave = await _collect_one(client.listen_chat_actions, fake_client.push_event, leave)
+    assert out_leave.kind == "leave"
+
+
+async def test_chat_action_title_change(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    ev = FakeChatActionEvent(-100123, new_title="Renamed Group")
+    out = await _collect_one(client.listen_chat_actions, fake_client.push_event, ev)
+    assert out.kind == "title"
+    assert out.raw_text == "Renamed Group"
+
+
+async def test_chat_action_broken_event_is_logged_not_raised(fake_client, caplog):
+    client = _build(fake_client)
+    await client.connect()
+
+    # _is_chat_action so it routes to the handler, but chat_id property raises on read
+    class Broken:
+        _is_chat_action = True
+
+        @property
+        def chat_id(self):
+            raise RuntimeError("boom")
+
+    with caplog.at_level("ERROR", logger="tg_messenger.core.client"):
+        await fake_client.push_event(Broken())  # must not raise
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
+async def test_chat_action_publish_without_subscribers_is_noop(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    # nobody subscribed — publish must be a silent no-op, not raise
+    await fake_client.push_event(FakeChatActionEvent(-100123, user_joined=True))
+
+
+# --- Цикл 73: поток read-receipt (listen_reads) ---
+
+
+async def test_message_read_inbox(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    ev = FakeMessageReadEvent(7, max_id=120, outbox=False)
+    out = await _collect_one(client.listen_reads, fake_client.push_event, ev)
+    assert isinstance(out, MessageReadEvent)
+    assert out.dialog_id == 7
+    assert out.max_id == 120
+    assert out.outbox is False
+
+
+async def test_message_read_outbox_means_they_read_ours(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    ev = FakeMessageReadEvent(-100123, max_id=99, outbox=True)
+    out = await _collect_one(client.listen_reads, fake_client.push_event, ev)
+    assert out.outbox is True
+    assert out.dialog_id == -100123
+    assert out.max_id == 99
+
+
+# --- Цикл 74: поток реакций (listen_reactions) ---
+
+
+class FakeReaction:
+    def __init__(self, emoticon):
+        self.emoticon = emoticon
+
+
+class FakeReactionResult:
+    def __init__(self, reaction):
+        self.reaction = reaction
+
+
+class FakeMessageReactions:
+    def __init__(self, results):
+        self.results = results
+
+
+class FakeReactionUpdate:
+    """Stand-in for telethon UpdateMessageReactions — peer/msg_id/reactions."""
+
+    def __init__(self, peer, msg_id, reactions):
+        self._raw_update = True
+        self.peer = peer
+        self.msg_id = msg_id
+        self.reactions = reactions
+
+
+async def test_reaction_emoticon_mapped(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    reactions = FakeMessageReactions([FakeReactionResult(FakeReaction("👍"))])
+    upd = FakeReactionUpdate(PeerUser(7), msg_id=55, reactions=reactions)
+    out = await _collect_one(client.listen_reactions, fake_client.push_event, upd)
+    assert isinstance(out, ReactionEvent)
+    assert out.message_id == 55
+    assert out.emoticon == "👍"
+    assert out.dialog_id == 7
+
+
+async def test_reaction_custom_emoji_maps_to_none(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+
+    class CustomReaction:  # ReactionCustomEmoji — no .emoticon attribute
+        document_id = 12345
+
+    reactions = FakeMessageReactions([FakeReactionResult(CustomReaction())])
+    upd = FakeReactionUpdate(PeerUser(7), msg_id=56, reactions=reactions)
+    out = await _collect_one(client.listen_reactions, fake_client.push_event, upd)
+    assert out.emoticon is None
+
+
+async def test_reaction_unknown_structure_is_warned_not_raised(fake_client, caplog):
+    client = _build(fake_client)
+    await client.connect()
+
+    # _raw_update routes it, but accessing msg_id explodes → warning, no crash
+    class Broken:
+        _raw_update = True
+        peer = None
+
+        @property
+        def msg_id(self):
+            raise RuntimeError("bad update")
+
+    with caplog.at_level("WARNING", logger="tg_messenger.core.client"):
+        await fake_client.push_event(Broken())  # must not raise
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings
+
+
+# --- Цикл 75: album_id (grouped_id) + send_reaction ---
+
+
+async def test_incoming_event_carries_album_id(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    ev = type("Evt", (), {})()
+    ev.chat_id = 7
+    ev.is_private = True
+    ev.message = FakeMessage(id=80, sender_id=7, text="part of album", grouped_id=9001)
+    out = await _collect_one(client.listen, fake_client.push_event, ev)
+    assert isinstance(out, IncomingEvent)
+    assert out.album_id == 9001
+
+
+async def test_incoming_event_without_album_has_none(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    ev = type("Evt", (), {})()
+    ev.chat_id = 7
+    ev.is_private = True
+    ev.message = FakeMessage(id=81, sender_id=7, text="single")
+    out = await _collect_one(client.listen, fake_client.push_event, ev)
+    assert out.album_id is None
+
+
+async def test_send_reaction_sends_request(fake_client):
+    from telethon.tl.functions.messages import SendReactionRequest
+
+    client = _build(fake_client)
+    await client.connect()
+    await client.send_reaction(7, 55, "👍")
+    sent = [r for r in fake_client.requests if isinstance(r, SendReactionRequest)]
+    assert sent, "send_reaction must issue a SendReactionRequest"
+    assert sent[-1].msg_id == 55
+    assert sent[-1].reaction[0].emoticon == "👍"
+
+
+async def test_send_reaction_flood_is_handled(fake_client, monkeypatch):
+    import tg_messenger.core.flood as flood
+    from tg_messenger.core.flood import HandledFloodWaitError
+
+    class FakeFloodWaitError(Exception):
+        def __init__(self, seconds):
+            super().__init__(f"flood {seconds}s")
+            self.seconds = seconds
+
+    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    client = _build(fake_client)
+    await client.connect()
+
+    async def boom(request):
+        raise FakeFloodWaitError(9999)  # non-transient → HandledFloodWaitError
+
+    fake_client.__call__ = boom
+    monkeypatch.setattr(type(fake_client), "__call__", lambda self, req: boom(req))
+    with pytest.raises(HandledFloodWaitError):
+        await client.send_reaction(7, 55, "👍")

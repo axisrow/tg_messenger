@@ -118,3 +118,69 @@ def test_messages_deleted_event_with_supergroup_chat():
 def test_messages_deleted_event_rejects_garbage():
     with pytest.raises(ValidationError):
         MessagesDeletedEvent(message_ids="not-a-list")
+
+
+# --- цикл 71: новые event-модели (#14) ---
+
+def test_chat_action_event_defaults():
+    from tg_messenger.core.models import ChatActionEvent
+
+    ev = ChatActionEvent(dialog_id=-100200, kind="join")
+    assert ev.dialog_id == -100200
+    assert ev.kind == "join"
+    assert ev.user is None and ev.actor is None and ev.raw_text is None
+
+
+def test_chat_action_event_with_users():
+    from tg_messenger.core.models import ChatActionEvent
+
+    u = User(id=7, first_name="Ann")
+    a = User(id=1, first_name="Admin")
+    ev = ChatActionEvent(dialog_id=-100200, kind="kick", user=u, actor=a, raw_text="kicked")
+    assert ev.user.id == 7 and ev.actor.id == 1 and ev.raw_text == "kicked"
+
+
+def test_chat_action_kind_rejects_unknown():
+    from tg_messenger.core.models import ChatActionEvent
+
+    with pytest.raises(ValidationError):
+        ChatActionEvent(dialog_id=1, kind="bogus")
+
+
+def test_message_read_event():
+    from tg_messenger.core.models import MessageReadEvent
+
+    ev = MessageReadEvent(dialog_id=7, max_id=42, outbox=True)
+    assert ev.dialog_id == 7 and ev.max_id == 42 and ev.outbox is True
+
+
+def test_message_read_event_outbox_defaults_false():
+    from tg_messenger.core.models import MessageReadEvent
+
+    assert MessageReadEvent(dialog_id=7, max_id=1).outbox is False
+
+
+def test_reaction_event_defaults():
+    from tg_messenger.core.models import ReactionEvent
+
+    ev = ReactionEvent(dialog_id=7, message_id=10)
+    assert ev.emoticon is None and ev.actor_id is None
+
+
+def test_reaction_event_with_emoticon():
+    from tg_messenger.core.models import ReactionEvent
+
+    ev = ReactionEvent(dialog_id=7, message_id=10, emoticon="👍", actor_id=99)
+    assert ev.emoticon == "👍" and ev.actor_id == 99
+
+
+def test_incoming_event_album_id_defaults_none():
+    msg = Message(id=1, dialog_id=7, sender_id=7, out=False, text="x", date=_now())
+    ev = IncomingEvent(dialog_id=7, message=msg)
+    assert ev.album_id is None
+
+
+def test_incoming_event_album_id_set():
+    msg = Message(id=1, dialog_id=7, sender_id=7, out=False, text="x", date=_now())
+    ev = IncomingEvent(dialog_id=7, message=msg, album_id=555)
+    assert ev.album_id == 555

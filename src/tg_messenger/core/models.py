@@ -52,6 +52,9 @@ class Message(BaseModel):
 class IncomingEvent(BaseModel):
     dialog_id: int
     message: Message
+    # grouped_id of an album — same value across the album's messages, None otherwise.
+    # v1 only marks it; consumers group by album_id themselves (no aggregator).
+    album_id: int | None = None
 
 
 class OutgoingEvent(BaseModel):
@@ -66,6 +69,40 @@ class MessagesDeletedEvent(BaseModel):
 
     chat_id: int | None = None
     message_ids: list[int]
+
+
+ChatActionKind = Literal["join", "leave", "kick", "title", "pin", "photo", "other"]
+
+
+class ChatActionEvent(BaseModel):
+    """A participant/structure change in a chat (events.ChatAction) — moderator signal."""
+
+    dialog_id: int
+    kind: ChatActionKind
+    user: User | None = None    # who joined/left/was acted on
+    actor: User | None = None   # who added/kicked them (None when self-action)
+    raw_text: str | None = None
+
+
+class MessageReadEvent(BaseModel):
+    """A read-receipt (events.MessageRead).
+
+    ``outbox=True`` means the OTHER party read OUR messages up to ``max_id`` — the
+    key "they've seen it" signal for the suggester.
+    """
+
+    dialog_id: int
+    max_id: int
+    outbox: bool = False
+
+
+class ReactionEvent(BaseModel):
+    """A reaction added to a message. Custom/premium reactions map to emoticon=None."""
+
+    dialog_id: int
+    message_id: int
+    emoticon: str | None = None
+    actor_id: int | None = None
 
 
 def message_line(m: Message) -> str:
