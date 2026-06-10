@@ -20,7 +20,18 @@ class WebStubClient:
         pass
 
     async def dialogs(self, dm_only=True):
-        return [Dialog(id=7, title="Ann", username="ann", unread=1)]
+        # повторяет контракт core: dm_only=False — все диалоги с kind и marked id
+        dms = [Dialog(id=7, title="Ann", username="ann", unread=1)]
+        if dm_only:
+            return dms
+        return dms + [
+            Dialog(id=-100200, title="Devs", kind="group"),
+            Dialog(id=-100123, title="News", kind="channel"),
+            Dialog(id=9, title="HelperBot", kind="bot"),
+        ]
+
+    async def group_dialogs(self):
+        return [d for d in await self.dialogs(dm_only=False) if d.kind != "dm"]
 
     async def history(self, peer, limit=50, offset_id=0):
         return [Message(id=1, dialog_id=peer, sender_id=peer, out=False, text="hi",
@@ -36,7 +47,7 @@ class WebStubClient:
         return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption or "<media>",
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
-    async def listen(self):
+    async def listen_all(self):
         async for ev in self.bus.subscribe():
             yield ev
 
@@ -64,6 +75,47 @@ async def test_dialogs_fragment(client_app):
     assert r.status_code == 200
     assert "Ann" in r.text
     assert "7" in r.text
+
+
+async def test_dialogs_default_tab_is_dm(client_app):
+    ac, _ = client_app
+    r = await ac.get("/dialogs")
+    assert r.status_code == 200
+    assert "Ann" in r.text
+    for non_dm in ("Devs", "News", "HelperBot"):
+        assert non_dm not in r.text
+
+
+async def test_dialogs_groups_tab(client_app):
+    ac, _ = client_app
+    r = await ac.get("/dialogs?tab=groups")
+    assert r.status_code == 200
+    assert "Ann" not in r.text
+    for non_dm in ("Devs", "News", "HelperBot"):
+        assert non_dm in r.text
+    assert 'hx-get="/dialogs/-100200/messages"' in r.text  # marked id кликабелен
+    assert 'data-kind="channel"' in r.text
+
+
+async def test_dialogs_unknown_tab_falls_back_to_dm(client_app):
+    ac, _ = client_app
+    r = await ac.get("/dialogs?tab=zzz")
+    assert r.status_code == 200
+    assert "Ann" in r.text
+    assert "Devs" not in r.text
+
+
+async def test_index_has_tab_buttons(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "/dialogs?tab=dm" in r.text
+    assert "/dialogs?tab=groups" in r.text
+
+
+async def test_messages_fragment_accepts_negative_id(client_app):
+    ac, _ = client_app
+    r = await ac.get("/dialogs/-100200/messages")
+    assert r.status_code == 200
 
 
 async def test_messages_fragment(client_app):
@@ -173,7 +225,7 @@ async def test_sse_stream_failure_is_logged_and_closes(caplog):
         raise RuntimeError("stream blew up")
         yield  # pragma: no cover
 
-    stub.listen = broken_listen
+    stub.listen_all = broken_listen
     gen = sse_event_stream(stub, dialog_id=7)
     with caplog.at_level("ERROR", logger="tg_messenger.web.app"):
         with pytest.raises(StopAsyncIteration):
@@ -206,4 +258,30 @@ async def test_stream_yields_sse_frame():
     frame = await asyncio.wait_for(task, timeout=2)
     assert "ping" in frame
     assert frame.startswith("data: ")
+    await gen.aclose()
+
+
+async def test_stream_yields_group_frame():
+    # SSE для группового диалога (marked id) живёт на listen_all
+    import asyncio
+
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+    gen = sse_event_stream(stub, dialog_id=-100200)
+    task = asyncio.create_task(gen.__anext__())
+    await asyncio.sleep(0)  # let it subscribe
+
+    dm = Message(id=10, dialog_id=7, sender_id=7, out=False, text="не то",
+                 date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus.publish(IncomingEvent(dialog_id=7, message=dm))
+
+    grp = Message(id=11, dialog_id=-100200, sender_id=9, out=False, text="в группе",
+                  date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus.publish(IncomingEvent(dialog_id=-100200, message=grp))
+
+    frame = await asyncio.wait_for(task, timeout=2)
+    import json
+    payload = json.loads(frame.removeprefix("data: ").strip())
+    assert payload == {"id": 11, "text": "в группе"}  # не DM-событие, а групповое
     await gen.aclose()

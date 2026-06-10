@@ -1,10 +1,11 @@
 import asyncio
 import logging
 
+import pytest
 from telethon.sessions import StringSession
 
-from tests.conftest import FakeChannel, FakeDialog, FakeDocument, FakeMessage, FakeUser
-from tg_messenger.core.client import StandaloneTelegramClient
+from tests.conftest import FakeChannel, FakeChat, FakeDialog, FakeDocument, FakeMessage, FakeUser
+from tg_messenger.core.client import StandaloneTelegramClient, _dialog_kind
 from tg_messenger.core.models import (
     Dialog,
     IncomingEvent,
@@ -64,6 +65,62 @@ async def test_dialogs_dm_only(fake_client):
     assert ann.unread == 2
     assert ann.last_text == "hey"
     assert ann.last_message_at is not None
+
+
+# --- Цикл 32: dialogs(dm_only=False) — все виды, marked id ---
+
+
+def _seed_all_kinds(fake_client):
+    fake_client.dialogs = [
+        FakeDialog(FakeUser(id=7, first_name="Ann", username="ann"), name="Ann"),
+        FakeDialog(FakeUser(id=9, first_name="Helper", bot=True), name="HelperBot"),
+        FakeDialog(FakeChat(id=50, title="Devs"), name="Devs"),
+        FakeDialog(FakeChannel(id=123, title="News", broadcast=True), name="News"),
+        FakeDialog(FakeChannel(id=200, title="SG", broadcast=False), name="SG"),
+    ]
+
+
+async def test_dialogs_all_returns_every_kind_with_marked_ids(fake_client):
+    _seed_all_kinds(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    dialogs = await client.dialogs(dm_only=False)
+    # id — marked (отрицательный для групп/каналов): совпадает с event.chat_id
+    assert {d.id: d.kind for d in dialogs} == {
+        7: "dm", 9: "bot", -50: "group", -100123: "channel", -100200: "group",
+    }
+    assert {d.id: d.title for d in dialogs}[-50] == "Devs"
+
+
+async def test_dialogs_dm_only_excludes_bots_and_groups(fake_client):
+    _seed_all_kinds(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    dialogs = await client.dialogs(dm_only=True)
+    assert [d.id for d in dialogs] == [7]
+    assert dialogs[0].kind == "dm"
+
+
+# --- Цикл 31: классификатор вида диалога ---
+
+
+@pytest.mark.parametrize(
+    ("entity", "kind"),
+    [
+        (FakeUser(id=7, first_name="Ann"), "dm"),
+        (FakeUser(id=9, first_name="Helper", bot=True), "bot"),
+        (FakeChat(id=50, title="Devs"), "group"),  # малая группа: title, без broadcast
+        (FakeChannel(id=200, title="SG", broadcast=False), "group"),  # супергруппа
+        (FakeChannel(id=123, title="News", broadcast=True), "channel"),  # бродкаст
+    ],
+)
+def test_dialog_kind_classifier(entity, kind):
+    assert _dialog_kind(entity) == kind
+
+
+def test_unknown_entity_is_not_dm():
+    # fail-safe прежней _is_dm_entity-семантики: ни title, ни имён → НЕ DM
+    assert _dialog_kind(object()) != "dm"
 
 
 async def test_history_maps_messages(fake_client):
@@ -268,6 +325,78 @@ async def test_get_me_returns_user(fake_client):
     assert me.username == "me"
 
 
+# --- Цикл 33: listen_all — входящие из всех чатов (вкладка «Группы») ---
+
+
+async def test_listen_all_yields_group_and_dm(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    group_event = _evt(-100200, is_private=False,
+                       message=FakeMessage(id=80, sender_id=9, text="из группы", out=False))
+    dm_event = _evt(7, is_private=True,
+                    message=FakeMessage(id=81, sender_id=7, text="из ЛС", out=False))
+
+    received = []
+
+    async def consume():
+        async for ev in client.listen_all():
+            received.append(ev)
+            if len(received) == 2:
+                return
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0)
+    await fake_client.push_event(group_event)
+    await fake_client.push_event(dm_event)
+    await asyncio.wait_for(task, timeout=1)
+    assert [(ev.dialog_id, ev.message.text) for ev in received] == [
+        (-100200, "из группы"), (7, "из ЛС"),
+    ]
+
+
+async def test_listen_all_does_not_leak_groups_into_listen(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    group_event = _evt(-100200, is_private=False,
+                       message=FakeMessage(id=82, sender_id=9, text="группа", out=False))
+    dm_event = _evt(7, is_private=True,
+                    message=FakeMessage(id=83, sender_id=7, text="лс", out=False))
+
+    dm_stream, all_stream = [], []
+
+    async def consume_dm():
+        async for ev in client.listen():
+            dm_stream.append(ev)
+            return
+
+    async def consume_all():
+        async for ev in client.listen_all():
+            all_stream.append(ev)
+            if len(all_stream) == 2:
+                return
+
+    tasks = [asyncio.create_task(consume_dm()), asyncio.create_task(consume_all())]
+    await asyncio.sleep(0)
+    await fake_client.push_event(group_event)
+    await fake_client.push_event(dm_event)
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+    assert [ev.message.text for ev in dm_stream] == ["лс"]
+    assert [ev.message.text for ev in all_stream] == ["группа", "лс"]
+
+
+async def test_broken_group_event_is_logged_not_raised(fake_client, caplog):
+    # групповые события больше не дропаются до try — сбой обязан попасть в лог
+    client = _build(fake_client)
+    await client.connect()
+    broken = _evt(-100200, is_private=False, message=object())  # нет .date
+
+    with caplog.at_level("ERROR", logger="tg_messenger.core.client"):
+        await fake_client.push_event(broken)  # must not raise
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
 # --- Цикл 28: поток удалений (listen_deleted) + entity_title ---
 
 
@@ -428,3 +557,257 @@ async def test_typing_propagates_body_exceptions(fake_client):
     else:
         raise AssertionError("body exception must propagate")
     assert fake_client.actions_active == []  # индикатор всё равно погашен
+
+
+# --- Циклы 42–45: TTL-кэш dialogs/history + инвалидация ---
+
+
+def _clk(t):
+    return lambda: t["now"]
+
+
+async def test_dialogs_cached_second_call_no_network(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.dialogs(dm_only=True)
+    await client.dialogs(dm_only=True)
+    assert fake_client.iter_dialogs_calls == 1  # second served from cache
+
+
+async def test_tab_switching_incident_one_network_call(fake_client):
+    """The PR #7 incident: dm→groups→dm must hit the wire ONCE, kinds correct."""
+    _seed_all_kinds(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    dm = await client.dialogs(dm_only=True)
+    groups = await client.dialogs(dm_only=False)
+    dm2 = await client.dialogs(dm_only=True)
+    assert fake_client.iter_dialogs_calls == 1
+    assert [d.id for d in dm] == [7]
+    assert {d.id for d in groups} == {7, 9, -50, -100123, -100200}
+    assert [d.id for d in dm2] == [7]
+
+
+async def test_dialogs_cache_refetches_after_ttl(fake_client):
+    _seed_dm(fake_client)
+    t = {"now": 0.0}
+    client = _build(fake_client, dialogs_ttl=30.0, clock=_clk(t))
+    await client.connect()
+    await client.dialogs(dm_only=True)
+    t["now"] = 31.0
+    await client.dialogs(dm_only=True)
+    assert fake_client.iter_dialogs_calls == 2
+
+
+async def test_dialogs_concurrent_clicks_coalesce(fake_client):
+    _seed_all_kinds(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    gate = asyncio.Event()
+    orig = fake_client.iter_dialogs
+
+    def gated(*a, **k):
+        inner = orig(*a, **k)
+
+        async def gen():
+            await gate.wait()
+            async for d in inner:
+                yield d
+
+        return gen()
+
+    fake_client.iter_dialogs = gated
+
+    async def release():
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        gate.set()
+
+    await asyncio.gather(
+        client.dialogs(dm_only=True),
+        client.dialogs(dm_only=False),
+        release(),
+    )
+    assert fake_client.iter_dialogs_calls == 1
+
+
+async def test_dialogs_result_mutation_does_not_corrupt_cache(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.dialogs(dm_only=True)
+    first.clear()  # consumer mutates the returned list
+    second = await client.dialogs(dm_only=True)
+    assert len(second) == 2  # cache untouched
+    assert fake_client.iter_dialogs_calls == 1
+
+
+# --- Цикл 43: кэш history() ---
+
+
+async def test_history_cached_same_key(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 1
+
+
+async def test_history_different_limit_separate_entry(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(7, limit=20)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_history_refetches_after_ttl(fake_client):
+    _seed_dm(fake_client)
+    t = {"now": 0.0}
+    client = _build(fake_client, history_ttl=15.0, clock=_clk(t))
+    await client.connect()
+    await client.history(7, limit=10)
+    t["now"] = 16.0
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_history_returns_copy(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.history(7, limit=10)
+    first.clear()
+    second = await client.history(7, limit=10)
+    assert len(second) == 2
+    assert fake_client.iter_messages_calls == 1
+
+
+# --- Цикл 44: инвалидация history ---
+
+
+async def test_send_text_invalidates_peer_history(fake_client):
+    _seed_dm(fake_client)
+    fake_client.messages[8] = [FakeMessage(id=3, sender_id=8, text="other")]
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(8, limit=10)
+    await client.send_text(7, "new")
+    await client.history(7, limit=10)  # refetch
+    await client.history(8, limit=10)  # still cached
+    assert fake_client.iter_messages_calls == 3
+
+
+async def test_send_media_invalidates_peer_history(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.send_media(7, "/tmp/x.jpg")
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_incoming_event_invalidates_history(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    ev = type("Ev", (), {
+        "chat_id": 7,
+        "is_private": True,
+        "message": FakeMessage(id=10, sender_id=7, text="ping"),
+    })()
+    await fake_client.push_event(ev)
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_outgoing_event_invalidates_history(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    ev = type("Ev", (), {
+        "chat_id": 7,
+        "message": FakeMessage(id=11, sender_id=1, text="me", out=True),
+    })()
+    await fake_client.push_event(ev)
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_deleted_event_with_chat_id_invalidates_that_peer(fake_client):
+    _seed_dm(fake_client)
+    fake_client.messages[8] = [FakeMessage(id=3, sender_id=8, text="other")]
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(8, limit=10)
+    ev = type("Ev", (), {"deleted_ids": [5], "chat_id": 7})()
+    await fake_client.push_event(ev)
+    await client.history(7, limit=10)  # refetch
+    await client.history(8, limit=10)  # cached
+    assert fake_client.iter_messages_calls == 3
+
+
+async def test_deleted_event_without_chat_id_invalidates_all_history(fake_client):
+    _seed_dm(fake_client)
+    fake_client.messages[8] = [FakeMessage(id=3, sender_id=8, text="other")]
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(8, limit=10)
+    ev = type("Ev", (), {"deleted_ids": [5]})()  # no chat_id
+    await fake_client.push_event(ev)
+    await client.history(7, limit=10)
+    await client.history(8, limit=10)
+    assert fake_client.iter_messages_calls == 4  # both refetched
+
+
+# --- Цикл 45: flood_sleep_threshold=0 ---
+
+
+async def test_default_factory_disables_silent_flood_sleep():
+    from tg_messenger.core.client import _default_factory
+
+    c = _default_factory(StringSession(), 1, "h")
+    assert c.flood_sleep_threshold == 0
+
+
+async def test_dialogs_flood_raises_handled_and_leaves_cache_empty(fake_client, monkeypatch):
+    import tg_messenger.core.flood as flood
+    from tg_messenger.core.flood import HandledFloodWaitError
+
+    class FakeFloodWaitError(Exception):
+        def __init__(self, seconds):
+            super().__init__(f"flood {seconds}s")
+            self.seconds = seconds
+
+    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+
+    calls = {"n": 0}
+
+    def boom(*a, **k):
+        calls["n"] += 1
+
+        async def gen():
+            raise FakeFloodWaitError(9999)
+            yield  # pragma: no cover
+
+        return gen()
+
+    fake_client.iter_dialogs = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.dialogs(dm_only=True)
+    # failed fetch not cached → a retry hits the wire again
+    with pytest.raises(HandledFloodWaitError):
+        await client.dialogs(dm_only=True)
+    assert calls["n"] == 2

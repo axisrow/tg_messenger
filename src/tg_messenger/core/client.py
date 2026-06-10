@@ -1,13 +1,15 @@
 """StandaloneTelegramClient — the UI-agnostic core.
 
-Thin async wrapper over a single Telethon client: dialogs (DM-only), history,
-send, media, plus a single NewMessage handler fanned out through EventBus.
+Thin async wrapper over a single Telethon client: dialogs (DM-only by default,
+``dm_only=False`` for every kind), history, send, media, plus event streams
+fanned out through EventBus (``listen`` private-only, ``listen_all`` every chat).
 All network calls route through the vendored flood-wait retry.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
@@ -15,10 +17,12 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 from tg_messenger.core.auth import DEFAULT_SESSION_DIR, SessionStore
+from tg_messenger.core.cache import TTLCache
 from tg_messenger.core.events import EventBus
 from tg_messenger.core.flood import run_with_flood_wait_retry
 from tg_messenger.core.models import (
     Dialog,
+    DialogKind,
     IncomingEvent,
     MediaRef,
     Message,
@@ -29,18 +33,29 @@ from tg_messenger.core.models import (
 
 logger = logging.getLogger(__name__)
 
+# read-side anti-flood: a full GetDialogsRequest / iter_messages is expensive and
+# floods on rapid repeats (tab switching) — cache them with a short TTL.
+DEFAULT_DIALOGS_TTL_SEC = 30.0
+DEFAULT_HISTORY_TTL_SEC = 15.0
+_DIALOGS_CACHE_KEY = "all"  # one entry: the full mapped list, dm_only filters from it
+
 
 def _default_factory(session, api_id, api_hash):
-    return TelegramClient(session, api_id, api_hash)
+    # flood_sleep_threshold=0: Telethon never sleeps silently on a FloodWait —
+    # every wait surfaces as an exception routed through run_with_flood_wait_retry.
+    return TelegramClient(session, api_id, api_hash, flood_sleep_threshold=0)
 
 
-def _is_dm_entity(entity) -> bool:
-    """DM = a User (has first/last name), not a channel/chat (has title), not a bot."""
+def _dialog_kind(entity) -> DialogKind:
+    """Classify a Telethon entity: bot beats User; title means group/channel."""
     if getattr(entity, "bot", False):
-        return False
+        return "bot"
     if getattr(entity, "title", None) is not None:
-        return False
-    return hasattr(entity, "first_name") or hasattr(entity, "last_name")
+        # Chat (small group) has no broadcast attr; Channel: megagroup vs broadcast
+        return "channel" if getattr(entity, "broadcast", False) else "group"
+    if hasattr(entity, "first_name") or hasattr(entity, "last_name"):
+        return "dm"
+    return "group"  # unknown entity — fail-safe NOT a DM (keeps the old filter's semantics)
 
 
 def _entity_title(entity) -> str:
@@ -95,6 +110,9 @@ class StandaloneTelegramClient:
         external_session: str | None = None,
         session_dir: Path | str = DEFAULT_SESSION_DIR,
         client_factory: Callable = _default_factory,
+        dialogs_ttl: float = DEFAULT_DIALOGS_TTL_SEC,
+        history_ttl: float = DEFAULT_HISTORY_TTL_SEC,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self._store = SessionStore(session_dir)
         if external_session is not None:
@@ -104,9 +122,18 @@ class StandaloneTelegramClient:
         self._session_name = session_name
         self._client = client_factory(StringSession(session_string or None), api_id, api_hash)
         self._bus: EventBus[IncomingEvent] = EventBus()
+        self._bus_all: EventBus[IncomingEvent] = EventBus()
         self._bus_out: EventBus[OutgoingEvent] = EventBus()
         self._bus_deleted: EventBus[MessagesDeletedEvent] = EventBus()
         self._handler_registered = False
+        # one full dialog list (all kinds); dm_only filters from it — see dialogs()
+        self._dialogs_cache: TTLCache[str, list[Dialog]] = TTLCache(
+            dialogs_ttl, maxsize=1, clock=clock
+        )
+        # keyed by (int(peer), limit, offset_id); invalidated per-peer on writes/events
+        self._history_cache: TTLCache[tuple[int, int, int], list[Message]] = TTLCache(
+            history_ttl, maxsize=64, clock=clock
+        )
 
     # --- connection ---
     async def connect(self) -> None:
@@ -140,19 +167,42 @@ class StandaloneTelegramClient:
 
     # --- dialogs / history ---
     async def dialogs(self, dm_only: bool = True) -> list[Dialog]:
+        """Mapped dialog list, served from a short-TTL cache.
+
+        The cache holds ONE full list (every kind); ``dm_only`` filters from it,
+        so tab switching after the first load makes zero network calls.
+        Concurrent first-loads coalesce (single-flight). The returned list is a
+        fresh copy — the cached models are shared (UIs render, never mutate).
+        """
+        full = await self._dialogs_cache.get_or_fetch(_DIALOGS_CACHE_KEY, self._fetch_dialogs)
+        if dm_only:
+            return [d for d in full if d.kind == "dm"]
+        return list(full)
+
+    async def group_dialogs(self) -> list[Dialog]:
+        """Every non-DM dialog (groups, supergroups, channels, bots).
+
+        The "Группы" tab in every UI — same cache as ``dialogs()``, filtered the
+        opposite way, so the kind filter lives in one place, not in each front-end.
+        """
+        full = await self._dialogs_cache.get_or_fetch(_DIALOGS_CACHE_KEY, self._fetch_dialogs)
+        return [d for d in full if d.kind != "dm"]
+
+    async def _fetch_dialogs(self) -> list[Dialog]:
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_dialogs(), operation="dialogs"
         )
         result = []
         for d in raw:
             entity = d.entity
-            if dm_only and not _is_dm_entity(entity):
-                continue
             last_msg = getattr(d, "message", None)
             result.append(
                 Dialog(
-                    id=entity.id,
+                    # telethon Dialog.id is the marked peer id (negative for groups/
+                    # channels) — the same value events carry and history/send accept
+                    id=int(getattr(d, "id", entity.id)),
                     title=_entity_title(entity),
+                    kind=_dialog_kind(entity),
                     username=getattr(entity, "username", None),
                     unread=getattr(d, "unread_count", 0) or 0,
                     last_text=getattr(last_msg, "text", None),
@@ -165,11 +215,20 @@ class StandaloneTelegramClient:
         return [d async for d in self._client.iter_dialogs()]
 
     async def history(self, peer: int, limit: int = 50, offset_id: int = 0) -> list[Message]:
-        """Return messages in chronological order (oldest first).
+        """Return messages in chronological order (oldest first), TTL-cached.
 
         Telethon yields newest-first; reversed here so UIs can render top-down
-        and append live messages at the bottom.
+        and append live messages at the bottom. Cached per ``(peer, limit,
+        offset_id)``; the cache is invalidated for a peer on every write and live
+        event so freshly-sent/received messages never go missing. Returns a copy.
         """
+        key = (int(peer), int(limit), int(offset_id))
+        msgs = await self._history_cache.get_or_fetch(
+            key, lambda: self._fetch_history(peer, limit, offset_id)
+        )
+        return list(msgs)
+
+    async def _fetch_history(self, peer, limit, offset_id) -> list[Message]:
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_history(peer, limit, offset_id), operation="history"
         )
@@ -178,11 +237,17 @@ class StandaloneTelegramClient:
     async def _collect_history(self, peer, limit, offset_id) -> list:
         return [m async for m in self._client.iter_messages(peer, limit=limit, offset_id=offset_id)]
 
+    def _invalidate_history(self, peer: int) -> None:
+        """Drop every cached history page of ``peer`` (any limit/offset)."""
+        p = int(peer)
+        self._history_cache.invalidate_if(lambda k: k[0] == p)
+
     # --- sending ---
     async def send_text(self, peer: int, text: str) -> Message:
         msg = await run_with_flood_wait_retry(
             lambda: self._client.send_message(peer, text), operation="send_text"
         )
+        self._invalidate_history(peer)  # the new message must show on reopen
         return self._to_message(msg, dialog_id=int(peer))
 
     async def send_media(self, peer: int, file_path: str | Path, caption: str | None = None) -> Message:
@@ -190,6 +255,7 @@ class StandaloneTelegramClient:
             lambda: self._client.send_file(peer, str(file_path), caption=caption),
             operation="send_media",
         )
+        self._invalidate_history(peer)
         return self._to_message(msg, dialog_id=int(peer))
 
     def typing(self, peer: int):
@@ -234,13 +300,16 @@ class StandaloneTelegramClient:
         self._handler_registered = True
 
     async def _on_new_message(self, event) -> None:
-        # DM-only product: drop group/channel traffic at the source
-        if not getattr(event, "is_private", True):
-            return
         try:
             dialog_id = int(getattr(event, "chat_id", 0) or 0)
+            # invalidate BEFORE mapping: a broken event still drops stale history
+            self._invalidate_history(dialog_id)
             message = self._to_message(event.message, dialog_id=dialog_id)
-            self._bus.publish(IncomingEvent(dialog_id=dialog_id, message=message))
+            incoming = IncomingEvent(dialog_id=dialog_id, message=message)
+            self._bus_all.publish(incoming)  # every chat — the UIs' groups tab
+            if getattr(event, "is_private", True):
+                # listen() stays private-only (DMs + bots) — the agent relies on it
+                self._bus.publish(incoming)
         except Exception:
             # don't depend on Telethon's logger config; record it ourselves
             logger.exception("failed to handle incoming message")
@@ -249,6 +318,7 @@ class StandaloneTelegramClient:
         # no is_private filter: groups are the whole point of the watch feature
         try:
             dialog_id = int(getattr(event, "chat_id", 0) or 0)
+            self._invalidate_history(dialog_id)
             message = self._to_message(event.message, dialog_id=dialog_id)
             self._bus_out.publish(OutgoingEvent(dialog_id=dialog_id, message=message))
         except Exception:
@@ -258,6 +328,11 @@ class StandaloneTelegramClient:
         try:
             ids = [int(i) for i in (getattr(event, "deleted_ids", None) or [])]
             chat_id = getattr(event, "chat_id", None)
+            # deletions are rare: drop the named peer, else wipe all history
+            if chat_id is not None:
+                self._invalidate_history(int(chat_id))
+            else:
+                self._history_cache.invalidate()
             self._bus_deleted.publish(
                 MessagesDeletedEvent(
                     chat_id=int(chat_id) if chat_id is not None else None, message_ids=ids
@@ -267,7 +342,13 @@ class StandaloneTelegramClient:
             logger.exception("failed to handle deleted-messages event")
 
     async def listen(self) -> AsyncIterator[IncomingEvent]:
+        """Incoming from private chats only (DMs + bots)."""
         async for ev in self._bus.subscribe():
+            yield ev
+
+    async def listen_all(self) -> AsyncIterator[IncomingEvent]:
+        """Incoming from every chat — groups and channels included."""
+        async for ev in self._bus_all.subscribe():
             yield ev
 
     async def listen_outgoing(self) -> AsyncIterator[OutgoingEvent]:

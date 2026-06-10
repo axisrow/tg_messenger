@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 MediaKind = Literal["photo", "voice", "document", "other"]
+DialogKind = Literal["dm", "group", "channel", "bot"]
 
 
 class User(BaseModel):
@@ -26,8 +27,12 @@ class MediaRef(BaseModel):
 
 
 class Dialog(BaseModel):
+    """``id`` is Telethon's marked peer id: negative for groups/channels —
+    the same value events carry in ``chat_id`` and history/send accept."""
+
     id: int
     title: str
+    kind: DialogKind = "dm"
     username: str | None = None
     unread: int = 0
     last_message_at: datetime | None = None

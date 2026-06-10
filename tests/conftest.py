@@ -39,6 +39,18 @@ class FakeUser:
 
 
 class FakeChannel:
+    """Telethon Channel: supergroup (broadcast=False) or broadcast channel (True)."""
+
+    def __init__(self, id, title=None, username=None, broadcast=False):
+        self.id = id
+        self.title = title
+        self.username = username
+        self.broadcast = broadcast
+
+
+class FakeChat:
+    """Telethon Chat (small group) — carries a title and NO broadcast attribute."""
+
     def __init__(self, id, title=None, username=None):
         self.id = id
         self.title = title
@@ -72,10 +84,19 @@ class FakeMessage:
         self.peer_id = peer_id
 
 
+def _marked_id(entity) -> int:
+    """Mimic telethon Dialog.id (utils.get_peer_id): marked id, negative for groups/channels."""
+    if isinstance(entity, FakeChannel):
+        return int(f"-100{entity.id}")
+    if isinstance(entity, FakeChat):
+        return -entity.id
+    return entity.id
+
+
 class FakeDialog:
     def __init__(self, entity, *, name="", unread_count=0, message=None):
         self.entity = entity
-        self.id = entity.id
+        self.id = _marked_id(entity)
         self.name = name
         self.title = name
         self.unread_count = unread_count
@@ -111,6 +132,9 @@ class FakeTelethonClient:
         self.code_requests: list[str] = []
         self.resend_requests: list = []
         self.signed_in_with: list = []
+        # network-call counters: the TTL-cache tests assert how often we hit the wire
+        self.iter_dialogs_calls = 0
+        self.iter_messages_calls = 0
 
     # --- connection / auth ---
     async def connect(self):
@@ -148,6 +172,8 @@ class FakeTelethonClient:
         return self.dialogs
 
     def iter_dialogs(self, *a, **k):
+        self.iter_dialogs_calls += 1
+
         async def gen():
             for d in self.dialogs:
                 yield d
@@ -155,6 +181,7 @@ class FakeTelethonClient:
         return gen()
 
     def iter_messages(self, peer, limit=50, ids=None, **k):
+        self.iter_messages_calls += 1
         items = self.messages.get(int(peer), [])
         if ids is not None:
             wanted = ids if isinstance(ids, (list, tuple)) else [ids]
