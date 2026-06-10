@@ -343,6 +343,125 @@ async def test_tui_shows_loading_until_dialogs_arrive():
         assert len(list(app.query(DialogItem))) == 1
 
 
+# --- цикл 96: суфлёр в TUI (подсказка ответа в открытом DM) ---
+
+
+class _QueueListenClient(TuiStubClient):
+    """listen_all yields events pushed via a queue (so a test can trigger one)."""
+
+    def __init__(self):
+        super().__init__()
+        self._events: asyncio.Queue = asyncio.Queue()
+
+    async def push_incoming(self, ev):
+        await self._events.put(ev)
+
+    async def listen_all(self):
+        while True:
+            yield await self._events.get()
+
+
+class StubSuggester:
+    def __init__(self, draft="suggested draft"):
+        self.draft = draft
+        self.calls: list[int] = []
+
+    async def suggest(self, dialog_id):
+        self.calls.append(dialog_id)
+        return self.draft
+
+
+def _incoming(dialog_id, text="hi there"):
+    return IncomingEvent(
+        dialog_id=dialog_id,
+        message=Message(id=10, dialog_id=dialog_id, sender_id=dialog_id, out=False,
+                        text=text, date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+    )
+
+
+async def test_tui_suggestion_appears_on_incoming_in_open_dialog():
+    stub = _QueueListenClient()
+    suggester = StubSuggester("how are you?")
+    app = MessengerTUI(client=stub, suggester=suggester)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7  # the DM is open
+        await stub.push_incoming(_incoming(7))
+        for _ in range(5):
+            await pilot.pause()
+        assert suggester.calls == [7]
+        from tg_messenger.tui.app import SUGGEST_PREFIX
+        rendered = str(app.query_one("#suggestion", Static).render())
+        assert "how are you?" in rendered
+        assert rendered.startswith(SUGGEST_PREFIX) or "how are you?" in rendered
+
+
+async def test_tui_suggestion_skipped_when_composer_not_empty():
+    stub = _QueueListenClient()
+    suggester = StubSuggester()
+    app = MessengerTUI(client=stub, suggester=suggester)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        app.query_one("#composer", Input).value = "typing already"
+        await stub.push_incoming(_incoming(7))
+        for _ in range(5):
+            await pilot.pause()
+        # композер не пуст — подсказку не дёргаем
+        assert suggester.calls == []
+
+
+async def test_tui_tab_accepts_suggestion_into_composer():
+    stub = _QueueListenClient()
+    suggester = StubSuggester("accepted text")
+    app = MessengerTUI(client=stub, suggester=suggester)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await stub.push_incoming(_incoming(7))
+        for _ in range(5):
+            await pilot.pause()
+        app.query_one("#composer", Input).focus()
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.query_one("#composer", Input).value == "accepted text"
+        # после принятия подсказка очищается
+        assert str(app.query_one("#suggestion", Static).render()) == ""
+
+
+async def test_tui_no_suggester_means_feature_off():
+    """suggester=None — фича выключена, входящее не падает."""
+    stub = _QueueListenClient()
+    app = MessengerTUI(client=stub)  # no suggester
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await stub.push_incoming(_incoming(7))
+        for _ in range(3):
+            await pilot.pause()
+        assert app.return_code is None  # alive, no crash
+
+
+async def test_tui_suggestion_error_is_logged_not_fatal(caplog):
+    stub = _QueueListenClient()
+
+    class BoomSuggester:
+        async def suggest(self, dialog_id):
+            raise RuntimeError("suggest blew up")
+
+    app = MessengerTUI(client=stub, suggester=BoomSuggester())
+    with caplog.at_level("ERROR", logger="tg_messenger.tui.app"):
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._current = 7
+            await stub.push_incoming(_incoming(7))
+            for _ in range(5):
+                await pilot.pause()
+            assert app.return_code is None
+    assert any("suggest" in r.message.lower() for r in caplog.records)
+
+
 # --- цикл 66: локальный поиск диалогов в TUI ---
 
 

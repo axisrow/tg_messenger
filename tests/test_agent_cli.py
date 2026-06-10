@@ -127,6 +127,47 @@ def test_build_orchestrator_reuses_main_model_for_vision(monkeypatch):
     assert orch._vision_fn is not None  # vision работает и без отдельной модели
 
 
+# --- Цикл 95: make_suggest_fn (черновик ответа) + build_suggester ---
+
+
+async def test_make_suggest_fn_builds_draft_from_context():
+    from tg_messenger.agent.suggest import ContextMessage, StyleProfile
+
+    model = FakeModel(reply="вот мой черновик")
+    suggest_fn = factory.make_suggest_fn(model)
+    context = [
+        ContextMessage(out=False, text="привет"),
+        ContextMessage(out=True, text="о, привет!"),
+        ContextMessage(out=False, text="как дела?"),
+    ]
+    profile = StyleProfile(avg_length=10.0, emoji_freq=0.2, examples=["ок"])
+    draft = await suggest_fn(context, profile)
+    assert draft == "вот мой черновик"
+    (messages,) = model.calls
+    # история ушла модели; профиль попал в промпт
+    rendered = "\n".join(str(m.content) for m in messages)
+    assert "привет" in rendered and "как дела?" in rendered
+
+
+async def test_make_suggest_fn_works_without_profile():
+    from tg_messenger.agent.suggest import ContextMessage
+
+    model = FakeModel(reply="черновик")
+    suggest_fn = factory.make_suggest_fn(model)
+    draft = await suggest_fn([ContextMessage(out=False, text="hi")], None)
+    assert draft == "черновик"
+
+
+def test_build_suggester_wires_model(monkeypatch):
+    from tg_messenger.agent.suggest import Suggester
+
+    monkeypatch.setattr(factory, "init_chat_model", lambda spec: FakeModel())
+    suggester = factory.build_suggester(
+        client=SimpleNamespace(), cfg=make_cfg(), storage=SimpleNamespace()
+    )
+    assert isinstance(suggester, Suggester)
+
+
 # --- Цикл 25: классификатор по списку интентов + видимость конфига в CLI ---
 
 RECIPE = IntentSpec(name="recipe", description="просит рецепт блюда", pipeline="chat",

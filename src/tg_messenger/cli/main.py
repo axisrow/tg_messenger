@@ -87,6 +87,26 @@ def make_agent_runner(client, *, notify_errors: bool = False):
     return AgentRunner(client, orchestrator, config=cfg, notify_errors=notify_errors)
 
 
+def make_suggester(client, *, storage=None):
+    """Build the reply Suggester (#17); the seam suggest tests patch.
+
+    Like make_agent_runner: needs the [agent] extra + TG_AGENT_MODEL (fail-fast).
+    """
+    try:
+        from tg_messenger.agent.factory import build_suggester
+    except ImportError as exc:
+        raise click.ClickException(
+            'Agent dependencies are not installed — pip install "tg-messenger[agent]"'
+        ) from exc
+    from tg_messenger.agent.config import AgentConfig
+
+    try:
+        cfg = AgentConfig.from_env()
+        return build_suggester(client, cfg, storage=storage)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 _CODE_DELIVERY_HINTS = {
     "app": "Code sent to your Telegram app — check devices where you are already logged in.",
     "sms": "Code sent via SMS.",
@@ -742,6 +762,53 @@ def agent(session: str, notify_errors: bool) -> None:
         _run(_do(), session=session)
     except KeyboardInterrupt:
         click.echo("stopped.")
+
+
+@cli.command()
+@click.argument("dialog_id", type=int)
+@click.option("--send", "do_send", is_flag=True,
+              help="Send the draft instead of just printing it.")
+@click.option("--learn", "do_learn", is_flag=True,
+              help="Build and persist the contact's style profile (one history pass).")
+@click.option("--session", default="default")
+def suggest(dialog_id: int, do_send: bool, do_learn: bool, session: str) -> None:
+    """Draft a reply for DIALOG_ID in the style of past messages (#17).
+
+    Human-in-the-loop: prints a draft you review/edit. --send sends it as-is;
+    --learn (re)builds the style profile from this dialog's history.
+    """
+    async def _do():
+        client = make_client(session_name=session)
+        from tg_messenger.agent.suggest import register_suggest_migrations
+
+        storage = make_storage()
+        register_suggest_migrations(storage)
+        # build the suggester (LLM stack) before the network — config errors show first
+        suggester = make_suggester(client, storage=storage)
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            await storage.connect()
+            try:
+                if do_learn:
+                    profile = await suggester.learn(dialog_id)
+                    click.echo(
+                        f"learned style profile for {dialog_id} "
+                        f"({len(profile.examples)} examples)."
+                    )
+                    return
+                draft = await suggester.suggest(dialog_id)
+                if do_send:
+                    await client.send_text(dialog_id, draft)
+                    click.echo("sent.")
+                else:
+                    click.echo(draft)
+            finally:
+                await storage.close()
+        finally:
+            await client.disconnect()
+
+    _run(_do(), session=session)
 
 
 @cli.command()

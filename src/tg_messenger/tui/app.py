@@ -20,6 +20,9 @@ from tg_messenger.core.auth import LOGIN_HINT
 
 logger = logging.getLogger(__name__)
 
+# shown before a draft in the suggestion strip; Tab accepts it into the composer
+SUGGEST_PREFIX = "💡 Tab: "
+
 
 def _make_real_client(session_name: str):
     from tg_messenger.core.client import StandaloneTelegramClient
@@ -123,18 +126,24 @@ class MessageBubble(Static):
 
 
 class MessengerTUI(App):
-    # priority: quitting must work even while focus sits in the composer Input
-    BINDINGS = [Binding("ctrl+c", "quit", "Quit", priority=True)]
+    # priority: quitting must work even while focus sits in the composer Input.
+    # Tab accepts a pending reply suggestion (priority so the Input doesn't eat it
+    # for focus traversal); the binding is a no-op when there's nothing to accept.
+    BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit", priority=True),
+        Binding("tab", "accept_suggestion", "Accept suggestion", priority=True, show=False),
+    ]
 
     CSS = """
     #sidebar { width: 32; border-right: solid $primary; }
     .out { color: $accent; text-align: right; }
     .in { color: $text; }
+    #suggestion { dock: bottom; color: $text-muted; height: auto; }
     #composer { dock: bottom; }
     """
 
     def __init__(self, *, client=None, session_name: str = "default",
-                 profiles: list[str] | None = None, client_factory=None):
+                 profiles: list[str] | None = None, client_factory=None, suggester=None):
         super().__init__()
         self._client = client
         self._session_name = session_name
@@ -145,6 +154,9 @@ class MessengerTUI(App):
         self._tab = "dm"
         self._started = False  # gates tab events until _startup finished
         self._all_dialogs: list = []  # full loaded list; search filters it locally
+        # reply suggester (#17) — None disables the feature; pending draft text below
+        self._suggester = suggester
+        self._pending_suggestion: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -154,6 +166,7 @@ class MessengerTUI(App):
                 yield DialogListView(id="dialogs")
             with Vertical():
                 yield Vertical(id="messages")
+                yield Static("", id="suggestion", markup=False)
                 yield Input(placeholder="Message…", id="composer")
 
     async def on_mount(self) -> None:
@@ -273,6 +286,11 @@ class MessengerTUI(App):
         await pane.mount(*(MessageBubble(m.text or "<media>", m.out) for m in messages))
 
     async def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "composer":
+            # the user is typing their own reply — a stale suggestion must go
+            if self._pending_suggestion is not None and event.value != self._pending_suggestion:
+                self._clear_suggestion()
+            return
         # only the search box filters; the composer's own changes are ignored.
         # Filtering is local (over self._all_dialogs) — no network, safe to await here.
         if event.input.id != "search":
@@ -309,6 +327,46 @@ class MessengerTUI(App):
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
                     await pane.mount(MessageBubble(ev.message.text or "<media>", out=False))
+                    self._maybe_suggest(ev.dialog_id)
         except Exception:
             logger.exception("incoming listener failed")
             self.notify("Incoming listener failed — see log.", severity="error")
+
+    def _maybe_suggest(self, dialog_id: int) -> None:
+        """Kick off a reply suggestion for an incoming message in the open dialog.
+
+        No-op when the feature is off (no suggester) or the user is already typing
+        — we never clobber a half-written reply. Network/LLM runs in a worker.
+        """
+        if self._suggester is None:
+            return
+        if self.query_one("#composer", Input).value:
+            return  # don't suggest over a draft the user is writing
+        self.run_worker(self._suggest(dialog_id), group="suggest", exclusive=True)
+
+    async def _suggest(self, dialog_id: int) -> None:
+        try:
+            draft = await self._suggester.suggest(dialog_id)
+        except Exception:
+            logger.exception("suggest failed (dialog %s)", dialog_id)
+            return
+        # the user may have switched dialogs or started typing while we waited
+        if dialog_id != self._current or self.query_one("#composer", Input).value:
+            return
+        self._pending_suggestion = draft
+        self.query_one("#suggestion", Static).update(f"{SUGGEST_PREFIX}{draft}" if draft else "")
+
+    def action_accept_suggestion(self) -> None:
+        """Tab — move a pending suggestion into the composer (else fall through)."""
+        if not self._pending_suggestion:
+            # nothing to accept: hand Tab back to normal focus traversal
+            self.screen.focus_next()
+            return
+        composer = self.query_one("#composer", Input)
+        composer.value = self._pending_suggestion
+        self._clear_suggestion()
+        composer.focus()
+
+    def _clear_suggestion(self) -> None:
+        self._pending_suggestion = None
+        self.query_one("#suggestion", Static).update("")

@@ -45,7 +45,8 @@
     <form id="composer" hx-post="/send" hx-target="#messages" hx-swap="beforeend"
           hx-on::after-request="this.reset()">
       <input type="hidden" name="dialog_id" id="dialog_id" value="">
-      <input type="text" name="text" placeholder="Message…" autocomplete="off" required>
+      <input type="text" name="text" id="composer-text" placeholder="Message…" autocomplete="off" required>
+      <button type="button" id="suggest-btn" title="Suggest a reply">💡 Suggest</button>
     </form>
   </main>
   <script>
@@ -73,6 +74,20 @@
         div.textContent = data.text || '<media>';
         document.getElementById('messages').appendChild(div);
       };
+    });
+    // Suggest: fetch a draft for the open dialog and drop it into the composer.
+    document.getElementById('suggest-btn').addEventListener('click', async () => {
+      const id = document.getElementById('dialog_id').value;
+      if (!id) return;
+      const btn = document.getElementById('suggest-btn');
+      btn.disabled = true;
+      try {
+        const resp = await fetch('/dialogs/' + id + '/suggest');
+        const text = await resp.text();
+        if (resp.ok) document.getElementById('composer-text').value = text;
+      } finally {
+        btn.disabled = false;
+      }
     });
   </script>
 </body>

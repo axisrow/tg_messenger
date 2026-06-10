@@ -78,10 +78,12 @@ async def sse_event_stream(client, dialog_id: int):
         return
 
 
-def build_app(*, client=None, session_name: str = "default") -> FastAPI:
+def build_app(*, client=None, session_name: str = "default", suggester=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.client = client or _make_real_client(session_name)
+        # reply suggester (#17) — optional; None disables the /suggest endpoint
+        app.state.suggester = suggester
         await app.state.client.connect()
         yield
         await app.state.client.disconnect()
@@ -173,6 +175,20 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
         finally:
             os.unlink(tmp_path)
         return HTMLResponse(_message_div(msg))
+
+    @app.get("/dialogs/{dialog_id}/suggest", response_class=HTMLResponse)
+    async def suggest(request: Request, dialog_id: int):
+        # draft a reply for a human to review; the JS in chat.html drops it into
+        # the composer input. 503 (not 500) when the feature is unconfigured.
+        suggester = request.app.state.suggester
+        if suggester is None:
+            return HTMLResponse(
+                '<div class="error">Suggest is not configured — needs the [agent]'
+                " extra and TG_AGENT_MODEL.</div>",
+                status_code=503,
+            )
+        draft = await suggester.suggest(dialog_id)
+        return HTMLResponse(escape(draft))
 
     @app.get("/stream/{dialog_id}")
     async def stream(request: Request, dialog_id: int):

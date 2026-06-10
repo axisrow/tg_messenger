@@ -409,3 +409,56 @@ async def test_stream_yields_group_frame():
     payload = json.loads(frame.removeprefix("data: ").strip())
     assert payload == {"id": 11, "text": "в группе"}  # не DM-событие, а групповое
     await gen.aclose()
+
+
+# --- цикл 97: суфлёр в web (черновик ответа по кнопке Suggest) ---
+
+
+class StubSuggester:
+    def __init__(self, draft="suggested reply"):
+        self.draft = draft
+        self.calls = []
+
+    async def suggest(self, dialog_id):
+        self.calls.append(dialog_id)
+        return self.draft
+
+
+@pytest_asyncio.fixture
+async def suggest_app():
+    stub = WebStubClient()
+    suggester = StubSuggester()
+    app = build_app(client=stub, suggester=suggester)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac, suggester
+
+
+async def test_suggest_endpoint_returns_draft(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.get("/dialogs/7/suggest")
+    assert r.status_code == 200
+    assert "suggested reply" in r.text
+    assert suggester.calls == [7]
+
+
+async def test_suggest_endpoint_negative_id(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.get("/dialogs/-100200/suggest")
+    assert r.status_code == 200
+    assert suggester.calls == [-100200]
+
+
+async def test_suggest_endpoint_404_when_no_suggester(client_app):
+    """build_app без suggester — кнопка/эндпоинт отвечает понятной ошибкой, не 500."""
+    ac, _ = client_app
+    r = await ac.get("/dialogs/7/suggest")
+    assert r.status_code == 503
+    assert "TG_AGENT_MODEL" in r.text or "suggest" in r.text.lower()
+
+
+async def test_index_has_suggest_button(suggest_app):
+    ac, _ = suggest_app
+    r = await ac.get("/")
+    assert "suggest" in r.text.lower()

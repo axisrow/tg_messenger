@@ -113,6 +113,7 @@ class AgentConfig:
     search_provider: str = "duckduckgo"
     vision_model: str | None = None  # None — картинки идут в основную модель
     intents: tuple[IntentSpec, ...] = ()  # кастомные интенты из agent.json
+    suggest_history_limit: int = 30  # сколько сообщений диалога уходит суфлёру (#17)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> AgentConfig:
@@ -166,6 +167,16 @@ class AgentConfig:
                 " e.g. 'openai:gpt-5.4' or 'anthropic:claude-sonnet-4-6'."
             )
 
+        raw_history = (env.get("TG_SUGGEST_HISTORY") or "30").strip()
+        try:
+            suggest_history_limit = int(raw_history)
+        except ValueError:
+            raise ValueError(
+                f"TG_SUGGEST_HISTORY={raw_history!r} is not an integer."
+            ) from None
+        if suggest_history_limit < 1:
+            raise ValueError("TG_SUGGEST_HISTORY must be a positive integer.")
+
         config_path = (env.get("TG_AGENT_CONFIG") or "").strip()
         if config_path:
             intents = load_intents(config_path)  # явно указанный файл обязан существовать
@@ -182,4 +193,5 @@ class AgentConfig:
             search_provider=search,
             vision_model=vision_model,
             intents=intents,
+            suggest_history_limit=suggest_history_limit,
         )
