@@ -101,10 +101,15 @@ class StandaloneTelegramClient:
         return [d async for d in self._client.iter_dialogs()]
 
     async def history(self, peer: int, limit: int = 50, offset_id: int = 0) -> list[Message]:
+        """Return messages in chronological order (oldest first).
+
+        Telethon yields newest-first; reversed here so UIs can render top-down
+        and append live messages at the bottom.
+        """
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_history(peer, limit, offset_id), operation="history"
         )
-        return [self._to_message(m, dialog_id=int(peer)) for m in raw]
+        return [self._to_message(m, dialog_id=int(peer)) for m in reversed(raw)]
 
     async def _collect_history(self, peer, limit, offset_id) -> list:
         return [m async for m in self._client.iter_messages(peer, limit=limit, offset_id=offset_id)]
@@ -151,6 +156,9 @@ class StandaloneTelegramClient:
         self._handler_registered = True
 
     async def _on_new_message(self, event) -> None:
+        # DM-only product: drop group/channel traffic at the source
+        if not getattr(event, "is_private", True):
+            return
         dialog_id = int(getattr(event, "chat_id", 0) or 0)
         message = self._to_message(event.message, dialog_id=dialog_id)
         self._bus.publish(IncomingEvent(dialog_id=dialog_id, message=message))

@@ -28,9 +28,10 @@ def _seed_dm(fake_client):
         FakeDialog(bob, name="Bob"),
         FakeDialog(chan, name="News"),  # not a DM
     ]
+    # Telethon iter_messages yields newest-first
     fake_client.messages[7] = [
-        FakeMessage(id=1, sender_id=7, text="hi", out=False),
         FakeMessage(id=2, sender_id=1, text="yo", out=True),
+        FakeMessage(id=1, sender_id=7, text="hi", out=False),
     ]
 
 
@@ -63,6 +64,7 @@ async def test_history_maps_messages(fake_client):
     await client.connect()
     msgs = await client.history(7, limit=10)
     assert all(isinstance(m, Message) for m in msgs)
+    # chronological order (oldest first), regardless of Telethon's newest-first
     assert [m.text for m in msgs] == ["hi", "yo"]
     assert msgs[1].out is True
 
@@ -83,6 +85,7 @@ async def test_listen_yields_incoming(fake_client):
     # Build a fake NewMessage event that points at dialog 7
     event = type("Evt", (), {})()
     event.chat_id = 7
+    event.is_private = True
     event.message = FakeMessage(id=50, sender_id=7, text="ping", out=False)
 
     received = []
@@ -99,6 +102,35 @@ async def test_listen_yields_incoming(fake_client):
     assert isinstance(received[0], IncomingEvent)
     assert received[0].message.text == "ping"
     assert received[0].dialog_id == 7
+
+
+async def test_listen_skips_non_private_chats(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+
+    group_event = type("Evt", (), {})()
+    group_event.chat_id = -100123
+    group_event.is_private = False
+    group_event.message = FakeMessage(id=51, sender_id=9, text="group noise", out=False)
+
+    dm_event = type("Evt", (), {})()
+    dm_event.chat_id = 7
+    dm_event.is_private = True
+    dm_event.message = FakeMessage(id=52, sender_id=7, text="dm", out=False)
+
+    received = []
+
+    async def consume():
+        async for ev in client.listen():
+            received.append(ev)
+            return
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0)
+    await fake_client.push_event(group_event)
+    await fake_client.push_event(dm_event)
+    await asyncio.wait_for(task, timeout=1)
+    assert [ev.message.text for ev in received] == ["dm"]
 
 
 async def test_download_message_media_by_id(fake_client, tmp_path):
