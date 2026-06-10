@@ -83,6 +83,39 @@ tg-messenger search -1001234567 "lunch" --limit 50
 The web UI exposes the same via `GET /dialogs/{id}/search?q=`. There is intentionally
 no global content search across all chats — that belongs to `tg_content_factory`.
 
+## Sending media
+
+Send a file, photo, video, GIF or voice note through any front-end.
+
+**CLI** — `send` takes `--file` plus optional media modifiers:
+
+```bash
+tg-messenger send 7 "look at this" --file ./photo.jpg     # caption from TEXT
+tg-messenger send 7 --file ./report.pdf --caption "Q3"    # caption from --caption
+tg-messenger send 7 --file ./note.ogg --voice             # send as a voice note
+tg-messenger send 7 --file ./clip.mp4 --video-note        # round video note
+tg-messenger send 7 --file ./photo.jpg --as-file          # plain document, no preview
+```
+
+`--voice`, `--video-note` and `--as-file` are mutually exclusive. A missing path
+fails fast (no network call) with a clear error.
+
+**TUI** — the composer understands an `@PATH` syntax: type `@` followed by a path
+(quote it if it has spaces) and an optional caption.
+
+```
+@./photo.jpg                     # send the file, no caption
+@"~/My Pics/cat.png" so cute     # quoted path + caption
+@/tmp/report.pdf Q3 results      # path + caption
+```
+
+A non-existent path is reported in the TUI (a toast) and nothing is sent. A message
+not starting with `@` is sent as plain text as before.
+
+**Web** — the 📎 button by the composer opens a file picker; the current composer text
+becomes the caption. Uploads are capped at `TG_WEB_MAX_UPLOAD_MB` (default 50) — a
+larger file is rejected with HTTP 413, an empty one with 400.
+
 ## Multiple accounts (profiles)
 
 Each saved login is a *profile* (a session file under `~/.tg_messenger/sessions/`).

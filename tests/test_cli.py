@@ -105,8 +105,11 @@ class StubClient:
     async def mark_read(self, peer):
         self.read_acks.append(peer)
 
-    async def send_media(self, peer, file_path, caption=None):
+    async def send_media(self, peer, file_path, *, caption=None, voice_note=False,
+                         video_note=False, force_document=False):
         self.sent.append((peer, "file", str(file_path), caption))
+        self.media_kwargs = {"voice_note": voice_note, "video_note": video_note,
+                             "force_document": force_document}
         return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
@@ -243,6 +246,52 @@ def test_send_file_uses_send_media(runner, tmp_path):
     result = r.invoke(cli_main.cli, ["send", "7", "caption", "--file", str(f)])
     assert result.exit_code == 0
     assert stub.sent[-1] == (7, "file", str(f), "caption")
+
+
+def test_send_file_caption_option(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--caption", "cap"])
+    assert result.exit_code == 0, result.output
+    assert stub.sent[-1] == (7, "file", str(f), "cap")
+
+
+def test_send_file_voice_flag(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "note.ogg"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--voice"])
+    assert result.exit_code == 0, result.output
+    assert stub.media_kwargs == {"voice_note": True, "video_note": False,
+                                 "force_document": False}
+
+
+def test_send_file_video_note_flag(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "v.mp4"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--video-note"])
+    assert result.exit_code == 0, result.output
+    assert stub.media_kwargs["video_note"] is True
+
+
+def test_send_file_as_file_flag(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--as-file"])
+    assert result.exit_code == 0, result.output
+    assert stub.media_kwargs["force_document"] is True
+
+
+def test_send_file_conflicting_flags_error(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--voice", "--as-file"])
+    assert result.exit_code != 0
+    assert stub.sent == []
 
 
 # --- цикл 80: reply/forward/edit/delete/read команды ---

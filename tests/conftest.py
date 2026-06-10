@@ -282,9 +282,14 @@ class FakeTelethonClient:
                           "schedule": schedule})
         return msg
 
-    async def send_file(self, peer, file, caption=None):
+    async def send_file(self, peer, file, caption=None, voice_note=False,
+                        video_note=False, force_document=False):
         msg = FakeMessage(id=998, sender_id=1, text=caption, out=True, peer_id=int(peer))
-        self.sent.append({"peer": int(peer), "file": str(file), "caption": caption})
+        self.sent.append({
+            "peer": int(peer), "file": str(file), "caption": caption,
+            "voice_note": voice_note, "video_note": video_note,
+            "force_document": force_document,
+        })
         return msg
 
     async def forward_messages(self, to_peer, message_ids, from_peer):

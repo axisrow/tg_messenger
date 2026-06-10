@@ -47,6 +47,9 @@
       <input type="hidden" name="dialog_id" id="dialog_id" value="">
       <input type="text" name="text" id="composer-text" placeholder="Message…" autocomplete="off" required>
       <button type="button" id="suggest-btn" title="Suggest a reply">💡 Suggest</button>
+      <label id="attach-btn" title="Attach a file">📎
+        <input type="file" id="attach-file" style="display:none">
+      </label>
     </form>
   </main>
   <script>
@@ -74,6 +77,24 @@
         div.textContent = data.text || '<media>';
         document.getElementById('messages').appendChild(div);
       };
+    });
+    // Attach a file: upload it as media to the open dialog, append the bubble.
+    document.getElementById('attach-file').addEventListener('change', async (e) => {
+      const id = document.getElementById('dialog_id').value;
+      const file = e.target.files[0];
+      if (!id || !file) { e.target.value = ''; return; }
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('caption', document.getElementById('composer-text').value);
+      const resp = await fetch('/dialogs/' + id + '/media', { method: 'POST', body: fd });
+      const html = await resp.text();
+      if (resp.ok) {
+        document.getElementById('messages').insertAdjacentHTML('beforeend', html);
+        document.getElementById('composer-text').value = '';
+      } else {
+        alert(html.replace(/<[^>]+>/g, '').trim() || 'Upload failed');
+      }
+      e.target.value = '';
     });
     // Suggest: fetch a draft for the open dialog and drop it into the composer.
     document.getElementById('suggest-btn').addEventListener('click', async () => {

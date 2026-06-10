@@ -48,8 +48,10 @@ class WebStubClient:
     async def mark_read(self, peer):
         self.read_acks.append(peer)
 
-    async def send_media(self, peer, file_path, caption=None):
+    async def send_media(self, peer, file_path, *, caption=None, voice_note=False,
+                         video_note=False, force_document=False):
         self.sent.append((peer, "media", caption))
+        self.media_path = str(file_path)
         return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption or "<media>",
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
@@ -257,7 +259,30 @@ async def test_media_upload_calls_send_media(client_app):
     )
     assert r.status_code == 200
     assert stub.sent == [(7, "media", "look")]
+    assert stub.media_path  # a real temp path was passed through
     assert "look" in r.text
+
+
+async def test_media_upload_over_limit_returns_413(client_app, monkeypatch):
+    monkeypatch.setenv("TG_WEB_MAX_UPLOAD_MB", "1")
+    ac, stub = client_app
+    big = b"x" * (2 * 1024 * 1024)  # 2 MiB > 1 MB limit
+    r = await ac.post(
+        "/dialogs/7/media",
+        files={"file": ("big.bin", big, "application/octet-stream")},
+    )
+    assert r.status_code == 413
+    assert stub.sent == []
+
+
+async def test_media_upload_empty_file_returns_400(client_app):
+    ac, stub = client_app
+    r = await ac.post(
+        "/dialogs/7/media",
+        files={"file": ("empty.bin", b"", "application/octet-stream")},
+    )
+    assert r.status_code == 400
+    assert stub.sent == []
 
 
 async def test_profiles_route_lists_saved_profiles(monkeypatch, tmp_path):

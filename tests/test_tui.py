@@ -5,7 +5,34 @@ import pytest
 from textual.widgets import Input, ListView, Static, Tabs
 
 from tg_messenger.core.models import Dialog, IncomingEvent, Message
-from tg_messenger.tui.app import DialogItem, MessageBubble, MessengerTUI, ProfileItem
+from tg_messenger.tui.app import (
+    DialogItem,
+    MessageBubble,
+    MessengerTUI,
+    ProfileItem,
+    parse_media_command,
+)
+
+
+def test_parse_media_simple():
+    assert parse_media_command("@a.jpg") == ("a.jpg", None)
+
+
+def test_parse_media_quoted_path_with_caption():
+    assert parse_media_command('@"с пробелом.png" подпись') == ("с пробелом.png", "подпись")
+
+
+def test_parse_media_path_and_caption():
+    assert parse_media_command("@/path/x.jpg caption here") == ("/path/x.jpg", "caption here")
+
+
+def test_parse_media_non_at_is_none():
+    assert parse_media_command("hello world") is None
+
+
+def test_parse_media_empty_after_at_is_none():
+    assert parse_media_command("@") is None
+    assert parse_media_command("@   ") is None
 
 
 class TuiStubClient:
@@ -48,6 +75,12 @@ class TuiStubClient:
     async def send_text(self, peer, text, reply_to=None):
         self.sent.append((peer, text, reply_to))
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
+                       date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    async def send_media(self, peer, file_path, *, caption=None, voice_note=False,
+                         video_note=False, force_document=False):
+        self.media_sent = (peer, str(file_path), caption)
+        return Message(id=4, dialog_id=peer, sender_id=1, out=True, text=caption or "<media>",
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
     async def mark_read(self, peer):
@@ -725,3 +758,34 @@ async def test_tui_single_profile_skips_screen():
         assert list(app.query(ProfileItem)) == []  # no selection screen
         assert list(app.query(DialogItem))  # went straight to dialogs
     assert captured.get("session_name") == "solo"
+
+
+async def test_tui_at_command_sends_media(tmp_path):
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, f"@{f} cap"))
+        await pilot.pause()
+        await pilot.pause()
+        assert getattr(stub, "media_sent", None) == (7, str(f), "cap")
+        bubbles = list(app.query(MessageBubble))
+        assert any("cap" in str(b.render()) for b in bubbles)
+
+
+async def test_tui_at_command_missing_file_notifies(tmp_path):
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        missing = str(tmp_path / "nope.jpg")
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, f"@{missing}"))
+        await pilot.pause()
+        assert getattr(stub, "media_sent", None) is None
+        assert app.return_code is None  # still alive

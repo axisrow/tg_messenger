@@ -448,16 +448,35 @@ def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> 
 @click.argument("dialog_id", type=int)
 @click.argument("text", required=False)
 @click.option("--file", "file_path", default=None, help="Send a file/photo instead of text.")
+@click.option("--caption", "caption", default=None,
+              help="Caption for --file (overrides the positional TEXT).")
+@click.option("--voice", "voice", is_flag=True, help="Send --file as a voice note.")
+@click.option("--video-note", "video_note", is_flag=True,
+              help="Send --file as a round video note.")
+@click.option("--as-file", "as_file", is_flag=True,
+              help="Send --file as a plain document (no media preview).")
 @click.option("--reply-to", "reply_to", type=int, default=None,
               help="Reply to this message id.")
 @click.option("--session", default="default")
-def send(dialog_id: int, text: str | None, file_path: str | None,
+def send(dialog_id: int, text: str | None, file_path: str | None, caption: str | None,
+         voice: bool, video_note: bool, as_file: bool,
          reply_to: int | None, session: str) -> None:
-    """Send a text message (or a file with --file); --reply-to to quote a message."""
+    """Send a text message (or a file with --file); --reply-to to quote a message.
+
+    --voice / --video-note / --as-file are mutually exclusive media modifiers.
+    Caption comes from --caption or, failing that, the positional TEXT.
+    """
+    if sum([voice, video_note, as_file]) > 1:
+        raise click.ClickException(
+            "--voice, --video-note and --as-file are mutually exclusive"
+        )
 
     async def _do(client):
         if file_path:
-            return await client.send_media(dialog_id, file_path, caption=text)
+            return await client.send_media(
+                dialog_id, file_path, caption=caption or text,
+                voice_note=voice, video_note=video_note, force_document=as_file,
+            )
         return await client.send_text(dialog_id, text or "", reply_to=reply_to)
 
     _run(_with_client(session, _do), session=session)

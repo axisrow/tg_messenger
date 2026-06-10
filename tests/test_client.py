@@ -763,14 +763,50 @@ async def test_send_text_invalidates_peer_history(fake_client):
     assert fake_client.iter_messages_calls == 3
 
 
-async def test_send_media_invalidates_peer_history(fake_client):
+async def test_send_media_invalidates_peer_history(fake_client, tmp_path):
     _seed_dm(fake_client)
     client = _build(fake_client)
     await client.connect()
+    f = tmp_path / "x.jpg"
+    f.write_bytes(b"x")
     await client.history(7, limit=10)
-    await client.send_media(7, "/tmp/x.jpg")
+    await client.send_media(7, str(f))
     await client.history(7, limit=10)
     assert fake_client.iter_messages_calls == 2
+
+
+async def test_send_media_passes_flags_to_telethon(fake_client, tmp_path):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    f = tmp_path / "note.ogg"
+    f.write_bytes(b"x")
+    await client.send_media(7, str(f), caption="cap", voice_note=True,
+                            video_note=False, force_document=True)
+    rec = fake_client.sent[-1]
+    assert rec["file"] == str(f)
+    assert rec["caption"] == "cap"
+    assert rec["voice_note"] is True
+    assert rec["video_note"] is False
+    assert rec["force_document"] is True
+
+
+async def test_send_media_missing_path_raises_before_network(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(ValueError, match="file not found"):
+        await client.send_media(7, "/no/such/file.jpg")
+    assert fake_client.sent == []
+
+
+async def test_send_media_directory_raises_before_network(fake_client, tmp_path):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(ValueError, match="file not found"):
+        await client.send_media(7, str(tmp_path))
+    assert fake_client.sent == []
 
 
 async def test_incoming_event_invalidates_history(fake_client):
