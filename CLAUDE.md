@@ -6,8 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Install
-pip install -e ".[dev]"
+pip install -e ".[dev]"          # core + CLI + web + tui + test/lint toolchain ([dev] pulls [web,tui])
 pip install -e ".[dev,agent]"   # + LLM stack for the agent layer (langchain/langgraph/deepagents)
+# As a library: base = core+CLI only; web/tui are extras ([web]/[tui]/[all]); CLI imports them
+#   lazily and `serve`/`tui` fail with a "pip install 'tg-messenger[web]'" hint when absent.
 
 # Run the full test suite
 pytest
@@ -98,7 +100,7 @@ agent/  ← LangGraph intent orchestrator over core (optional [agent] extra); co
 
 ### Interfaces
 All three offer a DM/groups split over the same core API (`?tab=` / Tabs / `--groups`); the groups view is every non-DM dialog (groups, supergroups, broadcast channels, bots), served by `client.group_dialogs()` — the front-ends never re-filter by kind themselves.
-- **`cli/main.py`**: click group. `make_client(**kwargs)` builds the client from env. `dialogs --groups` lists non-DM dialogs with a `[kind]` marker.
+- **`cli/main.py`**: click group. `make_client(**kwargs)` builds the client from env. `dialogs --groups` lists non-DM dialogs with a `[kind]` marker. **Packaging:** web/tui are optional extras — `serve`/`tui` import `tg_messenger.web`/`tg_messenger.tui` lazily inside the command and, on `ImportError`, raise a `ClickException` with a `pip install 'tg-messenger[web]'`/`[tui]` hint (base install must not pull fastapi/textual — locked by `tests/test_packaging.py`, a fresh-subprocess `sys.modules` check). The public API (`tg_messenger.__all__`, `tg_messenger.core.__all__`) is snapshot-pinned in the same test; `src/tg_messenger/py.typed` ships the typing marker.
 - **`web/app.py`**: FastAPI + server-rendered HTMX fragments + SSE for live messages (`sse_event_stream`, fed by `listen_all()` — group streams work too). `build_app(client=..., session_name=...)`. The client connects/disconnects in the FastAPI lifespan. `GET /dialogs?tab=dm|groups` (unknown tab falls back to dm); the tab buttons live in `chat.html`.
 - **`tui/app.py`**: Textual app, `MessengerTUI(session_name=...)`. Two non-obvious constraints: `on_mount` resets the loop's task factory **before** the client exists — Textual's `eager_task_factory` (py3.12+) breaks Telethon, see the comment in `on_mount`; don't remove or move that line. And all network work goes through `self.run_worker(...)`, never `await` in handlers — awaiting stalls the message pump. DM/Группы are a `SidebarTabs` (a `Tabs` subclass) above the single `#dialogs` `DialogListView`; `on_tabs_tab_activated` is gated by `self._started` (Tabs fires at mount, before the client exists; the flag is NOT named `_ready` — Textual's `App` already has a `_ready` coroutine) and reloads via a worker. `SidebarTabs` adds a `down`/`enter` binding that hands focus to `#dialogs` (and selects the first item) — Textual's `Tabs` only binds left/right, so without it you'd have to Tab past the strip to reach the list. The list is a `DialogListView` (a `ListView` subclass): `up` at the first item (or empty selection) jumps focus back to `#tabs` (the symmetric counterpart); anywhere else `up` scrolls the list as usual (defers to `cursor_up`).
 

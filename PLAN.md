@@ -404,6 +404,20 @@ history мгновенно); копия shallow (список копируетс
 titles сам). Дисциплина username-резолва: дорогой (~50 подряд → флуд), никогда
 `get_entity('@username')` в циклах — allowlist резолвится через dialog list однажды.
 
+## Циклы 47–50 — импортируемость как библиотека (#9, сделано)
+
+Цель umbrella #6: `pip install tg-messenger` = core+CLI, web/tui — extras, сторонний
+проект импортирует ядро без лишнего стека. `tests/test_packaging.py`:
+- **47** — изоляция core от UI-стека: fresh-subprocess проверяет, что `import tg_messenger`
+  и `import tg_messenger.cli.main` не тянут fastapi/uvicorn/textual/jinja2 в `sys.modules`.
+- **48** — понятные ошибки без extra: `serve`/`tui` оборачивают ленивый импорт в try/except,
+  на `ImportError` → `ClickException("... pip install 'tg-messenger[web]'/[tui]")`.
+- **49** — публичный API: снапшот `tg_messenger.__all__` и `tg_messenger.core.__all__`;
+  добавлены реэкспорты `SessionStore`, `LoginFlow`, `LOGIN_HINT`, `EventBus`,
+  `run_with_flood_wait_retry`, `HandledFloodWaitError`.
+- **50** — pyproject: base = telethon>=1.43/pydantic/click; extras `[web]`/`[tui]`/`[all]`;
+  `[dev]` тянет `[web,tui]`; `src/tg_messenger/py.typed` в wheel; README «Use as a library».
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.
