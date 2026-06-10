@@ -81,6 +81,8 @@ class FakeTelethonClient:
         self.messages: dict[int, list[FakeMessage]] = {}
         self.sent: list[dict] = []
         self.downloads: list[dict] = []
+        self.actions_active: list[tuple] = []
+        self.actions_log: list[tuple] = []
         self._handlers: list = []
         self.code_requests: list[str] = []
         self.resend_requests: list = []
@@ -162,6 +164,22 @@ class FakeTelethonClient:
     async def download_media(self, message, file):
         self.downloads.append({"message_id": getattr(message, "id", None), "dest": str(file)})
         return str(file)
+
+    # --- chat actions (typing indicator) ---
+    def action(self, entity, action):
+        fake = self
+
+        class _Action:
+            async def __aenter__(self):
+                fake.actions_active.append((int(entity), action))
+                fake.actions_log.append((int(entity), action))
+                return self
+
+            async def __aexit__(self, *exc):
+                fake.actions_active.remove((int(entity), action))
+                return False
+
+        return _Action()
 
     # --- events ---
     def add_event_handler(self, handler, event=None):

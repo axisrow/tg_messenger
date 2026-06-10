@@ -46,3 +46,9 @@ class Message(BaseModel):
 class IncomingEvent(BaseModel):
     dialog_id: int
     message: Message
+
+
+def message_line(m: Message) -> str:
+    """One-line text rendering shared by text UIs: '← [id] text' (→ for own messages)."""
+    who = "→" if m.out else "←"
+    return f"{who} [{m.id}] {m.text or '<media>'}"

@@ -42,6 +42,38 @@ def _entity_title(entity) -> str:
     return name or getattr(entity, "username", None) or str(getattr(entity, "id", ""))
 
 
+class _SafeChatAction:
+    """Telethon chat-action CM that logs its own failures instead of raising.
+
+    The indicator is a UX nicety — entering/exiting must never break the
+    caller's work. The caller's own exceptions still propagate.
+    """
+
+    def __init__(self, telethon_client, peer: int):
+        self._telethon_client = telethon_client
+        self._peer = peer
+        self._action = None
+
+    async def __aenter__(self):
+        try:
+            action = self._telethon_client.action(self._peer, "typing")
+            await action.__aenter__()
+            self._action = action
+        except Exception:
+            logger.warning("typing action failed for dialog %s — continuing without it",
+                           self._peer, exc_info=True)
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._action is not None:
+            try:
+                await self._action.__aexit__(*exc)
+            except Exception:
+                logger.warning("typing action cleanup failed for dialog %s",
+                               self._peer, exc_info=True)
+        return False
+
+
 class StandaloneTelegramClient:
     def __init__(
         self,
@@ -130,6 +162,16 @@ class StandaloneTelegramClient:
             operation="send_media",
         )
         return self._to_message(msg, dialog_id=int(peer))
+
+    def typing(self, peer: int):
+        """Async context manager: show the 'typing…' chat action while the body runs.
+
+        Best-effort by contract: the indicator's own failures are logged here and
+        never raised, so callers don't need defensive wrappers. No flood-wait
+        wrapper — it's a periodic fire-and-forget UX signal, not a data call.
+        Exceptions raised by the caller's body propagate normally.
+        """
+        return _SafeChatAction(self._client, peer)
 
     async def download_media(self, message, dest: str | Path) -> str:
         return await run_with_flood_wait_retry(

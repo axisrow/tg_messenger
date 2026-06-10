@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from telethon.sessions import StringSession
 
@@ -166,3 +167,55 @@ async def test_external_session_writes_no_files(fake_client, session_dir):
     )
     await client.connect()
     assert list(session_dir.iterdir()) == []
+
+
+async def test_typing_proxies_to_telethon_action(fake_client):
+    client = _build(fake_client)
+    async with client.typing(7):
+        assert fake_client.actions_active == [(7, "typing")]
+    assert fake_client.actions_active == []  # выключился на выходе
+    assert fake_client.actions_log == [(7, "typing")]
+
+
+async def test_typing_enter_failure_is_swallowed_and_logged(fake_client, caplog):
+    client = _build(fake_client)
+
+    def broken_action(entity, action):
+        raise RuntimeError("entity not found")
+
+    fake_client.action = broken_action
+    body_ran = False
+    with caplog.at_level(logging.WARNING, logger="tg_messenger.core.client"):
+        async with client.typing(7):
+            body_ran = True  # тело выполняется несмотря на сбой индикатора
+    assert body_ran
+    assert any("typing" in r.message for r in caplog.records)
+
+
+async def test_typing_exit_failure_is_swallowed_and_logged(fake_client, caplog):
+    client = _build(fake_client)
+
+    class _BrokenExit:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            raise RuntimeError("cancel failed")
+
+    fake_client.action = lambda entity, action: _BrokenExit()
+    with caplog.at_level(logging.WARNING, logger="tg_messenger.core.client"):
+        async with client.typing(7):
+            pass
+    assert any("typing" in r.message for r in caplog.records)
+
+
+async def test_typing_propagates_body_exceptions(fake_client):
+    client = _build(fake_client)
+    try:
+        async with client.typing(7):
+            raise RuntimeError("body failed")
+    except RuntimeError as exc:
+        assert str(exc) == "body failed"
+    else:
+        raise AssertionError("body exception must propagate")
+    assert fake_client.actions_active == []  # индикатор всё равно погашен

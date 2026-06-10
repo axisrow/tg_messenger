@@ -1,0 +1,184 @@
+"""Цикл 14: factory (сборка продакшен-частей) и CLI-команда `agent`.
+
+LLM-стек не вызывается: init_chat_model/create_deep_agent патчатся на фейки,
+CLI тестируется через CliRunner со стабами make_client/make_agent_runner.
+"""
+
+import logging
+import sys
+from types import SimpleNamespace
+
+import pytest
+from click.testing import CliRunner
+
+from tg_messenger.cli import main as cli_main
+
+# --- factory (нужен установленный agent-extra; без него — skip) ---
+
+deepagents = pytest.importorskip("deepagents")
+
+from tg_messenger.agent import factory  # noqa: E402
+from tg_messenger.agent.config import AgentConfig  # noqa: E402
+from tg_messenger.agent.orchestrator import Orchestrator  # noqa: E402
+
+
+def make_cfg(**kw):
+    defaults = dict(model="anthropic:claude-x", allow_all=True, search_provider="duckduckgo")
+    defaults.update(kw)
+    return AgentConfig(**defaults)
+
+
+class FakeModel:
+    def __init__(self, reply="ok"):
+        self.reply = reply
+        self.calls = []
+
+    async def ainvoke(self, messages):
+        self.calls.append(list(messages))
+        return SimpleNamespace(content=self.reply)
+
+
+def test_build_orchestrator_wires_model_and_tools(monkeypatch):
+    init_calls = []
+    deep_calls = []
+    fake_model = FakeModel()
+    monkeypatch.setattr(factory, "init_chat_model", lambda spec: init_calls.append(spec) or fake_model)
+    monkeypatch.setattr(
+        factory, "create_deep_agent",
+        lambda **kw: deep_calls.append(kw) or SimpleNamespace(ainvoke=None),
+    )
+    orch = factory.build_orchestrator(client=SimpleNamespace(), cfg=make_cfg())
+    assert isinstance(orch, Orchestrator)
+    assert init_calls == ["anthropic:claude-x"]
+    (kw,) = deep_calls
+    assert kw["model"] is fake_model
+    assert kw["system_prompt"].strip()
+    tool_names = {t.__name__ for t in kw["tools"]}
+    assert tool_names == {
+        "send_telegram_message", "read_telegram_history", "list_telegram_dialogs", "web_search",
+    }
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("task", "task"),
+    (" Task.\n", "task"),
+    ("chat", "chat"),
+    ("CHAT!", "chat"),
+])
+async def test_classifier_parses_model_reply(raw, expected):
+    classify = factory.make_classifier(FakeModel(reply=raw))
+    assert await classify("что-нибудь") == expected
+
+
+async def test_classifier_garbage_falls_back_to_chat_with_warning(caplog):
+    classify = factory.make_classifier(FakeModel(reply="I think maybe..."))
+    with caplog.at_level(logging.WARNING, logger="tg_messenger.agent.factory"):
+        assert await classify("что-нибудь") == "chat"
+    assert any("chat" in r.message for r in caplog.records)  # не молча
+
+
+async def test_classifier_sends_user_text_to_model():
+    model = FakeModel(reply="chat")
+    classify = factory.make_classifier(model)
+    await classify("привет, бот")
+    (messages,) = model.calls
+    assert messages[-1].content == "привет, бот"
+
+
+async def test_chat_fn_returns_content_and_keeps_history():
+    model = FakeModel(reply="ответ")
+    chat = factory.make_chat_fn(model)
+    history = [SimpleNamespace(content="раньше"), SimpleNamespace(content="сейчас")]
+    assert await chat(history) == "ответ"
+    (messages,) = model.calls
+    assert messages[-2:] == history  # история ушла модели целиком, в конце
+
+
+# --- CLI-команда agent ---
+
+class StubClient:
+    def __init__(self, **kw):
+        self.connected = False
+        self.authorized = True
+
+    async def connect(self):
+        self.connected = True
+
+    async def disconnect(self):
+        self.connected = False
+
+    async def is_authorized(self):
+        return self.authorized
+
+
+class StubRunner:
+    def __init__(self):
+        self.runs = 0
+        self.interrupt = False
+
+    async def run(self):
+        self.runs += 1
+        if self.interrupt:
+            raise KeyboardInterrupt
+
+
+@pytest.fixture
+def agent_cli(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)  # CLI грузит .env из cwd — изолируемся от реального
+    client = StubClient()
+    stub_runner = StubRunner()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    monkeypatch.setattr(cli_main, "make_agent_runner", lambda c, **kw: stub_runner)
+    return CliRunner(), client, stub_runner
+
+
+def test_agent_command_runs_runner_and_disconnects(agent_cli):
+    r, client, stub_runner = agent_cli
+    result = r.invoke(cli_main.cli, ["agent"])
+    assert result.exit_code == 0
+    assert stub_runner.runs == 1
+    assert client.connected is False  # disconnect в finally
+
+
+def test_agent_command_requires_login(agent_cli):
+    r, client, stub_runner = agent_cli
+    client.authorized = False
+    result = r.invoke(cli_main.cli, ["agent"])
+    assert result.exit_code != 0
+    assert "login" in result.output
+    assert stub_runner.runs == 0
+
+
+def test_agent_command_ctrl_c_says_stopped(agent_cli):
+    r, _, stub_runner = agent_cli
+    stub_runner.interrupt = True
+    result = r.invoke(cli_main.cli, ["agent"])
+    assert "stopped." in result.output
+
+
+def test_agent_listed_in_help(agent_cli):
+    r, *_ = agent_cli
+    result = r.invoke(cli_main.cli, ["--help"])
+    assert "agent" in result.output
+
+
+def test_missing_extra_gives_pip_hint(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: StubClient())
+    # import tg_messenger.agent.factory -> ImportError, как при невыставленном extra
+    monkeypatch.setitem(sys.modules, "tg_messenger.agent.factory", None)
+    result = CliRunner().invoke(cli_main.cli, ["agent"])
+    assert result.exit_code != 0
+    assert "tg-messenger[agent]" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_bad_config_gives_friendly_error(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: StubClient())
+    monkeypatch.delenv("TG_AGENT_MODEL", raising=False)
+    monkeypatch.delenv("TG_AGENT_ALLOWLIST", raising=False)
+    result = CliRunner().invoke(cli_main.cli, ["agent"])
+    assert result.exit_code != 0
+    assert "TG_AGENT_MODEL" in result.output
+    assert "Traceback" not in result.output

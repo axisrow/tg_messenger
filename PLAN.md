@@ -185,6 +185,64 @@ client = StandaloneTelegramClient(api_id, api_hash, external_session=existing_st
   `GET /stream/{id}` отдаёт один SSE-кадр когда `bus.publish`.
 - **TUI** проверяется smoke-тестом монтирования (Textual `run_test`/pilot) — без живого Telegram.
 
+## Циклы 9–14 — агентный слой (`tg-messenger agent`, LangGraph + deepagents)
+
+Поверх ядра — авто-ответчик на входящие лички: LangGraph-роутер классифицирует намерение
+(**chat** → одиночный вызов модели через `init_chat_model`; **task** → deep-агент
+`deepagents.create_deep_agent` с Telegram-инструментами и веб-поиском), ответ уходит в тот же
+диалог. Sibling-пакет `agent/` (core его не импортирует); LLM-стек — optional extra `[agent]`;
+все модельные контакты инжектируются (юнит-тесты без сети и без реального LLM; на чистом
+`.[dev]` агентные тесты скипаются через `importorskip`).
+
+- **Цикл 9 — `agent/config.py`.** `test_agent_config.py` (stdlib-only): `AgentConfig.from_env` —
+  `TG_AGENT_MODEL` строго `provider:model`; `TG_AGENT_ALLOWLIST` — `*` = всем, иначе CSV из
+  id/@username (нормализация), пустой → ошибка (явный выбор, не тихий дефолт);
+  `TG_AGENT_SEARCH` из 4 провайдеров, дефолт duckduckgo. Тут же extra `[agent]` в pyproject +
+  smoke `python -W error -c "import langgraph, langchain, deepagents"`.
+- **Цикл 10 — `agent/tools.py`.** `test_agent_tools.py` на стаб-клиенте: три async-функции с
+  docstring/аннотациями (это схема инструмента для модели) — `send_telegram_message` (зовёт
+  `client.send_text`, подтверждает id), `read_telegram_history` (формат `←/→ [id] text`),
+  `list_telegram_dialogs`; пустые история/диалоги → внятная строка. Без LangChain-импортов.
+- **Цикл 11 — `agent/search.py`.** `test_agent_search.py`: `build_search_fn(provider)` →
+  `web_search(query, max_results)`; SDK подменяются фейк-модулями в `sys.modules`; lazy-import
+  (отсутствие пакета → ValueError с pip-подсказкой), отсутствие ключа → fail-fast на старте;
+  duckduckgo без ключа; brave — REST через httpx.
+- **Цикл 12 — `agent/orchestrator.py`.** `test_agent_orchestrator.py`
+  (`importorskip("langgraph")`): настоящий граф classify → chat | task с инжектированными
+  `classify_fn`/`chat_fn`/`task_agent`; память диалога между ходами (`InMemorySaver`,
+  `thread_id` = dialog_id), изоляция диалогов, внутренние сообщения deep-агента не протекают
+  в историю (в state — только финальный ответ).
+- **Цикл 13 — `agent/runner.py`.** `test_agent_runner.py`: listen → фильтры (out=True; без
+  текста; allowlist по id и @username — резолв через `dialogs()` один раз на старте,
+  нерезолвленный → warning) → `handle` → `send_text` в тот же диалог; ошибка одного сообщения
+  логируется (`logger.exception`) и не роняет цикл; `notify_errors` шлёт короткую заглушку
+  (и её падение — тоже только лог). Петля исключена: core подписан `NewMessage(incoming=True)`.
+- **Цикл 14 — `agent/factory.py` + CLI.** `test_agent_cli.py`: `build_orchestrator` —
+  единственная точка LLM-стека (monkeypatch `factory.init_chat_model` /
+  `factory.create_deep_agent`); классификатор парсит односложный ответ, мусор → `chat` +
+  warning; команда `agent` по образцу `listen` (шов `make_agent_runner` рядом с `make_client`);
+  без extra → ClickException с `pip install "tg-messenger[agent]"`; ошибка конфига → текст
+  ValueError без Traceback. Финал: `.env.example` (блок TG_AGENT_*), CLAUDE.md.
+
+- **Цикл 15 — индикатор «печатает…».** `test_client.py`: `client.typing(peer)` — безопасный CM
+  поверх Telethon `action(peer, "typing")` (`_SafeChatAction`): шлёт действие периодически,
+  гасит на выходе; **по контракту не бросает** — сбой входа/выхода = warning в лог, тело и
+  исключения тела проходят нормально. `test_agent_runner.py`: индикатор активен, пока `handle`
+  думает, и гаснет после ответа — runner просто `async with client.typing(...)`, без обёрток.
+
+- **Цикл 16 — фиксы по ревью.** `test_agent_config.py`: `'*'` вперемешку с другими записями →
+  ValueError (раньше — молчаливая блокировка всех). `test_agent_runner.py`: инвариант «фильтр
+  по sender_id» зафиксирован тестом с расходящимися dialog_id/sender_id. `test_agent_search.py`:
+  ленивый генератор ddgs исчерпывается внутри worker-потока (`list()` в `to_thread`), не в
+  event loop; фейк brave-клиента стал одноразовым (нет утечки состояния между тестами).
+  Refactor: ответ графа — в выделенном ключе `reply` состояния, не `messages[-1]`.
+
+Принятые компромиссы v1: полное доверие allowlist'у — разрешённый собеседник может через
+задание читать/отправлять в любые диалоги (зафиксировано в `.env.example`); последовательная обработка (долгий task может вытеснить старые
+события из очереди EventBus — drop-oldest уже логируется); история в `InMemorySaver` живёт до
+рестарта процесса и не ограничена; @username-allowlist матчится только по существующим
+диалогам (надёжнее числовой id).
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.
