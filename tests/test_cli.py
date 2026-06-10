@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime, timezone
 
 import pytest
@@ -240,6 +241,30 @@ def test_login_2fa_prompts_password(monkeypatch):
     assert result.exit_code == 0
     assert inner.signed_in[-1]["password"] == "hunter2"
     assert stub.saved is True
+
+
+def test_dotenv_autoloaded_for_commands(runner, tmp_path, monkeypatch):
+    # isolate os.environ so the test can't leak TG_API_ID into the session
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text('TG_API_ID=42\nTG_API_HASH="abc"\n# comment\n', encoding="utf-8")
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0
+    assert os.environ["TG_API_ID"] == "42"
+    assert os.environ["TG_API_HASH"] == "abc"  # quotes stripped
+
+
+def test_dotenv_does_not_override_real_env(runner, tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.chdir(tmp_path)
+    os.environ["TG_API_ID"] = "111"
+    (tmp_path / ".env").write_text("TG_API_ID=42\n", encoding="utf-8")
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0
+    assert os.environ["TG_API_ID"] == "111"
 
 
 def test_help_lists_commands():

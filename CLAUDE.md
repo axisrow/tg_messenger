@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Install (editable, all extras) into the project venv
-python -m venv .venv && ./.venv/bin/pip install -e ".[dev,cli,tui,web]"
+# Install (editable) into the project venv — all three UIs ship in the base install; [dev] adds test/lint tools
+python -m venv .venv && ./.venv/bin/pip install -e ".[dev]"
 
 # Run the full test suite
 ./.venv/bin/pytest
@@ -24,7 +24,7 @@ python -m venv .venv && ./.venv/bin/pip install -e ".[dev,cli,tui,web]"
 ./.venv/bin/tg-messenger tui             # Textual TUI
 ```
 
-Runtime requires `TG_API_ID` and `TG_API_HASH` in the environment (Telegram API credentials). Tests never need them — they patch the network seams (see below).
+Runtime requires `TG_API_ID` and `TG_API_HASH` (Telegram API credentials) — from the environment or from a `.env` in the cwd, which the CLI entrypoint auto-loads (`_load_dotenv` in `cli/main.py`; real env wins, see `.env.example`). Unit tests never need them — they patch the network seams (see below). `tests/test_e2e.py` launches the real app as a subprocess and skips its credentialed tests when no creds are available.
 
 pytest is configured for `asyncio_mode = auto` (no `@pytest.mark.asyncio` needed), a 30s per-test timeout, and `filterwarnings = ["error"]` — **any warning fails the test**.
 
@@ -40,7 +40,7 @@ web/    ┘
 ```
 
 ### Core (`src/tg_messenger/core/`)
-- **`client.py` — `StandaloneTelegramClient`**: the only thing the UIs talk to. Thin async wrapper over one Telethon client exposing `dialogs()`, `history()`, `send_text()`, `send_media()`, `download_media()`, and `listen()`. DM-only filtering (`_is_dm_entity`) excludes bots/channels/groups. **Every network call routes through `run_with_flood_wait_retry`.**
+- **`client.py` — `StandaloneTelegramClient`**: the only thing the UIs talk to. Thin async wrapper over one Telethon client exposing `dialogs()`, `history()`, `send_text()`, `send_media()`, `download_media()`/`download_message_media()`, and `listen()`. DM-only filtering (`_is_dm_entity`) excludes bots/channels/groups. **Every network call routes through `run_with_flood_wait_retry`.**
 - **`flood.py`**: dependency-free FloodWait retry. Transient waits (≤60s, within a 120s budget) are slept-and-retried; anything else raises `HandledFloodWaitError`. Other exceptions propagate. Vendored from the parent `tg_content_factory` project — keep it pool/DB-free.
 - **`events.py` — `EventBus`**: asyncio fan-out. One Telethon `NewMessage` handler `publish()`es; each UI `subscribe()`s its own bounded queue. **Publishing never blocks** — a full subscriber queue drops its oldest item so a slow consumer can't stall the Telethon loop.
 - **`auth.py`**: `SessionStore` persists Telethon `StringSession` strings as 0600 plain-text files under `~/.tg_messenger/sessions/` (no SQLite). An external session string can be injected and is never written to disk. `LoginFlow` is the two-step phone→code→2FA sign-in; `phone_code_hash` stays bound to the same client/session.
