@@ -132,6 +132,9 @@ class FakeTelethonClient:
         self.code_requests: list[str] = []
         self.resend_requests: list = []
         self.signed_in_with: list = []
+        # network-call counters: the TTL-cache tests assert how often we hit the wire
+        self.iter_dialogs_calls = 0
+        self.iter_messages_calls = 0
 
     # --- connection / auth ---
     async def connect(self):
@@ -169,6 +172,8 @@ class FakeTelethonClient:
         return self.dialogs
 
     def iter_dialogs(self, *a, **k):
+        self.iter_dialogs_calls += 1
+
         async def gen():
             for d in self.dialogs:
                 yield d
@@ -176,6 +181,7 @@ class FakeTelethonClient:
         return gen()
 
     def iter_messages(self, peer, limit=50, ids=None, **k):
+        self.iter_messages_calls += 1
         items = self.messages.get(int(peer), [])
         if ids is not None:
             wanted = ids if isinstance(ids, (list, tuple)) else [ids]

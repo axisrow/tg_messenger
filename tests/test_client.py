@@ -557,3 +557,257 @@ async def test_typing_propagates_body_exceptions(fake_client):
     else:
         raise AssertionError("body exception must propagate")
     assert fake_client.actions_active == []  # индикатор всё равно погашен
+
+
+# --- Циклы 42–45: TTL-кэш dialogs/history + инвалидация ---
+
+
+def _clk(t):
+    return lambda: t["now"]
+
+
+async def test_dialogs_cached_second_call_no_network(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.dialogs(dm_only=True)
+    await client.dialogs(dm_only=True)
+    assert fake_client.iter_dialogs_calls == 1  # second served from cache
+
+
+async def test_tab_switching_incident_one_network_call(fake_client):
+    """The PR #7 incident: dm→groups→dm must hit the wire ONCE, kinds correct."""
+    _seed_all_kinds(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    dm = await client.dialogs(dm_only=True)
+    groups = await client.dialogs(dm_only=False)
+    dm2 = await client.dialogs(dm_only=True)
+    assert fake_client.iter_dialogs_calls == 1
+    assert [d.id for d in dm] == [7]
+    assert {d.id for d in groups} == {7, 9, -50, -100123, -100200}
+    assert [d.id for d in dm2] == [7]
+
+
+async def test_dialogs_cache_refetches_after_ttl(fake_client):
+    _seed_dm(fake_client)
+    t = {"now": 0.0}
+    client = _build(fake_client, dialogs_ttl=30.0, clock=_clk(t))
+    await client.connect()
+    await client.dialogs(dm_only=True)
+    t["now"] = 31.0
+    await client.dialogs(dm_only=True)
+    assert fake_client.iter_dialogs_calls == 2
+
+
+async def test_dialogs_concurrent_clicks_coalesce(fake_client):
+    _seed_all_kinds(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    gate = asyncio.Event()
+    orig = fake_client.iter_dialogs
+
+    def gated(*a, **k):
+        inner = orig(*a, **k)
+
+        async def gen():
+            await gate.wait()
+            async for d in inner:
+                yield d
+
+        return gen()
+
+    fake_client.iter_dialogs = gated
+
+    async def release():
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        gate.set()
+
+    await asyncio.gather(
+        client.dialogs(dm_only=True),
+        client.dialogs(dm_only=False),
+        release(),
+    )
+    assert fake_client.iter_dialogs_calls == 1
+
+
+async def test_dialogs_result_mutation_does_not_corrupt_cache(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.dialogs(dm_only=True)
+    first.clear()  # consumer mutates the returned list
+    second = await client.dialogs(dm_only=True)
+    assert len(second) == 2  # cache untouched
+    assert fake_client.iter_dialogs_calls == 1
+
+
+# --- Цикл 43: кэш history() ---
+
+
+async def test_history_cached_same_key(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 1
+
+
+async def test_history_different_limit_separate_entry(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(7, limit=20)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_history_refetches_after_ttl(fake_client):
+    _seed_dm(fake_client)
+    t = {"now": 0.0}
+    client = _build(fake_client, history_ttl=15.0, clock=_clk(t))
+    await client.connect()
+    await client.history(7, limit=10)
+    t["now"] = 16.0
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_history_returns_copy(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.history(7, limit=10)
+    first.clear()
+    second = await client.history(7, limit=10)
+    assert len(second) == 2
+    assert fake_client.iter_messages_calls == 1
+
+
+# --- Цикл 44: инвалидация history ---
+
+
+async def test_send_text_invalidates_peer_history(fake_client):
+    _seed_dm(fake_client)
+    fake_client.messages[8] = [FakeMessage(id=3, sender_id=8, text="other")]
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(8, limit=10)
+    await client.send_text(7, "new")
+    await client.history(7, limit=10)  # refetch
+    await client.history(8, limit=10)  # still cached
+    assert fake_client.iter_messages_calls == 3
+
+
+async def test_send_media_invalidates_peer_history(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.send_media(7, "/tmp/x.jpg")
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_incoming_event_invalidates_history(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    ev = type("Ev", (), {
+        "chat_id": 7,
+        "is_private": True,
+        "message": FakeMessage(id=10, sender_id=7, text="ping"),
+    })()
+    await fake_client.push_event(ev)
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_outgoing_event_invalidates_history(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    ev = type("Ev", (), {
+        "chat_id": 7,
+        "message": FakeMessage(id=11, sender_id=1, text="me", out=True),
+    })()
+    await fake_client.push_event(ev)
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_deleted_event_with_chat_id_invalidates_that_peer(fake_client):
+    _seed_dm(fake_client)
+    fake_client.messages[8] = [FakeMessage(id=3, sender_id=8, text="other")]
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(8, limit=10)
+    ev = type("Ev", (), {"deleted_ids": [5], "chat_id": 7})()
+    await fake_client.push_event(ev)
+    await client.history(7, limit=10)  # refetch
+    await client.history(8, limit=10)  # cached
+    assert fake_client.iter_messages_calls == 3
+
+
+async def test_deleted_event_without_chat_id_invalidates_all_history(fake_client):
+    _seed_dm(fake_client)
+    fake_client.messages[8] = [FakeMessage(id=3, sender_id=8, text="other")]
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(8, limit=10)
+    ev = type("Ev", (), {"deleted_ids": [5]})()  # no chat_id
+    await fake_client.push_event(ev)
+    await client.history(7, limit=10)
+    await client.history(8, limit=10)
+    assert fake_client.iter_messages_calls == 4  # both refetched
+
+
+# --- Цикл 45: flood_sleep_threshold=0 ---
+
+
+async def test_default_factory_disables_silent_flood_sleep():
+    from tg_messenger.core.client import _default_factory
+
+    c = _default_factory(StringSession(), 1, "h")
+    assert c.flood_sleep_threshold == 0
+
+
+async def test_dialogs_flood_raises_handled_and_leaves_cache_empty(fake_client, monkeypatch):
+    import tg_messenger.core.flood as flood
+    from tg_messenger.core.flood import HandledFloodWaitError
+
+    class FakeFloodWaitError(Exception):
+        def __init__(self, seconds):
+            super().__init__(f"flood {seconds}s")
+            self.seconds = seconds
+
+    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+
+    calls = {"n": 0}
+
+    def boom(*a, **k):
+        calls["n"] += 1
+
+        async def gen():
+            raise FakeFloodWaitError(9999)
+            yield  # pragma: no cover
+
+        return gen()
+
+    fake_client.iter_dialogs = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.dialogs(dm_only=True)
+    # failed fetch not cached → a retry hits the wire again
+    with pytest.raises(HandledFloodWaitError):
+        await client.dialogs(dm_only=True)
+    assert calls["n"] == 2

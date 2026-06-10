@@ -356,6 +356,54 @@ composer нет; агент и CLI `listen`/`chat` остаются DM-only; `Di
 групп/каналов сменился на marked id (согласован с `event.chat_id`, пригоден для
 history/send); unread-бейджи не live; SSE — один диалог на стрим.
 
+## Циклы 39–46 — анти-флуд: TTL-кэш dialogs/history + единый контур FloodWait
+
+Инцидент на живом тесте PR #7: быстрое переключение вкладок DM/Группы → каждый
+клик = `dialogs()` = `GetDialogsRequest` → FloodWait 22s. Telethon с дефолтным
+`flood_sleep_threshold=60` молча спал до 60s (UI висел «loading»), а наш
+`run_with_flood_wait_retry` этих флудов не видел — Telethon кидает `FloodWaitError`
+только при wait > threshold. Фикс — в `core` (правильная высота: все три UI
+получают его бесплатно).
+
+- **Цикл 39 — `TTLCache` get/set/TTL/eviction** (`core/cache.py`, stdlib-only).
+  `OrderedDict[key, (value, expires_at)]`; `clock` инжектится (`time.monotonic` по
+  умолчанию) — тесты двигают фейк-часы, не спят. Живо при `clock() < stored_at+ttl`,
+  мертво при `>=`; `maxsize`-eviction старейших (паттерн `watch.py`); повторный
+  `set` обновляет expiry и порядок.
+- **Цикл 40 — `invalidate`/`invalidate_if`**: точечно; `None` → всё; missing →
+  no-op; `invalidate_if(pred)` собирает ключи и удаляет (не мутирует dict в итерации).
+- **Цикл 41 — single-flight `get_or_fetch`**: per-key `asyncio.Lock`, double-check
+  под локом → конкурентные миссы одного ключа коалесцируются в один fetch; упавший
+  fetch НЕ кэшируется и не деадлочит (`try/finally`, лок снимается).
+- **Цикл 42 — кэш `dialogs()`** (фикс инцидента). Кэшируется ОДИН полный смаппленный
+  список (все kind, `maxsize=1`); `dm_only=True` фильтрует `kind=="dm"` из кэша →
+  dm→groups→dm = 1 сетевой вызов. TTL 30s. Возврат — копия (защита кэша).
+- **Цикл 43 — кэш `history()`**: ключ `(int(peer), limit, offset_id)`, TTL 15s,
+  `maxsize=64`. Возврат — копия; пагинация по `offset_id` — точный ключ, страницы
+  не склеиваются.
+- **Цикл 44 — инвалидация `history`**: `_invalidate_history(peer)` =
+  `invalidate_if(k[0]==int(peer))`. Зовётся в `send_text`/`send_media` (свежее
+  сообщение видно при переоткрытии), в `_on_new_message`/`_on_outgoing_message`
+  (внутри `try`, сразу после dialog_id, ДО маппинга — битое событие тоже
+  инвалидирует), в `_on_deleted` (по `chat_id` если есть, иначе полный сброс
+  history — удаления редки).
+- **Цикл 45 — `flood_sleep_threshold=0`** в `_default_factory`: Telethon больше
+  никогда не спит молча, все FloodWait идут через `run_with_flood_wait_retry`
+  (≤60s ретрай в бюджете 120s, иначе `HandledFloodWaitError` → web 503 / CLI
+  ClickException / TUI notify).
+- **Цикл 46 — финал**: полный `pytest` + `ruff`, PLAN.md/CLAUDE.md, push в
+  `feat/dialog-tabs` (PR #7).
+
+Решённые вопросы / компромиссы v1: `fresh=True`-байпас НЕ делаем (приглашение
+воссоздать флуд); dialogs-кэш событиями НЕ инвалидируется — намеренно (активная
+группа свела бы кэш на нет, вернулся бы инцидент; staleness ≤30s списка и ≤15s
+неоткрывавшейся истории принят, собственные действия и live-события инвалидируют
+history мгновенно); копия shallow (список копируется, модели шарятся — конвенция
+«UIs render, never mutate»); кэш в памяти процесса; `download_message_media` НЕ
+кэшируется (точечный fetch по id); `entity_title` не трогаем (watch мемоизирует
+titles сам). Дисциплина username-резолва: дорогой (~50 подряд → флуд), никогда
+`get_entity('@username')` в циклах — allowlist резолвится через dialog list однажды.
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.
