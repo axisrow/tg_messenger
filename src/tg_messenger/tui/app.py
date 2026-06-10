@@ -31,11 +31,12 @@ def _make_real_client(session_name: str):
 
 
 class SidebarTabs(Tabs):
-    """DM/groups tabs that hand focus down to the dialog list.
+    """DM/groups tabs that hand focus down to the sibling dialog list.
 
-    Textual's Tabs only binds left/right; Enter or Down here jumps focus to the
-    sibling #dialogs ListView so the user can start scrolling dialogs at once,
-    instead of having to Tab past the strip.
+    Textual's Tabs only binds left/right; Enter or Down here focuses the
+    #dialogs list (its sibling in #sidebar) so the user can start scrolling
+    dialogs at once, instead of having to Tab past the strip. Not focus_next:
+    Tabs holds focusable Tab children, so the chain would step inside itself.
     """
 
     BINDINGS = [
@@ -43,27 +44,31 @@ class SidebarTabs(Tabs):
     ]
 
     def action_focus_dialogs(self) -> None:
-        lv = self.app.query_one("#dialogs", ListView)
-        lv.focus()
-        if lv.index is None and len(lv) > 0:
-            lv.index = 0  # land on the first dialog so arrows scroll immediately
+        # query the shared #sidebar parent, not the whole screen
+        self.parent.query_one("#dialogs", ListView).focus()
 
 
 class DialogListView(ListView):
-    """Dialog list that returns focus to the tabs when Up is pressed at the top.
+    """Dialog list that returns focus to the sibling tabs when Up is pressed at the top.
 
-    Up from the first item (or an empty selection) jumps back to #tabs — the
-    symmetric counterpart to SidebarTabs' Down/Enter. Anywhere else, Up scrolls
-    the list as usual (defers to ListView's own cursor_up).
+    Up from the first item (or an empty selection) focuses the previous widget
+    in the chain — the tab strip — the symmetric counterpart to SidebarTabs'
+    Down/Enter. Anywhere else, Up scrolls the list as usual (ListView's cursor_up).
+    On_focus lands the cursor on the first dialog so arrows scroll immediately,
+    however focus arrived (mouse, Tab, or the keyboard handoff).
     """
 
     BINDINGS = [
         Binding("up", "cursor_up_or_tabs", "Up", show=False),
     ]
 
+    def on_focus(self) -> None:
+        if self.index is None and len(self) > 0:
+            self.index = 0
+
     def action_cursor_up_or_tabs(self) -> None:
         if self.index in (None, 0):
-            self.app.query_one("#tabs", SidebarTabs).focus()
+            self.screen.focus_previous()  # the tabs are the prior focusable
         else:
             self.action_cursor_up()
 
