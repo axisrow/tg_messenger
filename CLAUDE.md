@@ -20,7 +20,7 @@ pytest tests/test_client.py::test_name -x
 ruff check . && ruff check --fix .
 
 # Run the app
-tg-messenger --help         # CLI entrypoint (login, dialogs, read, send, listen, chat, serve, tui, agent)
+tg-messenger --help         # CLI entrypoint (login, dialogs, read, send, listen, watch, chat, serve, tui, agent)
 tg-messenger -v <cmd>        # DEBUG logging; file log: ~/.tg_messenger/logs/tg_messenger.log (env TG_LOG_DIR)
 tg-messenger serve           # web (FastAPI/uvicorn), default port 8090 (env TG_WEB_PORT; --port overrides)
 tg-messenger tui             # Textual TUI
@@ -33,7 +33,7 @@ pytest is configured for `asyncio_mode = auto` (no `@pytest.mark.asyncio` needed
 
 ## Architecture
 
-A single UI-agnostic core wrapped by three interchangeable front-ends, plus an optional agent layer. `PLAN.md` holds the full design and the TDD build sequence (cycles 0–8 core/UI, 9–25 agent); the project is built test-first.
+A single UI-agnostic core wrapped by three interchangeable front-ends, plus an optional agent layer. `PLAN.md` holds the full design and the TDD build sequence (cycles 0–8 core/UI, 9–25 agent, 26–30 deletion watch); the project is built test-first.
 
 ```
 core/   ← all Telegram logic, no UI imports
@@ -44,7 +44,8 @@ agent/  ← LangGraph intent orchestrator over core (optional [agent] extra); co
 ```
 
 ### Core (`src/tg_messenger/core/`)
-- **`client.py` — `StandaloneTelegramClient`**: the only thing the UIs talk to. Thin async wrapper over one Telethon client exposing `dialogs()`, `history()`, `send_text()`, `send_media()`, `download_media()`/`download_message_media()`, and `listen()`. DM-only filtering (`_is_dm_entity`) excludes bots/channels/groups. **Every network call routes through `run_with_flood_wait_retry`.**
+- **`client.py` — `StandaloneTelegramClient`**: the only thing the UIs talk to. Thin async wrapper over one Telethon client exposing `dialogs()`, `history()`, `send_text()`, `send_media()`, `download_media()`/`download_message_media()`, `get_me()`, `entity_title()`, and three event streams: `listen()` (incoming, DM-only — group traffic dropped at the source), `listen_outgoing()` (own messages from any device, groups INCLUDED — no DM filter) and `listen_deleted()` (`MessagesDeletedEvent`; Telegram names the chat only for channels/supergroups). Three Telethon handlers are registered eagerly at `connect()` — publishing into a bus without subscribers is a no-op. DM-only filtering (`_is_dm_entity`) excludes bots/channels/groups from `dialogs()`. **Every network call routes through `run_with_flood_wait_retry`.**
+- **`watch.py` — `DeletionWatcher`** (`tg-messenger watch`): backs up own deleted messages (e.g. removed by group moderator bots) to Saved Messages. A bounded cache of recent own messages (`OrderedDict`, 1000) is the only way to recognise OUR messages among deletions — `deleted_ids` carry no author; matching pops the entry (no duplicate notifications). Events without `chat_id` (DMs/small groups) must never match channel cache entries (`CHANNEL_ID_THRESHOLD` on marked ids) — per-channel message ids collide with the global id space. Messages in the self-dialog are not cached (no notification loop). `run()` uses `asyncio.gather`, NOT `TaskGroup` — TaskGroup wraps KeyboardInterrupt into BaseExceptionGroup and breaks the CLI Ctrl+C pattern. Best-effort by design: Telegram doesn't always send the deletion update; cache is in-memory.
 - **`flood.py`**: dependency-free FloodWait retry. Transient waits (≤60s, within a 120s budget) are slept-and-retried; anything else raises `HandledFloodWaitError`. Other exceptions propagate. Vendored from the parent `tg_content_factory` project — keep it pool/DB-free.
 - **`events.py` — `EventBus`**: asyncio fan-out. One Telethon `NewMessage` handler `publish()`es; each UI `subscribe()`s its own bounded queue. **Publishing never blocks** — a full subscriber queue drops its oldest item so a slow consumer can't stall the Telethon loop.
 - **`auth.py`**: `SessionStore` persists Telethon `StringSession` strings as 0600 plain-text files under `~/.tg_messenger/sessions/` (no SQLite). An external session string can be injected and is never written to disk. `LoginFlow` is the two-step phone→code→2FA sign-in; `phone_code_hash` stays bound to the same client/session.
@@ -71,5 +72,5 @@ Tests inject a fake Telethon client — never hit the network. Mirror these patt
 - **CLI**: `monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)`.
 - **TUI**: `MessengerTUI(client=stub)`.
 - **Agent**: `Orchestrator(classify_fn=fake, chat_fn=fake, task_agent=stub_with_ainvoke)`; factory tests monkeypatch `factory.init_chat_model`/`factory.create_deep_agent`; CLI patches `cli_main.make_agent_runner`. Agent test modules guard with `pytest.importorskip("langgraph"/"deepagents")` — the suite stays green on a plain `.[dev]` install (they skip). Tests never call a real LLM.
-- `tests/conftest.py` provides `FakeTelethonClient` (records `sent`/`downloads`, can `push_event` into registered handlers) and a `session_dir` tmp fixture.
+- `tests/conftest.py` provides `FakeTelethonClient` (records `sent`/`downloads`, can `push_event` into registered handlers — dispatched by builder type like real Telethon: `MessageDeleted` by the `deleted_ids` attribute, `NewMessage(incoming=)/(outgoing=)` by `event.message.out`) and a `session_dir` tmp fixture.
 - `tests/__init__.py` is deliberately empty — don't delete it. Without it `tests/` is a namespace package, and a stray top-level `tests` package in site-packages (ultralytics and yfinance_cache ship one) wins the import resolution, breaking `from tests.conftest import ...` at collection time.

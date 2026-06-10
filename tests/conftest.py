@@ -5,6 +5,28 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pytest
+from telethon import events as _tg_events
+
+
+def _builder_matches(builder, event) -> bool:
+    """Mimic Telethon dispatch: route a pushed event only to matching builders.
+
+    Just enough for our handlers: MessageDeleted events are recognised by the
+    ``deleted_ids`` attribute; NewMessage(incoming=)/(outgoing=) — by message.out.
+    """
+    if builder is None:
+        return True
+    if isinstance(builder, _tg_events.MessageDeleted):
+        return hasattr(event, "deleted_ids")
+    if isinstance(builder, _tg_events.NewMessage):
+        if hasattr(event, "deleted_ids"):
+            return False
+        out = bool(getattr(getattr(event, "message", None), "out", False))
+        if builder.outgoing and not builder.incoming:
+            return out
+        if builder.incoming and not builder.outgoing:
+            return not out
+    return True
 
 
 class FakeUser:
@@ -188,8 +210,9 @@ class FakeTelethonClient:
         self._handlers.append((handler, event))
 
     async def push_event(self, event):
-        for handler, _ in self._handlers:
-            await handler(event)
+        for handler, builder in self._handlers:
+            if _builder_matches(builder, event):
+                await handler(event)
 
 
 @pytest.fixture(autouse=True)

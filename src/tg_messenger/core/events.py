@@ -1,8 +1,9 @@
-"""EventBus — asyncio fan-out of incoming messages to N subscribers.
+"""EventBus — asyncio fan-out of events to N subscribers.
 
-One Telethon NewMessage handler publishes; every UI subscribes independently.
+One Telethon handler publishes; every consumer subscribes independently.
 Publishing never blocks: a full subscriber queue drops its oldest item so a
-slow consumer can't stall the Telethon event loop.
+slow consumer can't stall the Telethon event loop. Generic over the event
+type — the client runs separate buses for incoming/outgoing/deleted streams.
 """
 
 from __future__ import annotations
@@ -10,32 +11,33 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-
-from tg_messenger.core.models import IncomingEvent
+from typing import Generic, TypeVar
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAXSIZE = 100
 
+T = TypeVar("T")
 
-class EventBus:
+
+class EventBus(Generic[T]):
     def __init__(self, maxsize: int = DEFAULT_MAXSIZE):
         self._maxsize = maxsize
-        self._subscribers: set[asyncio.Queue[IncomingEvent]] = set()
+        self._subscribers: set[asyncio.Queue[T]] = set()
 
     @property
     def subscriber_count(self) -> int:
         return len(self._subscribers)
 
-    def _register(self) -> asyncio.Queue[IncomingEvent]:
-        queue: asyncio.Queue[IncomingEvent] = asyncio.Queue(maxsize=self._maxsize)
+    def _register(self) -> asyncio.Queue[T]:
+        queue: asyncio.Queue[T] = asyncio.Queue(maxsize=self._maxsize)
         self._subscribers.add(queue)
         return queue
 
-    def _unregister(self, queue: asyncio.Queue[IncomingEvent]) -> None:
+    def _unregister(self, queue: asyncio.Queue[T]) -> None:
         self._subscribers.discard(queue)
 
-    def publish(self, event: IncomingEvent) -> None:
+    def publish(self, event: T) -> None:
         for queue in self._subscribers:
             if queue.full():
                 try:
@@ -48,7 +50,7 @@ class EventBus:
                     pass
             queue.put_nowait(event)
 
-    async def subscribe(self) -> AsyncIterator[IncomingEvent]:
+    async def subscribe(self) -> AsyncIterator[T]:
         queue = self._register()
         try:
             while True:

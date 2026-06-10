@@ -290,6 +290,28 @@ def listen(session: str) -> None:
 
 
 @cli.command()
+@click.option("--session", default="default")
+def watch(session: str) -> None:
+    """Back up your deleted messages (e.g. removed by group moderator bots) to Saved Messages."""
+    from tg_messenger.core.watch import DeletionWatcher
+
+    async def _do():
+        client = make_client(session_name=session)
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            click.echo("Watching for deletions of your messages (Ctrl+C to stop)...")
+            await DeletionWatcher(client, echo=click.echo).run()
+        finally:
+            await client.disconnect()
+
+    try:
+        _run(_do(), session=session)
+    except KeyboardInterrupt:
+        click.echo("stopped.")
+
+
+@cli.command()
 @click.argument("dialog_id", type=int)
 @click.option("--session", default="default")
 def chat(dialog_id: int, session: str) -> None:
