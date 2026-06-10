@@ -13,6 +13,7 @@ class WebStubClient:
     def __init__(self):
         self.bus = EventBus()
         self.sent = []
+        self.searched = []
 
     async def connect(self):
         pass
@@ -48,6 +49,11 @@ class WebStubClient:
         return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption or "<media>",
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
+    async def search_messages(self, peer, query, limit=20):
+        self.searched.append((peer, query))
+        return [Message(id=5, dialog_id=peer, sender_id=peer, out=False, text="found-it",
+                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))]
+
     async def listen_all(self):
         async for ev in self.bus.subscribe():
             yield ev
@@ -78,6 +84,14 @@ async def test_dialogs_fragment(client_app):
     assert "7" in r.text
 
 
+async def test_dialogs_fragment_shows_visible_id(client_app):
+    # цикл 63: id диалога виден в тексте строки, не только в hx-get URL
+    ac, _ = client_app
+    r = await ac.get("/dialogs")
+    # "7 — Ann" — видимый id рядом с заголовком
+    assert "7 — Ann" in r.text
+
+
 async def test_dialogs_default_tab_is_dm(client_app):
     ac, _ = client_app
     r = await ac.get("/dialogs")
@@ -104,6 +118,46 @@ async def test_dialogs_unknown_tab_falls_back_to_dm(client_app):
     assert r.status_code == 200
     assert "Ann" in r.text
     assert "Devs" not in r.text
+
+
+# --- цикл 65: поиск диалогов (?q=) и сообщений (/dialogs/{id}/search) ---
+
+
+async def test_dialogs_query_filters_dm_tab(client_app):
+    ac, _ = client_app
+    r = await ac.get("/dialogs?q=ann")
+    assert r.status_code == 200
+    assert "Ann" in r.text
+
+
+async def test_dialogs_query_no_match_returns_empty(client_app):
+    ac, _ = client_app
+    r = await ac.get("/dialogs?q=zzznope")
+    assert r.status_code == 200
+    assert "Ann" not in r.text
+
+
+async def test_dialogs_query_filters_groups_tab(client_app):
+    ac, _ = client_app
+    r = await ac.get("/dialogs?tab=groups&q=Devs")
+    assert r.status_code == 200
+    assert "Devs" in r.text
+    for non_match in ("News", "HelperBot"):
+        assert non_match not in r.text
+
+
+async def test_dialog_search_calls_search_messages(client_app):
+    ac, stub = client_app
+    r = await ac.get("/dialogs/7/search?q=hi")
+    assert r.status_code == 200
+    assert "found-it" in r.text  # текст из заглушки search_messages
+    assert stub.searched == [(7, "hi")]
+
+
+async def test_index_has_search_input(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert 'name="q"' in r.text  # поле поиска над списком диалогов
 
 
 async def test_index_has_tab_buttons(client_app):

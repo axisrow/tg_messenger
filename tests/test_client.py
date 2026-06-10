@@ -134,6 +134,53 @@ async def test_history_maps_messages(fake_client):
     assert msgs[1].out is True
 
 
+# --- цикл 64: серверный поиск сообщений в диалоге ---
+
+async def test_search_messages_passes_query_and_maps(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    results = await client.search_messages(7, "hi", limit=5)
+    assert all(isinstance(m, Message) for m in results)
+    assert fake_client.last_search == "hi"  # server-side search= was passed through
+    assert [m.text for m in results] == ["hi"]  # only the matching message
+
+
+async def test_search_messages_limit_passed(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.search_messages(7, "", limit=3)
+    assert fake_client.iter_messages_calls >= 1
+
+
+async def test_search_messages_flood_is_handled(fake_client, monkeypatch):
+    # search routes through run_with_flood_wait_retry like every other read
+    import tg_messenger.core.flood as flood
+    from tg_messenger.core.flood import HandledFloodWaitError
+
+    class FakeFloodWaitError(Exception):
+        def __init__(self, seconds):
+            super().__init__(f"flood {seconds}s")
+            self.seconds = seconds
+
+    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+
+    def boom(*a, **k):
+        async def gen():
+            raise FakeFloodWaitError(9999)  # non-transient → HandledFloodWaitError
+            yield  # pragma: no cover
+
+        return gen()
+
+    fake_client.iter_messages = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.search_messages(7, "hi", limit=5)
+
+
 def test_media_ref_voice_wins_over_document():
     # Telethon: a voice note is a document with voice=True — .voice must be checked first
     doc = FakeDocument(file_name="note.ogg", size=2048)

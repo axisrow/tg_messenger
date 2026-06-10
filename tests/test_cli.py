@@ -24,6 +24,7 @@ class StubClient:
     def __init__(self, **kw):
         self.sent = []
         self.downloaded = []
+        self.searched = []
         self.history_items = None
         self.connected = False
         self.authorized = True
@@ -69,6 +70,11 @@ class StubClient:
             Message(id=1, dialog_id=peer, sender_id=peer, out=False, text="hi",
                     date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
         ]
+
+    async def search_messages(self, peer, query, limit=20):
+        self.searched.append((peer, query, limit))
+        return [Message(id=5, dialog_id=peer, sender_id=peer, out=False, text="found-it",
+                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))]
 
     async def download_message_media(self, peer, message_id, dest):
         self.downloaded.append((message_id, str(dest)))
@@ -122,6 +128,14 @@ def test_dialogs_lists_dms(runner):
     assert "7" in result.output
 
 
+def test_dialogs_prints_id_next_to_title(runner):
+    # цикл 63: id виден в выводе рядом с заголовком (id<TAB>title)
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0
+    assert "7\tAnn" in result.output
+
+
 def test_dialogs_groups_flag_lists_non_dm(runner):
     r, _ = runner
     result = r.invoke(cli_main.cli, ["dialogs", "--groups"])
@@ -131,6 +145,46 @@ def test_dialogs_groups_flag_lists_non_dm(runner):
     for kind in ("[group]", "[channel]", "[bot]"):
         assert kind in result.output
     assert "Ann" not in result.output  # DM не смешиваются с группами
+
+
+# --- цикл 65: поиск в CLI (dialogs --find, команда search) ---
+
+
+def test_dialogs_find_filters_by_query(runner):
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--find", "ann"])
+    assert result.exit_code == 0
+    assert "Ann" in result.output
+
+
+def test_dialogs_find_no_match_is_empty(runner):
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--find", "zzznope"])
+    assert result.exit_code == 0
+    assert "Ann" not in result.output
+
+
+def test_dialogs_find_works_with_groups(runner):
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--groups", "--find", "Devs"])
+    assert result.exit_code == 0
+    assert "Devs" in result.output
+    assert "News" not in result.output
+
+
+def test_search_command_calls_search_messages(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["search", "7", "hi"])
+    assert result.exit_code == 0, result.output
+    assert stub.searched == [(7, "hi", 20)]
+    assert "found-it" in result.output
+
+
+def test_search_command_passes_limit(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["search", "7", "hi", "--limit", "3"])
+    assert result.exit_code == 0, result.output
+    assert stub.searched == [(7, "hi", 3)]
 
 
 def test_read_prints_history(runner):

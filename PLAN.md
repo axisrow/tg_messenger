@@ -457,6 +457,33 @@ titles сам). Дисциплина username-резолва: дорогой (~5
     (через `_effective_session`).
   - доки: CLAUDE.md (Interfaces), README («Multiple accounts (profiles)»), PLAN.md.
 
+## Циклы 62–66 — поиск диалогов и сообщений (#12, сделано)
+
+- **62** (ядро, `core/search.py`): `filter_dialogs(dialogs, query)` — чистая, без сети,
+  поверх уже загруженного списка (#8-кэш). Title-подстрока (ci), username с/без `@`
+  (exact/prefix), id (точный + positive form marked id), пустой query → весь список.
+  Тесты `test_search.py`.
+- **64** (ядро, `client.search_messages`): `search_messages(peer, query, limit=20)` =
+  `iter_messages(search=query)` через `run_with_flood_wait_retry`, БЕЗ кэша (точечный
+  lookup, не страница). Глобального поиска по всем чатам намеренно нет — это работа
+  tg_content_factory. Тесты `test_client.py`.
+- **63** (id в UI + регрессы): `_dialog_li` (web), `DialogItem` (TUI), команда `dialogs`
+  (CLI) показывают id рядом с заголовком; регресс-тесты во всех трёх (`test_web.py`/
+  `test_tui.py`/`test_cli.py`).
+- **65** (UI поиска):
+  - **web** (`test_web.py`): `GET /dialogs?tab=&q=` фильтрует через `filter_dialogs`
+    (оба таба); `<input name="q">` над списком (HTMX `hx-get`, скрытый `#current-tab`
+    держит таб); `GET /dialogs/{id}/search?q=` → фрагмент найденных сообщений
+    (`client.search_messages`).
+  - **CLI** (`test_cli.py`): `dialogs --find QUERY` (локальный фильтр, совместим с
+    `--groups`); новая команда `search PEER QUERY [--limit]` (печатает через
+    `message_line`, как `read`).
+- **66** (TUI + доки):
+  - **TUI** (`test_tui.py`): `Input#search` над вкладками; `on_input_changed` фильтрует
+    видимые `DialogItem` через `filter_dialogs` поверх `self._all_dialogs` (локально,
+    без сети). Поиск сообщений внутри диалога в TUI отложен как v1-компромисс.
+  - доки: CLAUDE.md (core + Interfaces), README («Search»), PLAN.md.
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.

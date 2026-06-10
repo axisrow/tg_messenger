@@ -27,10 +27,17 @@
   <aside id="dialogs">
     <nav id="tabs">
       <button class="tab active" hx-get="/dialogs?tab=dm"
-              hx-target="#dialogs ul" hx-swap="innerHTML">DM</button>
+              hx-target="#dialogs ul" hx-swap="innerHTML"
+              hx-on:click="document.getElementById('dialog-search').value=''">DM</button>
       <button class="tab" hx-get="/dialogs?tab=groups"
-              hx-target="#dialogs ul" hx-swap="innerHTML">Группы</button>
+              hx-target="#dialogs ul" hx-swap="innerHTML"
+              hx-on:click="document.getElementById('dialog-search').value=''">Группы</button>
     </nav>
+    <input type="search" id="dialog-search" name="q" placeholder="Поиск диалогов…"
+           autocomplete="off"
+           hx-get="/dialogs" hx-trigger="input changed delay:200ms, search"
+           hx-include="#current-tab" hx-target="#dialogs ul" hx-swap="innerHTML">
+    <input type="hidden" id="current-tab" name="tab" value="dm">
     <ul hx-get="/dialogs" hx-trigger="load" hx-target="#dialogs ul" hx-swap="innerHTML"></ul>
   </aside>
   <main id="chat">
@@ -42,11 +49,13 @@
     </form>
   </main>
   <script>
-    // Highlight the active dialog-list tab.
+    // Highlight the active dialog-list tab and remember it for the search box.
     document.getElementById('tabs').addEventListener('click', (e) => {
       const tab = e.target.closest('.tab');
       if (!tab) return;
       document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', t === tab));
+      const hx = tab.getAttribute('hx-get') || '';
+      document.getElementById('current-tab').value = hx.includes('groups') ? 'groups' : 'dm';
     });
     // Track selected dialog id from clicks on the list, wire SSE for incoming.
     let es = null;

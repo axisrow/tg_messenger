@@ -251,6 +251,20 @@ class StandaloneTelegramClient:
         p = int(peer)
         self._history_cache.invalidate_if(lambda k: k[0] == p)
 
+    async def search_messages(self, peer: int, query: str, limit: int = 20) -> list[Message]:
+        """Server-side message search within a dialog (Telegram's own ``search=``).
+
+        NOT cached (a one-off lookup, not a page the UIs re-read); routed through
+        ``run_with_flood_wait_retry`` like every other network read.
+        """
+        raw = await run_with_flood_wait_retry(
+            lambda: self._collect_search(peer, query, limit), operation="search_messages"
+        )
+        return [self._to_message(m, dialog_id=int(peer)) for m in raw]
+
+    async def _collect_search(self, peer, query, limit) -> list:
+        return [m async for m in self._client.iter_messages(peer, search=query, limit=limit)]
+
     # --- sending ---
     async def send_text(self, peer: int, text: str) -> Message:
         msg = await run_with_flood_wait_retry(

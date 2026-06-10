@@ -180,13 +180,16 @@ class FakeTelethonClient:
 
         return gen()
 
-    def iter_messages(self, peer, limit=50, ids=None, **k):
+    def iter_messages(self, peer, limit=50, ids=None, search=None, **k):
         self.iter_messages_calls += 1
+        self.last_search = search  # so search_messages tests can assert it was passed
         items = self.messages.get(int(peer), [])
         if ids is not None:
             wanted = ids if isinstance(ids, (list, tuple)) else [ids]
             items = [m for m in items if m.id in wanted]
         else:
+            if search is not None:
+                items = [m for m in items if search.casefold() in (m.text or "").casefold()]
             items = items[:limit]
 
         async def gen():

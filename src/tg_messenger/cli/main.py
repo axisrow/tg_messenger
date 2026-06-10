@@ -339,18 +339,43 @@ def profiles() -> None:
 @cli.command()
 @click.option("--session", default="default")
 @click.option("--groups", is_flag=True, help="List groups/channels/bots instead of DMs.")
-def dialogs(session: str, groups: bool) -> None:
-    """List your dialogs (DMs by default; --groups for groups/channels/bots)."""
+@click.option("--find", "find", default=None,
+              help="Filter dialogs locally by title/username/id (no network).")
+def dialogs(session: str, groups: bool, find: str | None) -> None:
+    """List your dialogs (DMs by default; --groups for groups/channels/bots).
+
+    ``--find`` filters the already-fetched list locally (title substring, username
+    with/without @, or id) — no extra request.
+    """
+    from tg_messenger.core.search import filter_dialogs
 
     async def _do(client):
         return await (client.group_dialogs() if groups else client.dialogs())
 
     items = _run(_with_client(session, _do), session=session)
+    if find is not None:
+        items = filter_dialogs(items, find)
     for d in items:
         unread = f" ({d.unread} unread)" if d.unread else ""
         uname = f" @{d.username}" if d.username else ""
         kind = f" [{d.kind}]" if groups else ""  # одна вкладка смешивает виды — пометить
         click.echo(f"{d.id}\t{d.title}{uname}{kind}{unread}")
+
+
+@cli.command()
+@click.argument("dialog_id", type=int)
+@click.argument("query")
+@click.option("--limit", default=20, help="Max number of messages to return.")
+@click.option("--session", default="default")
+def search(dialog_id: int, query: str, limit: int, session: str) -> None:
+    """Search messages inside a dialog (Telegram's own server-side search)."""
+
+    async def _do(client):
+        return await client.search_messages(dialog_id, query, limit=limit)
+
+    messages = _run(_with_client(session, _do), session=session)
+    for m in messages:
+        click.echo(message_line(m))
 
 
 @cli.command()
