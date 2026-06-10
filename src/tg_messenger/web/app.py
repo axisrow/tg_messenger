@@ -137,16 +137,24 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
 
     @app.get("/dialogs/{dialog_id}/messages", response_class=HTMLResponse)
     async def messages(request: Request, dialog_id: int):
-        items = await request.app.state.client.history(dialog_id, limit=50)
+        client = request.app.state.client
+        items = await client.history(dialog_id, limit=50)
+        # opening a dialog clears its unread counter — best-effort, never block the read
+        try:
+            await client.mark_read(dialog_id)
+        except Exception:
+            logger.warning("mark_read failed for dialog %s — continuing", dialog_id, exc_info=True)
         return HTMLResponse("".join(_message_div(m) for m in items))
 
     @app.post("/send", response_class=HTMLResponse)
-    async def send(request: Request, dialog_id: str = Form(""), text: str = Form("")):
+    async def send(request: Request, dialog_id: str = Form(""), text: str = Form(""),
+                   reply_to: str = Form("")):
         if not dialog_id.strip().lstrip("-").isdigit():
             return HTMLResponse('<div class="error">Select a dialog first.</div>', status_code=400)
         if not text.strip():
             return HTMLResponse('<div class="error">Cannot send an empty message.</div>', status_code=400)
-        msg = await request.app.state.client.send_text(int(dialog_id), text)
+        reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
+        msg = await request.app.state.client.send_text(int(dialog_id), text, reply_to=reply_to_id)
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/media", response_class=HTMLResponse)

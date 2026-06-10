@@ -47,6 +47,7 @@ class Message(BaseModel):
     date: datetime
     text: str | None = None
     media: MediaRef | None = None
+    reply_to_id: int | None = None  # id of the message this one replies to, if any
 
 
 class IncomingEvent(BaseModel):

@@ -277,12 +277,49 @@ class StandaloneTelegramClient:
         return [m async for m in self._client.iter_messages(peer, search=query, limit=limit)]
 
     # --- sending ---
-    async def send_text(self, peer: int, text: str) -> Message:
+    async def send_text(self, peer: int, text: str, reply_to: int | None = None) -> Message:
         msg = await run_with_flood_wait_retry(
-            lambda: self._client.send_message(peer, text), operation="send_text"
+            lambda: self._client.send_message(peer, text, reply_to=reply_to),
+            operation="send_text",
         )
         self._invalidate_history(peer)  # the new message must show on reopen
         return self._to_message(msg, dialog_id=int(peer))
+
+    async def forward(self, from_peer: int, message_ids: list[int], to_peer: int) -> list[Message]:
+        """Forward ``message_ids`` from ``from_peer`` to ``to_peer``.
+
+        Invalidates the history cache of BOTH peers (source can change too via
+        Telegram's own behaviour, and the destination gains the new messages).
+        """
+        sent = await run_with_flood_wait_retry(
+            lambda: self._client.forward_messages(to_peer, message_ids, from_peer),
+            operation="forward",
+        )
+        self._invalidate_history(from_peer)
+        self._invalidate_history(to_peer)
+        return [self._to_message(m, dialog_id=int(to_peer)) for m in (sent or [])]
+
+    async def edit_text(self, peer: int, message_id: int, text: str) -> Message:
+        msg = await run_with_flood_wait_retry(
+            lambda: self._client.edit_message(peer, int(message_id), text),
+            operation="edit_text",
+        )
+        self._invalidate_history(peer)
+        return self._to_message(msg, dialog_id=int(peer))
+
+    async def delete_messages(self, peer: int, message_ids: list[int], revoke: bool = True) -> None:
+        """Delete messages; ``revoke=True`` removes them for everyone (default)."""
+        await run_with_flood_wait_retry(
+            lambda: self._client.delete_messages(peer, message_ids, revoke=revoke),
+            operation="delete_messages",
+        )
+        self._invalidate_history(peer)
+
+    async def mark_read(self, peer: int) -> None:
+        """Mark a dialog read (clears its unread counter), routed through flood retry."""
+        await run_with_flood_wait_retry(
+            lambda: self._client.send_read_acknowledge(peer), operation="mark_read"
+        )
 
     async def send_media(self, peer: int, file_path: str | Path, caption: str | None = None) -> Message:
         msg = await run_with_flood_wait_retry(
@@ -541,6 +578,9 @@ class StandaloneTelegramClient:
     @staticmethod
     def _to_message(raw, *, dialog_id: int) -> Message:
         media = StandaloneTelegramClient._to_media_ref(raw)
+        # best-effort: Telethon exposes .reply_to (MessageReplyHeader) with .reply_to_msg_id
+        reply_to = getattr(raw, "reply_to", None)
+        reply_to_id = getattr(reply_to, "reply_to_msg_id", None) if reply_to is not None else None
         return Message(
             id=getattr(raw, "id", 0),
             dialog_id=dialog_id,
@@ -549,4 +589,5 @@ class StandaloneTelegramClient:
             date=raw.date,
             text=getattr(raw, "text", None) or getattr(raw, "message", None),
             media=media,
+            reply_to_id=int(reply_to_id) if reply_to_id is not None else None,
         )
