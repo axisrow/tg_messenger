@@ -213,17 +213,21 @@ def login(session: str, phone: str) -> None:
 
 @cli.command()
 @click.option("--session", default="default")
-def dialogs(session: str) -> None:
-    """List your direct-message dialogs."""
+@click.option("--groups", is_flag=True, help="List groups/channels/bots instead of DMs.")
+def dialogs(session: str, groups: bool) -> None:
+    """List your dialogs (DMs by default; --groups for groups/channels/bots)."""
 
     async def _do(client):
+        if groups:
+            return [d for d in await client.dialogs(dm_only=False) if d.kind != "dm"]
         return await client.dialogs(dm_only=True)
 
     items = _run(_with_client(session, _do), session=session)
     for d in items:
         unread = f" ({d.unread} unread)" if d.unread else ""
         uname = f" @{d.username}" if d.username else ""
-        click.echo(f"{d.id}\t{d.title}{uname}{unread}")
+        kind = f" [{d.kind}]" if groups else ""  # одна вкладка смешивает виды — пометить
+        click.echo(f"{d.id}\t{d.title}{uname}{kind}{unread}")
 
 
 @cli.command()

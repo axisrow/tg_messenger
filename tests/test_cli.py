@@ -48,7 +48,15 @@ class StubClient:
         await asyncio.Event().wait()
 
     async def dialogs(self, dm_only=True):
-        return [Dialog(id=7, title="Ann", username="ann", unread=2)]
+        dms = [Dialog(id=7, title="Ann", username="ann", unread=2)]
+        if dm_only:
+            return dms
+        # повторяет контракт core: dm_only=False — все диалоги с kind и marked id
+        return dms + [
+            Dialog(id=-100200, title="Devs", kind="group"),
+            Dialog(id=-100123, title="News", kind="channel"),
+            Dialog(id=9, title="HelperBot", kind="bot"),
+        ]
 
     async def history(self, peer, limit=50, offset_id=0):
         if self.history_items is not None:
@@ -108,6 +116,17 @@ def test_dialogs_lists_dms(runner):
     assert result.exit_code == 0
     assert "Ann" in result.output
     assert "7" in result.output
+
+
+def test_dialogs_groups_flag_lists_non_dm(runner):
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--groups"])
+    assert result.exit_code == 0
+    assert "Devs" in result.output
+    assert "-100200" in result.output  # marked id — пригоден для read/send
+    for kind in ("[group]", "[channel]", "[bot]"):
+        assert kind in result.output
+    assert "Ann" not in result.output  # DM не смешиваются с группами
 
 
 def test_read_prints_history(runner):

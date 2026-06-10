@@ -1,9 +1,9 @@
 import asyncio
 from datetime import datetime, timezone
 
-from textual.widgets import Input, ListView
+from textual.widgets import Input, ListView, Tabs
 
-from tg_messenger.core.models import Dialog, Message
+from tg_messenger.core.models import Dialog, IncomingEvent, Message
 from tg_messenger.tui.app import DialogItem, MessageBubble, MessengerTUI
 
 
@@ -26,7 +26,14 @@ class TuiStubClient:
     async def dialogs(self, dm_only=True):
         self.dialogs_calls += 1
         # title contains markup-hostile brackets on purpose
-        return [Dialog(id=7, title="Ann [/x", username="ann", unread=0)]
+        dms = [Dialog(id=7, title="Ann [/x", username="ann", unread=0)]
+        if dm_only:
+            return dms
+        # повторяет контракт core: dm_only=False — все диалоги с kind и marked id
+        return dms + [
+            Dialog(id=-100200, title="Devs", kind="group"),
+            Dialog(id=9, title="HelperBot", kind="bot"),
+        ]
 
     async def history(self, peer, limit=50, offset_id=0):
         return [Message(id=1, dialog_id=peer, sender_id=peer, out=False,
@@ -38,7 +45,7 @@ class TuiStubClient:
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
-    async def listen(self):
+    async def listen_all(self):
         # idle forever; the worker just waits for events
         await asyncio.Event().wait()
         yield  # pragma: no cover
@@ -122,7 +129,7 @@ async def test_tui_listener_failure_logged_app_stays_alive(caplog):
         raise RuntimeError("listener blew up")
         yield  # pragma: no cover
 
-    stub.listen = broken_listen
+    stub.listen_all = broken_listen
     app = MessengerTUI(client=stub)
     with caplog.at_level("ERROR", logger="tg_messenger.tui.app"):
         async with app.run_test() as pilot:
@@ -272,6 +279,93 @@ async def test_tui_shows_loading_until_dialogs_arrive():
         await pilot.pause()
         assert app.query_one("#dialogs", ListView).loading is False
         assert len(list(app.query(DialogItem))) == 1
+
+
+# --- Цикл 36: вкладки DM / Группы ---
+
+
+def _listed_ids(app):
+    return [item.dialog_id for item in app.query(DialogItem)]
+
+
+async def test_tui_has_tabs_dm_active_by_default():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tabs = app.query_one(Tabs)
+        assert tabs.active == "dm"
+        assert _listed_ids(app) == [7]
+
+
+async def test_tui_groups_tab_lists_non_dm_dialogs():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "groups"
+        await pilot.pause()
+        assert _listed_ids(app) == [-100200, 9]  # без DM
+
+
+async def test_tui_tab_switch_back_reloads_dm():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tabs = app.query_one(Tabs)
+        tabs.active = "groups"
+        await pilot.pause()
+        tabs.active = "dm"
+        await pilot.pause()
+        assert _listed_ids(app) == [7]  # список перезагружен, не накоплен
+
+
+async def test_tui_tab_activation_before_startup_is_safe():
+    # переключение вкладки, пока connect ещё висит, не должно дёргать сеть
+    stub = TuiStubClient()
+    connect_entered = asyncio.Event()
+    stub.connect = hangs_forever(connect_entered)
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(connect_entered.wait(), 5)
+        await pilot.pause()
+        app.query_one(Tabs).active = "groups"
+        await pilot.pause()
+        assert stub.dialogs_calls == 0  # клиент ещё не готов — запроса не было
+        assert app.return_code is None  # и приложение живо
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
+# --- Цикл 37: live-входящие из групп ---
+
+
+class GroupEventClient(TuiStubClient):
+    """listen_all, который по сигналу отдаёт два события: DM и групповое."""
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def listen_all(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield IncomingEvent(dialog_id=7, message=Message(
+            id=20, dialog_id=7, sender_id=7, out=False, text="из ЛС", date=date))
+        yield IncomingEvent(dialog_id=-100200, message=Message(
+            id=21, dialog_id=-100200, sender_id=9, out=False, text="из группы", date=date))
+        await asyncio.Event().wait()  # idle forever
+
+
+async def test_tui_group_incoming_appends_bubble_for_open_group_only():
+    stub = GroupEventClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = -100200  # открыта группа
+        stub.fire.set()
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+        # ЛС-событие не дорисовано (чужой диалог), групповое — да
+        assert [str(b.render()) for b in bubbles] == ["из группы"]
 
 
 async def test_tui_disconnects_on_exit():

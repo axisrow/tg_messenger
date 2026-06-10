@@ -41,7 +41,7 @@ def _dialog_li(d) -> str:
     uname = f" @{escape(d.username)}" if d.username else ""
     unread = f' <span class="unread">{d.unread}</span>' if d.unread else ""
     return (
-        f'<li hx-get="/dialogs/{d.id}/messages" hx-target="#messages">'
+        f'<li hx-get="/dialogs/{d.id}/messages" hx-target="#messages" data-kind="{d.kind}">'
         f"{d.id} — {escape(d.title)}{uname}{unread}</li>"
     )
 
@@ -53,9 +53,9 @@ def _message_div(m) -> str:
 
 
 async def sse_event_stream(client, dialog_id: int):
-    """Yield SSE frames for incoming messages of one dialog."""
+    """Yield SSE frames for incoming messages of one dialog (any kind — groups too)."""
     try:
-        async for ev in client.listen():
+        async for ev in client.listen_all():
             if ev.dialog_id != dialog_id:
                 continue
             payload = json.dumps({"id": ev.message.id, "text": ev.message.text})
@@ -100,8 +100,13 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
         return TEMPLATES.TemplateResponse(request, "chat.html", {})
 
     @app.get("/dialogs", response_class=HTMLResponse)
-    async def dialogs(request: Request):
-        items = await request.app.state.client.dialogs(dm_only=True)
+    async def dialogs(request: Request, tab: str = "dm"):
+        # unknown tab falls back to dm — HTMX-friendly, never a 400
+        if tab == "groups":
+            items = await request.app.state.client.dialogs(dm_only=False)
+            items = [d for d in items if d.kind != "dm"]
+        else:
+            items = await request.app.state.client.dialogs(dm_only=True)
         return HTMLResponse("".join(_dialog_li(d) for d in items))
 
     @app.get("/dialogs/{dialog_id}/messages", response_class=HTMLResponse)

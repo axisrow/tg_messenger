@@ -1,10 +1,11 @@
 import asyncio
 import logging
 
+import pytest
 from telethon.sessions import StringSession
 
-from tests.conftest import FakeChannel, FakeDialog, FakeDocument, FakeMessage, FakeUser
-from tg_messenger.core.client import StandaloneTelegramClient
+from tests.conftest import FakeChannel, FakeChat, FakeDialog, FakeDocument, FakeMessage, FakeUser
+from tg_messenger.core.client import StandaloneTelegramClient, _dialog_kind
 from tg_messenger.core.models import (
     Dialog,
     IncomingEvent,
@@ -64,6 +65,62 @@ async def test_dialogs_dm_only(fake_client):
     assert ann.unread == 2
     assert ann.last_text == "hey"
     assert ann.last_message_at is not None
+
+
+# --- Цикл 32: dialogs(dm_only=False) — все виды, marked id ---
+
+
+def _seed_all_kinds(fake_client):
+    fake_client.dialogs = [
+        FakeDialog(FakeUser(id=7, first_name="Ann", username="ann"), name="Ann"),
+        FakeDialog(FakeUser(id=9, first_name="Helper", bot=True), name="HelperBot"),
+        FakeDialog(FakeChat(id=50, title="Devs"), name="Devs"),
+        FakeDialog(FakeChannel(id=123, title="News", broadcast=True), name="News"),
+        FakeDialog(FakeChannel(id=200, title="SG", broadcast=False), name="SG"),
+    ]
+
+
+async def test_dialogs_all_returns_every_kind_with_marked_ids(fake_client):
+    _seed_all_kinds(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    dialogs = await client.dialogs(dm_only=False)
+    # id — marked (отрицательный для групп/каналов): совпадает с event.chat_id
+    assert {d.id: d.kind for d in dialogs} == {
+        7: "dm", 9: "bot", -50: "group", -100123: "channel", -100200: "group",
+    }
+    assert {d.id: d.title for d in dialogs}[-50] == "Devs"
+
+
+async def test_dialogs_dm_only_excludes_bots_and_groups(fake_client):
+    _seed_all_kinds(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    dialogs = await client.dialogs(dm_only=True)
+    assert [d.id for d in dialogs] == [7]
+    assert dialogs[0].kind == "dm"
+
+
+# --- Цикл 31: классификатор вида диалога ---
+
+
+@pytest.mark.parametrize(
+    ("entity", "kind"),
+    [
+        (FakeUser(id=7, first_name="Ann"), "dm"),
+        (FakeUser(id=9, first_name="Helper", bot=True), "bot"),
+        (FakeChat(id=50, title="Devs"), "group"),  # малая группа: title, без broadcast
+        (FakeChannel(id=200, title="SG", broadcast=False), "group"),  # супергруппа
+        (FakeChannel(id=123, title="News", broadcast=True), "channel"),  # бродкаст
+    ],
+)
+def test_dialog_kind_classifier(entity, kind):
+    assert _dialog_kind(entity) == kind
+
+
+def test_unknown_entity_is_not_dm():
+    # fail-safe прежней _is_dm_entity-семантики: ни title, ни имён → НЕ DM
+    assert _dialog_kind(object()) != "dm"
 
 
 async def test_history_maps_messages(fake_client):
@@ -266,6 +323,78 @@ async def test_get_me_returns_user(fake_client):
     assert isinstance(me, User)
     assert me.id == 1
     assert me.username == "me"
+
+
+# --- Цикл 33: listen_all — входящие из всех чатов (вкладка «Группы») ---
+
+
+async def test_listen_all_yields_group_and_dm(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    group_event = _evt(-100200, is_private=False,
+                       message=FakeMessage(id=80, sender_id=9, text="из группы", out=False))
+    dm_event = _evt(7, is_private=True,
+                    message=FakeMessage(id=81, sender_id=7, text="из ЛС", out=False))
+
+    received = []
+
+    async def consume():
+        async for ev in client.listen_all():
+            received.append(ev)
+            if len(received) == 2:
+                return
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0)
+    await fake_client.push_event(group_event)
+    await fake_client.push_event(dm_event)
+    await asyncio.wait_for(task, timeout=1)
+    assert [(ev.dialog_id, ev.message.text) for ev in received] == [
+        (-100200, "из группы"), (7, "из ЛС"),
+    ]
+
+
+async def test_listen_all_does_not_leak_groups_into_listen(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    group_event = _evt(-100200, is_private=False,
+                       message=FakeMessage(id=82, sender_id=9, text="группа", out=False))
+    dm_event = _evt(7, is_private=True,
+                    message=FakeMessage(id=83, sender_id=7, text="лс", out=False))
+
+    dm_stream, all_stream = [], []
+
+    async def consume_dm():
+        async for ev in client.listen():
+            dm_stream.append(ev)
+            return
+
+    async def consume_all():
+        async for ev in client.listen_all():
+            all_stream.append(ev)
+            if len(all_stream) == 2:
+                return
+
+    tasks = [asyncio.create_task(consume_dm()), asyncio.create_task(consume_all())]
+    await asyncio.sleep(0)
+    await fake_client.push_event(group_event)
+    await fake_client.push_event(dm_event)
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+    assert [ev.message.text for ev in dm_stream] == ["лс"]
+    assert [ev.message.text for ev in all_stream] == ["группа", "лс"]
+
+
+async def test_broken_group_event_is_logged_not_raised(fake_client, caplog):
+    # групповые события больше не дропаются до try — сбой обязан попасть в лог
+    client = _build(fake_client)
+    await client.connect()
+    broken = _evt(-100200, is_private=False, message=object())  # нет .date
+
+    with caplog.at_level("ERROR", logger="tg_messenger.core.client"):
+        await fake_client.push_event(broken)  # must not raise
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
 
 
 # --- Цикл 28: поток удалений (listen_deleted) + entity_title ---

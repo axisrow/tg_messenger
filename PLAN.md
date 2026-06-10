@@ -312,6 +312,50 @@ client = StandaloneTelegramClient(api_id, api_hash, external_session=existing_st
 запущен); собственные удаления тоже дают уведомление (актора в событии нет); правки
 (`MessageEdited`) не трекаются; авто-нажатие капчи — следующий релиз.
 
+## Циклы 31–38 — вкладки «DM / Группы» (web, TUI, CLI)
+
+Вторая вкладка рядом с DM во всех трёх интерфейсах: всё не-DM — группы, супергруппы,
+каналы-бродкасты, боты. Живые обновления в открытой группе — полноценные, как в DM.
+Агент намеренно остаётся DM-only.
+
+- **Цикл 31 — `Dialog.kind` + `_dialog_kind`.** `DialogKind = dm|group|channel|bot`
+  (default "dm" — стабы не ломаются). Классификатор: bot → "bot"; title → "channel"
+  при broadcast=True, иначе "group" (Chat без атрибута broadcast — тоже group);
+  имена → "dm"; неизвестная сущность → "group" (fail-safe вне DM). `_is_dm_entity`
+  переписан через kind — поведение бит-в-бит. conftest: `FakeChannel(broadcast=)`,
+  новый `FakeChat` (title, БЕЗ broadcast — как настоящий telethon Chat).
+- **Цикл 32 — `dialogs(dm_only=False)`: kind + marked id.** Критичный фикс: раньше
+  `Dialog.id = entity.id` (голый, положительный), а события несут marked id
+  (отрицательный для групп/каналов) — фильтры live-потоков для групп не совпали бы
+  никогда. Теперь `id=int(getattr(d, "id", entity.id))` — телетоновский `Dialog.id`
+  уже marked. conftest `FakeDialog` мимикрирует (`_marked_id`: Channel → `-100…`,
+  Chat → `-id`).
+- **Цикл 33 — `listen_all()`.** Третья шина входящих: `_on_new_message` маппит один
+  раз и публикует в `_bus_all` всегда, в `_bus` — только private. `listen()` не
+  изменился ни на бит (агент зависит от него). Никакого merge генераторов в UI —
+  это create_task/cancel и «Task was destroyed»-варнинг при filterwarnings=error.
+  Проверка is_private перенесена внутрь try: битое групповое событие логируется.
+- **Цикл 34 — web-вкладки.** `GET /dialogs?tab=dm|groups` (неизвестный tab → dm,
+  без 400); кнопки в `chat.html` (`hx-get` → `#dialogs ul`), active-класс — 3 строки
+  delegated-JS; `_dialog_li` несёт `data-kind`. Существующий JS выбора диалога
+  парсит и отрицательные id.
+- **Цикл 35 — web SSE → `listen_all()`.** Одна строка в `sse_event_stream` — фильтр
+  по dialog_id корректен для любого вида без эвристик по знаку id.
+- **Цикл 36 — TUI-вкладки.** `Tabs(Tab DM, Tab Группы)` над единственным ListView
+  в `Vertical#sidebar` (НЕ TabbedContent — ре-парентит ListView). Гард
+  `self._started` гасит TabActivated при mount (клиента ещё нет); имя НЕ `_ready` —
+  у Textual `App._ready` уже есть (коллизия даёт «'bool' is not callable»).
+  Перезагрузка списка — только `run_worker(group="dialogs", exclusive=True)`.
+- **Цикл 37 — TUI live из групп.** `_drain_incoming` → `listen_all()`.
+- **Цикл 38 — CLI `dialogs --groups`.** Не-DM списком с пометкой `[kind]`
+  (виды смешаны в одной выдаче).
+
+Принятые компромиссы v1: бродкаст-каналы read-only — отправка без прав даёт ошибку
+Telegram (web 500-фрагмент / TUI notify / CLI ClickException), превентивной блокировки
+composer нет; агент и CLI `listen`/`chat` остаются DM-only; `Dialog.id` для
+групп/каналов сменился на marked id (согласован с `event.chat_id`, пригоден для
+history/send); unread-бейджи не live; SSE — один диалог на стрим.
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.

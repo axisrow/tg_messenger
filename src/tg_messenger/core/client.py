@@ -1,7 +1,8 @@
 """StandaloneTelegramClient — the UI-agnostic core.
 
-Thin async wrapper over a single Telethon client: dialogs (DM-only), history,
-send, media, plus a single NewMessage handler fanned out through EventBus.
+Thin async wrapper over a single Telethon client: dialogs (DM-only by default,
+``dm_only=False`` for every kind), history, send, media, plus event streams
+fanned out through EventBus (``listen`` private-only, ``listen_all`` every chat).
 All network calls route through the vendored flood-wait retry.
 """
 
@@ -19,6 +20,7 @@ from tg_messenger.core.events import EventBus
 from tg_messenger.core.flood import run_with_flood_wait_retry
 from tg_messenger.core.models import (
     Dialog,
+    DialogKind,
     IncomingEvent,
     MediaRef,
     Message,
@@ -34,13 +36,21 @@ def _default_factory(session, api_id, api_hash):
     return TelegramClient(session, api_id, api_hash)
 
 
+def _dialog_kind(entity) -> DialogKind:
+    """Classify a Telethon entity: bot beats User; title means group/channel."""
+    if getattr(entity, "bot", False):
+        return "bot"
+    if getattr(entity, "title", None) is not None:
+        # Chat (small group) has no broadcast attr; Channel: megagroup vs broadcast
+        return "channel" if getattr(entity, "broadcast", False) else "group"
+    if hasattr(entity, "first_name") or hasattr(entity, "last_name"):
+        return "dm"
+    return "group"  # unknown entity — fail-safe NOT a DM (keeps the old filter's semantics)
+
+
 def _is_dm_entity(entity) -> bool:
     """DM = a User (has first/last name), not a channel/chat (has title), not a bot."""
-    if getattr(entity, "bot", False):
-        return False
-    if getattr(entity, "title", None) is not None:
-        return False
-    return hasattr(entity, "first_name") or hasattr(entity, "last_name")
+    return _dialog_kind(entity) == "dm"
 
 
 def _entity_title(entity) -> str:
@@ -104,6 +114,7 @@ class StandaloneTelegramClient:
         self._session_name = session_name
         self._client = client_factory(StringSession(session_string or None), api_id, api_hash)
         self._bus: EventBus[IncomingEvent] = EventBus()
+        self._bus_all: EventBus[IncomingEvent] = EventBus()
         self._bus_out: EventBus[OutgoingEvent] = EventBus()
         self._bus_deleted: EventBus[MessagesDeletedEvent] = EventBus()
         self._handler_registered = False
@@ -151,8 +162,11 @@ class StandaloneTelegramClient:
             last_msg = getattr(d, "message", None)
             result.append(
                 Dialog(
-                    id=entity.id,
+                    # telethon Dialog.id is the marked peer id (negative for groups/
+                    # channels) — the same value events carry and history/send accept
+                    id=int(getattr(d, "id", entity.id)),
                     title=_entity_title(entity),
+                    kind=_dialog_kind(entity),
                     username=getattr(entity, "username", None),
                     unread=getattr(d, "unread_count", 0) or 0,
                     last_text=getattr(last_msg, "text", None),
@@ -234,13 +248,14 @@ class StandaloneTelegramClient:
         self._handler_registered = True
 
     async def _on_new_message(self, event) -> None:
-        # DM-only product: drop group/channel traffic at the source
-        if not getattr(event, "is_private", True):
-            return
         try:
             dialog_id = int(getattr(event, "chat_id", 0) or 0)
             message = self._to_message(event.message, dialog_id=dialog_id)
-            self._bus.publish(IncomingEvent(dialog_id=dialog_id, message=message))
+            incoming = IncomingEvent(dialog_id=dialog_id, message=message)
+            self._bus_all.publish(incoming)  # every chat — the UIs' groups tab
+            if getattr(event, "is_private", True):
+                # listen() stays private-only (DMs + bots) — the agent relies on it
+                self._bus.publish(incoming)
         except Exception:
             # don't depend on Telethon's logger config; record it ourselves
             logger.exception("failed to handle incoming message")
@@ -267,7 +282,13 @@ class StandaloneTelegramClient:
             logger.exception("failed to handle deleted-messages event")
 
     async def listen(self) -> AsyncIterator[IncomingEvent]:
+        """Incoming from private chats only (DMs + bots)."""
         async for ev in self._bus.subscribe():
+            yield ev
+
+    async def listen_all(self) -> AsyncIterator[IncomingEvent]:
+        """Incoming from every chat — groups and channels included."""
+        async for ev in self._bus_all.subscribe():
             yield ev
 
     async def listen_outgoing(self) -> AsyncIterator[OutgoingEvent]:

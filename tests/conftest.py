@@ -39,6 +39,18 @@ class FakeUser:
 
 
 class FakeChannel:
+    """Telethon Channel: supergroup (broadcast=False) or broadcast channel (True)."""
+
+    def __init__(self, id, title=None, username=None, broadcast=False):
+        self.id = id
+        self.title = title
+        self.username = username
+        self.broadcast = broadcast
+
+
+class FakeChat:
+    """Telethon Chat (small group) — carries a title and NO broadcast attribute."""
+
     def __init__(self, id, title=None, username=None):
         self.id = id
         self.title = title
@@ -72,10 +84,19 @@ class FakeMessage:
         self.peer_id = peer_id
 
 
+def _marked_id(entity) -> int:
+    """Mimic telethon Dialog.id (utils.get_peer_id): marked id, negative for groups/channels."""
+    if isinstance(entity, FakeChannel):
+        return int(f"-100{entity.id}")
+    if isinstance(entity, FakeChat):
+        return -entity.id
+    return entity.id
+
+
 class FakeDialog:
     def __init__(self, entity, *, name="", unread_count=0, message=None):
         self.entity = entity
-        self.id = entity.id
+        self.id = _marked_id(entity)
         self.name = name
         self.title = name
         self.unread_count = unread_count

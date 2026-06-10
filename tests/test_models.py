@@ -39,6 +39,21 @@ def test_dialog_defaults():
     assert dialog.last_message_at is None
 
 
+def test_dialog_kind_defaults_to_dm():
+    assert Dialog(id=7, title="Ann").kind == "dm"
+
+
+def test_dialog_kind_accepts_group_channel_bot():
+    assert Dialog(id=-50, title="Devs", kind="group").kind == "group"
+    assert Dialog(id=-100123, title="News", kind="channel").kind == "channel"
+    assert Dialog(id=9, title="HelperBot", kind="bot").kind == "bot"
+
+
+def test_dialog_kind_rejects_unknown():
+    with pytest.raises(ValidationError):
+        Dialog(id=7, title="x", kind="megagroup")
+
+
 def test_message_text_only():
     msg = Message(id=1, dialog_id=7, sender_id=42, out=False, text="hi", date=_now())
     assert msg.text == "hi"

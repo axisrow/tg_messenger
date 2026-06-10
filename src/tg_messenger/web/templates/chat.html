@@ -7,6 +7,9 @@
   <style>
     body { font-family: system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
     #dialogs { width: 300px; border-right: 1px solid #ccc; overflow-y: auto; }
+    #tabs { display: flex; border-bottom: 1px solid #ccc; }
+    #tabs .tab { flex: 1; padding: 8px; border: none; background: #f7f7f7; cursor: pointer; }
+    #tabs .tab.active { background: #fff; font-weight: bold; border-bottom: 2px solid #2481cc; }
     #dialogs ul { list-style: none; margin: 0; padding: 0; }
     #dialogs li { padding: 10px; cursor: pointer; border-bottom: 1px solid #eee; }
     #dialogs li:hover { background: #f3f3f3; }
@@ -22,6 +25,12 @@
 </head>
 <body>
   <aside id="dialogs">
+    <nav id="tabs">
+      <button class="tab active" hx-get="/dialogs?tab=dm"
+              hx-target="#dialogs ul" hx-swap="innerHTML">DM</button>
+      <button class="tab" hx-get="/dialogs?tab=groups"
+              hx-target="#dialogs ul" hx-swap="innerHTML">Группы</button>
+    </nav>
     <ul hx-get="/dialogs" hx-trigger="load" hx-target="#dialogs ul" hx-swap="innerHTML"></ul>
   </aside>
   <main id="chat">
@@ -33,6 +42,12 @@
     </form>
   </main>
   <script>
+    // Highlight the active dialog-list tab.
+    document.getElementById('tabs').addEventListener('click', (e) => {
+      const tab = e.target.closest('.tab');
+      if (!tab) return;
+      document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', t === tab));
+    });
     // Track selected dialog id from clicks on the list, wire SSE for incoming.
     let es = null;
     document.body.addEventListener('click', (e) => {
