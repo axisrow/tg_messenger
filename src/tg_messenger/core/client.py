@@ -65,14 +65,14 @@ class StandaloneTelegramClient:
 
     # --- connection ---
     async def connect(self) -> None:
-        await self._client.connect()
+        await run_with_flood_wait_retry(lambda: self._client.connect(), operation="connect")
         self._ensure_handler()
 
     async def disconnect(self) -> None:
         await self._client.disconnect()
 
     async def is_authorized(self) -> bool:
-        return await self._client.is_user_authorized()
+        return await run_with_flood_wait_retry(lambda: self._client.is_user_authorized(), operation="is_authorized")
 
     def save_session(self) -> None:
         self._store.save(self._session_name, self._client.session.save())
