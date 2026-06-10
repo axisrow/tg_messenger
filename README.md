@@ -116,6 +116,28 @@ not starting with `@` is sent as plain text as before.
 becomes the caption. Uploads are capped at `TG_WEB_MAX_UPLOAD_MB` (default 50) — a
 larger file is rejected with HTTP 413, an empty one with 400.
 
+## Web authorization
+
+Set `TG_WEB_PASS` to put the whole web UI behind a password. With it, every route
+sits behind an HMAC-cookie session: `GET /login` shows a password form, a correct
+password (compared in constant time) sets a signed cookie valid for 7 days, and
+`GET /logout` clears it. The cookie is signed with a per-process random key
+(`secrets.token_bytes`), so a restart invalidates all sessions and the value cannot
+be forged or extended. A wrong password is logged (WARNING with the client IP) and
+delayed before a 401. Unauthenticated requests redirect browsers to `/login` and
+return 401 to API/SSE callers (including `GET /stream/{id}`).
+
+Without `TG_WEB_PASS`, a bind to `127.0.0.1` is unauthenticated as before, but
+binding to a non-localhost host (e.g. `--host 0.0.0.0`) is **refused** — set the
+password or pass `--insecure` (a deliberate, logged bypass).
+
+```bash
+TG_WEB_PASS=secret tg-messenger serve --host 0.0.0.0
+```
+
+> This adds authentication, not transport encryption. There is no built-in HTTPS:
+> terminate TLS at a reverse proxy (nginx/caddy) in front of the server.
+
 ## Multiple accounts (profiles)
 
 Each saved login is a *profile* (a session file under `~/.tg_messenger/sessions/`).

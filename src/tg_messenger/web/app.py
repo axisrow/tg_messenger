@@ -6,16 +6,21 @@ StandaloneTelegramClient is created from env and connected on startup.
 
 from __future__ import annotations
 
+import asyncio
+import hmac
 import json
 import logging
 import os
+import secrets
 import tempfile
+import time
 from contextlib import asynccontextmanager
+from hashlib import sha256
 from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
@@ -26,6 +31,50 @@ from tg_messenger.core.search import filter_dialogs
 logger = logging.getLogger(__name__)
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+# --- web authorization (#24) -------------------------------------------------
+COOKIE_NAME = "tg_session"
+COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 days
+# paths reachable without a valid cookie (the login wizard itself)
+_PUBLIC_PATHS = frozenset({"/login", "/logout"})
+# wrong-password penalty; injected so tests monkeypatch it to a no-op (no real sleep)
+_WRONG_PASSWORD_DELAY = 1.0
+
+
+async def _login_delay(seconds: float) -> None:
+    """Sleep after a failed login. Tests monkeypatch this to a no-op."""
+    await asyncio.sleep(seconds)
+
+
+def _sign_cookie(key: bytes, *, expiry: int | None = None) -> str:
+    """Build a signed cookie value ``"{expiry}:{hmac_hex}"``.
+
+    The HMAC-SHA256 (per-process random ``key``) is taken over the expiry, so a
+    client cannot forge or extend a cookie without the key.
+    """
+    if expiry is None:
+        expiry = int(time.time()) + COOKIE_MAX_AGE
+    mac = hmac.new(key, str(expiry).encode("ascii"), sha256).hexdigest()
+    return f"{expiry}:{mac}"
+
+
+def _valid_cookie(key: bytes, value: str | None) -> bool:
+    """Constant-time validate a cookie: good signature AND not expired."""
+    if not value or ":" not in value:
+        return False
+    expiry_str, _, mac = value.partition(":")
+    try:
+        expiry = int(expiry_str)
+    except ValueError:
+        return False
+    expected = hmac.new(key, str(expiry).encode("ascii"), sha256).hexdigest()
+    if not hmac.compare_digest(mac, expected):
+        return False
+    return expiry > int(time.time())
+
+
+def _wants_html(request: Request) -> bool:
+    return "text/html" in request.headers.get("accept", "")
 
 
 def _make_real_client(session_name: str):
@@ -103,7 +152,9 @@ async def sse_event_stream(client, dialog_id: int):
         return
 
 
-def build_app(*, client=None, session_name: str = "default", suggester=None) -> FastAPI:
+def build_app(
+    *, client=None, session_name: str = "default", suggester=None, web_pass: str | None = None
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.client = client or _make_real_client(session_name)
@@ -114,6 +165,53 @@ def build_app(*, client=None, session_name: str = "default", suggester=None) -> 
         await app.state.client.disconnect()
 
     app = FastAPI(lifespan=lifespan)
+    # per-process random cookie-signing key — restart invalidates every session.
+    app.state.cookie_key = secrets.token_bytes(32)
+    app.state.web_pass = web_pass
+
+    if web_pass:
+        @app.middleware("http")
+        async def auth_gate(request: Request, call_next):
+            if request.url.path in _PUBLIC_PATHS:
+                return await call_next(request)
+            if _valid_cookie(app.state.cookie_key, request.cookies.get(COOKIE_NAME)):
+                return await call_next(request)
+            # browsers (HTML) go to the login form; API/SSE callers get a hard 401
+            if _wants_html(request):
+                return RedirectResponse("/login", status_code=302)
+            return HTMLResponse(
+                '<div class="error">Authentication required.</div>', status_code=401
+            )
+
+        @app.get("/login", response_class=HTMLResponse)
+        async def login_form(request: Request):
+            return TEMPLATES.TemplateResponse(request, "login.html", {})
+
+        @app.post("/login")
+        async def login_submit(request: Request, password: str = Form("")):
+            if hmac.compare_digest(password, web_pass):
+                resp = RedirectResponse("/", status_code=303)
+                resp.set_cookie(
+                    COOKIE_NAME,
+                    _sign_cookie(app.state.cookie_key),
+                    max_age=COOKIE_MAX_AGE,
+                    httponly=True,
+                    samesite="lax",
+                )
+                return resp
+            # no silent failure: log the attempt with the client IP, then a delay
+            client_ip = request.client.host if request.client else "?"
+            logger.warning("failed web login attempt from %s", client_ip)
+            await _login_delay(_WRONG_PASSWORD_DELAY)
+            return HTMLResponse(
+                '<div class="error">Wrong password.</div>', status_code=401
+            )
+
+        @app.get("/logout")
+        async def logout(request: Request):
+            resp = RedirectResponse("/login", status_code=303)
+            resp.delete_cookie(COOKIE_NAME)
+            return resp
 
     @app.exception_handler(UnauthorizedError)
     async def unauthorized(request: Request, exc: UnauthorizedError):
