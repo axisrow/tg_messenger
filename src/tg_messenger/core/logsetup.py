@@ -1,10 +1,11 @@
 """Logging setup: rotating file log plus an optional stderr handler.
 
 Every entrypoint calls ``setup_logging`` once; the file always records INFO+
-(DEBUG with verbose), the console only WARNING+ so normal CLI output stays
-clean. The TUI passes ``console=False`` — stderr would corrupt the alternate
-screen. Log content policy: operations, ids and error text — never message
-bodies or credentials.
+(DEBUG with verbose). The console only shows ERROR+ and skips ``tg_messenger.cli``
+records entirely — the CLI talks to the user via click, log noise belongs to the
+file. ``--verbose`` lifts both restrictions. The TUI passes ``console=False`` —
+stderr would corrupt the alternate screen. Log content policy: operations, ids
+and error text — never message bodies or credentials.
 """
 
 from __future__ import annotations
@@ -79,8 +80,13 @@ def setup_logging(
 
     if console:
         console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.setLevel(logging.DEBUG if verbose else logging.WARNING)
+        console_handler.setLevel(logging.DEBUG if verbose else logging.ERROR)
         console_handler.setFormatter(_ConsoleFormatter(_CONSOLE_FORMAT))
+        if not verbose:
+            # the CLI already reports its errors via click — no stderr duplicates
+            console_handler.addFilter(
+                lambda record: not record.name.startswith("tg_messenger.cli")
+            )
         setattr(console_handler, _MARKER, True)
         root.addHandler(console_handler)
 

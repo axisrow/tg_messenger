@@ -322,9 +322,23 @@ def test_login_resend_failure_does_not_abort(monkeypatch):
     # empty Enter -> resend fails -> login keeps waiting for the original code
     result = CliRunner().invoke(cli_main.cli, ["login"], input="+10000000000\n\n123\n")
     assert result.exit_code == 0
-    assert "Could not resend code" in result.output
+    # a short human message instead of the raw telethon paragraph
+    assert "previous code is still valid" in result.output
+    assert "flash-call" not in result.output  # telethon's verbose text stays out
     assert "Traceback" not in result.output
     assert inner.signed_in[-1]["code"] == "123"
+    assert stub.saved is True
+
+
+def test_login_other_resend_errors_show_short_reason(monkeypatch):
+    from telethon.errors.rpcerrorlist import PhoneCodeExpiredError
+
+    inner = FakeInnerLoginClient(resend_error=PhoneCodeExpiredError(None))
+    stub = LoginStubClient(inner)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["login"], input="+10000000000\n\n123\n")
+    assert result.exit_code == 0
+    assert "Could not resend code" in result.output
     assert stub.saved is True
 
 
@@ -467,6 +481,14 @@ def test_serve_unifies_uvicorn_logging(serve_spy):
     result = CliRunner().invoke(cli_main.cli, ["serve"])
     assert result.exit_code == 0
     assert serve_spy[0]["log_config"] is None
+
+
+def test_serve_announces_url(serve_spy, monkeypatch):
+    # uvicorn's own startup banner goes to the file now — the CLI must say the URL
+    monkeypatch.delenv("TG_WEB_PORT", raising=False)
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code == 0
+    assert "http://127.0.0.1:8090" in result.output
 
 
 def test_verbose_flag_sets_debug_level(runner):

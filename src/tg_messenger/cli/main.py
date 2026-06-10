@@ -124,7 +124,7 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 @click.option("--phone", prompt=True, help="Phone number in international format.")
 def login(session: str, phone: str) -> None:
     """Interactive login: phone -> code -> optional 2FA."""
-    from telethon.errors import RPCError, SessionPasswordNeededError
+    from telethon.errors import RPCError, SendCodeUnavailableError, SessionPasswordNeededError
 
     from tg_messenger.core.auth import LoginFlow
 
@@ -149,10 +149,18 @@ def login(session: str, phone: str) -> None:
                         # no alternative channel (next_type=None): a fresh send_code
                         # repeats the same channel — like the web's "send again" button
                         delivery = await flow.send_code(phone)
-                except RPCError as exc:
+                except SendCodeUnavailableError as exc:
                     # the original code is still valid — keep the login alive
                     logger.warning("code resend failed: %s", exc)
-                    click.echo(f"Could not resend code: {exc}", err=True)
+                    click.echo(
+                        "Telegram won't resend right now — the previous code is still valid;"
+                        " check the 'Telegram' service chat in your app.",
+                        err=True,
+                    )
+                    continue
+                except RPCError as exc:
+                    logger.warning("code resend failed: %s", exc)
+                    click.echo(f"Could not resend code: {type(exc).__name__}", err=True)
                     continue
                 click.echo(_delivery_message(delivery))
             try:
@@ -302,7 +310,8 @@ def serve(host: str, port: int, session: str) -> None:
 
     from tg_messenger.web.app import build_app
 
-    # log_config=None: uvicorn's records propagate to our root logger (file + console)
+    # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
+    click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
     uvicorn.run(build_app(session_name=session), host=host, port=port, log_config=None)
 
 

@@ -71,12 +71,26 @@ def test_repeated_setup_does_not_duplicate_handlers(tmp_path):
     assert len(_marked_handlers()) == first
 
 
-def test_console_handler_warning_by_default(tmp_path):
+def test_console_handler_error_only_by_default(tmp_path):
+    # WARNING noise (telethon reconnects etc.) belongs to the file, not the terminal
     setup_logging(log_dir=tmp_path / "logs")
     handlers = _console_handlers()
     assert len(handlers) == 1
-    assert handlers[0].level == logging.WARNING
+    assert handlers[0].level == logging.ERROR
     assert handlers[0].stream is sys.stderr
+
+
+def test_console_skips_cli_logger_records(tmp_path, capsys):
+    # the CLI talks to the user via click; its log records must not duplicate on stderr
+    log_file = setup_logging(log_dir=tmp_path / "logs")
+    logging.getLogger("tg_messenger.cli.main").error("boom-cli-marker")
+    logging.getLogger("tg_messenger.core.client").error("boom-core-marker")
+    err = capsys.readouterr().err
+    assert "boom-cli-marker" not in err
+    assert "boom-core-marker" in err
+    content = log_file.read_text(encoding="utf-8")
+    assert "boom-cli-marker" in content  # still recorded in the file
+    assert "boom-core-marker" in content
 
 
 def test_console_handler_debug_when_verbose(tmp_path):
