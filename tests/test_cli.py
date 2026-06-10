@@ -8,7 +8,15 @@ from click.testing import CliRunner
 from tests.conftest import make_sent_code
 from tg_messenger.cli import main as cli_main
 from tg_messenger.core.flood import HandledFloodWaitError
-from tg_messenger.core.models import Dialog, IncomingEvent, MediaRef, Message
+from tg_messenger.core.models import (
+    Dialog,
+    IncomingEvent,
+    MediaRef,
+    Message,
+    MessagesDeletedEvent,
+    OutgoingEvent,
+    User,
+)
 
 
 class StubClient:
@@ -63,6 +71,28 @@ class StubClient:
         self.sent.append((peer, "file", str(file_path), caption))
         return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    async def get_me(self):
+        return User(id=1, first_name="Me")
+
+    async def entity_title(self, peer):
+        return "My Group"
+
+    async def listen_outgoing(self):
+        yield OutgoingEvent(
+            dialog_id=-100123,
+            message=Message(id=10, dialog_id=-100123, sender_id=1, out=True,
+                            text="удалят меня", date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+        )
+        await asyncio.Event().wait()
+
+    async def listen_deleted(self):
+        for _ in range(10):
+            await asyncio.sleep(0)  # дать outgoing-потоку закэшировать сообщение
+        yield MessagesDeletedEvent(chat_id=-100123, message_ids=[10])
+        for _ in range(10):
+            await asyncio.sleep(0)  # дать watcher'у отправить уведомление
+        raise KeyboardInterrupt  # эмуляция Ctrl+C (паттерн listen_interrupt)
 
 
 @pytest.fixture
@@ -371,6 +401,31 @@ def test_listen_without_login_gives_hint(runner):
     assert stub.connected is False
 
 
+# --- Цикл 30: команда watch (бэкап удалённых сообщений) ---
+
+
+def test_watch_notifies_saved_messages(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["watch"])
+    assert result.exit_code == 0
+    assert "Watching" in result.output
+    (peer, text), = stub.sent
+    assert peer == 1  # Saved Messages = собственный id
+    assert "удалят меня" in text
+    assert "My Group" in text
+    assert "stopped." in result.output
+    assert stub.connected is False  # disconnect в finally
+
+
+def test_watch_without_login_gives_hint(runner):
+    r, stub = runner
+    stub.authorized = False
+    result = r.invoke(cli_main.cli, ["watch"])
+    assert result.exit_code != 0
+    assert "tg-messenger login" in result.output
+    assert stub.connected is False
+
+
 def test_revoked_session_mid_command_gives_hint(runner, monkeypatch):
     from telethon.errors.rpcerrorlist import AuthKeyUnregisteredError
 
@@ -499,5 +554,5 @@ def test_verbose_flag_sets_debug_level(runner):
 def test_help_lists_commands():
     result = CliRunner().invoke(cli_main.cli, ["--help"])
     assert result.exit_code == 0
-    for cmd in ("login", "dialogs", "read", "send", "listen", "serve", "tui"):
+    for cmd in ("login", "dialogs", "read", "send", "listen", "watch", "serve", "tui"):
         assert cmd in result.output

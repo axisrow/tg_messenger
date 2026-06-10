@@ -283,6 +283,35 @@ client = StandaloneTelegramClient(api_id, api_hash, external_session=existing_st
 документ (без сжатия) не обрабатывается — только telegram-«photo»; голосовые определяются,
 но не обрабатываются (v1).
 
+## Циклы 26–30 — отслеживание удалений своих сообщений (`tg-messenger watch`)
+
+Боты-модераторы в группах удаляют сообщения пользователя (неотвеченная капча и т.п.) —
+написанное теряется. v1: бэкап удалённых в Saved Messages; авто-капча — не в этом релизе.
+
+- **Цикл 26 — модели.** `OutgoingEvent(dialog_id, message)`, `MessagesDeletedEvent(chat_id |
+  None, message_ids)` — Telegram называет чат только для каналов/супергрупп.
+- **Цикл 27 — поток своих сообщений.** conftest: `push_event` диспатчит по типу builder
+  (как настоящий Telethon) — refactor на зелёном. `listen_outgoing()` через отдельный
+  EventBus (`Generic[T]`), handler `NewMessage(outgoing=True)` БЕЗ is_private-фильтра
+  (группы — суть фичи); входящий DM-поток не тронут. `get_me() -> User`.
+- **Цикл 28 — поток удалений.** `listen_deleted()`; `entity_title(peer)` (фикс
+  `_entity_title`: приоритет `.title` — названия групп игнорировались).
+- **Цикл 29 — `core/watch.py` `DeletionWatcher`.** Кэш своих сообщений (OrderedDict,
+  1000, eviction) — единственный фильтр «своих»: `deleted_ids` не несут автора. Матч
+  изымает запись (повтор события не дублирует уведомление); событие без chat_id не
+  матчит канальные записи (`CHANNEL_ID_THRESHOLD` — пер-канальные id пересекаются с
+  глобальными); self-диалог не кэшируется (нет цикла уведомлений); одно уведомление
+  на (событие × диалог); title best-effort с фолбэком на id; сбой send_text — в лог,
+  цикл живёт. `run()` — `asyncio.gather`, не TaskGroup (KeyboardInterrupt завернулся
+  бы в BaseExceptionGroup и сломал Ctrl+C в CLI).
+- **Цикл 30 — CLI `watch`.** Демон по паттерну `listen`; `echo=click.echo` — summary
+  в консоль.
+
+Принятые компромиссы v1: `MessageDeleted` не гарантирован Telegram'ом (пропуски
+возможны — best-effort); кэш в памяти (рестарт = потеря, работает только пока `watch`
+запущен); собственные удаления тоже дают уведомление (актора в событии нет); правки
+(`MessageEdited`) не трекаются; авто-нажатие капчи — следующий релиз.
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.

@@ -17,7 +17,15 @@ from telethon.sessions import StringSession
 from tg_messenger.core.auth import DEFAULT_SESSION_DIR, SessionStore
 from tg_messenger.core.events import EventBus
 from tg_messenger.core.flood import run_with_flood_wait_retry
-from tg_messenger.core.models import Dialog, IncomingEvent, MediaRef, Message
+from tg_messenger.core.models import (
+    Dialog,
+    IncomingEvent,
+    MediaRef,
+    Message,
+    MessagesDeletedEvent,
+    OutgoingEvent,
+    User,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +44,9 @@ def _is_dm_entity(entity) -> bool:
 
 
 def _entity_title(entity) -> str:
+    title = getattr(entity, "title", None)  # groups/channels carry a title, users don't
+    if title:
+        return title
     first = getattr(entity, "first_name", None) or ""
     last = getattr(entity, "last_name", None) or ""
     name = f"{first} {last}".strip()
@@ -92,7 +103,9 @@ class StandaloneTelegramClient:
             session_string = self._store.load(session_name)
         self._session_name = session_name
         self._client = client_factory(StringSession(session_string or None), api_id, api_hash)
-        self._bus = EventBus()
+        self._bus: EventBus[IncomingEvent] = EventBus()
+        self._bus_out: EventBus[OutgoingEvent] = EventBus()
+        self._bus_deleted: EventBus[MessagesDeletedEvent] = EventBus()
         self._handler_registered = False
 
     # --- connection ---
@@ -108,6 +121,22 @@ class StandaloneTelegramClient:
 
     def save_session(self) -> None:
         self._store.save(self._session_name, self._client.session.save())
+
+    async def get_me(self) -> User:
+        raw = await run_with_flood_wait_retry(lambda: self._client.get_me(), operation="get_me")
+        return User(
+            id=getattr(raw, "id", 0),
+            first_name=getattr(raw, "first_name", None),
+            last_name=getattr(raw, "last_name", None),
+            username=getattr(raw, "username", None),
+        )
+
+    async def entity_title(self, peer: int) -> str:
+        """Human-readable name of a user/group/channel (group title wins)."""
+        entity = await run_with_flood_wait_retry(
+            lambda: self._client.get_entity(int(peer)), operation="entity_title"
+        )
+        return _entity_title(entity)
 
     # --- dialogs / history ---
     async def dialogs(self, dm_only: bool = True) -> list[Dialog]:
@@ -198,6 +227,10 @@ class StandaloneTelegramClient:
         if self._handler_registered:
             return
         self._client.add_event_handler(self._on_new_message, events.NewMessage(incoming=True))
+        # own messages from ANY device + deletions — the watch feature's raw streams;
+        # publishing into a bus without subscribers is a no-op, so eager is free
+        self._client.add_event_handler(self._on_outgoing_message, events.NewMessage(outgoing=True))
+        self._client.add_event_handler(self._on_deleted, events.MessageDeleted())
         self._handler_registered = True
 
     async def _on_new_message(self, event) -> None:
@@ -212,8 +245,37 @@ class StandaloneTelegramClient:
             # don't depend on Telethon's logger config; record it ourselves
             logger.exception("failed to handle incoming message")
 
+    async def _on_outgoing_message(self, event) -> None:
+        # no is_private filter: groups are the whole point of the watch feature
+        try:
+            dialog_id = int(getattr(event, "chat_id", 0) or 0)
+            message = self._to_message(event.message, dialog_id=dialog_id)
+            self._bus_out.publish(OutgoingEvent(dialog_id=dialog_id, message=message))
+        except Exception:
+            logger.exception("failed to handle outgoing message")
+
+    async def _on_deleted(self, event) -> None:
+        try:
+            ids = [int(i) for i in (getattr(event, "deleted_ids", None) or [])]
+            chat_id = getattr(event, "chat_id", None)
+            self._bus_deleted.publish(
+                MessagesDeletedEvent(
+                    chat_id=int(chat_id) if chat_id is not None else None, message_ids=ids
+                )
+            )
+        except Exception:
+            logger.exception("failed to handle deleted-messages event")
+
     async def listen(self) -> AsyncIterator[IncomingEvent]:
         async for ev in self._bus.subscribe():
+            yield ev
+
+    async def listen_outgoing(self) -> AsyncIterator[OutgoingEvent]:
+        async for ev in self._bus_out.subscribe():
+            yield ev
+
+    async def listen_deleted(self) -> AsyncIterator[MessagesDeletedEvent]:
+        async for ev in self._bus_deleted.subscribe():
             yield ev
 
     # --- mapping ---

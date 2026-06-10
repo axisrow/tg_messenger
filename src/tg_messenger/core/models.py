@@ -49,6 +49,20 @@ class IncomingEvent(BaseModel):
     message: Message
 
 
+class OutgoingEvent(BaseModel):
+    """Own message sent from any device (groups included — no DM filter)."""
+
+    dialog_id: int
+    message: Message
+
+
+class MessagesDeletedEvent(BaseModel):
+    """Telegram only names the chat for channels/supergroups; elsewhere it's None."""
+
+    chat_id: int | None = None
+    message_ids: list[int]
+
+
 def message_line(m: Message) -> str:
     """One-line text rendering shared by text UIs: '← [id] text' (→ for own messages)."""
     who = "→" if m.out else "←"

@@ -5,7 +5,14 @@ from telethon.sessions import StringSession
 
 from tests.conftest import FakeChannel, FakeDialog, FakeDocument, FakeMessage, FakeUser
 from tg_messenger.core.client import StandaloneTelegramClient
-from tg_messenger.core.models import Dialog, IncomingEvent, Message
+from tg_messenger.core.models import (
+    Dialog,
+    IncomingEvent,
+    Message,
+    MessagesDeletedEvent,
+    OutgoingEvent,
+    User,
+)
 
 VALID_SESSION = StringSession().save()  # valid, empty session string
 
@@ -174,6 +181,183 @@ async def test_listen_handler_error_is_logged_not_raised(fake_client, caplog):
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert errors, "a broken incoming event must be logged"
     assert errors[0].exc_info is not None  # traceback recorded
+
+
+# --- Цикл 27: поток своих сообщений (listen_outgoing) + get_me ---
+
+
+def _evt(chat_id, *, is_private, message):
+    event = type("Evt", (), {})()
+    event.chat_id = chat_id
+    event.is_private = is_private
+    event.message = message
+    return event
+
+
+async def test_listen_outgoing_yields_own_group_messages(fake_client):
+    # is_private=False НЕ фильтруется: группы — суть фичи watch
+    client = _build(fake_client)
+    await client.connect()
+    event = _evt(-100123, is_private=False,
+                 message=FakeMessage(id=60, sender_id=1, text="моё в группе", out=True))
+
+    received = []
+
+    async def consume():
+        async for ev in client.listen_outgoing():
+            received.append(ev)
+            return
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0)
+    await fake_client.push_event(event)
+    await asyncio.wait_for(task, timeout=1)
+    assert isinstance(received[0], OutgoingEvent)
+    assert received[0].dialog_id == -100123
+    assert received[0].message.text == "моё в группе"
+    assert received[0].message.out is True
+
+
+async def test_outgoing_and_incoming_streams_do_not_cross(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    out_event = _evt(7, is_private=True,
+                     message=FakeMessage(id=61, sender_id=1, text="своё", out=True))
+    in_event = _evt(7, is_private=True,
+                    message=FakeMessage(id=62, sender_id=7, text="чужое", out=False))
+
+    incoming, outgoing = [], []
+
+    async def consume_in():
+        async for ev in client.listen():
+            incoming.append(ev)
+            return
+
+    async def consume_out():
+        async for ev in client.listen_outgoing():
+            outgoing.append(ev)
+            return
+
+    tasks = [asyncio.create_task(consume_in()), asyncio.create_task(consume_out())]
+    await asyncio.sleep(0)
+    await fake_client.push_event(out_event)
+    await fake_client.push_event(in_event)
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+    assert [ev.message.text for ev in incoming] == ["чужое"]
+    assert [ev.message.text for ev in outgoing] == ["своё"]
+
+
+async def test_outgoing_handler_error_is_logged_not_raised(fake_client, caplog):
+    client = _build(fake_client)
+    await client.connect()
+    broken = _evt(7, is_private=True, message=type("Brk", (), {"out": True})())  # нет .date
+
+    with caplog.at_level("ERROR", logger="tg_messenger.core.client"):
+        await fake_client.push_event(broken)  # must not raise
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
+async def test_get_me_returns_user(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    me = await client.get_me()
+    assert isinstance(me, User)
+    assert me.id == 1
+    assert me.username == "me"
+
+
+# --- Цикл 28: поток удалений (listen_deleted) + entity_title ---
+
+
+def _deleted_evt(ids, chat_id=None):
+    event = type("Del", (), {})()
+    event.deleted_ids = list(ids)
+    if chat_id is not None:
+        event.chat_id = chat_id
+    return event
+
+
+async def test_listen_deleted_supergroup_carries_chat_id(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+
+    received = []
+
+    async def consume():
+        async for ev in client.listen_deleted():
+            received.append(ev)
+            return
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0)
+    await fake_client.push_event(_deleted_evt([50, 51], chat_id=-1001234567890))
+    await asyncio.wait_for(task, timeout=1)
+    assert isinstance(received[0], MessagesDeletedEvent)
+    assert received[0].chat_id == -1001234567890
+    assert received[0].message_ids == [50, 51]
+
+
+async def test_listen_deleted_private_has_no_chat_id(fake_client):
+    # Telegram не сообщает чат для ЛС/малых групп — chat_id остаётся None
+    client = _build(fake_client)
+    await client.connect()
+
+    received = []
+
+    async def consume():
+        async for ev in client.listen_deleted():
+            received.append(ev)
+            return
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0)
+    await fake_client.push_event(_deleted_evt([60]))
+    await asyncio.wait_for(task, timeout=1)
+    assert received[0].chat_id is None
+    assert received[0].message_ids == [60]
+
+
+async def test_deleted_event_does_not_leak_into_message_streams(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+
+    incoming, deleted = [], []
+
+    async def consume_in():
+        async for ev in client.listen():
+            incoming.append(ev)
+            return
+
+    async def consume_del():
+        async for ev in client.listen_deleted():
+            deleted.append(ev)
+            return
+
+    in_task = asyncio.create_task(consume_in())
+    del_task = asyncio.create_task(consume_del())
+    await asyncio.sleep(0)
+    await fake_client.push_event(_deleted_evt([70]))
+    dm = _evt(7, is_private=True, message=FakeMessage(id=71, sender_id=7, text="dm", out=False))
+    await fake_client.push_event(dm)
+    await asyncio.wait_for(asyncio.gather(in_task, del_task), timeout=1)
+    assert [ev.message.text for ev in incoming] == ["dm"]  # deleted-событие не утекло
+    assert deleted[0].message_ids == [70]
+
+
+async def test_entity_title_prefers_group_title(fake_client):
+    _seed_dm(fake_client)  # содержит FakeChannel(id=100, title="News")
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.entity_title(100) == "News"
+
+
+async def test_entity_title_falls_back_to_user_name(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.entity_title(7) == "Ann"
 
 
 async def test_download_message_media_by_id(fake_client, tmp_path):

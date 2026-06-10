@@ -3,7 +3,15 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
-from tg_messenger.core.models import Dialog, IncomingEvent, MediaRef, Message, User
+from tg_messenger.core.models import (
+    Dialog,
+    IncomingEvent,
+    MediaRef,
+    Message,
+    MessagesDeletedEvent,
+    OutgoingEvent,
+    User,
+)
 
 
 def _now():
@@ -71,3 +79,27 @@ def test_incoming_event_wraps_message():
 def test_message_requires_date():
     with pytest.raises(ValidationError):
         Message(id=1, dialog_id=7, sender_id=42, out=False, text="hi")
+
+
+def test_outgoing_event_wraps_message():
+    msg = Message(id=3, dialog_id=-100123, sender_id=1, out=True, text="моё", date=_now())
+    event = OutgoingEvent(dialog_id=-100123, message=msg)
+    assert event.dialog_id == -100123
+    assert event.message.out is True
+
+
+def test_messages_deleted_event_chat_unknown_by_default():
+    # в ЛС/малых группах Telegram не сообщает чат — только id сообщений
+    event = MessagesDeletedEvent(message_ids=[50, 51])
+    assert event.chat_id is None
+    assert event.message_ids == [50, 51]
+
+
+def test_messages_deleted_event_with_supergroup_chat():
+    event = MessagesDeletedEvent(chat_id=-1001234567890, message_ids=[7])
+    assert event.chat_id == -1001234567890
+
+
+def test_messages_deleted_event_rejects_garbage():
+    with pytest.raises(ValidationError):
+        MessagesDeletedEvent(message_ids="not-a-list")
