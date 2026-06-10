@@ -125,6 +125,63 @@ async def test_unauthorized_session_gives_401_with_hint():
     assert "tg-messenger login" in r.text
 
 
+async def test_unhandled_error_returns_500_fragment_and_is_logged(caplog):
+    stub = WebStubClient()
+
+    async def boom(dm_only=True):
+        raise RuntimeError("kaboom")
+
+    stub.dialogs = boom
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            with caplog.at_level("ERROR", logger="tg_messenger.web.app"):
+                r = await ac.get("/dialogs")
+    assert r.status_code == 500
+    assert "error" in r.text  # HTMX-friendly fragment, not a blank 500
+    errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
+async def test_flood_wait_returns_503_with_hint():
+    from tg_messenger.core.flood import HandledFloodWaitError
+
+    stub = WebStubClient()
+
+    async def boom(dm_only=True):
+        raise HandledFloodWaitError("dialogs", 100)
+
+    stub.dialogs = boom
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/dialogs")
+    assert r.status_code == 503
+    assert "flood wait" in r.text.lower()
+
+
+async def test_sse_stream_failure_is_logged_and_closes(caplog):
+    import pytest
+
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+
+    async def broken_listen():
+        raise RuntimeError("stream blew up")
+        yield  # pragma: no cover
+
+    stub.listen = broken_listen
+    gen = sse_event_stream(stub, dialog_id=7)
+    with caplog.at_level("ERROR", logger="tg_messenger.web.app"):
+        with pytest.raises(StopAsyncIteration):
+            await gen.__anext__()
+    errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
 async def test_stream_yields_sse_frame():
     # Drive the SSE generator directly: subscribing then publishing must
     # produce one data frame for the matching dialog (and skip others).

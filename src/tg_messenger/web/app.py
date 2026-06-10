@@ -7,6 +7,7 @@ StandaloneTelegramClient is created from env and connected on startup.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
@@ -17,6 +18,10 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
+
+from tg_messenger.core.flood import HandledFloodWaitError
+
+logger = logging.getLogger(__name__)
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -48,11 +53,16 @@ def _message_div(m) -> str:
 
 async def sse_event_stream(client, dialog_id: int):
     """Yield SSE frames for incoming messages of one dialog."""
-    async for ev in client.listen():
-        if ev.dialog_id != dialog_id:
-            continue
-        payload = json.dumps({"id": ev.message.id, "text": ev.message.text})
-        yield f"data: {payload}\n\n"
+    try:
+        async for ev in client.listen():
+            if ev.dialog_id != dialog_id:
+                continue
+            payload = json.dumps({"id": ev.message.id, "text": ev.message.text})
+            yield f"data: {payload}\n\n"
+    except Exception:
+        # close the stream; the browser's EventSource will reconnect
+        logger.exception("SSE stream for dialog %s failed", dialog_id)
+        return
 
 
 def build_app(*, client=None, session_name: str = "default") -> FastAPI:
@@ -70,6 +80,24 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
         return HTMLResponse(
             '<div class="error">Not logged in — run: tg-messenger login</div>',
             status_code=401,
+        )
+
+    @app.exception_handler(HandledFloodWaitError)
+    async def flood_wait(request: Request, exc: HandledFloodWaitError):
+        logger.warning("%s: flood wait %ss", exc.operation, exc.wait_seconds)
+        return HTMLResponse(
+            f'<div class="error">Telegram flood wait {exc.wait_seconds}s — try again later.</div>',
+            status_code=503,
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, exc: Exception):
+        logger.error(
+            "unhandled error: %s %s", request.method, request.url.path, exc_info=exc
+        )
+        return HTMLResponse(
+            '<div class="error">Internal error — see log for details.</div>',
+            status_code=500,
         )
 
     @app.get("/", response_class=HTMLResponse)

@@ -350,6 +350,84 @@ def test_dotenv_does_not_override_real_env(runner, tmp_path, monkeypatch):
     assert os.environ["TG_API_ID"] == "111"
 
 
+def test_unexpected_error_hint_instead_of_traceback(runner, monkeypatch):
+    r, stub = runner
+
+    async def boom(dm_only=True):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(stub, "dialogs", boom)
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code != 0
+    assert "Unexpected error" in result.output
+    assert "kaboom" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_unexpected_error_traceback_lands_in_log_file(runner, monkeypatch):
+    from pathlib import Path
+
+    r, stub = runner
+
+    async def boom(dm_only=True):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(stub, "dialogs", boom)
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code != 0
+    log_file = Path(os.environ["TG_LOG_DIR"]) / "tg_messenger.log"
+    content = log_file.read_text(encoding="utf-8")
+    assert "kaboom" in content
+    assert "Traceback" in content
+
+
+def test_flood_wait_is_logged_to_file(runner, monkeypatch):
+    from pathlib import Path
+
+    r, stub = runner
+
+    async def boom(peer, text):
+        raise HandledFloodWaitError("send_text", 9999)
+
+    monkeypatch.setattr(stub, "send_text", boom)
+    result = r.invoke(cli_main.cli, ["send", "7", "hi"])
+    assert result.exit_code != 0
+    log_file = Path(os.environ["TG_LOG_DIR"]) / "tg_messenger.log"
+    assert "flood wait" in log_file.read_text(encoding="utf-8")
+
+
+def test_chat_listener_failure_is_reported(runner, monkeypatch, caplog):
+    r, stub = runner
+
+    async def broken_listen():
+        raise RuntimeError("listener blew up")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(stub, "listen", broken_listen)
+    with caplog.at_level("ERROR", logger="tg_messenger.cli.main"):
+        result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
+    assert result.exit_code == 0  # the REPL itself still worked
+    assert (7, "hello") in stub.sent
+    assert "listener failed" in result.output
+    errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
+def test_serve_unifies_uvicorn_logging(serve_spy):
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code == 0
+    assert serve_spy[0]["log_config"] is None
+
+
+def test_verbose_flag_sets_debug_level(runner):
+    import logging
+
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["-v", "dialogs"])
+    assert result.exit_code == 0
+    assert logging.getLogger().level == logging.DEBUG
+
+
 def test_help_lists_commands():
     result = CliRunner().invoke(cli_main.cli, ["--help"])
     assert result.exit_code == 0

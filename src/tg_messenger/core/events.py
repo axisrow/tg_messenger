@@ -8,9 +8,12 @@ slow consumer can't stall the Telethon event loop.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 from tg_messenger.core.models import IncomingEvent
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAXSIZE = 100
 
@@ -37,6 +40,10 @@ class EventBus:
             if queue.full():
                 try:
                     queue.get_nowait()  # drop oldest
+                    logger.warning(
+                        "subscriber queue full (maxsize=%d), dropping oldest event",
+                        self._maxsize,
+                    )
                 except asyncio.QueueEmpty:
                     pass
             queue.put_nowait(event)

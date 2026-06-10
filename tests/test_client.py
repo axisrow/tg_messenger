@@ -133,6 +133,23 @@ async def test_listen_skips_non_private_chats(fake_client):
     assert [ev.message.text for ev in received] == ["dm"]
 
 
+async def test_listen_handler_error_is_logged_not_raised(fake_client, caplog):
+    client = _build(fake_client)
+    await client.connect()
+
+    broken_event = type("Evt", (), {})()
+    broken_event.chat_id = 7
+    broken_event.is_private = True
+    broken_event.message = object()  # no .date -> mapping blows up
+
+    with caplog.at_level("ERROR", logger="tg_messenger.core.client"):
+        await fake_client.push_event(broken_event)  # must not raise
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors, "a broken incoming event must be logged"
+    assert errors[0].exc_info is not None  # traceback recorded
+
+
 async def test_download_message_media_by_id(fake_client, tmp_path):
     fake_client.messages[7] = [FakeMessage(id=42, sender_id=7, text=None, media=object())]
     client = _build(fake_client)

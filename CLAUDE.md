@@ -20,6 +20,7 @@ python -m venv .venv && ./.venv/bin/pip install -e ".[dev]"
 
 # Run the app
 ./.venv/bin/tg-messenger --help         # CLI entrypoint (login, dialogs, read, send, listen, chat, serve, tui)
+./.venv/bin/tg-messenger -v <cmd>        # DEBUG logging; file log: ~/.tg_messenger/logs/tg_messenger.log (env TG_LOG_DIR)
 ./.venv/bin/tg-messenger serve           # web (FastAPI/uvicorn), default port 8090 (env TG_WEB_PORT; --port overrides)
 ./.venv/bin/tg-messenger tui             # Textual TUI
 ```
@@ -45,6 +46,7 @@ web/    ┘
 - **`events.py` — `EventBus`**: asyncio fan-out. One Telethon `NewMessage` handler `publish()`es; each UI `subscribe()`s its own bounded queue. **Publishing never blocks** — a full subscriber queue drops its oldest item so a slow consumer can't stall the Telethon loop.
 - **`auth.py`**: `SessionStore` persists Telethon `StringSession` strings as 0600 plain-text files under `~/.tg_messenger/sessions/` (no SQLite). An external session string can be injected and is never written to disk. `LoginFlow` is the two-step phone→code→2FA sign-in; `phone_code_hash` stays bound to the same client/session.
 - **`models.py`**: Pydantic v2 domain models (`Dialog`, `Message`, `User`, `MediaRef`, `IncomingEvent`) shared across all interfaces. UIs render these, never raw Telethon objects — mapping happens in `StandaloneTelegramClient._to_message`.
+- **`logsetup.py`** — `setup_logging(verbose=, console=)`: rotating file log (always, INFO+; DEBUG with `-v`) + stderr handler (WARNING+, one-line — tracebacks go to the file only). Every CLI invocation calls it; the `tui` command re-runs it with `console=False` (stderr corrupts the alternate screen). Tests are isolated via the autouse `TG_LOG_DIR` fixture in conftest. **No silent failures**: anything caught-and-suppressed must be logged (`logger.exception`/`warning`) — see `_on_new_message`, `EventBus.publish` drops, the chat listener task, SSE streams and the web `Exception` handler.
 
 ### Interfaces
 - **`cli/main.py`**: click group. `make_client(**kwargs)` builds the client from env.

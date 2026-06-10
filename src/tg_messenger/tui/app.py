@@ -6,11 +6,14 @@ and appends incoming bubbles for the selected dialog.
 
 from __future__ import annotations
 
+import logging
 import os
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, ListItem, ListView, Static
+
+logger = logging.getLogger(__name__)
 
 
 def _make_real_client(session_name: str):
@@ -59,11 +62,16 @@ class MessengerTUI(App):
     async def on_mount(self) -> None:
         if self._client is None:
             self._client = _make_real_client(self._session_name)
-        await self._client.connect()
-        if not await self._client.is_authorized():
-            self.exit(return_code=1, message="Not logged in. Run: tg-messenger login")
+        try:
+            await self._client.connect()
+            if not await self._client.is_authorized():
+                self.exit(return_code=1, message="Not logged in. Run: tg-messenger login")
+                return
+            await self._load_dialogs()
+        except Exception as exc:
+            logger.exception("TUI startup failed")
+            self.exit(return_code=1, message=f"Startup failed: {exc}")
             return
-        await self._load_dialogs()
         self.run_worker(self._drain_incoming(), exclusive=False)
 
     async def on_unmount(self) -> None:
@@ -90,13 +98,22 @@ class MessengerTUI(App):
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if self._current is None or not event.value.strip():
             return
-        await self._client.send_text(self._current, event.value)
+        try:
+            await self._client.send_text(self._current, event.value)
+        except Exception as exc:
+            logger.exception("send failed (dialog %s)", self._current)
+            self.notify(f"Send failed: {exc}", severity="error")
+            return
         pane = self.query_one("#messages", Vertical)
         await pane.mount(MessageBubble(event.value, out=True))
         event.input.value = ""
 
     async def _drain_incoming(self) -> None:
-        async for ev in self._client.listen():
-            if ev.dialog_id == self._current:
-                pane = self.query_one("#messages", Vertical)
-                await pane.mount(MessageBubble(ev.message.text or "<media>", out=False))
+        try:
+            async for ev in self._client.listen():
+                if ev.dialog_id == self._current:
+                    pane = self.query_one("#messages", Vertical)
+                    await pane.mount(MessageBubble(ev.message.text or "<media>", out=False))
+        except Exception:
+            logger.exception("incoming listener failed")
+            self.notify("Incoming listener failed — see log.", severity="error")

@@ -51,6 +51,20 @@ async def test_unsubscribe_on_cancel_cleans_up():
     assert bus.subscriber_count == 0
 
 
+async def test_overflow_drop_is_logged(caplog):
+    bus = EventBus(maxsize=1)
+    queue = bus._register()
+    try:
+        bus.publish(_event("1"))
+        with caplog.at_level("WARNING", logger="tg_messenger.core.events"):
+            bus.publish(_event("2"))
+        dropped = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert dropped, "dropping an event must emit a WARNING"
+        assert "queue full" in dropped[0].getMessage()
+    finally:
+        bus._unregister(queue)
+
+
 async def test_overflow_drops_oldest_without_blocking():
     bus = EventBus(maxsize=2)
     queue = bus._register()  # internal handle for the test

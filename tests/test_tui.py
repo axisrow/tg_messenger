@@ -75,6 +75,63 @@ async def test_tui_exits_with_hint_when_not_logged_in():
     assert stub.connected is False
 
 
+async def test_tui_startup_failure_exits_with_code_and_log(caplog):
+    stub = TuiStubClient()
+
+    async def boom(dm_only=True):
+        raise RuntimeError("startup blew up")
+
+    stub.dialogs = boom
+    app = MessengerTUI(client=stub)
+    with caplog.at_level("ERROR", logger="tg_messenger.tui.app"):
+        async with app.run_test() as pilot:
+            await pilot.pause()
+    assert app.return_code == 1
+    assert stub.connected is False
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
+async def test_tui_send_failure_notifies_instead_of_crashing(caplog):
+    from textual.widgets import Input
+
+    stub = TuiStubClient()
+
+    async def boom(peer, text):
+        raise RuntimeError("send blew up")
+
+    stub.send_text = boom
+    app = MessengerTUI(client=stub)
+    with caplog.at_level("ERROR", logger="tg_messenger.tui.app"):
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._current = 7
+            composer = app.query_one("#composer", Input)
+            await app.on_input_submitted(Input.Submitted(composer, "hi"))
+            await pilot.pause()
+            assert app.return_code is None  # still alive
+            assert list(app.query(MessageBubble)) == []  # nothing mounted
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
+async def test_tui_listener_failure_logged_app_stays_alive(caplog):
+    stub = TuiStubClient()
+
+    async def broken_listen():
+        raise RuntimeError("listener blew up")
+        yield  # pragma: no cover
+
+    stub.listen = broken_listen
+    app = MessengerTUI(client=stub)
+    with caplog.at_level("ERROR", logger="tg_messenger.tui.app"):
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.return_code is None  # worker died, app did not
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
 async def test_tui_disconnects_on_exit():
     stub = TuiStubClient()
     app = MessengerTUI(client=stub)

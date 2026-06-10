@@ -7,6 +7,7 @@ Commands: login, dialogs, read, send, listen, chat, serve, tui.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 
@@ -15,6 +16,9 @@ from telethon.errors import UnauthorizedError
 
 from tg_messenger.core.client import StandaloneTelegramClient
 from tg_messenger.core.flood import HandledFloodWaitError
+from tg_messenger.core.logsetup import log_file_path, setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def _load_dotenv(path: Path | str = ".env") -> None:
@@ -66,13 +70,21 @@ def _login_hint(session: str = "default") -> str:
 def _run(coro, session: str = "default"):
     try:
         return asyncio.run(coro)
+    except (click.ClickException, click.Abort):
+        raise  # already user-friendly
     except HandledFloodWaitError as exc:
+        logger.warning("%s: flood wait %ss", exc.operation, exc.wait_seconds)
         raise click.ClickException(
             f"Telegram flood wait {exc.wait_seconds}s — try again later."
         ) from exc
     except UnauthorizedError as exc:
         # session missing or revoked mid-command
         raise click.ClickException(_login_hint(session)) from exc
+    except Exception as exc:
+        logger.exception("command failed")
+        raise click.ClickException(
+            f"Unexpected error: {exc} — details logged to {log_file_path()}"
+        ) from exc
 
 
 async def _ensure_authorized(client, session: str) -> None:
@@ -91,9 +103,14 @@ async def _with_client(session, fn):
 
 
 @click.group()
-def cli() -> None:
+@click.option("-v", "--verbose", is_flag=True, help="Verbose (DEBUG) logging.")
+@click.pass_context
+def cli(ctx: click.Context, verbose: bool) -> None:
     """tg_messenger — chat in your Telegram DMs from the terminal."""
+    ctx.ensure_object(dict)
+    ctx.obj["verbose"] = verbose
     _load_dotenv()
+    setup_logging(verbose=verbose)
 
 
 @cli.command()
@@ -246,7 +263,12 @@ def chat(dialog_id: int, session: str) -> None:
                         await client.send_text(dialog_id, line)
             finally:
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                results = await asyncio.gather(task, return_exceptions=True)
+                for r in results:
+                    # CancelledError is BaseException — a real failure only
+                    if isinstance(r, Exception):
+                        logger.error("chat listener failed", exc_info=r)
+                        click.echo(f"listener failed: {r}", err=True)
         finally:
             await client.disconnect()
 
@@ -266,15 +288,19 @@ def serve(host: str, port: int, session: str) -> None:
 
     from tg_messenger.web.app import build_app
 
-    uvicorn.run(build_app(session_name=session), host=host, port=port)
+    # log_config=None: uvicorn's records propagate to our root logger (file + console)
+    uvicorn.run(build_app(session_name=session), host=host, port=port, log_config=None)
 
 
 @cli.command()
 @click.option("--session", default="default")
-def tui(session: str) -> None:
+@click.pass_context
+def tui(ctx: click.Context, session: str) -> None:
     """Launch the TUI interface."""
     from tg_messenger.tui.app import MessengerTUI
 
+    # stderr handler would corrupt the alternate screen — file log only
+    setup_logging(verbose=ctx.obj.get("verbose", False), console=False)
     MessengerTUI(session_name=session).run()
 
 

@@ -165,6 +165,12 @@ class FakeTelethonClient:
             await handler(event)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_log_dir(tmp_path, monkeypatch):
+    # the CLI entrypoint calls setup_logging(); tests must never write ~/.tg_messenger/logs
+    monkeypatch.setenv("TG_LOG_DIR", str(tmp_path / "logs"))
+
+
 @pytest.fixture
 def fake_client():
     return FakeTelethonClient()

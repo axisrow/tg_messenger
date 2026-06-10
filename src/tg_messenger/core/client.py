@@ -7,6 +7,7 @@ All network calls route through the vendored flood-wait retry.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from tg_messenger.core.auth import DEFAULT_SESSION_DIR, SessionStore
 from tg_messenger.core.events import EventBus
 from tg_messenger.core.flood import run_with_flood_wait_retry
 from tg_messenger.core.models import Dialog, IncomingEvent, MediaRef, Message
+
+logger = logging.getLogger(__name__)
 
 
 def _default_factory(session, api_id, api_hash):
@@ -159,9 +162,13 @@ class StandaloneTelegramClient:
         # DM-only product: drop group/channel traffic at the source
         if not getattr(event, "is_private", True):
             return
-        dialog_id = int(getattr(event, "chat_id", 0) or 0)
-        message = self._to_message(event.message, dialog_id=dialog_id)
-        self._bus.publish(IncomingEvent(dialog_id=dialog_id, message=message))
+        try:
+            dialog_id = int(getattr(event, "chat_id", 0) or 0)
+            message = self._to_message(event.message, dialog_id=dialog_id)
+            self._bus.publish(IncomingEvent(dialog_id=dialog_id, message=message))
+        except Exception:
+            # don't depend on Telethon's logger config; record it ourselves
+            logger.exception("failed to handle incoming message")
 
     async def listen(self) -> AsyncIterator[IncomingEvent]:
         async for ev in self._bus.subscribe():
