@@ -136,6 +136,124 @@ async def test_sign_in_before_code_raises(fake_client):
         await flow.sign_in(code="12345")
 
 
+# --- цикл 130: LoginSession — конечный автомат phone→code→(password)→done ---
+
+
+class _FakeInnerLogin:
+    """Raw Telethon stand-in for LoginSession tests (mirrors test_cli)."""
+
+    def __init__(self, sign_in_error=None, with_next_type=True):
+        self.sign_in_error = sign_in_error
+        self.with_next_type = with_next_type
+        self.signed_in = []
+        self.code_requests = []
+        self.resends = 0
+
+    async def send_code_request(self, phone):
+        self.code_requests.append(phone)
+        from tests.conftest import make_sent_code
+
+        return make_sent_code("App", "h", next_kind="Sms" if self.with_next_type else None)
+
+    async def __call__(self, request):
+        from tests.conftest import make_sent_code
+
+        self.resends += 1
+        return make_sent_code("Sms", "h2")
+
+    async def sign_in(self, phone=None, code=None, password=None, **kw):
+        if code is not None and self.sign_in_error is not None:
+            raise self.sign_in_error
+        self.signed_in.append({"code": code, "password": password})
+        return object()
+
+
+async def test_login_session_happy_path():
+    inner = _FakeInnerLogin()
+    sess = auth.LoginSession(inner)
+    assert sess.state == "phone"
+    delivery = await sess.submit_phone("+10000000000")
+    assert delivery.kind == "app"
+    assert sess.state == "code"
+    await sess.submit_code("12345")
+    assert sess.state == "done"
+    assert inner.signed_in[-1]["code"] == "12345"
+
+
+async def test_login_session_2fa_branch():
+    from telethon.errors import SessionPasswordNeededError
+
+    inner = _FakeInnerLogin(sign_in_error=SessionPasswordNeededError(None))
+    sess = auth.LoginSession(inner)
+    await sess.submit_phone("+10000000000")
+    await sess.submit_code("12345")
+    assert sess.state == "password"
+    await sess.submit_password("hunter2")
+    assert sess.state == "done"
+    assert inner.signed_in[-1]["password"] == "hunter2"
+
+
+async def test_login_session_wrong_code_keeps_state():
+    from telethon.errors import PhoneCodeInvalidError
+
+    inner = _FakeInnerLogin(sign_in_error=PhoneCodeInvalidError(None))
+    sess = auth.LoginSession(inner)
+    await sess.submit_phone("+10000000000")
+    with pytest.raises(auth.LoginError):
+        await sess.submit_code("000")
+    # state is preserved — the user can retry the code
+    assert sess.state == "code"
+
+
+async def test_login_session_resend():
+    inner = _FakeInnerLogin()
+    sess = auth.LoginSession(inner)
+    await sess.submit_phone("+10000000000")
+    delivery = await sess.resend()
+    assert delivery.kind == "sms"
+    assert inner.resends == 1
+    assert sess.state == "code"
+
+
+async def test_login_session_code_before_phone_raises():
+    inner = _FakeInnerLogin()
+    sess = auth.LoginSession(inner)
+    with pytest.raises(RuntimeError):
+        await sess.submit_code("12345")
+
+
+async def test_login_session_password_before_code_raises():
+    inner = _FakeInnerLogin()
+    sess = auth.LoginSession(inner)
+    await sess.submit_phone("+10000000000")
+    with pytest.raises(RuntimeError):
+        await sess.submit_password("hunter2")
+
+
+# --- цикл 135: телефон и код НЕ попадают в лог-файл ---
+
+
+async def test_login_secrets_not_in_log_file(tmp_path, monkeypatch):
+    import logging
+
+    from tg_messenger.core.logsetup import setup_logging
+
+    monkeypatch.setenv("TG_LOG_DIR", str(tmp_path))
+    setup_logging(verbose=True)  # DEBUG → the most verbose path possible
+    secret_phone = "+19998887766"
+    secret_code = "SECRET12345"
+    try:
+        inner = _FakeInnerLogin()
+        sess = auth.LoginSession(inner)
+        await sess.submit_phone(secret_phone)
+        await sess.submit_code(secret_code)
+    finally:
+        logging.shutdown()
+    logs = "".join(p.read_text() for p in tmp_path.glob("*.log"))
+    assert secret_phone not in logs
+    assert secret_code not in logs
+
+
 # --- циклы 53–54: опциональное шифрование SessionStore (Fernet enc:v2:) ---
 
 pytest.importorskip("cryptography")

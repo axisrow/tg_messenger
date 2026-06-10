@@ -308,7 +308,9 @@ async def test_profiles_route_lists_saved_profiles(monkeypatch, tmp_path):
     assert "active" in r.text.lower()
 
 
-async def test_unauthorized_session_gives_401_with_hint():
+async def test_unauthorized_session_redirects_to_tg_login():
+    # not-logged-in Telegram session: ordinary routes now bounce to the login
+    # wizard instead of the old dead-end 401 fragment (#26).
     from telethon.errors.rpcerrorlist import AuthKeyUnregisteredError
 
     stub = WebStubClient()
@@ -321,9 +323,9 @@ async def test_unauthorized_session_gives_401_with_hint():
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-            r = await ac.get("/dialogs")
-    assert r.status_code == 401
-    assert "tg-messenger login" in r.text
+            r = await ac.get("/dialogs", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/tg-login"
 
 
 async def test_unhandled_error_returns_500_fragment_and_is_logged(caplog):
@@ -487,3 +489,166 @@ async def test_index_has_suggest_button(suggest_app):
     ac, _ = suggest_app
     r = await ac.get("/")
     assert "suggest" in r.text.lower()
+
+
+# --- циклы 131-132: web-мастер логина Telegram (/tg-login) ---
+
+from tg_messenger.core.auth import CodeDelivery, LoginError  # noqa: E402
+
+
+class FakeLoginSession:
+    """Stand-in for core.LoginSession driving the web/TUI login wizard."""
+
+    def __init__(self, *, needs_2fa=False, wrong_code=False):
+        self.state = "phone"
+        self.phones = []
+        self.codes = []
+        self.passwords = []
+        self.resends = 0
+        self._needs_2fa = needs_2fa
+        self._wrong_code = wrong_code
+
+    async def submit_phone(self, phone):
+        self.phones.append(phone)
+        self.state = "code"
+        return CodeDelivery(kind="app", next_kind="sms", timeout=60)
+
+    async def resend(self):
+        self.resends += 1
+        return CodeDelivery(kind="sms")
+
+    async def submit_code(self, code):
+        self.codes.append(code)
+        if self._wrong_code:
+            raise LoginError("Wrong code — try again.")
+        if self._needs_2fa:
+            self.state = "password"
+            return
+        self.state = "done"
+
+    async def submit_password(self, password):
+        self.passwords.append(password)
+        self.state = "done"
+
+
+def _login_app(session, *, web_pass=None, save_hook=None):
+    stub = WebStubClient()
+    if save_hook is not None:
+        stub.save_session = save_hook
+    return build_app(client=stub, login_session=session, web_pass=web_pass)
+
+
+async def _login_client(app):
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+
+
+async def test_tg_login_get_shows_phone_form():
+    app = _login_app(FakeLoginSession())
+    async for ac in _login_client(app):
+        r = await ac.get("/tg-login")
+        assert r.status_code == 200
+        assert "phone" in r.text.lower()
+
+
+async def test_tg_login_phone_returns_code_fragment_with_hint():
+    sess = FakeLoginSession()
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        r = await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        assert r.status_code == 200
+        assert sess.phones == ["+10000000000"]
+        assert "Telegram" in r.text  # подсказка: код в приложении Telegram
+        assert "code" in r.text.lower()
+
+
+async def test_tg_login_code_done_redirects_to_chat():
+    sess = FakeLoginSession()
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        r = await ac.post("/tg-login/code", data={"code": "12345"})
+        assert r.status_code in (302, 303)
+        assert r.headers["location"] == "/"
+        assert sess.codes == ["12345"]
+
+
+async def test_tg_login_code_2fa_returns_password_fragment():
+    sess = FakeLoginSession(needs_2fa=True)
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        r = await ac.post("/tg-login/code", data={"code": "12345"})
+        assert r.status_code == 200
+        assert "password" in r.text.lower()
+
+
+async def test_tg_login_password_redirects():
+    sess = FakeLoginSession(needs_2fa=True)
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        await ac.post("/tg-login/code", data={"code": "12345"})
+        r = await ac.post("/tg-login/password", data={"password": "hunter2"})
+        assert r.status_code in (302, 303)
+        assert r.headers["location"] == "/"
+        assert sess.passwords == ["hunter2"]
+
+
+async def test_tg_login_wrong_code_shows_error_not_500():
+    sess = FakeLoginSession(wrong_code=True)
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        r = await ac.post("/tg-login/code", data={"code": "000"})
+        assert r.status_code == 200
+        assert "Wrong code" in r.text
+        # state stays at code so the user can retry
+        assert sess.state == "code"
+
+
+async def test_tg_login_success_saves_session():
+    saved = []
+    sess = FakeLoginSession()
+
+    def save_hook():
+        saved.append(True)
+
+    app = _login_app(sess, save_hook=save_hook)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        await ac.post("/tg-login/code", data={"code": "12345"})
+    assert saved == [True]
+
+
+async def test_unauthorized_routes_redirect_to_tg_login():
+    from telethon.errors.rpcerrorlist import AuthKeyUnregisteredError
+
+    stub = WebStubClient()
+
+    async def boom(dm_only=True):
+        raise AuthKeyUnregisteredError(None)
+
+    stub.dialogs = boom
+    app = build_app(client=stub, login_session=FakeLoginSession())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/dialogs", follow_redirects=False)
+    assert r.status_code in (302, 303)
+    assert r.headers["location"] == "/tg-login"
+
+
+async def test_tg_login_behind_web_pass():
+    # /tg-login is reachable only for an authenticated web user (#24): without
+    # the cookie the auth gate redirects to /login, not /tg-login.
+    app = _login_app(FakeLoginSession(), web_pass="s3cret")
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/tg-login", headers={"accept": "text/html"},
+                             follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/login"

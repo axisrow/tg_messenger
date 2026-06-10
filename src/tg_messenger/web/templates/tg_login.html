@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>tg_messenger — Telegram login</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; display: flex; height: 100vh;
+           align-items: center; justify-content: center; margin: 0; background: #f7f7f7; }
+    #card { background: #fff; padding: 24px; border-radius: 12px; min-width: 280px;
+            box-shadow: 0 2px 12px rgba(0,0,0,.08); display: flex; flex-direction: column; gap: 12px; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    input { padding: 8px; font-size: 15px; }
+    button { padding: 8px; background: #2481cc; color: #fff; border: none;
+             border-radius: 6px; cursor: pointer; font-size: 15px; }
+    .hint { color: #555; font-size: 13px; }
+    .error { color: #c0392b; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div id="card">
+    <h1>Войти в Telegram</h1>
+    <form hx-post="/tg-login/phone" hx-target="#card" hx-swap="outerHTML">
+      <label for="phone">Phone number</label>
+      <input id="phone" type="tel" name="phone" autofocus placeholder="+1 555 0100"
+             autocomplete="tel">
+      <button type="submit">Отправить код</button>
+    </form>
+  </div>
+</body>
+</html>

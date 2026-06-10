@@ -116,6 +116,24 @@ not starting with `@` is sent as plain text as before.
 becomes the caption. Uploads are capped at `TG_WEB_MAX_UPLOAD_MB` (default 50) — a
 larger file is rejected with HTTP 413, an empty one with 400.
 
+## Logging in from the Web or TUI
+
+You don't have to use the CLI `login` command — both the Web and the TUI can sign
+you in interactively (phone → code → optional 2FA password):
+
+- **Web** — when the served session isn't logged in, every page redirects to the
+  `/tg-login` wizard: enter your phone, then the code Telegram sends (the page tells
+  you where it went — usually the in-app "Telegram" service chat), then a 2FA
+  password if your account has one. On success the session is saved and you land in
+  the chat. With `TG_WEB_PASS` set, `/tg-login` sits **behind** the web password.
+- **TUI** — `tg-messenger tui` against a logged-out session opens a login screen
+  instead of exiting: type the phone, press Enter, type the code, press Enter (and
+  the 2FA password if asked). A wrong code is reported and you can retry; Ctrl+C
+  quits cleanly. On success the dialog list loads as usual.
+
+The whole flow runs over one connected client (Telegram binds the login `code` to
+that single session), and the phone number and code are never written to the logs.
+
 ## Web authorization
 
 Set `TG_WEB_PASS` to put the whole web UI behind a password. With it, every route

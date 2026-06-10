@@ -17,7 +17,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 
-from tg_messenger.core.auth import LOGIN_HINT
+from tg_messenger.core.auth import LoginError, LoginSession, delivery_hint
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,87 @@ class ProfileScreen(ModalScreen[str]):
             self.dismiss(item.profile)
 
 
+class LoginScreen(ModalScreen[bool]):
+    """Telegram login wizard: phone → code → (2FA password) → done.
+
+    Drives a core ``LoginSession`` (the state machine that keeps phone_code_hash
+    bound to the one connected client). Network steps run through ``run_worker``
+    — never awaited in a handler — so the message pump never stalls. Dismisses
+    with ``True`` once the session reaches ``done``; the app then continues its
+    normal startup (loads dialogs). Phone numbers and codes are never logged.
+    """
+
+    BINDINGS = [
+        # Ctrl+C must quit cleanly even mid-login (priority: focus sits in Input)
+        Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
+    ]
+
+    def __init__(self, login_session):
+        super().__init__()
+        self._session = login_session
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="login-box"):
+            yield Label("Войти в Telegram", id="login-title")
+            yield Label("Номер телефона (международный формат):", id="login-prompt")
+            yield Input(id="login-input", placeholder="+10000000000")
+
+    def on_mount(self) -> None:
+        self.query_one("#login-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # never await network in a handler — hand each step to a worker
+        value = event.value.strip()
+        if not value:
+            return
+        self.query_one("#login-input", Input).value = ""
+        state = self._session.state
+        if state == "phone":
+            self.run_worker(self._do_phone(value), exclusive=True)
+        elif state == "code":
+            self.run_worker(self._do_code(value), exclusive=True)
+        elif state == "password":
+            self.run_worker(self._do_password(value), exclusive=True)
+
+    async def _do_phone(self, phone: str) -> None:
+        try:
+            delivery = await self._session.submit_phone(phone)
+        except Exception as exc:
+            logger.exception("login: submit_phone failed")  # phone stays out of the log
+            self.notify(f"Не удалось отправить код: {exc}", severity="error")
+            return
+        self.query_one("#login-prompt", Label).update(delivery_hint(delivery))
+        self.query_one("#login-input", Input).placeholder = "Код"
+
+    async def _do_code(self, code: str) -> None:
+        try:
+            await self._session.submit_code(code)
+        except LoginError as exc:
+            self.notify(str(exc), severity="error")  # state preserved — retry
+            return
+        except Exception as exc:
+            logger.exception("login: submit_code failed")
+            self.notify(f"Ошибка входа: {exc}", severity="error")
+            return
+        if self._session.state == "password":
+            self.query_one("#login-prompt", Label).update("Пароль 2FA:")
+            self.query_one("#login-input", Input).placeholder = "Пароль 2FA"
+            return
+        self.dismiss(True)
+
+    async def _do_password(self, password: str) -> None:
+        try:
+            await self._session.submit_password(password)
+        except LoginError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        except Exception as exc:
+            logger.exception("login: submit_password failed")
+            self.notify(f"Ошибка входа: {exc}", severity="error")
+            return
+        self.dismiss(True)
+
+
 class SidebarTabs(Tabs):
     """DM/groups tabs that hand focus down to the sibling dialog list.
 
@@ -185,11 +266,14 @@ class MessengerTUI(App):
     """
 
     def __init__(self, *, client=None, session_name: str = "default",
-                 profiles: list[str] | None = None, client_factory=None, suggester=None):
+                 profiles: list[str] | None = None, client_factory=None, suggester=None,
+                 login_session=None):
         super().__init__()
         self._client = client
         self._session_name = session_name
         self._profiles = profiles or []
+        # login wizard state machine (test seam); built from the client otherwise
+        self._login_session = login_session
         # how a client is built once a profile is chosen (injectable for tests)
         self._client_factory = client_factory or _make_real_client
         self._current: int | None = None
@@ -239,8 +323,15 @@ class MessengerTUI(App):
         try:
             await self._client.connect()
             if not await self._client.is_authorized():
-                self.exit(return_code=1, message=LOGIN_HINT)
-                return
+                # show the login wizard instead of exiting; on success continue startup
+                session = self._login_session
+                if session is None:
+                    inner = getattr(self._client, "_client", self._client)
+                    session = LoginSession(inner)
+                ok = await self.push_screen_wait(LoginScreen(session))
+                if not ok:
+                    self.exit(return_code=1)
+                    return
             await self._load_dialogs()
         except Exception as exc:
             logger.exception("TUI startup failed")
