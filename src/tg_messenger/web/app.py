@@ -158,6 +158,21 @@ async def sse_event_stream(client, dialog_id: int):
         return
 
 
+def _tg_login_phone_fragment(*, error: str) -> str:
+    """HTMX fragment: re-render the phone step with an error (e.g. invalid number)."""
+    return (
+        '<div id="card">'
+        "<h1>Вход в Telegram</h1>"
+        f'<div class="error">{escape(error)}</div>'
+        '<form hx-post="/tg-login/phone" hx-target="#card" hx-swap="outerHTML">'
+        '<label for="phone">Phone</label>'
+        '<input id="phone" type="tel" name="phone" autofocus>'
+        '<button type="submit">Отправить код</button>'
+        "</form>"
+        "</div>"
+    )
+
+
 def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
     """HTMX fragment: the code-entry step of the /tg-login wizard."""
     hint = escape(delivery_hint(delivery)) if delivery is not None else ""
@@ -283,13 +298,20 @@ def build_app(
     async def tg_login_phone(request: Request, phone: str = Form("")):
         session = request.app.state.login_session
         # the phone number itself never reaches a log line
-        delivery = await session.submit_phone(phone.strip())
+        try:
+            delivery = await session.submit_phone(phone.strip())
+        except LoginError as exc:
+            # invalid/refused phone: re-render the phone step with the message (not a 500)
+            return HTMLResponse(_tg_login_phone_fragment(error=str(exc)))
         return HTMLResponse(_tg_login_code_fragment(delivery))
 
     @app.post("/tg-login/resend", response_class=HTMLResponse)
     async def tg_login_resend(request: Request):
         session = request.app.state.login_session
-        delivery = await session.resend()
+        try:
+            delivery = await session.resend()
+        except LoginError as exc:
+            return HTMLResponse(_tg_login_code_fragment(error=str(exc)))
         return HTMLResponse(_tg_login_code_fragment(delivery))
 
     @app.post("/tg-login/code", response_class=HTMLResponse)

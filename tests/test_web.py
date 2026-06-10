@@ -510,6 +510,8 @@ class FakeLoginSession:
 
     async def submit_phone(self, phone):
         self.phones.append(phone)
+        if getattr(self, "_wrong_phone", False):
+            raise LoginError("Invalid phone number.")
         self.state = "code"
         return CodeDelivery(kind="app", next_kind="sms", timeout=60)
 
@@ -607,6 +609,17 @@ async def test_tg_login_wrong_code_shows_error_not_500():
         assert "Wrong code" in r.text
         # state stays at code so the user can retry
         assert sess.state == "code"
+
+
+async def test_tg_login_bad_phone_shows_error_not_500():
+    sess = FakeLoginSession()
+    sess._wrong_phone = True
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        r = await ac.post("/tg-login/phone", data={"phone": "not-a-phone"})
+        assert r.status_code == 200  # error rendered in the form, not a 500
+        assert "Invalid phone" in r.text
+        assert sess.state == "phone"  # can retry the phone step
 
 
 async def test_tg_login_success_saves_session():
