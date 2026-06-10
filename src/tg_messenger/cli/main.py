@@ -811,6 +811,177 @@ def suggest(dialog_id: int, do_send: bool, do_learn: bool, session: str) -> None
     _run(_do(), session=session)
 
 
+# --- ghostwrite (#18): auto-reply in your style in explicitly enabled DMs ---------
+
+
+@cli.command()
+@click.option("--session", default="default")
+@click.option("--enforce", is_flag=True,
+              help="Actually send replies (default is dry-run: log only).")
+def ghostwrite(session: str, enforce: bool) -> None:
+    """Auto-reply in your style in explicitly enabled DMs (dry-run unless --enforce).
+
+    Destructive (sends from your account) and per-dialog opt-in only — enable dialogs with
+    `ghostwrite-dialogs enable`. Safeties: hourly rate cap, auto-pause when you reply by
+    hand, and `ghostwrite-dialogs pause-all` as a kill switch.
+    """
+    from tg_messenger.agent.ghostwrite import (
+        GhostwriteEngine,
+        list_enabled,
+        register_ghostwrite_migrations,
+    )
+    from tg_messenger.agent.suggest import register_suggest_migrations
+
+    async def _do():
+        client = make_client(session_name=session)
+        storage = make_storage(session)
+        register_ghostwrite_migrations(storage)
+        register_suggest_migrations(storage)  # the suggester reads style profiles from here
+        # build the suggester (LLM stack) before the network — config errors show first
+        suggester = make_suggester(client, storage=storage)
+        await storage.connect()
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            enabled = await list_enabled(storage)
+            if enabled:
+                click.echo("Ghostwrite enabled for dialogs: "
+                           + ", ".join(str(d) for d in enabled))
+            else:
+                click.echo("⚠ no dialogs enabled — use 'ghostwrite-dialogs enable PEER'",
+                           err=True)
+            engine = GhostwriteEngine(client, suggester, storage, enforce=enforce)
+            mode = "ENFORCING" if enforce else "dry-run"
+            click.echo(f"Ghostwriting ({mode}) — Ctrl+C to stop...")
+            await engine.run()
+        finally:
+            await client.disconnect()
+            await storage.close()
+
+    try:
+        _run(_do(), session=session)
+    except KeyboardInterrupt:
+        click.echo("stopped.")
+
+
+@cli.group("ghostwrite-dialogs")
+def ghostwrite_dialogs() -> None:
+    """Manage the ghostwrite per-dialog allowlist (enable / disable / list / pause)."""
+
+
+def _open_ghostwrite_storage(session: str):
+    from tg_messenger.agent.ghostwrite import register_ghostwrite_migrations
+
+    storage = make_storage(session)
+    register_ghostwrite_migrations(storage)
+    return storage
+
+
+@ghostwrite_dialogs.command("enable")
+@click.argument("peer")
+@click.option("--session", default="default")
+def ghostwrite_dialogs_enable(peer: str, session: str) -> None:
+    """Turn ghostwrite ON for a DM by PEER (numeric id). '*' is rejected by design."""
+    if peer.strip() == "*":
+        raise click.ClickException(
+            "'*' (everyone) is not allowed for ghostwrite — enable each dialog explicitly."
+        )
+    try:
+        dialog_id = int(peer)
+    except ValueError as exc:
+        raise click.ClickException(f"PEER must be a numeric dialog id, got {peer!r}") from exc
+    from tg_messenger.agent.ghostwrite import enable_dialog
+
+    async def _do():
+        storage = _open_ghostwrite_storage(session)
+        await storage.connect()
+        try:
+            await enable_dialog(storage, dialog_id)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"ghostwrite enabled for dialog {dialog_id}.")
+
+
+@ghostwrite_dialogs.command("disable")
+@click.argument("dialog_id", type=int)
+@click.option("--session", default="default")
+def ghostwrite_dialogs_disable(dialog_id: int, session: str) -> None:
+    """Turn ghostwrite OFF for a dialog."""
+    from tg_messenger.agent.ghostwrite import disable_dialog
+
+    async def _do():
+        storage = _open_ghostwrite_storage(session)
+        await storage.connect()
+        try:
+            await disable_dialog(storage, dialog_id)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"ghostwrite disabled for dialog {dialog_id}.")
+
+
+@ghostwrite_dialogs.command("list")
+@click.option("--session", default="default")
+def ghostwrite_dialogs_list(session: str) -> None:
+    """List dialogs where ghostwrite is enabled."""
+    from tg_messenger.agent.ghostwrite import list_enabled
+
+    async def _do():
+        storage = _open_ghostwrite_storage(session)
+        await storage.connect()
+        try:
+            return await list_enabled(storage)
+        finally:
+            await storage.close()
+
+    enabled = _run(_do(), session=session)
+    if not enabled:
+        click.echo("No dialogs enabled.")
+        return
+    for dialog_id in enabled:
+        click.echo(str(dialog_id))
+
+
+@ghostwrite_dialogs.command("pause-all")
+@click.option("--session", default="default")
+def ghostwrite_dialogs_pause_all(session: str) -> None:
+    """Kill switch: pause every enabled dialog (resume one with 'resume PEER')."""
+    from tg_messenger.agent.ghostwrite import pause_all
+
+    async def _do():
+        storage = _open_ghostwrite_storage(session)
+        await storage.connect()
+        try:
+            await pause_all(storage)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo("ghostwrite paused for all enabled dialogs.")
+
+
+@ghostwrite_dialogs.command("resume")
+@click.argument("dialog_id", type=int)
+@click.option("--session", default="default")
+def ghostwrite_dialogs_resume(dialog_id: int, session: str) -> None:
+    """Clear a dialog's pause (re-arm it after pause-all or an auto-pause)."""
+    from tg_messenger.agent.ghostwrite import resume_dialog
+
+    async def _do():
+        storage = _open_ghostwrite_storage(session)
+        await storage.connect()
+        try:
+            await resume_dialog(storage, dialog_id)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"ghostwrite resumed for dialog {dialog_id}.")
+
+
 @cli.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=lambda: int(os.environ.get("TG_WEB_PORT", "8090")), type=int)

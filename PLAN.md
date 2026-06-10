@@ -623,6 +623,39 @@ v1-компромиссы: суфлёр сам не действует (толь
 codepoint, без grapheme-точности); профили/last_read — per-profile SQLite; история уходит в LLM
 целиком (приватность задокументирована).
 
+## Циклы (ghostwrite, #18, сделано)
+
+Этап 2 суфлёра: `tg-messenger ghostwrite` — САМ отвечает в стиле владельца в ЯВНО включённых
+ЛС (переиспользует `Suggester` #17, который ИНЖЕКТИРУЕТСЯ — `ghostwrite.py` langchain НЕ
+импортирует, движок/storage зелёные на голом `[dev]` без `importorskip`). Паттерн
+ModerationEngine #16 / watch.py: `run()` через `asyncio.gather` (НЕ TaskGroup — Ctrl+C);
+dry-run по умолчанию (отправка только `--enforce`). Деструктивно → жёсткие предохранители.
+
+- **A — storage** (`tests/test_ghostwrite.py`): таблицы `ghostwrite_dialogs`(dialog_id PK,
+  enabled, paused_until)/`ghostwrite_log`; `register_ghostwrite_migrations`; CRUD
+  `enable_dialog`/`disable_dialog`/`list_enabled`/`pause_dialog`/`resume_dialog`/`pause_all`/
+  `is_active(storage, dialog_id, now=)` (enabled И не на паузе) — всё на tmp-SQLite.
+- **B — движок dry-run**: `GhostwriteEngine(client, suggester, storage, *, enforce=False,
+  clock=, max_per_hour=, pause_on_human_sec=)`. `process_incoming(message)`: активный диалог →
+  `suggester.suggest(dialog_id)` → enforce=False: would-лог + журнал `dry_run=1`, `send_text`
+  НЕ зовётся. Выключенный диалог → суфлёр НЕ зовётся.
+- **C — enforce + лимит/час**: enforce=True → `send_text` + журнал `dry_run=0`; `max_per_hour`
+  скользящее окно в памяти (bounded `OrderedDict`, инжектируемый clock) → превышение → пропуск +
+  warning (проверяется ДО суфлёра — нет лишнего LLM-вызова). Не-active диалог → пропуск.
+- **D — авто-пауза при человеке**: `on_outgoing(event)` из `listen_outgoing` — исходящее в
+  ghostwrite-диалоге, которое НЕ отправил движок (кэш own-id, патторн watch; sentinel `True`,
+  не `None`) → `pause_dialog(now + pause_on_human_sec)`. Own-сообщение движка паузу НЕ ставит.
+- **E — деградация**: ошибка суфлёра → `logger.exception`, движок жив; пустой/пробельный
+  suggest → пропуск (пустое не шлём, журнала нет).
+- **F — CLI**: `ghostwrite [--enforce]` (паттерн watch, Ctrl+C чисто, лог включённых на старте);
+  группа `ghostwrite-dialogs`: enable/disable/list/pause-all/resume. `enable '*'` → ClickException
+  (запрещён by design). Тесты CliRunner + стаб (`make_suggester`/`make_storage` seam).
+- **G — финал**: `.env.example` (ghostwrite accepted-risk блок), CLAUDE.md/PLAN.md, pytest+ruff.
+
+v1-компромиссы: только CLI (без web/TUI); лимит/окно и кэш own-id — в памяти (рестарт сбрасывает;
+`paused_until` в storage переживает); без эскалации/ML — простой reuse суфлёра; приватность —
+история уходит в LLM (accepted risk, как у agent/suggester).
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.

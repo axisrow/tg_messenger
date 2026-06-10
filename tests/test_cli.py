@@ -706,6 +706,88 @@ def test_revoked_session_mid_command_gives_hint(runner, monkeypatch):
     assert "Traceback" not in result.output
 
 
+# --- Цикл F (#18): команды ghostwrite + ghostwrite-dialogs ---
+
+
+class FakeSuggesterCli:
+    """Stub Suggester for the ghostwrite CLI: never touches an LLM."""
+
+    async def suggest(self, dialog_id):
+        return "auto reply"
+
+
+@pytest.fixture
+def gw_runner(monkeypatch, tmp_path):
+    """CLI runner whose ghostwrite storage is a fresh tmp SQLite db; no LLM."""
+    from tg_messenger.core.storage import Storage
+
+    stub = StubClient()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    monkeypatch.setattr(cli_main, "make_storage", lambda profile="default": Storage(tmp_path / "gw.db"))
+    monkeypatch.setattr(cli_main, "make_suggester", lambda client, storage=None: FakeSuggesterCli())
+    return CliRunner(), stub, tmp_path
+
+
+def test_ghostwrite_dialogs_enable_list_disable(gw_runner):
+    r, _stub, _tp = gw_runner
+    en = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    assert en.exit_code == 0, en.output
+
+    lst = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "list"])
+    assert lst.exit_code == 0
+    assert "7" in lst.output
+
+    dis = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "disable", "7"])
+    assert dis.exit_code == 0
+
+    lst2 = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "list"])
+    assert "No dialogs" in lst2.output or "7" not in lst2.output
+
+
+def test_ghostwrite_enable_star_is_rejected(gw_runner):
+    r, _stub, _tp = gw_runner
+    result = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "*"])
+    assert result.exit_code != 0
+    assert "*" in result.output
+
+
+def test_ghostwrite_pause_all_and_resume(gw_runner):
+    r, _stub, _tp = gw_runner
+    r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    pa = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "pause-all"])
+    assert pa.exit_code == 0, pa.output
+    res = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "resume", "7"])
+    assert res.exit_code == 0, res.output
+
+
+def test_ghostwrite_runs_and_stops_on_ctrl_c(gw_runner):
+    r, stub, _tp = gw_runner
+    r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    result = r.invoke(cli_main.cli, ["ghostwrite"])
+    assert result.exit_code == 0, result.output
+    assert "dry-run" in result.output
+    assert "stopped." in result.output
+    assert stub.connected is False
+    # dry-run: nothing was actually sent
+    assert stub.sent == []
+
+
+def test_ghostwrite_enforce_flag_shown(gw_runner):
+    r, stub, _tp = gw_runner
+    r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    result = r.invoke(cli_main.cli, ["ghostwrite", "--enforce"])
+    assert result.exit_code == 0, result.output
+    assert "ENFORCING" in result.output
+
+
+def test_ghostwrite_without_login_gives_hint(gw_runner):
+    r, stub, _tp = gw_runner
+    stub.authorized = False
+    result = r.invoke(cli_main.cli, ["ghostwrite"])
+    assert result.exit_code != 0
+    assert "tg-messenger login" in result.output
+
+
 def test_dotenv_autoloaded_for_commands(runner, tmp_path, monkeypatch):
     # isolate os.environ so the test can't leak TG_API_ID into the session
     monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
