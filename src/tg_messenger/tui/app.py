@@ -60,6 +60,9 @@ class MessengerTUI(App):
         if self._client is None:
             self._client = _make_real_client(self._session_name)
         await self._client.connect()
+        if not await self._client.is_authorized():
+            self.exit(return_code=1, message="Not logged in. Run: tg-messenger login")
+            return
         await self._load_dialogs()
         self.run_worker(self._drain_incoming(), exclusive=False)
 

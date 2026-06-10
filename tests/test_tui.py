@@ -8,6 +8,8 @@ class TuiStubClient:
     def __init__(self):
         self.sent = []
         self.connected = False
+        self.authorized = True
+        self.dialogs_calls = 0
 
     async def connect(self):
         self.connected = True
@@ -15,7 +17,11 @@ class TuiStubClient:
     async def disconnect(self):
         self.connected = False
 
+    async def is_authorized(self):
+        return self.authorized
+
     async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
         # title contains markup-hostile brackets on purpose
         return [Dialog(id=7, title="Ann [/x", username="ann", unread=0)]
 
@@ -56,6 +62,17 @@ async def test_tui_survives_markup_hostile_text():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
         assert len(bubbles) == 1
+
+
+async def test_tui_exits_with_hint_when_not_logged_in():
+    stub = TuiStubClient()
+    stub.authorized = False
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+    assert app.return_code == 1
+    assert stub.dialogs_calls == 0  # dialogs were never requested
+    assert stub.connected is False
 
 
 async def test_tui_disconnects_on_exit():

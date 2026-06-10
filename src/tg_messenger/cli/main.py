@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 
 import click
+from telethon.errors import UnauthorizedError
 
 from tg_messenger.core.client import StandaloneTelegramClient
 from tg_messenger.core.flood import HandledFloodWaitError
@@ -38,19 +39,35 @@ def make_client(**kwargs) -> StandaloneTelegramClient:
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
 
 
-def _run(coro):
+def _login_hint(session: str = "default") -> str:
+    hint = "Not logged in. Run: tg-messenger login"
+    if session != "default":
+        hint += f" --session {session}"
+    return hint
+
+
+def _run(coro, session: str = "default"):
     try:
         return asyncio.run(coro)
     except HandledFloodWaitError as exc:
         raise click.ClickException(
             f"Telegram flood wait {exc.wait_seconds}s — try again later."
         ) from exc
+    except UnauthorizedError as exc:
+        # session missing or revoked mid-command
+        raise click.ClickException(_login_hint(session)) from exc
+
+
+async def _ensure_authorized(client, session: str) -> None:
+    if not await client.is_authorized():
+        raise click.ClickException(_login_hint(session))
 
 
 async def _with_client(session, fn):
     client = make_client(session_name=session)
     await client.connect()
     try:
+        await _ensure_authorized(client, session)
         return await fn(client)
     finally:
         await client.disconnect()
@@ -101,7 +118,7 @@ def dialogs(session: str) -> None:
     async def _do(client):
         return await client.dialogs(dm_only=True)
 
-    items = _run(_with_client(session, _do))
+    items = _run(_with_client(session, _do), session=session)
     for d in items:
         unread = f" ({d.unread} unread)" if d.unread else ""
         uname = f" @{d.username}" if d.username else ""
@@ -130,7 +147,7 @@ def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> 
                 if saved:
                     click.echo(f"  saved: {saved}")
 
-    _run(_with_client(session, _do))
+    _run(_with_client(session, _do), session=session)
 
 
 @cli.command()
@@ -146,7 +163,7 @@ def send(dialog_id: int, text: str | None, file_path: str | None, session: str) 
             return await client.send_media(dialog_id, file_path, caption=text)
         return await client.send_text(dialog_id, text or "")
 
-    _run(_with_client(session, _do))
+    _run(_with_client(session, _do), session=session)
     click.echo("sent.")
 
 
@@ -159,6 +176,7 @@ def listen(session: str) -> None:
         client = make_client(session_name=session)
         await client.connect()
         try:
+            await _ensure_authorized(client, session)
             click.echo("Listening for incoming messages (Ctrl+C to stop)...")
             async for ev in client.listen():
                 click.echo(f"← [{ev.dialog_id}] {ev.message.text or '<media>'}")
@@ -166,7 +184,7 @@ def listen(session: str) -> None:
             await client.disconnect()
 
     try:
-        _run(_do())
+        _run(_do(), session=session)
     except KeyboardInterrupt:
         click.echo("stopped.")
 
@@ -180,28 +198,31 @@ def chat(dialog_id: int, session: str) -> None:
     async def _do():
         client = make_client(session_name=session)
         await client.connect()
-
-        async def printer():
-            async for ev in client.listen():
-                if ev.dialog_id == dialog_id:
-                    click.echo(f"\n← {ev.message.text or '<media>'}")
-
-        task = asyncio.create_task(printer())
         try:
-            while True:
-                try:
-                    line = await asyncio.to_thread(input, "> ")
-                except EOFError:
-                    break
-                if line.strip():
-                    await client.send_text(dialog_id, line)
+            await _ensure_authorized(client, session)
+
+            async def printer():
+                async for ev in client.listen():
+                    if ev.dialog_id == dialog_id:
+                        click.echo(f"\n← {ev.message.text or '<media>'}")
+
+            task = asyncio.create_task(printer())
+            try:
+                while True:
+                    try:
+                        line = await asyncio.to_thread(input, "> ")
+                    except EOFError:
+                        break
+                    if line.strip():
+                        await client.send_text(dialog_id, line)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
             await client.disconnect()
 
     try:
-        _run(_do())
+        _run(_do(), session=session)
     except KeyboardInterrupt:
         click.echo("stopped.")
 

@@ -16,6 +16,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from telethon.errors import UnauthorizedError
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -63,6 +64,13 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
         await app.state.client.disconnect()
 
     app = FastAPI(lifespan=lifespan)
+
+    @app.exception_handler(UnauthorizedError)
+    async def unauthorized(request: Request, exc: UnauthorizedError):
+        return HTMLResponse(
+            '<div class="error">Not logged in — run: tg-messenger login</div>',
+            status_code=401,
+        )
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request):

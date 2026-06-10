@@ -16,7 +16,11 @@ class StubClient:
         self.downloaded = []
         self.history_items = None
         self.connected = False
+        self.authorized = True
         self.listen_interrupt = True  # emulate Ctrl+C after the first event
+
+    async def is_authorized(self):
+        return self.authorized
 
     async def connect(self):
         self.connected = True
@@ -241,6 +245,40 @@ def test_login_2fa_prompts_password(monkeypatch):
     assert result.exit_code == 0
     assert inner.signed_in[-1]["password"] == "hunter2"
     assert stub.saved is True
+
+
+def test_dialogs_without_login_gives_hint_not_traceback(runner):
+    r, stub = runner
+    stub.authorized = False
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code != 0
+    assert "tg-messenger login" in result.output
+    assert "Traceback" not in result.output
+    assert stub.connected is False  # client got disconnected
+
+
+def test_listen_without_login_gives_hint(runner):
+    r, stub = runner
+    stub.authorized = False
+    result = r.invoke(cli_main.cli, ["listen"])
+    assert result.exit_code != 0
+    assert "tg-messenger login" in result.output
+    assert stub.connected is False
+
+
+def test_revoked_session_mid_command_gives_hint(runner, monkeypatch):
+    from telethon.errors.rpcerrorlist import AuthKeyUnregisteredError
+
+    r, stub = runner
+
+    async def boom(dm_only=True):
+        raise AuthKeyUnregisteredError(None)
+
+    monkeypatch.setattr(stub, "dialogs", boom)
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code != 0
+    assert "tg-messenger login" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_dotenv_autoloaded_for_commands(runner, tmp_path, monkeypatch):

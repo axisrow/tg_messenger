@@ -122,6 +122,21 @@ def test_serve_starts_and_serves_index():
 
 
 @pytest.mark.skipif(not HAS_CREDS, reason="нет TG_API_ID/TG_API_HASH (окружение или .env)")
+@pytest.mark.skipif(SESSION_FILE.exists(), reason="сессия есть — этот тест про её отсутствие")
+def test_serve_dialogs_without_session_gives_401_hint():
+    """Без логина /dialogs отвечает 401 с подсказкой, а не 500 с traceback."""
+    port = _free_port()
+    proc = _serve(port, _cred_env())
+    try:
+        _wait_http(port, proc)  # дождаться старта по индексу
+        r = httpx.get(f"http://127.0.0.1:{port}/dialogs", timeout=15)
+        assert r.status_code == 401
+        assert "tg-messenger login" in r.text
+    finally:
+        _stop(proc)
+
+
+@pytest.mark.skipif(not HAS_CREDS, reason="нет TG_API_ID/TG_API_HASH (окружение или .env)")
 @pytest.mark.skipif(not SESSION_FILE.exists(),
                     reason="нет сессии — выполните: tg-messenger login")
 def test_serve_dialogs_with_real_session():

@@ -107,6 +107,24 @@ async def test_media_upload_calls_send_media(client_app):
     assert "look" in r.text
 
 
+async def test_unauthorized_session_gives_401_with_hint():
+    from telethon.errors.rpcerrorlist import AuthKeyUnregisteredError
+
+    stub = WebStubClient()
+
+    async def boom(dm_only=True):
+        raise AuthKeyUnregisteredError(None)
+
+    stub.dialogs = boom
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/dialogs")
+    assert r.status_code == 401
+    assert "tg-messenger login" in r.text
+
+
 async def test_stream_yields_sse_frame():
     # Drive the SSE generator directly: subscribing then publishing must
     # produce one data frame for the matching dialog (and skip others).
