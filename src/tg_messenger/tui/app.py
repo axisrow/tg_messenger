@@ -30,6 +30,25 @@ def _make_real_client(session_name: str):
     )
 
 
+class SidebarTabs(Tabs):
+    """DM/groups tabs that hand focus down to the dialog list.
+
+    Textual's Tabs only binds left/right; Enter or Down here jumps focus to the
+    sibling #dialogs ListView so the user can start scrolling dialogs at once,
+    instead of having to Tab past the strip.
+    """
+
+    BINDINGS = [
+        Binding("down,enter", "focus_dialogs", "Dialogs", show=False),
+    ]
+
+    def action_focus_dialogs(self) -> None:
+        lv = self.app.query_one("#dialogs", ListView)
+        lv.focus()
+        if lv.index is None and len(lv) > 0:
+            lv.index = 0  # land on the first dialog so arrows scroll immediately
+
+
 class DialogItem(ListItem):
     def __init__(self, dialog_id: int, title: str):
         # markup=False: titles/messages are untrusted text, [brackets] must render literally
@@ -64,7 +83,7 @@ class MessengerTUI(App):
     def compose(self) -> ComposeResult:
         with Horizontal():
             with Vertical(id="sidebar"):
-                yield Tabs(Tab("DM", id="dm"), Tab("Группы", id="groups"))
+                yield SidebarTabs(Tab("DM", id="dm"), Tab("Группы", id="groups"))
                 yield ListView(id="dialogs")
             with Vertical():
                 yield Vertical(id="messages")

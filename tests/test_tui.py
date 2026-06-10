@@ -375,3 +375,42 @@ async def test_tui_disconnects_on_exit():
         await pilot.pause()
         assert stub.connected is True
     assert stub.connected is False
+
+
+# --- UX: Enter / стрелка-вниз с вкладок → фокус на список диалогов ---
+
+
+async def test_down_arrow_on_tabs_moves_focus_to_dialogs():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tabs = app.query_one(Tabs)
+        tabs.focus()
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        assert app.focused is app.query_one("#dialogs", ListView)
+
+
+async def test_enter_on_tabs_moves_focus_to_dialogs():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tabs = app.query_one(Tabs)
+        tabs.focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.focused is app.query_one("#dialogs", ListView)
+
+
+async def test_down_focuses_first_dialog_so_it_is_navigable():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).focus()
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        assert lv.index == 0  # списком сразу можно листать
