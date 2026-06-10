@@ -26,6 +26,10 @@ web = [
 tui = [
     "textual>=0.60",
 ]
+crypto = [
+    # at-rest session encryption (Fernet) — SSO-compatible with tg_content_factory
+    "cryptography>=42",
+]
 agent = [
     "langchain>=1.0",   # init_chat_model — единый интерфейс моделей
     "langgraph>=1.0",   # StateGraph + checkpointer
@@ -34,11 +38,11 @@ agent = [
     "httpx>=0.27",      # brave search REST
 ]
 all = [
-    "tg-messenger[web,tui,agent]",
+    "tg-messenger[web,tui,crypto,agent]",
 ]
 dev = [
-    # тесты web/tui должны бежать локально → dev тянет оба extra
-    "tg-messenger[web,tui]",
+    # тесты web/tui/crypto должны бежать локально → dev тянет эти extras
+    "tg-messenger[web,tui,crypto]",
     "pytest>=8",
     # 1.3.0 leaks event loops -> ResourceWarning fails the suite (filterwarnings=error)
     "pytest-asyncio>=1.4",

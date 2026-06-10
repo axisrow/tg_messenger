@@ -134,3 +134,55 @@ async def test_sign_in_before_code_raises(fake_client):
     flow = auth.LoginFlow(fake_client)
     with pytest.raises(RuntimeError):
         await flow.sign_in(code="12345")
+
+
+# --- циклы 53–54: опциональное шифрование SessionStore (Fernet enc:v2:) ---
+
+pytest.importorskip("cryptography")
+
+_ENC_KEY = "shared-sso-secret"
+
+
+def test_save_encrypts_with_key(session_dir):
+    store = SessionStore(session_dir, encryption_key=_ENC_KEY)
+    store.save("default", VALID_SESSION)
+    raw = store.path_for("default").read_text(encoding="utf-8").strip()
+    assert raw.startswith("enc:v2:")
+    # the plaintext session must NOT appear anywhere in the file
+    assert VALID_SESSION not in raw
+    # and load round-trips it back
+    assert store.load("default") == VALID_SESSION
+
+
+def test_load_factory_written_session_sso(session_dir):
+    # simulate a session encrypted by tg_content_factory with the same shared key
+    from tg_messenger.core.session_cipher import encrypt_session
+
+    path = SessionStore(session_dir).path_for("default")
+    session_dir.mkdir(parents=True, exist_ok=True)
+    path.write_text(encrypt_session(VALID_SESSION, _ENC_KEY), encoding="utf-8")
+    store = SessionStore(session_dir, encryption_key=_ENC_KEY)
+    assert store.load("default") == VALID_SESSION
+
+
+def test_lazy_migration_plaintext_to_encrypted(session_dir):
+    import stat as _stat
+
+    plain = SessionStore(session_dir)
+    plain.save("default", VALID_SESSION)  # writes plaintext
+    # now load with a key — should rewrite the file encrypted, preserving 0600
+    keyed = SessionStore(session_dir, encryption_key=_ENC_KEY)
+    assert keyed.load("default") == VALID_SESSION
+    raw = keyed.path_for("default").read_text(encoding="utf-8").strip()
+    assert raw.startswith("enc:v2:")
+    mode = _stat.S_IMODE(keyed.path_for("default").stat().st_mode)
+    assert mode == 0o600
+
+
+def test_encrypted_file_without_key_errors_with_hint(session_dir):
+    keyed = SessionStore(session_dir, encryption_key=_ENC_KEY)
+    keyed.save("default", VALID_SESSION)
+    # drop the key — the encrypted file can't be read, with a SESSION_ENCRYPTION_KEY hint
+    no_key = SessionStore(session_dir)
+    with pytest.raises(ValueError, match="SESSION_ENCRYPTION_KEY"):
+        no_key.load("default")

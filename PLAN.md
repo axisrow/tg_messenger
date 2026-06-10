@@ -418,6 +418,22 @@ titles сам). Дисциплина username-резолва: дорогой (~5
 - **50** — pyproject: base = telethon>=1.43/pydantic/click; extras `[web]`/`[tui]`/`[all]`;
   `[dev]` тянет `[web,tui]`; `src/tg_messenger/py.typed` в wheel; README «Use as a library».
 
+## Циклы 51–56 — шифрование сессий (Fernet) + SSO с фабрикой (#10, сделано)
+
+`core/session_cipher.py` + `SessionStore(encryption_key=)`:
+- **51** (`test_session_cipher.py`): `encrypt_session`/`decrypt_session`/`is_encrypted`;
+  `enc:v2:` = Fernet над PBKDF2(secret, salt=`b"tg_session_key_v2"`, 200k, 32) — схема
+  фабрики байт-в-байт (тест переderives ключ с захардкоженными константами независимо);
+  v1 read-only, plaintext passthrough, неверный ключ → ValueError.
+- **52**: monkeypatch ImportError `cryptography` → при ключе понятная ошибка с `[crypto]`.
+- **53/54** (`test_auth.py`): save пишет `enc:v2:` (без plaintext-подстроки), load расшифровывает,
+  чтение чужого `enc:v2:` с тем же ключом (SSO); ленивая миграция plaintext→enc (0600 сохранён);
+  enc-файл без ключа → ошибка с подсказкой про `SESSION_ENCRYPTION_KEY`.
+- **55** (`test_cli.py`): `login --export-session` печатает строку + warning (не в лог);
+  `--import-session` валидирует и сохраняет, мусор → «invalid StringSession».
+- **56**: pyproject `[crypto]` (в `[all]`/`[dev]`); `.env.example` (`SESSION_ENCRYPTION_KEY`);
+  README «Session encryption & SSO»; CLAUDE.md/PLAN.md.
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.

@@ -50,6 +50,8 @@ def _load_dotenv(path: Path | str = ".env") -> None:
 def make_client(**kwargs) -> StandaloneTelegramClient:
     api_id = int(os.environ.get("TG_API_ID", "0"))
     api_hash = os.environ.get("TG_API_HASH", "")
+    # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
+    kwargs.setdefault("encryption_key", os.environ.get("SESSION_ENCRYPTION_KEY") or None)
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
 
 
@@ -152,14 +154,68 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     setup_logging(verbose=verbose, console_skip_prefixes=("tg_messenger.cli",))
 
 
+def _export_session(session: str) -> None:
+    """Print the plaintext StringSession to stdout — full account access, never logged."""
+
+    async def _do():
+        client = make_client(session_name=session)
+        await client.connect()
+        try:
+            if not await client.is_authorized():
+                raise click.ClickException(LOGIN_HINT)
+            return client.export_session_string()
+        finally:
+            await client.disconnect()
+
+    session_string = _run(_do())
+    click.echo("WARNING: this StringSession grants full access to your account — keep it secret.",
+               err=True)
+    click.echo(session_string)
+
+
+def _import_session(session: str) -> None:
+    """Read a StringSession from stdin (no echo), validate it, and save it under ``session``."""
+    from tg_messenger.core.auth import validate_session_string
+
+    raw = click.prompt("Paste StringSession", hide_input=True).strip()
+    try:
+        # validate before touching the client so garbage is rejected up front
+        validate_session_string(raw)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    make_client(session_name=session).import_session_string(raw)
+    click.echo(f"Session '{session}' imported and saved.")
+
+
 @cli.command()
 @click.option("--session", default="default", help="Session name.")
-@click.option("--phone", prompt=True, help="Phone number in international format.")
-def login(session: str, phone: str) -> None:
-    """Interactive login: phone -> code -> optional 2FA."""
+@click.option("--phone", default=None, help="Phone number in international format.")
+@click.option("--export-session", "export_session", is_flag=True,
+              help="Print the plaintext StringSession to stdout (full account access) and exit.")
+@click.option("--import-session", "import_session", is_flag=True,
+              help="Read a StringSession from stdin (no echo), validate and save it.")
+def login(session: str, phone: str | None, export_session: bool, import_session: bool) -> None:
+    """Interactive login: phone -> code -> optional 2FA.
+
+    ``--export-session`` / ``--import-session`` move a session between machines or
+    projects (SSO with tg_content_factory) without a fresh phone login.
+    """
     from telethon.errors import RPCError, SendCodeUnavailableError, SessionPasswordNeededError
 
     from tg_messenger.core.auth import LoginFlow
+
+    if export_session and import_session:
+        raise click.ClickException("choose either --export-session or --import-session, not both")
+
+    if export_session:
+        _export_session(session)
+        return
+    if import_session:
+        _import_session(session)
+        return
+
+    if not phone:
+        phone = click.prompt("Phone number in international format")
 
     async def _do():
         client = make_client(session_name=session)

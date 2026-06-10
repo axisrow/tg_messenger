@@ -57,3 +57,25 @@ asyncio.run(main())
 
 The public surface (`tg_messenger.__all__`) also exports `SessionStore`, `LoginFlow`,
 `LOGIN_HINT`, `EventBus`, `run_with_flood_wait_retry` and `HandledFloodWaitError`.
+
+## Session encryption & SSO with tg_content_factory
+
+By default sessions live as plaintext `0600` files under `~/.tg_messenger/sessions/`.
+Set `SESSION_ENCRYPTION_KEY` (and `pip install 'tg-messenger[crypto]'`) to store them
+encrypted instead — Fernet over a PBKDF2-derived key, format `enc:v2:`, **byte-compatible
+with [tg_content_factory](https://github.com/axisrow/tg_content_factory)**. A plaintext file
+read under a key is lazily rewritten encrypted; an encrypted file read without the key errors
+with a hint.
+
+Two ways to share one login across both projects (single sign-on):
+
+- **Shared key (option A):** put the same `SESSION_ENCRYPTION_KEY` in both `.env` files —
+  the encrypted session strings become mutually readable.
+- **Export / import (option B):**
+  ```bash
+  tg-messenger login --export-session         # prints the plaintext StringSession (full access!)
+  tg-messenger login --import-session         # reads a StringSession from stdin (no echo) and saves it
+  ```
+  or inject directly as a library: `StandaloneTelegramClient(..., external_session=STRING)`.
+
+Session strings are never written to logs.
