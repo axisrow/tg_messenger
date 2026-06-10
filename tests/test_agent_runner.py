@@ -4,20 +4,31 @@
 клиент — стаб с программируемым listen(). Сети и LLM нет.
 """
 
+import base64
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 from tg_messenger.agent.config import AgentConfig
+from tg_messenger.agent.media import MAX_IMAGE_BYTES, ImageInput
 from tg_messenger.agent.runner import AgentRunner
-from tg_messenger.core.models import Dialog, IncomingEvent, Message
+from tg_messenger.core.models import Dialog, IncomingEvent, MediaRef, Message
 
 
-def ev(dialog_id=7, sender_id=7, text="ping", out=False, msg_id=1):
+def ev(dialog_id=7, sender_id=7, text="ping", out=False, msg_id=1, media=None):
     return IncomingEvent(
         dialog_id=dialog_id,
         message=Message(id=msg_id, dialog_id=dialog_id, sender_id=sender_id, out=out,
-                        text=text, date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+                        text=text, media=media, date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
     )
+
+
+def photo(size=1024, mime_type="image/png"):
+    return MediaRef(kind="photo", size=size, mime_type=mime_type, downloadable=True)
+
+
+def voice():
+    return MediaRef(kind="voice", mime_type="audio/ogg", downloadable=True)
 
 
 def cfg(**kw):
@@ -33,6 +44,17 @@ class StubClient:
         self.sent = []
         self.dialogs_calls = 0
         self.typing_active = []
+        self.downloads = []
+        self.download_payload = b"img-bytes"
+        self.download_fail = False
+
+    async def download_message_media(self, peer, message_id, dest):
+        self.downloads.append((peer, message_id))
+        if self.download_fail:
+            raise RuntimeError("net down")
+        path = Path(dest) / "p.jpg"
+        path.write_bytes(self.download_payload)
+        return str(path)
 
     def typing(self, peer):
         stub = self
@@ -65,10 +87,12 @@ class StubClient:
 class StubOrchestrator:
     def __init__(self):
         self.handled = []
+        self.images = []  # image (или None) каждого вызова handle, по порядку
         self.fail_on = set()  # тексты, на которых handle взрывается
 
-    async def handle(self, dialog_id, text):
+    async def handle(self, dialog_id, text, *, image=None):
         self.handled.append((dialog_id, text))
+        self.images.append(image)
         if text in self.fail_on:
             raise RuntimeError("llm exploded")
         return f"re: {text}"
@@ -199,3 +223,74 @@ async def test_allowlist_checks_sender_id_not_dialog_id():
     runner, client, orch = make(events, config=config)
     await runner.run()
     assert orch.handled == [(500, "разрешён")]
+
+
+# --- Цикл 20: диспетчеризация медиа (voice / photo / прочее) ---
+
+
+async def test_voice_message_is_logged_and_skipped(caplog):
+    runner, client, orch = make([ev(text=None, media=voice()), ev(text="ok", msg_id=2)])
+    with caplog.at_level(logging.INFO, logger="tg_messenger.agent.runner"):
+        await runner.run()
+    assert orch.handled == [(7, "ok")]  # голосовое не дошло до оркестратора, цикл жив
+    assert any("voice" in r.message for r in caplog.records)
+
+
+async def test_photo_with_caption_goes_to_handle_with_image():
+    runner, client, orch = make([ev(text="что это?", media=photo())])
+    await runner.run()
+    assert orch.handled == [(7, "что это?")]
+    (image,) = orch.images
+    assert isinstance(image, ImageInput)
+    assert base64.b64decode(image.base64_data) == client.download_payload
+    assert image.mime_type == "image/png"
+    assert client.sent == [(7, "re: что это?")]
+
+
+async def test_photo_without_caption_passes_empty_text():
+    runner, client, orch = make([ev(text=None, media=photo())])
+    await runner.run()
+    assert orch.handled == [(7, "")]
+    assert orch.images[0] is not None
+
+
+async def test_text_message_passes_no_image():
+    runner, client, orch = make([ev(text="привет")])
+    await runner.run()
+    assert orch.images == [None]
+    assert client.downloads == []
+
+
+async def test_photo_from_stranger_is_not_downloaded():
+    # allowlist проверяется ДО скачивания — чужие не тратят сеть/диск
+    config = cfg(allow_all=False, allow_ids=frozenset({123}))
+    runner, client, orch = make([ev(sender_id=99, text=None, media=photo())], config=config)
+    await runner.run()
+    assert client.downloads == []
+    assert orch.handled == []
+
+
+async def test_photo_download_error_is_logged_and_loop_survives(caplog):
+    runner, client, orch = make([ev(text=None, media=photo()), ev(text="ok", msg_id=2)])
+    client.download_fail = True
+    with caplog.at_level(logging.ERROR, logger="tg_messenger.agent.runner"):
+        await runner.run()
+    assert orch.handled == [(7, "ok")]
+    assert any(r.exc_info for r in caplog.records)  # не молча: logger.exception
+
+
+async def test_oversize_photo_is_skipped_without_reply():
+    runner, client, orch = make([ev(text=None, media=photo(size=MAX_IMAGE_BYTES + 1))])
+    await runner.run()
+    assert client.downloads == []  # warning логирует agent.media (см. test_agent_media)
+    assert orch.handled == []
+    assert client.sent == []
+
+
+async def test_document_with_caption_goes_to_text_path():
+    doc = MediaRef(kind="document", file_name="report.pdf", downloadable=True)
+    runner, client, orch = make([ev(text="глянь файл", media=doc)])
+    await runner.run()
+    assert orch.handled == [(7, "глянь файл")]
+    assert orch.images == [None]
+    assert client.downloads == []
