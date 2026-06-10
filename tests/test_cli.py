@@ -772,6 +772,28 @@ def test_profile_menu_picks_second(monkeypatch, tmp_path):
     assert captured.get("session_name") == "bob"  # sorted: alice, bob, carol → #2
 
 
+def test_profile_menu_reprompts_on_out_of_range(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    captured = {}
+
+    def fake_make_client(**kw):
+        captured.update(kw)
+        return StubClient()
+
+    store = SessionStore(tmp_path)
+    for name in ("alice", "bob", "carol"):
+        store.save(name, _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    monkeypatch.setattr(cli_main, "make_client", fake_make_client)
+    monkeypatch.setattr(cli_main, "_is_interactive", lambda: True)
+    # 9 is out of range → re-prompt; then 2 picks bob
+    result = CliRunner().invoke(cli_main.cli, ["dialogs"], input="9\n2\n")
+    assert result.exit_code == 0, result.output
+    assert "out of range" in result.output
+    assert captured.get("session_name") == "bob"
+
+
 # --- цикл 61: serve/tui учитывают глобальный --profile ---
 
 def test_serve_uses_global_profile_as_session(monkeypatch):
