@@ -39,6 +39,7 @@ from tg_messenger.core.models import (
     ReactionEvent,
     User,
 )
+from tg_messenger.core.ratelimit import TokenBucket
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,7 @@ class StandaloneTelegramClient:
         client_factory: Callable = _default_factory,
         dialogs_ttl: float = DEFAULT_DIALOGS_TTL_SEC,
         history_ttl: float = DEFAULT_HISTORY_TTL_SEC,
+        send_rate_per_min: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
     ):
         self._store = SessionStore(session_dir, encryption_key=encryption_key)
@@ -148,6 +150,11 @@ class StandaloneTelegramClient:
         # keyed by (int(peer), limit, offset_id); invalidated per-peer on writes/events
         self._history_cache: TTLCache[tuple[int, int, int], list[Message]] = TTLCache(
             history_ttl, maxsize=64, clock=clock
+        )
+        # one global cap on outgoing sends across every caller (#25); 0 = disabled.
+        # burst = the rate (1 minute's worth) so a quiet account isn't throttled.
+        self._send_bucket = TokenBucket(
+            send_rate_per_min, burst=max(1, int(send_rate_per_min)), clock=clock
         )
 
     # --- connection ---
@@ -288,6 +295,7 @@ class StandaloneTelegramClient:
         schedule: timedelta | datetime | None = None,
     ) -> Message:
         """Send ``text`` to ``peer``; ``schedule`` (a delay or absolute time) defers it server-side."""
+        await self._send_bucket.acquire()  # global outgoing cap (#25), before the retry loop
         msg = await run_with_flood_wait_retry(
             lambda: self._client.send_message(peer, text, reply_to=reply_to, schedule=schedule),
             operation="send_text",
@@ -301,6 +309,7 @@ class StandaloneTelegramClient:
         Invalidates the history cache of BOTH peers (source can change too via
         Telegram's own behaviour, and the destination gains the new messages).
         """
+        await self._send_bucket.acquire()  # global outgoing cap (#25)
         sent = await run_with_flood_wait_retry(
             lambda: self._client.forward_messages(to_peer, message_ids, from_peer),
             operation="forward",
@@ -429,6 +438,7 @@ class StandaloneTelegramClient:
         path = Path(file_path)
         if not path.is_file():
             raise ValueError(f"file not found: {file_path}")
+        await self._send_bucket.acquire()  # global outgoing cap (#25), after the cheap path check
         msg = await run_with_flood_wait_retry(
             lambda: self._client.send_file(
                 peer, str(path), caption=caption, voice_note=voice_note,
@@ -441,6 +451,7 @@ class StandaloneTelegramClient:
 
     async def send_reaction(self, peer: int, message_id: int, emoticon: str) -> None:
         """React to a message with a standard emoji, routed through flood-wait retry."""
+        await self._send_bucket.acquire()  # global outgoing cap (#25)
         await run_with_flood_wait_retry(
             lambda: self._client(
                 SendReactionRequest(

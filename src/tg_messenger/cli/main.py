@@ -53,6 +53,8 @@ def make_client(**kwargs) -> StandaloneTelegramClient:
     api_hash = os.environ.get("TG_API_HASH", "")
     # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
     kwargs.setdefault("encryption_key", os.environ.get("SESSION_ENCRYPTION_KEY") or None)
+    # global outgoing rate cap (#25): TG_SEND_RATE sends/min, 0/unset = off
+    kwargs.setdefault("send_rate_per_min", float(os.environ.get("TG_SEND_RATE", "0") or 0))
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
 
 

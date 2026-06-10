@@ -1558,3 +1558,40 @@ async def test_check_username_flood_is_handled(fake_client, monkeypatch):
     monkeypatch.setattr(type(fake_client), "__call__", lambda self, req: boom(req))
     with pytest.raises(HandledFloodWaitError):
         await client.check_username("freename1")
+
+
+# --- цикл 128: интеграция token-bucket в отправку (#25) ---
+
+async def test_send_rate_limit_waits_when_exhausted(fake_client, caplog):
+    _seed_dm(fake_client)
+    t = {"now": 0.0}
+    slept = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+        t["now"] += s
+
+    # rate 60/min = 1/sec, burst 1: first send instant, second must wait ~1s.
+    # swap in a burst=1 bucket with the fake clock+sleep (the default burst = 1 minute).
+    from tg_messenger.core.ratelimit import TokenBucket
+
+    client = _build(fake_client)
+    client._send_bucket = TokenBucket(60.0, burst=1, clock=lambda: t["now"], sleep=fake_sleep)
+    await client.connect()
+    with caplog.at_level("WARNING", logger="tg_messenger.core.ratelimit"):
+        await client.send_text(7, "first")
+        await client.send_text(7, "second")
+    assert len(slept) == 1
+    assert abs(slept[0] - 1.0) < 0.01
+    assert any("rate limit" in r.message for r in caplog.records)
+
+
+async def test_send_rate_limit_disabled_by_default(fake_client):
+    # default send_rate_per_min=0 → no throttling (regression: existing send tests unaffected)
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    assert client._send_bucket.enabled is False
+    for i in range(50):
+        await client.send_text(7, f"msg{i}")  # never blocks
+    assert len(fake_client.sent) == 50
