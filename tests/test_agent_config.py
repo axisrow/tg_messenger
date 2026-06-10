@@ -2,7 +2,7 @@
 
 import pytest
 
-from tg_messenger.agent.config import SEARCH_PROVIDERS, AgentConfig
+from tg_messenger.agent.config import SEARCH_PROVIDERS, AgentConfig, langsmith_tracing_enabled
 
 VALID_ENV = {
     "TG_AGENT_MODEL": "anthropic:claude-sonnet-4-6",
@@ -85,3 +85,29 @@ def test_star_mixed_with_other_entries_raises(allowlist):
     # раньше '*' молча уходил в usernames и не матчился никогда — агент блокировал всех
     with pytest.raises(ValueError, match=r"\*"):
         AgentConfig.from_env({**VALID_ENV, "TG_AGENT_ALLOWLIST": allowlist})
+
+
+# --- Цикл 17: langsmith_tracing_enabled — трассировка LangGraph/LangChain env-ами ---
+
+
+@pytest.mark.parametrize("env", [{}, {"LANGSMITH_TRACING": "false"}, {"LANGSMITH_TRACING": "0"}])
+def test_langsmith_tracing_off_by_default(env):
+    assert langsmith_tracing_enabled(env) is False
+
+
+@pytest.mark.parametrize("flag", ["true", "True", "1", "yes"])
+def test_langsmith_tracing_on_with_key(flag):
+    env = {"LANGSMITH_TRACING": flag, "LANGSMITH_API_KEY": "lsv2-key"}
+    assert langsmith_tracing_enabled(env) is True
+
+
+def test_langsmith_tracing_on_without_key_fails_fast():
+    # иначе langsmith молча сыпал бы фоновые ошибки на каждый трейс
+    with pytest.raises(ValueError, match="LANGSMITH_API_KEY"):
+        langsmith_tracing_enabled({"LANGSMITH_TRACING": "true"})
+
+
+def test_langsmith_tracing_defaults_to_os_environ(monkeypatch):
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2-key")
+    assert langsmith_tracing_enabled() is True

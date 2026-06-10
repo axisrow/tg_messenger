@@ -182,3 +182,35 @@ def test_bad_config_gives_friendly_error(monkeypatch, tmp_path):
     assert result.exit_code != 0
     assert "TG_AGENT_MODEL" in result.output
     assert "Traceback" not in result.output
+
+
+# --- Цикл 17: статус LangSmith-трассировки при старте агента ---
+
+
+def test_agent_announces_langsmith_tracing(agent_cli, monkeypatch):
+    r, *_ = agent_cli
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2-key")
+    monkeypatch.setenv("LANGSMITH_PROJECT", "tg-messenger")
+    result = r.invoke(cli_main.cli, ["agent"])
+    assert result.exit_code == 0
+    assert "LangSmith tracing: on (project=tg-messenger)" in result.output
+
+
+def test_agent_tracing_without_key_fails_fast(agent_cli, monkeypatch):
+    r, client, stub_runner = agent_cli
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    result = r.invoke(cli_main.cli, ["agent"])
+    assert result.exit_code != 0
+    assert "LANGSMITH_API_KEY" in result.output
+    assert "Traceback" not in result.output
+    assert stub_runner.runs == 0  # до сети и до запуска runner'а
+
+
+def test_agent_is_silent_about_tracing_when_off(agent_cli, monkeypatch):
+    r, *_ = agent_cli
+    monkeypatch.delenv("LANGSMITH_TRACING", raising=False)
+    result = r.invoke(cli_main.cli, ["agent"])
+    assert result.exit_code == 0
+    assert "LangSmith" not in result.output
