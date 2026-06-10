@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -5,7 +6,7 @@ from click.testing import CliRunner
 
 from tg_messenger.cli import main as cli_main
 from tg_messenger.core.flood import HandledFloodWaitError
-from tg_messenger.core.models import Dialog, MediaRef, Message
+from tg_messenger.core.models import Dialog, IncomingEvent, MediaRef, Message
 
 
 class StubClient:
@@ -13,12 +14,24 @@ class StubClient:
         self.sent = []
         self.downloaded = []
         self.history_items = None
+        self.connected = False
+        self.listen_interrupt = True  # emulate Ctrl+C after the first event
 
     async def connect(self):
-        pass
+        self.connected = True
 
     async def disconnect(self):
-        pass
+        self.connected = False
+
+    async def listen(self):
+        yield IncomingEvent(
+            dialog_id=7,
+            message=Message(id=10, dialog_id=7, sender_id=7, out=False, text="ping",
+                            date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+        )
+        if self.listen_interrupt:
+            raise KeyboardInterrupt
+        await asyncio.Event().wait()
 
     async def dialogs(self, dm_only=True):
         return [Dialog(id=7, title="Ann", username="ann", unread=2)]
@@ -137,6 +150,96 @@ def test_read_download_saves_media(runner, tmp_path):
     assert result.exit_code == 0
     # only the media message (id=2) is downloaded
     assert [mid for mid, _ in stub.downloaded] == [2]
+
+
+def test_read_download_creates_directory(runner, tmp_path):
+    r, stub = runner
+    stub.history_items = [
+        Message(id=2, dialog_id=7, sender_id=7, out=False, text=None,
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                media=MediaRef(kind="other", downloadable=True)),
+    ]
+    target = tmp_path / "dl" / "nested"
+    result = r.invoke(cli_main.cli, ["read", "7", "--download", str(target)])
+    assert result.exit_code == 0
+    assert target.is_dir()
+    assert [mid for mid, _ in stub.downloaded] == [2]
+
+
+def test_listen_stops_and_disconnects_on_ctrl_c(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["listen"])
+    assert result.exit_code == 0
+    assert "ping" in result.output
+    assert stub.connected is False
+
+
+def test_chat_sends_and_disconnects_on_eof(runner):
+    r, stub = runner
+    stub.listen_interrupt = False  # printer just idles; EOF on stdin ends the REPL
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
+    assert result.exit_code == 0
+    assert (7, "hello") in stub.sent
+    assert stub.connected is False
+
+
+class FakeInnerLoginClient:
+    """Stands in for the raw Telethon client used by LoginFlow."""
+
+    def __init__(self, sign_in_error=None):
+        self.sign_in_error = sign_in_error
+        self.signed_in = []
+
+    async def send_code_request(self, phone):
+        return type("Sent", (), {"phone_code_hash": "h"})()
+
+    async def sign_in(self, phone=None, code=None, password=None, **kw):
+        if code is not None and self.sign_in_error is not None:
+            raise self.sign_in_error
+        self.signed_in.append({"code": code, "password": password})
+        return object()
+
+
+class LoginStubClient:
+    def __init__(self, inner):
+        self._client = inner
+        self.connected = False
+        self.saved = False
+
+    async def connect(self):
+        self.connected = True
+
+    async def disconnect(self):
+        self.connected = False
+
+    def save_session(self):
+        self.saved = True
+
+
+def test_login_wrong_code_fails_without_2fa_prompt(monkeypatch):
+    from telethon.errors import PhoneCodeInvalidError
+
+    inner = FakeInnerLoginClient(sign_in_error=PhoneCodeInvalidError(None))
+    stub = LoginStubClient(inner)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["login"], input="+10000000000\n123\n")
+    assert result.exit_code != 0
+    assert "2FA" not in result.output
+    assert stub.saved is False
+
+
+def test_login_2fa_prompts_password(monkeypatch):
+    from telethon.errors import SessionPasswordNeededError
+
+    inner = FakeInnerLoginClient(sign_in_error=SessionPasswordNeededError(None))
+    stub = LoginStubClient(inner)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(
+        cli_main.cli, ["login"], input="+10000000000\n123\nhunter2\n"
+    )
+    assert result.exit_code == 0
+    assert inner.signed_in[-1]["password"] == "hunter2"
+    assert stub.saved is True
 
 
 def test_help_lists_commands():

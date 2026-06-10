@@ -49,22 +49,28 @@ def cli() -> None:
 @click.option("--phone", prompt=True, help="Phone number in international format.")
 def login(session: str, phone: str) -> None:
     """Interactive login: phone -> code -> optional 2FA."""
+    from telethon.errors import RPCError, SessionPasswordNeededError
+
     from tg_messenger.core.auth import LoginFlow
 
     async def _do():
         client = make_client(session_name=session)
         await client.connect()
-        flow = LoginFlow(client._client)
-        await flow.send_code(phone)
-        code = click.prompt("Code")
         try:
-            await flow.sign_in(code=code)
-        except Exception:
-            pw = click.prompt("2FA password", hide_input=True)
-            await flow.check_password(pw)
-        client.save_session()
-        await client.disconnect()
-        click.echo(f"Logged in, session '{session}' saved.")
+            flow = LoginFlow(client._client)
+            await flow.send_code(phone)
+            code = click.prompt("Code")
+            try:
+                await flow.sign_in(code=code)
+            except SessionPasswordNeededError:
+                pw = click.prompt("2FA password", hide_input=True)
+                await flow.check_password(pw)
+            except RPCError as exc:
+                raise click.ClickException(f"Sign-in failed: {exc}") from exc
+            client.save_session()
+            click.echo(f"Logged in, session '{session}' saved.")
+        finally:
+            await client.disconnect()
 
     _run(_do())
 
@@ -94,6 +100,8 @@ def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> 
     """Print the message history of a dialog (and optionally download media)."""
 
     async def _do(client):
+        if download_dir:
+            os.makedirs(download_dir, exist_ok=True)
         messages = await client.history(dialog_id, limit=limit)
         for m in messages:
             who = "→" if m.out else "←"
@@ -132,11 +140,17 @@ def listen(session: str) -> None:
     async def _do():
         client = make_client(session_name=session)
         await client.connect()
-        click.echo("Listening for incoming messages (Ctrl+C to stop)...")
-        async for ev in client.listen():
-            click.echo(f"← [{ev.dialog_id}] {ev.message.text or '<media>'}")
+        try:
+            click.echo("Listening for incoming messages (Ctrl+C to stop)...")
+            async for ev in client.listen():
+                click.echo(f"← [{ev.dialog_id}] {ev.message.text or '<media>'}")
+        finally:
+            await client.disconnect()
 
-    _run(_do())
+    try:
+        _run(_do())
+    except KeyboardInterrupt:
+        click.echo("stopped.")
 
 
 @cli.command()
@@ -157,14 +171,21 @@ def chat(dialog_id: int, session: str) -> None:
         task = asyncio.create_task(printer())
         try:
             while True:
-                line = await asyncio.to_thread(input, "> ")
+                try:
+                    line = await asyncio.to_thread(input, "> ")
+                except EOFError:
+                    break
                 if line.strip():
                     await client.send_text(dialog_id, line)
         finally:
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
             await client.disconnect()
 
-    _run(_do())
+    try:
+        _run(_do())
+    except KeyboardInterrupt:
+        click.echo("stopped.")
 
 
 @cli.command()
