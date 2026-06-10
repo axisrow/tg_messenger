@@ -31,7 +31,12 @@ class IntentSpec:
 
 
 def load_intents(path: str | Path) -> tuple[IntentSpec, ...]:
-    """Parse the agent.json intents file; every problem is a user-facing ValueError."""
+    """Parse the agent.json intents file; every problem is a user-facing ValueError.
+
+    Strictness is deliberately asymmetric: unknown keys INSIDE an intent are an
+    error (typos must not pass silently), while unknown root-level keys are
+    tolerated — that's where ``"//"``-style comments live (see agent.json.example).
+    """
     path = Path(path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))

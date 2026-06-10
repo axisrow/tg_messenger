@@ -187,6 +187,16 @@ async def test_image_without_vision_fn_is_a_hard_error():
     assert classify_calls == []  # упали до графа, история не тронута
 
 
+async def test_vision_node_without_pending_image_fails_loudly():
+    # инвариант «handle кладёт картинку перед invoke» сломан (например, будущая
+    # параллелизация) — нужна понятная ошибка, а не голый KeyError по thread_id
+    vision, _ = make_vision()
+    orch, *_ = build(vision_fn=vision)
+    state = {"messages": [AIMessage(content="x")]}
+    with pytest.raises(RuntimeError, match="pending image"):
+        await orch._vision(state, {"configurable": {"thread_id": "7"}})
+
+
 # --- Цикл 24: кастомные интент-узлы из конфига ---
 
 RECIPE = IntentSpec(name="recipe", description="просит рецепт", pipeline="chat",

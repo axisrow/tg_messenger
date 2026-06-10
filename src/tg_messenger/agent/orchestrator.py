@@ -114,7 +114,6 @@ class Orchestrator:
                 reply = await self._chat_fn(messages)
             return {"messages": [AIMessage(content=reply)], "reply": reply}
 
-        intent_node.__name__ = f"intent_{spec.name}"
         return intent_node
 
     async def _chat(self, state: OrchestratorState) -> dict:
@@ -128,7 +127,12 @@ class Orchestrator:
 
     async def _vision(self, state: OrchestratorState, config: RunnableConfig) -> dict:
         thread_id = config["configurable"]["thread_id"]
-        multimodal = self._pending_images.pop(thread_id)
+        multimodal = self._pending_images.pop(thread_id, None)
+        if multimodal is None:
+            raise RuntimeError(
+                f"vision node reached without a pending image for thread {thread_id} —"
+                " the sequential-handling invariant of _pending_images is broken"
+            )
         # история из state (там плейсхолдер последним) + мультимодальное сообщение
         reply = await self._vision_fn([*state["messages"][:-1], multimodal])
         return {"messages": [AIMessage(content=reply)], "reply": reply}
