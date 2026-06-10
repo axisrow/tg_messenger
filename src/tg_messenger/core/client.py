@@ -179,6 +179,15 @@ class StandaloneTelegramClient:
             return [d for d in full if d.kind == "dm"]
         return list(full)
 
+    async def group_dialogs(self) -> list[Dialog]:
+        """Every non-DM dialog (groups, supergroups, channels, bots).
+
+        The "Группы" tab in every UI — same cache as ``dialogs()``, filtered the
+        opposite way, so the kind filter lives in one place, not in each front-end.
+        """
+        full = await self._dialogs_cache.get_or_fetch(_DIALOGS_CACHE_KEY, self._fetch_dialogs)
+        return [d for d in full if d.kind != "dm"]
+
     async def _fetch_dialogs(self) -> list[Dialog]:
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_dialogs(), operation="dialogs"

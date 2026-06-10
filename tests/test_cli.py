@@ -58,6 +58,9 @@ class StubClient:
             Dialog(id=9, title="HelperBot", kind="bot"),
         ]
 
+    async def group_dialogs(self):
+        return [d for d in await self.dialogs(dm_only=False) if d.kind != "dm"]
+
     async def history(self, peer, limit=50, offset_id=0):
         if self.history_items is not None:
             return self.history_items

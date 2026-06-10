@@ -34,9 +34,9 @@ class SidebarTabs(Tabs):
     """DM/groups tabs that hand focus down to the sibling dialog list.
 
     Textual's Tabs only binds left/right; Enter or Down here focuses the
-    #dialogs list (its sibling in #sidebar) so the user can start scrolling
-    dialogs at once, instead of having to Tab past the strip. Not focus_next:
-    Tabs holds focusable Tab children, so the chain would step inside itself.
+    #dialogs list so the user can start scrolling dialogs at once, instead of
+    having to Tab past the strip. Not focus_next: Tabs holds focusable Tab
+    children, so the chain would step inside itself.
     """
 
     BINDINGS = [
@@ -44,8 +44,7 @@ class SidebarTabs(Tabs):
     ]
 
     def action_focus_dialogs(self) -> None:
-        # query the shared #sidebar parent, not the whole screen
-        self.parent.query_one("#dialogs", ListView).focus()
+        self.screen.query_one("#dialogs", ListView).focus()
 
 
 class DialogListView(ListView):
@@ -150,9 +149,9 @@ class MessengerTUI(App):
     async def _load_dialogs(self) -> None:
         lv = self.query_one("#dialogs", ListView)
         if self._tab == "groups":
-            items = [d for d in await self._client.dialogs(dm_only=False) if d.kind != "dm"]
+            items = await self._client.group_dialogs()
         else:
-            items = await self._client.dialogs(dm_only=True)
+            items = await self._client.dialogs()
         for d in items:
             await lv.append(DialogItem(d.id, d.title))
 

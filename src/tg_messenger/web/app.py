@@ -102,11 +102,8 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
     @app.get("/dialogs", response_class=HTMLResponse)
     async def dialogs(request: Request, tab: str = "dm"):
         # unknown tab falls back to dm — HTMX-friendly, never a 400
-        if tab == "groups":
-            items = await request.app.state.client.dialogs(dm_only=False)
-            items = [d for d in items if d.kind != "dm"]
-        else:
-            items = await request.app.state.client.dialogs(dm_only=True)
+        client = request.app.state.client
+        items = await (client.group_dialogs() if tab == "groups" else client.dialogs())
         return HTMLResponse("".join(_dialog_li(d) for d in items))
 
     @app.get("/dialogs/{dialog_id}/messages", response_class=HTMLResponse)

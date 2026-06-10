@@ -218,9 +218,7 @@ def dialogs(session: str, groups: bool) -> None:
     """List your dialogs (DMs by default; --groups for groups/channels/bots)."""
 
     async def _do(client):
-        if groups:
-            return [d for d in await client.dialogs(dm_only=False) if d.kind != "dm"]
-        return await client.dialogs(dm_only=True)
+        return await (client.group_dialogs() if groups else client.dialogs())
 
     items = _run(_with_client(session, _do), session=session)
     for d in items:
