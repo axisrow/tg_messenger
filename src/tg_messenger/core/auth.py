@@ -7,6 +7,7 @@ session string can be wrapped without touching disk.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -16,6 +17,8 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.auth import ResendCodeRequest
 
 from tg_messenger.core.flood import run_with_flood_wait_retry
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SESSION_DIR = Path.home() / ".tg_messenger" / "sessions"
 
@@ -114,7 +117,13 @@ class LoginFlow:
             lambda: self._client.send_code_request(phone), operation="send_code"
         )
         self._phone = phone
-        return self._bind(sent)
+        delivery = self._bind(sent)
+        # what Telegram promised (the phone number stays out of the log)
+        logger.info(
+            "send_code: code_type=%s next_type=%s timeout=%s",
+            delivery.kind, delivery.next_kind, delivery.timeout,
+        )
+        return delivery
 
     async def resend_code(self) -> CodeDelivery:
         """Ask Telegram to resend the code via the next delivery channel."""
@@ -126,7 +135,12 @@ class LoginFlow:
             )),
             operation="resend_code",
         )
-        return self._bind(sent)
+        delivery = self._bind(sent)
+        logger.info(
+            "resend_code: code_type=%s next_type=%s timeout=%s",
+            delivery.kind, delivery.next_kind, delivery.timeout,
+        )
+        return delivery
 
     async def sign_in(self, code: str):
         if self._phone is None:

@@ -90,6 +90,24 @@ async def test_resend_code_switches_channel_and_rebinds_hash(fake_client):
     assert flow._code_hash == "hash456"
 
 
+async def test_send_code_logs_delivery_without_phone(fake_client, caplog):
+    flow = auth.LoginFlow(fake_client)
+    with caplog.at_level("INFO", logger="tg_messenger.core.auth"):
+        await flow.send_code("+10000000000")
+    infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert any("send_code" in m and "code_type=app" in m for m in infos)
+    assert "+10000000000" not in caplog.text  # phone numbers stay out of the log
+
+
+async def test_resend_code_logs_delivery(fake_client, caplog):
+    flow = auth.LoginFlow(fake_client)
+    await flow.send_code("+10000000000")
+    with caplog.at_level("INFO", logger="tg_messenger.core.auth"):
+        await flow.resend_code()
+    infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert any("resend_code" in m and "code_type=sms" in m for m in infos)
+
+
 async def test_resend_before_send_code_raises(fake_client):
     flow = auth.LoginFlow(fake_client)
     with pytest.raises(RuntimeError):
