@@ -124,6 +124,21 @@ class StubClient:
         )
         await asyncio.Event().wait()
 
+    admin = True  # default: we can moderate every chat
+
+    async def is_admin(self, peer):
+        return self.admin
+
+    async def listen_all(self):
+        if False:  # pragma: no cover — empty async generator, then idle
+            yield None
+        raise KeyboardInterrupt  # эмуляция Ctrl+C (паттерн listen_interrupt)
+
+    async def listen_chat_actions(self):
+        if False:  # pragma: no cover
+            yield None
+        await asyncio.Event().wait()
+
     async def listen_deleted(self):
         for _ in range(10):
             await asyncio.sleep(0)  # дать outgoing-потоку закэшировать сообщение
@@ -580,6 +595,100 @@ def test_watch_without_login_gives_hint(runner):
     assert result.exit_code != 0
     assert "tg-messenger login" in result.output
     assert stub.connected is False
+
+
+# --- Цикл 89: команда moderate + moderate-rules ---
+
+
+@pytest.fixture
+def mod_runner(monkeypatch, tmp_path):
+    """CLI runner whose moderation storage is a fresh tmp SQLite db."""
+    from tg_messenger.core.moderation import register_moderation_migrations
+    from tg_messenger.core.storage import Storage
+
+    stub = StubClient()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+
+    def _make_storage(profile="default"):
+        s = Storage(tmp_path / "mod.db")
+        # the CLI re-registers migrations on its own handle; here we return a bare one
+        return s
+
+    # register_moderation_migrations is called by the CLI; bare Storage is fine
+    monkeypatch.setattr(cli_main, "make_storage", lambda profile="default": Storage(tmp_path / "mod.db"))
+    return CliRunner(), stub, tmp_path, register_moderation_migrations
+
+
+_RULE_JSON = """{
+  "chat_id": -100200,
+  "name": "no-spam",
+  "conditions": {"pattern": "spam"},
+  "actions": {"delete": true}
+}"""
+
+
+def test_moderate_rules_add_list_remove(mod_runner, tmp_path):
+    r, stub, _tp, _ = mod_runner
+    rule_file = tmp_path / "rule.json"
+    rule_file.write_text(_RULE_JSON, encoding="utf-8")
+
+    add = r.invoke(cli_main.cli, ["moderate-rules", "add", str(rule_file)])
+    assert add.exit_code == 0, add.output
+    assert "no-spam" in add.output
+
+    lst = r.invoke(cli_main.cli, ["moderate-rules", "list"])
+    assert lst.exit_code == 0
+    assert "no-spam" in lst.output and "-100200" in lst.output
+
+    rm = r.invoke(cli_main.cli, ["moderate-rules", "remove", "--", "-100200", "no-spam"])
+    assert rm.exit_code == 0
+
+    lst2 = r.invoke(cli_main.cli, ["moderate-rules", "list"])
+    assert "No rules." in lst2.output
+
+
+def test_moderate_rules_add_rejects_bad_json(mod_runner, tmp_path):
+    r, _stub, _tp, _ = mod_runner
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    result = r.invoke(cli_main.cli, ["moderate-rules", "add", str(bad)])
+    assert result.exit_code != 0
+    assert "invalid rule JSON" in result.output
+
+
+def test_moderate_runs_and_stops_on_ctrl_c(mod_runner):
+    r, stub, _tp, _ = mod_runner
+    result = r.invoke(cli_main.cli, ["moderate"])
+    assert result.exit_code == 0
+    assert "dry-run" in result.output
+    assert "stopped." in result.output
+    assert stub.connected is False
+
+
+def test_moderate_enforce_flag_shown(mod_runner):
+    r, _stub, _tp, _ = mod_runner
+    result = r.invoke(cli_main.cli, ["moderate", "--enforce"])
+    assert result.exit_code == 0
+    assert "ENFORCING" in result.output
+
+
+def test_moderate_without_admin_warns(mod_runner, tmp_path):
+    r, stub, _tp, _ = mod_runner
+    stub.admin = False  # no rights anywhere
+    rule_file = tmp_path / "rule.json"
+    rule_file.write_text(_RULE_JSON, encoding="utf-8")
+    r.invoke(cli_main.cli, ["moderate-rules", "add", str(rule_file)])
+    result = r.invoke(cli_main.cli, ["moderate"])
+    assert result.exit_code == 0
+    assert "no admin rights" in result.output
+
+
+def test_moderate_without_login_gives_hint(mod_runner):
+    r, stub, _tp, _ = mod_runner
+    stub.authorized = False
+    result = r.invoke(cli_main.cli, ["moderate"])
+    assert result.exit_code != 0
+    assert "tg-messenger login" in result.output
 
 
 def test_revoked_session_mid_command_gives_hint(runner, monkeypatch):

@@ -56,6 +56,13 @@ def make_client(**kwargs) -> StandaloneTelegramClient:
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
 
 
+def make_storage(profile: str = "default"):
+    """Build the per-profile SQLite Storage; the seam moderation tests patch."""
+    from tg_messenger.core.storage import Storage, default_db_path
+
+    return Storage(default_db_path(profile))
+
+
 def make_agent_runner(client, *, notify_errors: bool = False):
     """Build the AI agent runner; the second seam tests patch (next to ``make_client``)."""
     try:
@@ -533,6 +540,132 @@ def watch(session: str) -> None:
         _run(_do(), session=session)
     except KeyboardInterrupt:
         click.echo("stopped.")
+
+
+@cli.command()
+@click.option("--session", default="default")
+@click.option("--enforce", is_flag=True,
+              help="Actually delete/mute/ban (default is dry-run: log only).")
+def moderate(session: str, enforce: bool) -> None:
+    """Auto-moderate group chats by stored rules (dry-run unless --enforce).
+
+    On start, checks admin rights in every chat with rules; chats where we can't
+    act are skipped with a warning (the command does not abort).
+    """
+    from tg_messenger.core.moderation import (
+        ModerationEngine,
+        check_admin_rights,
+        register_moderation_migrations,
+    )
+
+    async def _do():
+        client = make_client(session_name=session)
+        storage = make_storage(session)
+        register_moderation_migrations(storage)
+        await storage.connect()
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            rights = await check_admin_rights(client, storage)
+            for chat_id, ok in rights.items():
+                if not ok:
+                    click.echo(f"⚠ no admin rights in chat {chat_id} — its rules are disabled",
+                               err=True)
+            engine = ModerationEngine(client, storage, enforce=enforce)
+            engine.disable_chats([cid for cid, ok in rights.items() if not ok])
+            mode = "ENFORCING" if enforce else "dry-run"
+            click.echo(f"Moderating ({mode}) — Ctrl+C to stop...")
+            await engine.run()
+        finally:
+            await client.disconnect()
+            await storage.close()
+
+    try:
+        _run(_do(), session=session)
+    except KeyboardInterrupt:
+        click.echo("stopped.")
+
+
+@cli.group("moderate-rules")
+def moderate_rules() -> None:
+    """Manage moderation rules (list / add / remove)."""
+
+
+def _open_storage(session: str):
+    from tg_messenger.core.moderation import register_moderation_migrations
+
+    storage = make_storage(session)
+    register_moderation_migrations(storage)
+    return storage
+
+
+@moderate_rules.command("list")
+@click.option("--session", default="default")
+@click.option("--chat", "chat_id", type=int, default=None, help="Filter by chat id.")
+def moderate_rules_list(session: str, chat_id: int | None) -> None:
+    """List stored moderation rules."""
+    from tg_messenger.core.moderation import list_rules
+
+    async def _do():
+        storage = _open_storage(session)
+        await storage.connect()
+        try:
+            return await list_rules(storage, chat_id=chat_id)
+        finally:
+            await storage.close()
+
+    rules = _run(_do(), session=session)
+    if not rules:
+        click.echo("No rules.")
+        return
+    for r in rules:
+        state = "on" if r.enabled else "off"
+        click.echo(f"{r.chat_id}\t{r.name}\t[{state}]")
+
+
+@moderate_rules.command("add")
+@click.argument("rule_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--session", default="default")
+def moderate_rules_add(rule_file: str, session: str) -> None:
+    """Add (or replace) a rule from a JSON file (see moderation.json.example)."""
+    from tg_messenger.core.moderation import ModerationRule, add_rule
+
+    raw = Path(rule_file).read_text(encoding="utf-8")
+    try:
+        rule = ModerationRule.model_validate_json(raw)
+    except Exception as exc:
+        raise click.ClickException(f"invalid rule JSON: {exc}") from exc
+
+    async def _do():
+        storage = _open_storage(session)
+        await storage.connect()
+        try:
+            await add_rule(storage, rule)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"rule '{rule.name}' added for chat {rule.chat_id}.")
+
+
+@moderate_rules.command("remove")
+@click.argument("chat_id", type=int)
+@click.argument("name")
+@click.option("--session", default="default")
+def moderate_rules_remove(chat_id: int, name: str, session: str) -> None:
+    """Remove a rule by CHAT_ID and NAME."""
+    from tg_messenger.core.moderation import remove_rule
+
+    async def _do():
+        storage = _open_storage(session)
+        await storage.connect()
+        try:
+            await remove_rule(storage, chat_id, name)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"rule '{name}' removed from chat {chat_id}.")
 
 
 @cli.command()
