@@ -542,14 +542,17 @@ best-effort `None` (raw-апдейт не несёт надёжного един
   Инвалидация history своего peer (как раньше).
 - **78**: `forward(from_peer, ids, to_peer)` → `forward_messages`, инвалидирует history ОБОИХ
   peer'ов; `edit_text(peer, id, text)` → `edit_message`; `delete_messages(peer, ids, revoke=True)`
-  → `delete_messages`. Все через `run_with_flood_wait_retry`; инвалидируют history. Тесты:
-  правильные вызовы фейка, инвалидация, non-transient flood → `HandledFloodWaitError`.
+  → `delete_messages`. Перед удалением core fetch'ит ids из указанного peer и отвергает
+  missing/mismatched сообщения; `revoke=False` запрещён для channel/megagroup marked ids, потому что
+  Telegram там удаляет для всех. Все через `run_with_flood_wait_retry`; инвалидируют history. Тесты:
+  правильные вызовы фейка, safety rejects, инвалидация, non-transient flood → `HandledFloodWaitError`.
 - **79**: `mark_read(peer)` → `send_read_acknowledge` (retry, НЕ инвалидирует history);
   регресс на `Dialog.unread` из telethon-диалога.
 - **80**: CLI — `send --reply-to`, команды `forward FROM IDS TO`, `edit PEER ID TEXT`,
-  `delete PEER IDS [--for-me]` (revoke=False), `mark-read PEER`. IDS через запятую (`_parse_ids`,
-  битый токен → `ClickException`). `read` остаётся печатью истории — отметка прочитанным вынесена
-  в отдельную команду `mark-read`, чтобы не ломать существующую.
+  `delete PEER IDS [--for-me]` (revoke=False только там, где Telegram поддерживает локальное удаление),
+  `mark-read PEER`. IDS через запятую (`_parse_ids`, битый токен → `ClickException`); channel/
+  megagroup `--for-me` получает ClickException до подключения клиента. `read` остаётся печатью истории —
+  отметка прочитанным вынесена в отдельную команду `mark-read`, чтобы не ломать существующую.
 - **81**: web — бейдж `<span class="unread">N</span>` в `_dialog_li`; открытие диалога
   (`GET .../messages`) зовёт `mark_read` best-effort (ошибка → `logger.warning`, история всё равно
   отдаётся); `/send` принимает `reply_to` (Form) и прокидывает в `send_text`. TUI — `(N)` в

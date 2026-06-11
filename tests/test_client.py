@@ -16,7 +16,7 @@ from tests.conftest import (
     FakeMessageReadEvent,
     FakeUser,
 )
-from tg_messenger.core.client import StandaloneTelegramClient, _dialog_kind
+from tg_messenger.core.client import MessageDeleteValidationError, StandaloneTelegramClient, _dialog_kind
 from tg_messenger.core.models import (
     ChatActionEvent,
     Dialog,
@@ -1209,6 +1209,13 @@ def _flood_patch(monkeypatch):
     return FakeFloodWaitError
 
 
+def _seed_delete_messages(fake_client, peer: int = 7, ids=(1, 2)) -> None:
+    fake_client.messages[int(peer)] = [
+        FakeMessage(id=mid, sender_id=1, text=f"m{mid}", out=True, peer_id=int(peer))
+        for mid in ids
+    ]
+
+
 async def test_forward_calls_telethon_and_returns_messages(fake_client):
     client = _build(fake_client)
     await client.connect()
@@ -1279,6 +1286,7 @@ async def test_edit_text_flood_is_handled(fake_client, monkeypatch):
 
 
 async def test_delete_messages_calls_telethon_with_revoke(fake_client):
+    _seed_delete_messages(fake_client)
     client = _build(fake_client)
     await client.connect()
     await client.delete_messages(7, [1, 2])
@@ -1286,6 +1294,7 @@ async def test_delete_messages_calls_telethon_with_revoke(fake_client):
 
 
 async def test_delete_messages_for_me_passes_revoke_false(fake_client):
+    _seed_delete_messages(fake_client, ids=(1,))
     client = _build(fake_client)
     await client.connect()
     await client.delete_messages(7, [1], revoke=False)
@@ -1294,17 +1303,19 @@ async def test_delete_messages_for_me_passes_revoke_false(fake_client):
 
 async def test_delete_messages_invalidates_history(fake_client):
     _seed_dm(fake_client)
+    _seed_delete_messages(fake_client, ids=(1,))
     client = _build(fake_client)
     await client.connect()
     await client.history(7, limit=10)
     await client.delete_messages(7, [1])
     await client.history(7, limit=10)
-    assert fake_client.iter_messages_calls == 2
+    assert fake_client.iter_messages_calls == 3  # history + validation + refetch
 
 
 async def test_delete_messages_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
     flood_error = _flood_patch(monkeypatch)
+    _seed_delete_messages(fake_client, ids=(1,))
     client = _build(fake_client)
     await client.connect()
 
@@ -1314,6 +1325,34 @@ async def test_delete_messages_flood_is_handled(fake_client, monkeypatch):
     fake_client.delete_messages = boom
     with pytest.raises(HandledFloodWaitError):
         await client.delete_messages(7, [1])
+
+
+async def test_delete_messages_rejects_missing_ids_before_delete(fake_client):
+    _seed_delete_messages(fake_client, ids=(1,))
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(MessageDeleteValidationError, match="not found"):
+        await client.delete_messages(7, [1, 2])
+    assert fake_client.deleted == []
+
+
+async def test_delete_messages_rejects_messages_from_other_peer(fake_client):
+    fake_client.messages[7] = [
+        FakeMessage(id=1, sender_id=1, text="wrong", out=True, peer_id=8)
+    ]
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(MessageDeleteValidationError, match="belongs to dialog 8"):
+        await client.delete_messages(7, [1])
+    assert fake_client.deleted == []
+
+
+async def test_delete_messages_for_me_rejects_channels_before_delete(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(MessageDeleteValidationError, match="not supported"):
+        await client.delete_messages(-1000000000123, [1], revoke=False)
+    assert fake_client.deleted == []
 
 
 # --- Цикл 79: mark_read + unread ---

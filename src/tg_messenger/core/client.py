@@ -44,6 +44,28 @@ logger = logging.getLogger(__name__)
 DEFAULT_DIALOGS_TTL_SEC = 30.0
 DEFAULT_HISTORY_TTL_SEC = 15.0
 _DIALOGS_CACHE_KEY = "all"  # one entry: the full mapped list, dm_only filters from it
+_CHANNEL_ID_THRESHOLD = -1_000_000_000_000
+
+
+class MessageDeleteValidationError(ValueError):
+    """Raised before a delete call when Telegram could delete outside the intended peer."""
+
+
+def is_channel_or_megagroup_id(peer: int) -> bool:
+    """Telethon marks channels/supergroups as ``-(10^12 + channel_id)``."""
+    return int(peer) <= _CHANNEL_ID_THRESHOLD
+
+
+def _message_dialog_id(raw) -> int | None:
+    chat_id = getattr(raw, "chat_id", None)
+    if chat_id is not None:
+        return int(chat_id)
+    peer = getattr(raw, "peer_id", None)
+    if peer is None:
+        return None
+    if isinstance(peer, int):
+        return peer
+    return int(tl_utils.get_peer_id(peer))
 
 
 def _default_factory(session, api_id, api_hash):
@@ -309,11 +331,41 @@ class StandaloneTelegramClient:
 
     async def delete_messages(self, peer: int, message_ids: list[int], revoke: bool = True) -> None:
         """Delete messages; ``revoke=True`` removes them for everyone (default)."""
+        if not revoke and is_channel_or_megagroup_id(peer):
+            raise MessageDeleteValidationError(
+                "--for-me is not supported for channels/supergroups; Telegram deletes there for everyone"
+            )
+        await self._validate_delete_messages(peer, message_ids)
         await run_with_flood_wait_retry(
             lambda: self._client.delete_messages(peer, message_ids, revoke=revoke),
             operation="delete_messages",
         )
         self._invalidate_history(peer)
+
+    async def _validate_delete_messages(self, peer: int, message_ids: list[int]) -> None:
+        wanted = {int(mid) for mid in message_ids}
+        if not wanted:
+            return
+        raw = await run_with_flood_wait_retry(
+            lambda: self._collect_messages_by_ids(peer, list(wanted)),
+            operation="delete_messages_validate",
+        )
+        by_id = {int(getattr(m, "id")): m for m in raw if m is not None and getattr(m, "id", None) is not None}
+        missing = wanted - set(by_id)
+        if missing:
+            joined = ", ".join(str(mid) for mid in sorted(missing))
+            raise MessageDeleteValidationError(
+                f"message ids not found in dialog {int(peer)}: {joined}"
+            )
+        for mid, msg in by_id.items():
+            dialog_id = _message_dialog_id(msg)
+            if dialog_id != int(peer):
+                raise MessageDeleteValidationError(
+                    f"message {mid} belongs to dialog {dialog_id}, not {int(peer)}"
+                )
+
+    async def _collect_messages_by_ids(self, peer, message_ids) -> list:
+        return [m async for m in self._client.iter_messages(peer, ids=message_ids)]
 
     async def mark_read(self, peer: int) -> None:
         """Mark a dialog read (clears its unread counter), routed through flood retry."""

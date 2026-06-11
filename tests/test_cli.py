@@ -275,6 +275,14 @@ def test_delete_command_for_me_keeps_revoke_false(runner):
     assert stub.deleted_calls == [(7, [1], False)]
 
 
+def test_delete_command_for_me_rejects_channel_marked_id(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["delete", "--for-me", "--", "-1000000000123", "1"])
+    assert result.exit_code != 0
+    assert "--for-me is not supported" in result.output
+    assert stub.deleted_calls == []
+
+
 def test_delete_command_rejects_bad_ids(runner):
     r, _ = runner
     result = r.invoke(cli_main.cli, ["delete", "7", "nope"])

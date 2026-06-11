@@ -18,7 +18,11 @@ from telethon.errors import UnauthorizedError
 
 from tg_messenger.agent.config import langsmith_tracing_enabled
 from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT, SessionStore, validate_session_string
-from tg_messenger.core.client import StandaloneTelegramClient
+from tg_messenger.core.client import (
+    MessageDeleteValidationError,
+    StandaloneTelegramClient,
+    is_channel_or_megagroup_id,
+)
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.logsetup import log_file_path, setup_logging
 from tg_messenger.core.models import message_line
@@ -132,6 +136,8 @@ def _run(coro, session: str = "default"):
     except HandledFloodWaitError as exc:
         logger.warning("%s: flood wait %ss", exc.operation, exc.wait_seconds)
         raise click.ClickException(exc.user_message) from exc
+    except MessageDeleteValidationError as exc:
+        raise click.ClickException(str(exc)) from exc
     except UnauthorizedError as exc:
         # session missing or revoked mid-command
         raise click.ClickException(_login_hint(session)) from exc
@@ -487,6 +493,10 @@ def edit(dialog_id: int, message_id: int, text: str, session: str) -> None:
 def delete(dialog_id: int, ids: str, for_me: bool, session: str) -> None:
     """Delete messages (comma-separated IDS); --for-me to keep them for others."""
     message_ids = _parse_ids(ids)
+    if for_me and is_channel_or_megagroup_id(dialog_id):
+        raise click.ClickException(
+            "--for-me is not supported for channels/supergroups; Telegram deletes there for everyone"
+        )
 
     async def _do(client):
         return await client.delete_messages(dialog_id, message_ids, revoke=not for_me)
