@@ -7,6 +7,7 @@ Commands: login, dialogs, read, send, listen, chat, serve, tui.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -1056,7 +1057,7 @@ def ghostwrite(ctx: click.Context, session: str, enforce: bool) -> None:
         list_enabled,
         register_ghostwrite_migrations,
     )
-    from tg_messenger.agent.suggest import register_suggest_migrations
+    from tg_messenger.agent.suggest import register_suggest_migrations, watch_read_receipts
     session = _effective_session(ctx, session)
 
     async def _do():
@@ -1080,7 +1081,17 @@ def ghostwrite(ctx: click.Context, session: str, enforce: bool) -> None:
             engine = GhostwriteEngine(client, suggester, storage, enforce=enforce)
             mode = "ENFORCING" if enforce else "dry-run"
             click.echo(f"Ghostwriting ({mode}) — Ctrl+C to stop...")
-            await engine.run()
+            # цикл 98 (#17): рядом с движком пишем read-receipts (last_read
+            # per dialog, kv) — сигнал «прочитал и молчит» для #18/#19.
+            # Фоновая задача + cancel в finally, не gather: KeyboardInterrupt
+            # из движка не должен бросать вечный watcher недобитым.
+            watcher = asyncio.create_task(watch_read_receipts(client, storage))
+            try:
+                await engine.run()
+            finally:
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watcher
         finally:
             await client.disconnect()
             await storage.close()
@@ -1361,6 +1372,9 @@ def heartbeat_remove(ctx: click.Context, peer: int, session: str) -> None:
 def heartbeat_run(ctx: click.Context, session: str) -> None:
     """Run the heartbeat scheduler: send stored plans' pings on schedule (Ctrl+C to stop)."""
     from tg_messenger.core.heartbeat import HeartbeatService, register_heartbeat_migrations
+
+    # суфлёрская фиксация read-receipts (#17, kv) — лёгкий модуль без LLM-стека
+    from tg_messenger.agent.suggest import watch_read_receipts
     session = _effective_session(ctx, session)
 
     async def _do():
@@ -1372,7 +1386,15 @@ def heartbeat_run(ctx: click.Context, session: str) -> None:
         try:
             await _ensure_authorized(client, session)
             click.echo("Heartbeat scheduler running — Ctrl+C to stop...")
-            await HeartbeatService(client, storage).run()
+            # сигнал «прочитал и молчит»: last_read пишется и здесь (#17/#19);
+            # фоновая задача + cancel в finally — см. комментарий в ghostwrite
+            watcher = asyncio.create_task(watch_read_receipts(client, storage))
+            try:
+                await HeartbeatService(client, storage).run()
+            finally:
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watcher
         finally:
             await client.disconnect()
             await storage.close()

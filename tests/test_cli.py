@@ -53,6 +53,12 @@ class StubClient:
             raise KeyboardInterrupt
         await asyncio.Event().wait()
 
+    async def listen_reads(self):
+        from tg_messenger.core.models import MessageReadEvent
+
+        yield MessageReadEvent(dialog_id=7, max_id=10, outbox=True)
+        await asyncio.Event().wait()
+
     async def dialogs(self, dm_only=True):
         dms = [Dialog(id=7, title="Ann", username="ann", unread=2)]
         if dm_only:
@@ -902,6 +908,22 @@ def test_ghostwrite_runs_and_stops_on_ctrl_c(gw_runner):
     assert stub.sent == []
 
 
+def test_ghostwrite_watches_read_receipts(gw_runner, monkeypatch):
+    # цикл 98 (#17): фиксация last_read из listen_reads живёт в долгоживущем
+    # ghostwrite-цикле — иначе сигнал никогда не пишется
+    r, stub, _tp, _seen = gw_runner
+    calls = []
+
+    async def spy(client, storage):
+        calls.append(client)
+
+    monkeypatch.setattr("tg_messenger.agent.suggest.watch_read_receipts", spy)
+    r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    result = r.invoke(cli_main.cli, ["ghostwrite"])
+    assert result.exit_code == 0, result.output
+    assert calls and calls[0] is stub
+
+
 def test_ghostwrite_enforce_flag_shown(gw_runner):
     r, stub, _tp, _seen = gw_runner
     r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
@@ -1024,6 +1046,26 @@ def test_heartbeat_run_stops_on_ctrl_c(hb_runner, monkeypatch):
     assert result.exit_code == 0, result.output
     assert "stopped." in result.output
     assert stub.connected is False
+
+
+def test_heartbeat_run_watches_read_receipts(hb_runner, monkeypatch):
+    # сигнал «прочитал и молчит» (#17/#19) пишется и из heartbeat run
+    r, stub, _tp, _seen = hb_runner
+    calls = []
+
+    async def spy(client, storage):
+        calls.append(client)
+
+    monkeypatch.setattr("tg_messenger.agent.suggest.watch_read_receipts", spy)
+    r.invoke(cli_main.cli, ["heartbeat", "plan", "7", "--interval", "24", "--template", "ping"])
+
+    async def boom(peer, limit=1):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(stub, "history", boom)
+    result = r.invoke(cli_main.cli, ["heartbeat", "run"])
+    assert result.exit_code == 0, result.output
+    assert calls and calls[0] is stub
 
 
 def test_heartbeat_run_without_login_gives_hint(hb_runner):
