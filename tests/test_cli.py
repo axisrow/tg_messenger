@@ -1653,3 +1653,61 @@ def test_username_clear_confirms(runner):
     result = cli.invoke(cli_main.cli, ["username", "clear"])
     assert result.exit_code == 0, result.output
     assert stub.cleared is True
+
+
+# --- Цикл 125: режимы запуска serve (web-auth #24) ---
+
+
+@pytest.fixture
+def serve_capture(monkeypatch):
+    """Like serve_spy but captures build_app kwargs too."""
+    client = object()
+    suggester = object()
+    calls = {"uvicorn": [], "build_app": [], "optional_suggester": []}
+    monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls["uvicorn"].append(kw))
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    monkeypatch.setattr(
+        cli_main,
+        "make_optional_suggester",
+        lambda c, **kw: calls["optional_suggester"].append((c, kw)) or suggester,
+    )
+    monkeypatch.setattr(
+        "tg_messenger.web.app.build_app",
+        lambda **kw: calls["build_app"].append(kw) or object(),
+    )
+    return calls
+
+
+def test_serve_public_host_without_pass_refuses(serve_capture, monkeypatch):
+    monkeypatch.delenv("TG_WEB_PASS", raising=False)
+    result = CliRunner().invoke(cli_main.cli, ["serve", "--host", "0.0.0.0"])
+    assert result.exit_code != 0
+    assert "TG_WEB_PASS" in result.output
+    assert not serve_capture["uvicorn"]  # never started
+
+
+def test_serve_public_host_insecure_starts_with_warning(serve_capture, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.delenv("TG_WEB_PASS", raising=False)
+    with caplog.at_level(logging.WARNING, logger="tg_messenger.cli.main"):
+        result = CliRunner().invoke(cli_main.cli, ["serve", "--host", "0.0.0.0", "--insecure"])
+    assert result.exit_code == 0, result.output
+    assert serve_capture["uvicorn"]  # started
+    assert any("insecure" in rec.message.lower() or "without" in rec.message.lower()
+               for rec in caplog.records)
+
+
+def test_serve_localhost_without_pass_starts(serve_capture, monkeypatch):
+    monkeypatch.delenv("TG_WEB_PASS", raising=False)
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code == 0, result.output
+    assert serve_capture["uvicorn"]
+    assert serve_capture["build_app"][0].get("web_pass") is None
+
+
+def test_serve_passes_web_pass_from_env(serve_capture, monkeypatch):
+    monkeypatch.setenv("TG_WEB_PASS", "hunter2")
+    result = CliRunner().invoke(cli_main.cli, ["serve", "--host", "0.0.0.0"])
+    assert result.exit_code == 0, result.output
+    assert serve_capture["build_app"][0].get("web_pass") == "hunter2"
