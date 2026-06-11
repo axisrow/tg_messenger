@@ -328,9 +328,16 @@ def test_flood_wait_friendly_message(runner, monkeypatch):
 
 @pytest.fixture
 def serve_spy(monkeypatch):
-    calls = []
-    monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls.append(kw))
-    monkeypatch.setattr("tg_messenger.web.app.build_app", lambda **kw: object())
+    calls = {"uvicorn": [], "build": []}
+    client = object()
+    suggester = object()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c: suggester)
+    monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls["uvicorn"].append(kw))
+    monkeypatch.setattr(
+        "tg_messenger.web.app.build_app",
+        lambda **kw: calls["build"].append(kw) or object(),
+    )
     return calls
 
 
@@ -338,21 +345,21 @@ def test_serve_defaults_to_8090(serve_spy, monkeypatch):
     monkeypatch.delenv("TG_WEB_PORT", raising=False)
     result = CliRunner().invoke(cli_main.cli, ["serve"])
     assert result.exit_code == 0
-    assert serve_spy[0]["port"] == 8090
+    assert serve_spy["uvicorn"][0]["port"] == 8090
 
 
 def test_serve_reads_env_port(serve_spy, monkeypatch):
     monkeypatch.setenv("TG_WEB_PORT", "9099")
     result = CliRunner().invoke(cli_main.cli, ["serve"])
     assert result.exit_code == 0
-    assert serve_spy[0]["port"] == 9099
+    assert serve_spy["uvicorn"][0]["port"] == 9099
 
 
 def test_serve_flag_overrides_env(serve_spy, monkeypatch):
     monkeypatch.setenv("TG_WEB_PORT", "9099")
     result = CliRunner().invoke(cli_main.cli, ["serve", "--port", "1234"])
     assert result.exit_code == 0
-    assert serve_spy[0]["port"] == 1234
+    assert serve_spy["uvicorn"][0]["port"] == 1234
 
 
 def test_read_download_saves_media(runner, tmp_path):
@@ -844,7 +851,7 @@ def test_chat_listener_failure_is_reported(runner, monkeypatch, caplog):
 def test_serve_unifies_uvicorn_logging(serve_spy):
     result = CliRunner().invoke(cli_main.cli, ["serve"])
     assert result.exit_code == 0
-    assert serve_spy[0]["log_config"] is None
+    assert serve_spy["uvicorn"][0]["log_config"] is None
 
 
 def test_serve_announces_url(serve_spy, monkeypatch):
@@ -1225,7 +1232,10 @@ def test_profile_menu_reprompts_on_out_of_range(monkeypatch, tmp_path):
 
 def test_serve_uses_global_profile_as_session(monkeypatch):
     captured = {}
+    client = object()
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c: object())
     monkeypatch.setattr(
         "tg_messenger.web.app.build_app",
         lambda **kw: captured.update(kw) or object(),
@@ -1235,12 +1245,37 @@ def test_serve_uses_global_profile_as_session(monkeypatch):
     assert captured.get("session_name") == "work"
 
 
+def test_serve_wires_suggester(monkeypatch):
+    captured = {}
+    client = object()
+    suggester = object()
+    monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c: suggester)
+    monkeypatch.setattr(
+        "tg_messenger.web.app.build_app",
+        lambda **kw: captured.update(kw) or object(),
+    )
+
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["client"] is client
+    assert captured["suggester"] is suggester
+
+
 def test_tui_uses_global_profile_as_session(monkeypatch):
     captured = {}
+    client = object()
+    suggester = object()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c: suggester)
 
     class FakeTUI:
-        def __init__(self, *, session_name="default"):
+        def __init__(self, *, client=None, session_name="default", suggester=None):
+            captured["client"] = client
             captured["session_name"] = session_name
+            captured["suggester"] = suggester
 
         def run(self):
             pass
@@ -1249,3 +1284,5 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
     result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "tui"])
     assert result.exit_code == 0, result.output
     assert captured.get("session_name") == "work"
+    assert captured["client"] is client
+    assert captured["suggester"] is suggester

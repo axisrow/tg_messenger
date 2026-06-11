@@ -125,6 +125,19 @@ def make_suggester(client, *, storage=None):
         raise click.ClickException(str(exc)) from exc
 
 
+def make_optional_suggester(client):
+    """Best-effort production suggester for web/TUI.
+
+    Suggest is an optional [agent] feature. A missing extra or model should disable
+    the draft endpoint/strip, not prevent the web UI or TUI from starting.
+    """
+    try:
+        return make_suggester(client)
+    except click.ClickException as exc:
+        logger.warning("reply suggester disabled: %s", exc)
+        return None
+
+
 _CODE_DELIVERY_HINTS = {
     "app": "Code sent to your Telegram app — check devices where you are already logged in.",
     "sms": "Code sent via SMS.",
@@ -880,9 +893,16 @@ def serve(ctx: click.Context, host: str, port: int, session: str) -> None:
         raise click.ClickException("web UI requires: pip install 'tg-messenger[web]'") from exc
 
     session = _effective_session(ctx, session)
+    client = make_client(session_name=session)
+    suggester = make_optional_suggester(client)
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
     click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
-    uvicorn.run(build_app(session_name=session), host=host, port=port, log_config=None)
+    uvicorn.run(
+        build_app(client=client, session_name=session, suggester=suggester),
+        host=host,
+        port=port,
+        log_config=None,
+    )
 
 
 @cli.command()
@@ -898,7 +918,9 @@ def tui(ctx: click.Context, session: str) -> None:
     # stderr handler would corrupt the alternate screen — file log only
     setup_logging(verbose=ctx.obj["verbose"], console=False, profile=ctx.obj.get("profile"))
     session = _effective_session(ctx, session)
-    MessengerTUI(session_name=session).run()
+    client = make_client(session_name=session)
+    suggester = make_optional_suggester(client)
+    MessengerTUI(client=client, session_name=session, suggester=suggester).run()
 
 
 if __name__ == "__main__":
