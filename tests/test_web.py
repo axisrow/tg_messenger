@@ -498,6 +498,9 @@ class StubSuggester:
         self.closed += 1
 
 
+SUGGEST_HEADERS = {"X-TG-Messenger-CSRF": "1"}
+
+
 @pytest_asyncio.fixture
 async def suggest_app():
     stub = WebStubClient()
