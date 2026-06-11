@@ -57,6 +57,31 @@ def _session_store() -> SessionStore:
     return SessionStore(os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
 
 
+DEFAULT_MAX_UPLOAD_MB = 50
+
+
+def _max_upload_mb() -> int:
+    """Upload size cap in MB (env ``TG_WEB_MAX_UPLOAD_MB``, default 50).
+
+    A non-numeric/non-positive override falls back to the default, logged — never
+    crashes the request.
+    """
+    raw = os.environ.get("TG_WEB_MAX_UPLOAD_MB")
+    if raw is None:
+        return DEFAULT_MAX_UPLOAD_MB
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("invalid TG_WEB_MAX_UPLOAD_MB=%r — using default %d",
+                       raw, DEFAULT_MAX_UPLOAD_MB)
+        return DEFAULT_MAX_UPLOAD_MB
+    if value <= 0:
+        logger.warning("non-positive TG_WEB_MAX_UPLOAD_MB=%r — using default %d",
+                       raw, DEFAULT_MAX_UPLOAD_MB)
+        return DEFAULT_MAX_UPLOAD_MB
+    return value
+
+
 def _profile_li(name: str, *, active: bool) -> str:
     cls = ' class="active"' if active else ""
     marker = " (active)" if active else ""
@@ -215,9 +240,21 @@ def build_app(*, client=None, session_name: str = "default", suggester=None) -> 
         file: UploadFile = File(...),
         caption: str | None = Form(None),
     ):
+        data = await file.read()
+        if not data:
+            logger.warning("media upload for dialog %s rejected: empty file", dialog_id)
+            return HTMLResponse('<div class="error">Empty file.</div>', status_code=400)
+        max_mb = _max_upload_mb()
+        if len(data) > max_mb * 1024 * 1024:
+            logger.warning("media upload for dialog %s rejected: %d bytes > %d MB",
+                           dialog_id, len(data), max_mb)
+            return HTMLResponse(
+                f'<div class="error">File too large (limit {max_mb} MB).</div>',
+                status_code=413,
+            )
         suffix = Path(file.filename or "").suffix
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(await file.read())
+            tmp.write(data)
             tmp_path = tmp.name
         try:
             msg = await request.app.state.client.send_media(dialog_id, tmp_path, caption=caption)

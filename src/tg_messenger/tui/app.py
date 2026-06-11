@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -22,6 +23,47 @@ logger = logging.getLogger(__name__)
 
 # shown before a draft in the suggestion strip; Tab accepts it into the composer
 SUGGEST_PREFIX = "💡 Tab: "
+
+
+def parse_media_command(text: str) -> tuple[str, str | None] | None:
+    """Parse a composer ``@PATH [caption]`` media command.
+
+    Pure (no filesystem). Returns ``(path, caption)`` or ``None`` when ``text`` is
+    not a media command (doesn't start with ``@`` or has no path after it).
+    The path may be quoted (``@"with spaces.png" cap``); the rest is the caption.
+    """
+    if not text.startswith("@"):
+        return None
+    rest = text[1:]
+    if not rest.strip():
+        return None
+    try:
+        # split off only the first token (the path), keep the remainder verbatim
+        tokens = shlex.split(rest, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    path = tokens[0]
+    if not path:
+        return None
+    # caption = everything after the first token, re-derived from the raw text so
+    # internal quoting/spacing of the caption is preserved literally
+    remainder = _strip_first_token(rest)
+    caption = remainder.strip() or None
+    return path, caption
+
+
+def _strip_first_token(s: str) -> str:
+    """Return ``s`` with its first shlex token (quoted or not) removed."""
+    lexer = shlex.shlex(s, posix=True)
+    lexer.whitespace_split = True
+    try:
+        lexer.get_token()  # consume the first token
+    except ValueError:
+        return ""
+    # lexer.instream holds the unconsumed tail
+    return lexer.instream.read()
 
 
 def _make_real_client(session_name: str):
@@ -318,6 +360,19 @@ class MessengerTUI(App):
         if self._current is None or not event.value.strip():
             return
         text = event.value
+        parsed = parse_media_command(text)
+        if parsed is not None:
+            path, caption = parsed
+            if not os.path.isfile(path):
+                # validate BEFORE the worker/network; surface, don't send
+                logger.warning("media path not found: %s (dialog %s)", path, self._current)
+                self.notify(f"File not found: {path}", severity="error")
+                return
+            event.input.value = ""  # clear optimistically; restored on failure
+            self.run_worker(
+                self._send_media(self._current, path, caption), exclusive=False
+            )
+            return
         event.input.value = ""  # clear optimistically; restored on failure
         self.run_worker(self._send_text(self._current, text), exclusive=False)
 
@@ -334,6 +389,18 @@ class MessengerTUI(App):
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
             await pane.mount(MessageBubble(text, out=True))
+
+    async def _send_media(self, peer: int, path: str, caption: str | None) -> None:
+        try:
+            await self._client.send_media(peer, path, caption=caption)
+        except Exception as exc:
+            logger.exception("send media failed (dialog %s, %s)", peer, path)
+            self.notify(f"Send failed: {exc}", severity="error")
+            return
+        if peer == self._current:  # user may have switched dialogs mid-send
+            pane = self.query_one("#messages", Vertical)
+            label = caption or f"📎 {os.path.basename(path)}"
+            await pane.mount(MessageBubble(label, out=True))
 
     async def _drain_incoming(self) -> None:
         try:

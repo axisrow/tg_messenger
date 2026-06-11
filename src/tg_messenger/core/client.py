@@ -453,9 +453,30 @@ class StandaloneTelegramClient:
         )
         self._dialogs_cache.invalidate(_DIALOGS_CACHE_KEY)
 
-    async def send_media(self, peer: int, file_path: str | Path, caption: str | None = None) -> Message:
+    async def send_media(
+        self,
+        peer: int,
+        file_path: str | Path,
+        *,
+        caption: str | None = None,
+        voice_note: bool = False,
+        video_note: bool = False,
+        force_document: bool = False,
+    ) -> Message:
+        """Upload ``file_path`` to ``peer``.
+
+        ``voice_note``/``video_note``/``force_document`` map straight onto Telethon
+        ``send_file``. The path is validated BEFORE any network call — a missing path
+        or a directory raises ``ValueError`` (no FloodWait budget burned on a typo).
+        """
+        path = Path(file_path)
+        if not path.is_file():
+            raise ValueError(f"file not found: {file_path}")
         msg = await run_with_flood_wait_retry(
-            lambda: self._client.send_file(peer, str(file_path), caption=caption),
+            lambda: self._client.send_file(
+                peer, str(path), caption=caption, voice_note=voice_note,
+                video_note=video_note, force_document=force_document,
+            ),
             operation="send_media",
         )
         self._invalidate_history(peer)
