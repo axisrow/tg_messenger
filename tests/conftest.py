@@ -193,7 +193,7 @@ class FakeTelethonClient:
         self.forwarded: list[dict] = []
         self.edited: list[dict] = []
         self.deleted: list[dict] = []
-        self.read_acks: list[int] = []
+        self.read_acks: list[dict] = []
         self.downloads: list[dict] = []
         self.actions_active: list[tuple] = []
         self.actions_log: list[tuple] = []
@@ -307,8 +307,8 @@ class FakeTelethonClient:
         self.deleted.append({"peer": int(peer), "message_ids": list(ids), "revoke": revoke})
         return None
 
-    async def send_read_acknowledge(self, peer):
-        self.read_acks.append(int(peer))
+    async def send_read_acknowledge(self, peer, max_id=None):
+        self.read_acks.append({"peer": int(peer), "max_id": max_id})
         return True
 
     async def download_media(self, message, file):

@@ -546,7 +546,7 @@ best-effort `None` (raw-апдейт не несёт надёжного един
   missing/mismatched сообщения; `revoke=False` запрещён для channel/megagroup marked ids, потому что
   Telegram там удаляет для всех. Все через `run_with_flood_wait_retry`; инвалидируют history. Тесты:
   правильные вызовы фейка, safety rejects, инвалидация, non-transient flood → `HandledFloodWaitError`.
-- **79**: `mark_read(peer)` → `send_read_acknowledge` (retry, НЕ инвалидирует history,
+- **79**: `mark_read(peer, max_id=None)` → `send_read_acknowledge` (retry, НЕ инвалидирует history,
   но инвалидирует dialogs cache после успешного ack, чтобы badge unread перечитался);
   регресс на `Dialog.unread` из telethon-диалога.
 - **80**: CLI — `send --reply-to`, команды `forward FROM IDS TO`, `edit PEER ID TEXT`,
@@ -555,11 +555,11 @@ best-effort `None` (raw-апдейт не несёт надёжного един
   megagroup `--for-me` получает ClickException до подключения клиента. `read` остаётся печатью истории —
   отметка прочитанным вынесена в отдельную команду `mark-read`, чтобы не ломать существующую.
 - **81**: web — бейдж `<span class="unread">N</span>` в `_dialog_li`; открытие диалога
-  (`GET .../messages`) планирует `mark_read` best-effort в tracked background task (ошибка →
-  `logger.warning`, история отдаётся без ожидания read ack); `/send` принимает `reply_to` (Form)
-  и прокидывает в `send_text`. TUI — `(N)` в
-  `DialogItem`; `on_list_view_selected` запускает `_mark_read` воркером (best-effort, без await
-  в хендлере).
+  (`GET .../messages`) планирует `mark_read(..., max_id=<latest rendered id>)` best-effort в tracked
+  background task (ошибка → `logger.warning`, история отдаётся без ожидания read ack, новые сообщения
+  после snapshot остаются unread); `/send` принимает `reply_to` (Form) и прокидывает в `send_text`.
+  TUI — `(N)` в `DialogItem`; после загрузки history запускает `_mark_read` воркером с max_id
+  отрендеренного snapshot (best-effort, без await в хендлере).
 - **82**: CLAUDE.md (блок про действия в client.py) + PLAN.md этот блок.
 
 v1-компромиссы (в рамках плана): в TUI нет выбора сообщения, поэтому reply/forward/edit/delete

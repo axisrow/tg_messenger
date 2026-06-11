@@ -46,8 +46,8 @@ class WebStubClient:
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
-    async def mark_read(self, peer):
-        self.read_acks.append(peer)
+    async def mark_read(self, peer, max_id=None):
+        self.read_acks.append((peer, max_id))
 
     async def send_media(self, peer, file_path, caption=None):
         self.sent.append((peer, "media", caption))
@@ -227,7 +227,7 @@ async def test_opening_messages_marks_read(client_app):
     ac, stub = client_app
     await ac.get("/dialogs/7/messages")
     await asyncio.sleep(0)
-    assert stub.read_acks == [7]
+    assert stub.read_acks == [(7, 1)]
 
 
 async def test_messages_mark_read_does_not_block_response():
@@ -235,10 +235,10 @@ async def test_messages_mark_read_does_not_block_response():
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def slow_mark_read(peer):
+    async def slow_mark_read(peer, max_id=None):
         started.set()
         await release.wait()
-        stub.read_acks.append(peer)
+        stub.read_acks.append((peer, max_id))
 
     stub.mark_read = slow_mark_read
     app = build_app(client=stub)
@@ -252,7 +252,24 @@ async def test_messages_mark_read_does_not_block_response():
             assert stub.read_acks == []
             release.set()
             await asyncio.sleep(0)
-    assert stub.read_acks == [7]
+    assert stub.read_acks == [(7, 1)]
+
+
+async def test_messages_empty_history_does_not_mark_read():
+    stub = WebStubClient()
+
+    async def empty_history(peer, limit=50, offset_id=0):
+        return []
+
+    stub.history = empty_history
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/dialogs/7/messages")
+            await asyncio.sleep(0)
+    assert r.status_code == 200
+    assert stub.read_acks == []
 
 
 async def test_messages_mark_read_failure_does_not_break(caplog):
@@ -261,7 +278,7 @@ async def test_messages_mark_read_failure_does_not_break(caplog):
 
     stub = WebStubClient()
 
-    async def boom(peer):
+    async def boom(peer, max_id=None):
         raise RuntimeError("nope")
 
     stub.mark_read = boom

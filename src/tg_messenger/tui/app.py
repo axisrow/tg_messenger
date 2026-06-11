@@ -250,13 +250,10 @@ class MessengerTUI(App):
             self._current = item.dialog_id
             # exclusive group: selecting another dialog cancels a still-loading history
             self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
-            # opening a dialog clears its unread counter — best-effort, via a worker
-            # (never await network in a handler; the message pump must stay free)
-            self.run_worker(self._mark_read(item.dialog_id), group="mark_read", exclusive=False)
 
-    async def _mark_read(self, dialog_id: int) -> None:
+    async def _mark_read(self, dialog_id: int, max_id: int) -> None:
         try:
-            await self._client.mark_read(dialog_id)
+            await self._client.mark_read(dialog_id, max_id=max_id)
         except Exception:
             logger.warning("mark_read failed (dialog %s) — continuing", dialog_id, exc_info=True)
 
@@ -273,6 +270,13 @@ class MessengerTUI(App):
             return
         pane.loading = False
         await pane.mount(*(MessageBubble(m.text or "<media>", m.out) for m in messages))
+        if messages:
+            # Acknowledge exactly the loaded snapshot; messages arriving later stay unread.
+            self.run_worker(
+                self._mark_read(dialog_id, max(m.id for m in messages)),
+                group="mark_read",
+                exclusive=False,
+            )
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         # only the search box filters; the composer's own changes are ignored.

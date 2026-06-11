@@ -102,8 +102,8 @@ class StubClient:
     async def delete_messages(self, peer, message_ids, revoke=True):
         self.deleted_calls.append((peer, list(message_ids), revoke))
 
-    async def mark_read(self, peer):
-        self.read_acks.append(peer)
+    async def mark_read(self, peer, max_id=None):
+        self.read_acks.append((peer, max_id))
 
     async def send_media(self, peer, file_path, caption=None):
         self.sent.append((peer, "file", str(file_path), caption))
@@ -294,7 +294,7 @@ def test_mark_read_command_marks_read(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["mark-read", "7"])
     assert result.exit_code == 0, result.output
-    assert stub.read_acks == [7]
+    assert stub.read_acks == [(7, None)]
 
 
 def test_flood_wait_friendly_message(runner, monkeypatch):

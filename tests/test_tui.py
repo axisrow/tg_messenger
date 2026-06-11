@@ -50,8 +50,8 @@ class TuiStubClient:
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
-    async def mark_read(self, peer):
-        self.read_acks.append(peer)
+    async def mark_read(self, peer, max_id=None):
+        self.read_acks.append((peer, max_id))
 
     async def listen_all(self):
         # idle forever; the worker just waits for events
@@ -137,7 +137,7 @@ async def test_tui_selecting_dialog_marks_read():
         await app.on_list_view_selected(ListView.Selected(lv, item, 0))
         await pilot.pause()
         await pilot.pause()
-    assert stub.read_acks == [7]
+    assert stub.read_acks == [(7, 1)]
 
 
 async def test_tui_survives_markup_hostile_text():

@@ -1362,7 +1362,14 @@ async def test_mark_read_calls_send_read_acknowledge(fake_client):
     client = _build(fake_client)
     await client.connect()
     await client.mark_read(7)
-    assert fake_client.read_acks == [7]
+    assert fake_client.read_acks == [{"peer": 7, "max_id": None}]
+
+
+async def test_mark_read_passes_max_id(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await client.mark_read(7, max_id=42)
+    assert fake_client.read_acks == [{"peer": 7, "max_id": 42}]
 
 
 async def test_mark_read_invalidates_dialogs_cache(fake_client):
@@ -1386,7 +1393,7 @@ async def test_mark_read_flood_is_handled(fake_client, monkeypatch):
     client = _build(fake_client)
     await client.connect()
 
-    async def boom(peer):
+    async def boom(peer, max_id=None):
         raise flood_error(9999)
 
     fake_client.send_read_acknowledge = boom
@@ -1403,7 +1410,7 @@ async def test_mark_read_flood_keeps_dialogs_cache(fake_client, monkeypatch):
     first = await client.dialogs()
     assert next(d for d in first if d.id == 7).unread == 2
 
-    async def boom(peer):
+    async def boom(peer, max_id=None):
         raise flood_error(9999)
 
     fake_client.dialogs[0].unread_count = 0

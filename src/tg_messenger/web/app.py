@@ -81,15 +81,15 @@ async def sse_event_stream(client, dialog_id: int):
         return
 
 
-async def _mark_read_best_effort(client, dialog_id: int) -> None:
+async def _mark_read_best_effort(client, dialog_id: int, max_id: int) -> None:
     try:
-        await client.mark_read(dialog_id)
+        await client.mark_read(dialog_id, max_id=max_id)
     except Exception:
         logger.warning("mark_read failed for dialog %s — continuing", dialog_id, exc_info=True)
 
 
-def _schedule_mark_read(app: FastAPI, client, dialog_id: int) -> None:
-    task = asyncio.create_task(_mark_read_best_effort(client, dialog_id))
+def _schedule_mark_read(app: FastAPI, client, dialog_id: int, max_id: int) -> None:
+    task = asyncio.create_task(_mark_read_best_effort(client, dialog_id, max_id))
     app.state.background_tasks.add(task)
     task.add_done_callback(app.state.background_tasks.discard)
 
@@ -164,7 +164,8 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
         client = request.app.state.client
         items = await client.history(dialog_id, limit=50)
         # opening a dialog clears its unread counter, but it must never block rendering history
-        _schedule_mark_read(request.app, client, dialog_id)
+        if items:
+            _schedule_mark_read(request.app, client, dialog_id, max(m.id for m in items))
         return HTMLResponse("".join(_message_div(m) for m in items))
 
     @app.post("/send", response_class=HTMLResponse)

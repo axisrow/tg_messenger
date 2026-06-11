@@ -367,10 +367,11 @@ class StandaloneTelegramClient:
     async def _collect_messages_by_ids(self, peer, message_ids) -> list:
         return [m async for m in self._client.iter_messages(peer, ids=message_ids)]
 
-    async def mark_read(self, peer: int) -> None:
+    async def mark_read(self, peer: int, max_id: int | None = None) -> None:
         """Mark a dialog read (clears its unread counter), routed through flood retry."""
         await run_with_flood_wait_retry(
-            lambda: self._client.send_read_acknowledge(peer), operation="mark_read"
+            lambda: self._client.send_read_acknowledge(peer, max_id=max_id),
+            operation="mark_read",
         )
         self._dialogs_cache.invalidate(_DIALOGS_CACHE_KEY)
 
