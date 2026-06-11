@@ -89,8 +89,8 @@ Each saved login is a *profile* (a session file under `~/.tg_messenger/sessions/
 Log in to as many as you like and pick one per run with the global `--profile` flag:
 
 ```bash
-tg-messenger login --profile work --phone +1...   # create/replace the "work" profile
-tg-messenger login --profile personal --phone +1...
+tg-messenger --profile work login --phone +1...   # create/replace the "work" profile
+tg-messenger --profile personal login --phone +1...
 tg-messenger profiles                             # list saved profiles
 tg-messenger --profile work dialogs               # any command targets a profile
 tg-messenger --profile personal serve             # CLI / TUI / web all accept --profile
@@ -101,26 +101,6 @@ menu; a non-interactive shell errors instead of guessing. One process serves one
 profile, and each non-default profile gets its own log file
 (`~/.tg_messenger/logs/tg_messenger_<profile>.log`). The web exposes a read-only
 `GET /profiles` listing saved profiles with the active one flagged.
-
-## Reply suggester
-
-`tg-messenger suggest` drafts a reply in the style of your past messages with a contact —
-a **draft for you to review and edit**, never an auto-reply (full automation is a separate
-feature). Needs the `[agent]` extra and `TG_AGENT_MODEL` (same as the agent).
-
-```bash
-tg-messenger suggest 7            # print a draft reply for dialog 7
-tg-messenger suggest 7 --send     # send the draft as-is
-tg-messenger suggest --learn 7    # (re)build the contact's style profile from history
-```
-
-The draft also appears in the web UI (the 💡 Suggest button by the composer) and the TUI
-(an incoming message in the open DM shows a 💡 hint — press Tab to accept it).
-
-**Privacy:** generating a draft sends the recent conversation history — and the style profile
-built from your own replies — to your configured LLM provider (and, with LangSmith tracing on,
-into the traces). Learning is always an explicit per-contact command; nothing is scanned in the
-background.
 
 ## Session encryption & SSO with tg_content_factory
 

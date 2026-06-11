@@ -23,8 +23,8 @@ from tg_messenger.core.models import ChatActionEvent, Message
 
 logger = logging.getLogger(__name__)
 
-# a cheap link detector — http(s) or t.me / @mentions of channels count as links
-_LINK_RE = re.compile(r"(https?://|t\.me/|www\.)", re.IGNORECASE)
+# a cheap link detector — http(s), t.me, www, or channel @mentions count as links
+_LINK_RE = re.compile(r"(https?://|t\.me/|www\.|(?<!\w)@[A-Za-z0-9_]{5,})", re.IGNORECASE)
 
 
 class RuleConditions(BaseModel):
@@ -52,6 +52,13 @@ class RuleActions(BaseModel):
     mute_sec: int | None = None
     ban: bool = False
     warn_text: str | None = None
+
+    @field_validator("mute_sec")
+    @classmethod
+    def _valid_mute_duration(cls, v: int | None) -> int | None:
+        if v is not None and v < 30:
+            raise ValueError("mute_sec must be at least 30 seconds")
+        return v
 
 
 class ModerationRule(BaseModel):
@@ -158,8 +165,8 @@ async def list_rules(storage, chat_id: int | None = None) -> list[ModerationRule
     ]
 
 
-async def remove_rule(storage, chat_id: int, name: str) -> None:
-    await storage.execute(
+async def remove_rule(storage, chat_id: int, name: str) -> int:
+    return await storage.execute(
         "DELETE FROM moderation_rules WHERE chat_id = ? AND name = ?", (int(chat_id), name)
     )
 
@@ -172,16 +179,26 @@ RATE_WINDOW_SEC = 60.0
 
 
 async def check_admin_rights(client, storage) -> dict[int, bool]:
-    """For every chat that has rules, check whether we can moderate it.
+    """For every chat that has rules, check whether we have the rights they need.
 
-    Returns ``{chat_id: is_admin}``. Chats where we lack rights are logged
+    Returns ``{chat_id: can_run_rules}``. Chats where we lack rights are logged
     (``logger.warning``) — the engine simply finds no enabled rules there at
     runtime if the caller disables them; this never raises.
     """
-    chat_ids = sorted({r.chat_id for r in await list_rules(storage)})
+    rules_by_chat: dict[int, list[ModerationRule]] = {}
+    for rule in await list_rules(storage):
+        rules_by_chat.setdefault(rule.chat_id, []).append(rule)
     result: dict[int, bool] = {}
-    for chat_id in chat_ids:
-        ok = await client.is_admin(chat_id)
+    for chat_id, rules in sorted(rules_by_chat.items()):
+        needs_delete = any(rule.enabled and rule.actions.delete for rule in rules)
+        needs_ban = any(
+            rule.enabled and (rule.actions.ban or rule.actions.mute_sec is not None)
+            for rule in rules
+        )
+        rights = await client.moderation_rights(chat_id)
+        ok = (not needs_delete or rights["delete_messages"]) and (
+            not needs_ban or rights["ban_users"]
+        )
         result[chat_id] = ok
         if not ok:
             logger.warning(
@@ -222,10 +239,26 @@ class ModerationEngine:
         self._joined: OrderedDict[tuple[int, int], float] = OrderedDict()
         # (chat_id, sender_id) -> sliding window of recent message times
         self._rate: OrderedDict[tuple[int, int], deque[float]] = OrderedDict()
+        # Rules are process-local for the running moderator. CLI add/remove commands
+        # happen before starting a fresh engine; the hot message path should not hit
+        # SQLite for every incoming message in active groups.
+        self._rules_by_chat: dict[int, list[ModerationRule]] | None = None
 
     def disable_chats(self, chat_ids) -> None:
         """Mark chats we can't moderate (no admin rights) so their rules are skipped."""
         self._blocked_chats.update(int(c) for c in chat_ids)
+
+    async def load_rules(self) -> None:
+        """Load moderation rules into memory for the current engine run."""
+        rules_by_chat: dict[int, list[ModerationRule]] = {}
+        for rule in await list_rules(self._storage):
+            rules_by_chat.setdefault(rule.chat_id, []).append(rule)
+        self._rules_by_chat = rules_by_chat
+
+    async def _rules_for_chat(self, chat_id: int) -> list[ModerationRule]:
+        if self._rules_by_chat is None:
+            await self.load_rules()
+        return list((self._rules_by_chat or {}).get(chat_id, ()))
 
     async def run(self) -> None:
         import asyncio
@@ -265,8 +298,8 @@ class ModerationEngine:
             return False
         return (self._clock() - joined_at) <= within_sec
 
-    def _over_rate_limit(self, chat_id: int, sender_id: int, limit: int) -> bool:
-        """Record this message's time, then report if the trailing 60s window hit ``limit``."""
+    def _record_rate_window(self, chat_id: int, sender_id: int) -> int:
+        """Record this message once, then return the sender's trailing 60s count."""
         now = self._clock()
         key = (chat_id, sender_id)
         window = self._rate.get(key)
@@ -279,16 +312,17 @@ class ModerationEngine:
             window.popleft()
         while len(self._rate) > self._rate_cache_size:
             self._rate.popitem(last=False)
-        return len(window) >= limit
+        return len(window)
 
     async def process_message(self, message: Message) -> None:
         """Apply the first matching enabled rule for the message's chat (if any)."""
         chat_id = message.dialog_id
         if chat_id in self._blocked_chats:
             return  # no admin rights here — nothing to do
-        rules = await list_rules(self._storage, chat_id=chat_id)
-        # rate window must be updated for EVERY message regardless of rules; do it once
-        # per rule lazily below — but a single sender_id, so evaluate per-rule on demand.
+        rules = await self._rules_for_chat(chat_id)
+        rate_count: int | None = None
+        if any(r.enabled and r.conditions.max_messages_per_minute is not None for r in rules):
+            rate_count = self._record_rate_window(chat_id, message.sender_id)
         for rule in rules:
             if not rule.enabled:
                 continue
@@ -300,9 +334,7 @@ class ModerationEngine:
                 )
             over_rate = False
             if cond.max_messages_per_minute is not None:
-                over_rate = self._over_rate_limit(
-                    chat_id, message.sender_id, cond.max_messages_per_minute
-                )
+                over_rate = (rate_count or 0) >= cond.max_messages_per_minute
             if rule_matches(
                 cond, message,
                 is_new_member=is_new_member,
@@ -315,9 +347,10 @@ class ModerationEngine:
     async def _apply(self, rule: ModerationRule, message: Message) -> None:
         chat_id = message.dialog_id
         actions = rule.actions
-        if actions.delete:
-            await self._do(rule, message, "delete",
-                           lambda: self._client.delete_messages(chat_id, [message.id]))
+        if actions.warn_text is not None:
+            await self._do(rule, message, "warn",
+                           lambda: self._client.send_text(chat_id, actions.warn_text,
+                                                          reply_to=message.id))
         if actions.mute_sec is not None:
             await self._do(rule, message, "mute",
                            lambda: self._client.mute_user(chat_id, message.sender_id,
@@ -325,10 +358,9 @@ class ModerationEngine:
         if actions.ban:
             await self._do(rule, message, "ban",
                            lambda: self._client.ban_user(chat_id, message.sender_id))
-        if actions.warn_text is not None:
-            await self._do(rule, message, "warn",
-                           lambda: self._client.send_text(chat_id, actions.warn_text,
-                                                          reply_to=message.id))
+        if actions.delete:
+            await self._do(rule, message, "delete",
+                           lambda: self._client.delete_messages(chat_id, [message.id]))
 
     async def _do(self, rule: ModerationRule, message: Message, action: str, call) -> None:
         """Run (or, in dry-run, skip) one action; journal it; never let it kill the engine."""

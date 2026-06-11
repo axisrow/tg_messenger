@@ -17,6 +17,8 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from tg_messenger.core.names import sanitize_profile_name
+
 DEFAULT_LOG_DIR = Path.home() / ".tg_messenger" / "logs"
 LOG_FILE_NAME = "tg_messenger.log"
 
@@ -49,9 +51,10 @@ def _log_file_name(profile: str | None) -> str:
     Per-profile isolation keeps two concurrently running accounts (one process each)
     from interleaving into a single log file.
     """
-    if not profile or profile == "default":
+    safe_profile = sanitize_profile_name(profile) if profile else "default"
+    if safe_profile == "default":
         return LOG_FILE_NAME
-    return f"tg_messenger_{profile}.log"
+    return f"tg_messenger_{safe_profile}.log"
 
 
 def log_file_path(log_dir: Path | str | None = None, *, profile: str | None = None) -> Path:
