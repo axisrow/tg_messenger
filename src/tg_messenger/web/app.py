@@ -32,6 +32,7 @@ from tg_messenger.core.search import filter_dialogs
 logger = logging.getLogger(__name__)
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+SUGGEST_CSRF_HEADER = "x-tg-messenger-csrf"
 
 # --- web authorization (#24) -------------------------------------------------
 COOKIE_NAME = "tg_session"
@@ -140,6 +141,25 @@ def _message_div(m) -> str:
     cls = "out" if m.out else "in"
     body = escape(m.text) if m.text else "&lt;media&gt;"
     return f'<div class="msg {cls}" data-id="{m.id}">{body}</div>'
+
+
+def _same_origin_error(request: Request) -> HTMLResponse | None:
+    if request.headers.get(SUGGEST_CSRF_HEADER) != "1":
+        return HTMLResponse(
+            '<div class="error">Suggest requires a same-origin request.</div>',
+            status_code=403,
+        )
+    origin = request.headers.get("origin")
+    if origin is None:
+        return None
+    host = request.headers.get("host") or request.url.netloc
+    expected = f"{request.url.scheme}://{host}"
+    if origin != expected:
+        return HTMLResponse(
+            '<div class="error">Suggest requires a same-origin request.</div>',
+            status_code=403,
+        )
+    return None
 
 
 async def sse_event_stream(client, dialog_id: int):
@@ -340,10 +360,13 @@ def build_app(
             os.unlink(tmp_path)
         return HTMLResponse(_message_div(msg))
 
-    @app.get("/dialogs/{dialog_id}/suggest", response_class=PlainTextResponse)
+    @app.post("/dialogs/{dialog_id}/suggest", response_class=PlainTextResponse)
     async def suggest(request: Request, dialog_id: int):
         # draft a reply for a human to review; the JS in chat.html drops it into
         # the composer input. 503 (not 500) when the feature is unconfigured.
+        same_origin_error = _same_origin_error(request)
+        if same_origin_error is not None:
+            return same_origin_error
         suggester = request.app.state.suggester
         if suggester is None:
             return HTMLResponse(
