@@ -845,6 +845,15 @@ def test_profiles_command_lists_saved(monkeypatch, tmp_path):
     assert "bob" in result.output
 
 
+def test_profiles_command_empty_hint_uses_global_profile_position(monkeypatch, tmp_path):
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli_main.cli, ["profiles"])
+
+    assert result.exit_code == 0, result.output
+    assert "tg-messenger --profile NAME login" in result.output
+
+
 def test_multiple_profiles_non_interactive_errors(monkeypatch, tmp_path):
     from tg_messenger.core.auth import SessionStore
 

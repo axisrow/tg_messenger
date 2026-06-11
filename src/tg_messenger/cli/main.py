@@ -341,7 +341,7 @@ def profiles() -> None:
     """List saved account profiles (sessions on disk)."""
     names = _session_store().list_profiles()
     if not names:
-        click.echo("No profiles yet — run: tg-messenger login --profile NAME")
+        click.echo("No profiles yet — run: tg-messenger --profile NAME login")
         return
     for name in names:
         click.echo(name)
