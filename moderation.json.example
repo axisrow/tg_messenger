@@ -1,0 +1,18 @@
+{
+  "chat_id": -1001234567890,
+  "name": "no-links-from-newbies",
+  "enabled": true,
+  "conditions": {
+    "pattern": "(?i)\\b(buy|sale|crypto)\\b",
+    "has_link": true,
+    "is_forward": false,
+    "from_new_member_within_sec": 600,
+    "max_messages_per_minute": null
+  },
+  "actions": {
+    "delete": true,
+    "mute_sec": 3600,
+    "ban": false,
+    "warn_text": "Links from new members are not allowed here."
+  }
+}
