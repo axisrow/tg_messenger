@@ -48,7 +48,13 @@ class StubWorker:
 def _setup(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     client = StubClient()
-    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+
+    def fake_make_client(**kw):
+        client.make_client_kwargs = getattr(client, "make_client_kwargs", [])
+        client.make_client_kwargs.append(kw)
+        return client
+
+    monkeypatch.setattr(cli_main, "make_client", fake_make_client)
     monkeypatch.setattr(cli_main, "make_factory_client", lambda **kw: object())
     monkeypatch.setattr("tg_messenger.interop.worker.Worker", StubWorker)
     return client
@@ -90,6 +96,13 @@ def test_worker_types_filter_passed(monkeypatch, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert StubWorker.last.types == ["dm_reply", "fetch_history"]
+
+
+def test_worker_uses_global_profile(monkeypatch, tmp_path):
+    client = _setup(monkeypatch, tmp_path)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "worker", "--factory-url", "http://f"])
+    assert result.exit_code == 0, result.output
+    assert client.make_client_kwargs[-1]["session_name"] == "work"
 
 
 def test_worker_requires_factory_url(monkeypatch, tmp_path):

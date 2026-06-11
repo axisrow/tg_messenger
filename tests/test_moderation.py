@@ -20,6 +20,7 @@ from tg_messenger.core.moderation import (
     RuleActions,
     RuleConditions,
     add_rule,
+    check_admin_rights,
     list_rules,
     register_moderation_migrations,
     remove_rule,
@@ -32,6 +33,7 @@ def _msg(text=None, *, is_forward=False, sender_id=7):
     return Message(
         id=1, dialog_id=-100200, sender_id=sender_id, out=False,
         text=text, date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        is_forward=is_forward,
     )
 
 
@@ -58,6 +60,8 @@ def test_invalid_regex_rejected_fail_fast():
 def test_has_link_condition():
     cond = RuleConditions(has_link=True)
     assert rule_matches(cond, _msg("visit https://example.com now"), is_new_member=False)
+    assert rule_matches(cond, _msg("join @some_channel"), is_new_member=False)
+    assert not rule_matches(cond, _msg("email me at user@gmail.com"), is_new_member=False)
     assert not rule_matches(cond, _msg("no links here"), is_new_member=False)
 
 
@@ -92,6 +96,11 @@ def test_empty_conditions_matches_everything():
 def test_rule_actions_defaults():
     a = RuleActions()
     assert a.delete is False and a.mute_sec is None and a.ban is False and a.warn_text is None
+
+
+def test_mute_duration_under_30_seconds_rejected():
+    with pytest.raises(ValidationError, match="mute_sec"):
+        RuleActions(mute_sec=29)
 
 
 # --- цикл 84: хранение правил (storage) ---
@@ -154,9 +163,19 @@ async def test_remove_rule(tmp_path):
     try:
         await add_rule(storage, _rule(name="a"))
         await add_rule(storage, _rule(name="b"))
-        await remove_rule(storage, -100200, "a")
+        deleted = await remove_rule(storage, -100200, "a")
+        assert deleted == 1
         rules = await list_rules(storage)
         assert [r.name for r in rules] == ["b"]
+    finally:
+        await storage.close()
+
+
+async def test_remove_rule_reports_missing_rule(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        deleted = await remove_rule(storage, -100200, "missing")
+        assert deleted == 0
     finally:
         await storage.close()
 
@@ -167,6 +186,66 @@ async def test_migration_applied(tmp_path):
         # both tables exist — a query against each succeeds
         await storage.fetchall("SELECT * FROM moderation_rules")
         await storage.fetchall("SELECT * FROM moderation_log")
+    finally:
+        await storage.close()
+
+
+async def test_check_admin_rights_uses_rule_actions(tmp_path):
+    storage = await _storage(tmp_path)
+    client = FakeModClient()
+    client.rights = {"delete_messages": True, "ban_users": False}
+    try:
+        await add_rule(storage, _rule(
+            chat_id=-100200, name="delete-ok",
+            actions=RuleActions(delete=True),
+        ))
+        await add_rule(storage, _rule(
+            chat_id=-100300, name="ban-needs-ban-users",
+            actions=RuleActions(ban=True),
+        ))
+
+        rights = await check_admin_rights(client, storage)
+
+        assert rights == {-100200: True, -100300: False}
+    finally:
+        await storage.close()
+
+
+async def test_check_admin_rights_warn_only_needs_no_admin_rights(tmp_path):
+    storage = await _storage(tmp_path)
+    client = FakeModClient()
+    client.rights = {"delete_messages": False, "ban_users": False}
+    try:
+        await add_rule(storage, _rule(
+            chat_id=-100200, name="warn-only",
+            actions=RuleActions(warn_text="careful"),
+        ))
+
+        rights = await check_admin_rights(client, storage)
+
+        assert rights == {-100200: True}
+    finally:
+        await storage.close()
+
+
+async def test_check_admin_rights_ignores_disabled_rules(tmp_path):
+    storage = await _storage(tmp_path)
+    client = FakeModClient()
+    client.rights = {"delete_messages": True, "ban_users": False}
+    try:
+        await add_rule(storage, _rule(
+            chat_id=-100200, name="delete-ok",
+            actions=RuleActions(delete=True),
+        ))
+        await add_rule(storage, _rule(
+            chat_id=-100200, name="disabled-ban",
+            enabled=False,
+            actions=RuleActions(ban=True),
+        ))
+
+        rights = await check_admin_rights(client, storage)
+
+        assert rights == {-100200: True}
     finally:
         await storage.close()
 
@@ -185,9 +264,13 @@ class FakeModClient:
         self.banned: list = []
         self.sent: list = []
         self.fail_action: str | None = None  # name of action that raises
+        self.rights = {"delete_messages": True, "ban_users": True}
 
     async def get_me(self):
         return ADMIN
+
+    async def moderation_rights(self, peer):
+        return self.rights
 
     async def delete_messages(self, peer, message_ids, revoke=True):
         if self.fail_action == "delete":
@@ -229,6 +312,7 @@ def _imsg(text="hi", *, sender_id=7, msg_id=1, is_forward=False):
     return Message(
         id=msg_id, dialog_id=CHAT, sender_id=sender_id, out=False,
         text=text, date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        is_forward=is_forward,
     )
 
 
@@ -287,6 +371,59 @@ async def test_rate_limit_window_fires(tmp_path):
             t["now"] = float(i)
             await engine.process_message(_imsg(sender_id=7, msg_id=i))
         assert client.deleted == [(CHAT, [3])]  # only the 3rd is over the limit
+    finally:
+        await storage.close()
+
+
+async def test_rate_limit_records_each_message_once_across_rules(tmp_path):
+    engine, client, storage, t = _mk_engine(tmp_path, enforce=True)
+    await storage.connect()
+    try:
+        await add_rule(storage, ModerationRule(
+            chat_id=CHAT, name="pattern-rate",
+            conditions=RuleConditions(pattern="never", max_messages_per_minute=3),
+            actions=RuleActions(ban=True),
+        ))
+        await add_rule(storage, ModerationRule(
+            chat_id=CHAT, name="flood",
+            conditions=RuleConditions(max_messages_per_minute=3),
+            actions=RuleActions(delete=True),
+        ))
+        for i in range(1, 3):
+            t["now"] = float(i)
+            await engine.process_message(_imsg(text="plain", sender_id=7, msg_id=i))
+        assert client.deleted == []
+
+        t["now"] = 3.0
+        await engine.process_message(_imsg(text="plain", sender_id=7, msg_id=3))
+        assert client.deleted == [(CHAT, [3])]
+        assert client.banned == []
+    finally:
+        await storage.close()
+
+
+async def test_engine_caches_rules_after_first_message(tmp_path):
+    engine, client, storage, t = _mk_engine(tmp_path, enforce=True)
+    await storage.connect()
+    original_fetchall = storage.fetchall
+    fetch_count = {"rules": 0}
+
+    async def counted_fetchall(sql, params=()):
+        if "FROM moderation_rules" in sql:
+            fetch_count["rules"] += 1
+        return await original_fetchall(sql, params)
+
+    storage.fetchall = counted_fetchall
+    try:
+        await add_rule(storage, ModerationRule(
+            chat_id=CHAT, name="spam",
+            conditions=RuleConditions(pattern="spam"),
+            actions=RuleActions(delete=True),
+        ))
+        await engine.process_message(_imsg(text="spam", msg_id=1))
+        await engine.process_message(_imsg(text="spam", msg_id=2))
+        assert fetch_count["rules"] == 1
+        assert client.deleted == [(CHAT, [1]), (CHAT, [2])]
     finally:
         await storage.close()
 
@@ -361,6 +498,8 @@ async def test_enforce_all_actions(tmp_path):
         assert client.muted == [(CHAT, 7, 300)]
         assert client.banned == [(CHAT, 7)]
         assert client.sent and client.sent[0][0] == CHAT and client.sent[0][1] == "no!"
+        log = await storage.fetchall("SELECT action, dry_run FROM moderation_log")
+        assert log == [("warn", 0), ("mute", 0), ("ban", 0), ("delete", 0)]
     finally:
         await storage.close()
 
