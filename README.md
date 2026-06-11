@@ -58,6 +58,25 @@ asyncio.run(main())
 The public surface (`tg_messenger.__all__`) also exports `SessionStore`, `LoginFlow`,
 `LOGIN_HINT`, `EventBus`, `run_with_flood_wait_retry` and `HandledFloodWaitError`.
 
+## Multiple accounts (profiles)
+
+Each saved login is a *profile* (a session file under `~/.tg_messenger/sessions/`).
+Log in to as many as you like and pick one per run with the global `--profile` flag:
+
+```bash
+tg-messenger --profile work login --phone +1...   # create/replace the "work" profile
+tg-messenger --profile personal login --phone +1...
+tg-messenger profiles                             # list saved profiles
+tg-messenger --profile work dialogs               # any command targets a profile
+tg-messenger --profile personal serve             # CLI / TUI / web all accept --profile
+```
+
+With more than one profile and **no** `--profile`, the CLI and TUI pop a selection
+menu; a non-interactive shell errors instead of guessing. One process serves one
+profile, and each non-default profile gets its own log file
+(`~/.tg_messenger/logs/tg_messenger_<profile>.log`). The web exposes a read-only
+`GET /profiles` listing saved profiles with the active one flagged.
+
 ## Session encryption & SSO with tg_content_factory
 
 By default sessions live as plaintext `0600` files under `~/.tg_messenger/sessions/`.

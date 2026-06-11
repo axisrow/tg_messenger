@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from pathlib import Path
 from typing import NamedTuple
 
@@ -17,6 +16,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.auth import ResendCodeRequest
 
 from tg_messenger.core.flood import run_with_flood_wait_retry
+from tg_messenger.core.names import sanitize_profile_name
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +24,7 @@ DEFAULT_SESSION_DIR = Path.home() / ".tg_messenger" / "sessions"
 
 # single source for the "you need to log in" UX hint, shared by all three UIs
 LOGIN_HINT = "Not logged in. Run: tg-messenger login"
-
-_SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
-
-
-def _sanitize(name: str) -> str:
-    cleaned = _SAFE.sub("_", name).strip("._") or "default"
-    return cleaned
+_sanitize = sanitize_profile_name
 
 
 def validate_session_string(session_string: str) -> str:
@@ -67,7 +61,7 @@ class SessionStore:
         self._encryption_key = encryption_key or None  # treat "" as no key
 
     def path_for(self, name: str) -> Path:
-        return self.session_dir / f"{_sanitize(name)}.session"
+        return self.session_dir / f"{sanitize_profile_name(name)}.session"
 
     def load(self, name: str) -> str | None:
         from tg_messenger.core.session_cipher import decrypt_session, is_encrypted
@@ -107,6 +101,12 @@ class SessionStore:
     def from_external(self, session_string: str) -> str:
         """Validate and return the session string verbatim — never written to disk."""
         return _validate_session_string(session_string)
+
+    def list_profiles(self) -> list[str]:
+        """Sorted profile names = ``*.session`` files in the session dir (no extension)."""
+        if not self.session_dir.is_dir():
+            return []
+        return sorted(p.stem for p in self.session_dir.glob("*.session") if p.is_file())
 
 
 class CodeDelivery(NamedTuple):

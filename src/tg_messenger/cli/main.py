@@ -13,10 +13,11 @@ import sys
 from pathlib import Path
 
 import click
+from click.core import ParameterSource
 from telethon.errors import UnauthorizedError
 
 from tg_messenger.agent.config import langsmith_tracing_enabled
-from tg_messenger.core.auth import LOGIN_HINT, SessionStore, validate_session_string
+from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT, SessionStore, validate_session_string
 from tg_messenger.core.client import StandaloneTelegramClient
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.logsetup import log_file_path, setup_logging
@@ -53,7 +54,11 @@ def _session_encryption_key() -> str | None:
 
 
 def _session_store() -> SessionStore:
-    return SessionStore(encryption_key=_session_encryption_key())
+    """SessionStore over the configured session dir (env override for tests/ops)."""
+    return SessionStore(
+        os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
+        encryption_key=_session_encryption_key(),
+    )
 
 
 def make_client(**kwargs) -> StandaloneTelegramClient:
@@ -61,6 +66,7 @@ def make_client(**kwargs) -> StandaloneTelegramClient:
     api_hash = os.environ.get("TG_API_HASH", "")
     # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
     kwargs.setdefault("encryption_key", _session_encryption_key())
+    kwargs.setdefault("session_dir", os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
 
 
@@ -142,6 +148,7 @@ async def _ensure_authorized(client, session: str) -> None:
 
 
 async def _with_client(session, fn):
+    session = _effective_session(click.get_current_context(silent=True), session)
     client = make_client(session_name=session)
     await client.connect()
     try:
@@ -151,16 +158,65 @@ async def _with_client(session, fn):
         await client.disconnect()
 
 
+def _is_interactive() -> bool:
+    """True when a human can answer a prompt (stdin is a tty)."""
+    return sys.stdin.isatty()
+
+
+def _resolve_profile(session: str) -> str:
+    """Pick the profile when ``--session/--profile`` was left at its default.
+
+    0 or 1 saved profile → keep ``session`` (``default`` / the only one). With >1 and
+    an interactive stdin, prompt a numbered menu; non-interactive → a clear error.
+    An explicit non-default ``session`` short-circuits all of this.
+    """
+    if session != "default":
+        return session
+    profiles = _session_store().list_profiles()
+    if len(profiles) <= 1:
+        return profiles[0] if profiles else session
+    if not _is_interactive():
+        raise click.ClickException(
+            f"multiple profiles ({', '.join(profiles)}) — pass --profile NAME"
+        )
+    for i, name in enumerate(profiles, 1):
+        click.echo(f"  {i}. {name}")
+    while True:
+        choice = click.prompt("Select profile", type=int)
+        if 1 <= choice <= len(profiles):
+            return profiles[choice - 1]
+        click.echo("out of range", err=True)
+
+
 @click.group()
 @click.option("-v", "--verbose", is_flag=True, help="Verbose (DEBUG) logging.")
+@click.option("--profile", default=None, help="Account profile (session name) to use.")
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool) -> None:
+def cli(ctx: click.Context, verbose: bool, profile: str | None) -> None:
     """tg_messenger — chat in your Telegram DMs from the terminal."""
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
+    ctx.obj["profile"] = profile
     _load_dotenv()
-    # the CLI reports its own errors via click — keep its log records off stderr
-    setup_logging(verbose=verbose, console_skip_prefixes=("tg_messenger.cli",))
+    # the CLI reports its own errors via click — keep its log records off stderr.
+    # The final profile may still come from a menu, but an explicit --profile
+    # already isolates the log file (two accounts = two processes = two files).
+    setup_logging(
+        verbose=verbose, console_skip_prefixes=("tg_messenger.cli",), profile=profile
+    )
+
+
+def _effective_session(ctx: click.Context | None, session: str) -> str:
+    """Combine the global --profile with a command's --session, then resolve a menu."""
+    profile = ctx.obj.get("profile") if ctx is not None and ctx.obj else None
+    if profile:
+        return profile
+    if (
+        ctx is not None
+        and ctx.get_parameter_source("session") == ParameterSource.COMMANDLINE
+    ):
+        return session
+    return _resolve_profile(session)
 
 
 def _export_session(session: str) -> None:
@@ -206,7 +262,9 @@ def _import_session(session: str) -> None:
               help="Print the plaintext StringSession to stdout (full account access) and exit.")
 @click.option("--import-session", "import_session", is_flag=True,
               help="Read a StringSession from stdin (no echo), validate and save it.")
-def login(session: str, phone: str | None, export_session: bool, import_session: bool) -> None:
+@click.pass_context
+def login(ctx: click.Context, session: str, phone: str | None,
+          export_session: bool, import_session: bool) -> None:
     """Interactive login: phone -> code -> optional 2FA.
 
     ``--export-session`` / ``--import-session`` move a session between machines or
@@ -215,6 +273,11 @@ def login(session: str, phone: str | None, export_session: bool, import_session:
     from telethon.errors import RPCError, SendCodeUnavailableError, SessionPasswordNeededError
 
     from tg_messenger.core.auth import LoginFlow
+
+    # login names a (possibly new) profile — honour the global --profile, but never
+    # pop a selection menu here (you're creating/replacing this one).
+    if ctx.obj and ctx.obj.get("profile"):
+        session = ctx.obj["profile"]
 
     if export_session and import_session:
         raise click.ClickException("choose either --export-session or --import-session, not both")
@@ -280,6 +343,17 @@ def login(session: str, phone: str | None, export_session: bool, import_session:
 
 
 @cli.command()
+def profiles() -> None:
+    """List saved account profiles (sessions on disk)."""
+    names = _session_store().list_profiles()
+    if not names:
+        click.echo("No profiles yet — run: tg-messenger --profile NAME login")
+        return
+    for name in names:
+        click.echo(name)
+
+
+@cli.command()
 @click.option("--session", default="default")
 @click.option("--groups", is_flag=True, help="List groups/channels/bots instead of DMs.")
 def dialogs(session: str, groups: bool) -> None:
@@ -339,8 +413,10 @@ def send(dialog_id: int, text: str | None, file_path: str | None, session: str) 
 
 @cli.command()
 @click.option("--session", default="default")
-def listen(session: str) -> None:
+@click.pass_context
+def listen(ctx: click.Context, session: str) -> None:
     """Print incoming messages live."""
+    session = _effective_session(ctx, session)
 
     async def _do():
         client = make_client(session_name=session)
@@ -361,9 +437,12 @@ def listen(session: str) -> None:
 
 @cli.command()
 @click.option("--session", default="default")
-def watch(session: str) -> None:
+@click.pass_context
+def watch(ctx: click.Context, session: str) -> None:
     """Back up your deleted messages (e.g. removed by group moderator bots) to Saved Messages."""
     from tg_messenger.core.watch import DeletionWatcher
+
+    session = _effective_session(ctx, session)
 
     async def _do():
         client = make_client(session_name=session)
@@ -384,8 +463,10 @@ def watch(session: str) -> None:
 @cli.command()
 @click.argument("dialog_id", type=int)
 @click.option("--session", default="default")
-def chat(dialog_id: int, session: str) -> None:
+@click.pass_context
+def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
     """Interactive REPL: see incoming and send replies."""
+    session = _effective_session(ctx, session)
 
     async def _do():
         client = make_client(session_name=session)
@@ -428,8 +509,10 @@ def chat(dialog_id: int, session: str) -> None:
 @click.option("--session", default="default")
 @click.option("--notify-errors", is_flag=True,
               help="Reply with a short notice when processing a message fails.")
-def agent(session: str, notify_errors: bool) -> None:
+@click.pass_context
+def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
     """AI assistant: auto-reply to incoming DMs, route tasks to a deep agent."""
+    session = _effective_session(ctx, session)
     # langchain/langgraph трассируются в LangSmith сами по LANGSMITH_* env —
     # здесь только fail-fast (включено без ключа) и видимый статус
     try:
@@ -461,7 +544,8 @@ def agent(session: str, notify_errors: bool) -> None:
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=lambda: int(os.environ.get("TG_WEB_PORT", "8090")), type=int)
 @click.option("--session", default="default")
-def serve(host: str, port: int, session: str) -> None:
+@click.pass_context
+def serve(ctx: click.Context, host: str, port: int, session: str) -> None:
     """Launch the web interface."""
     try:
         import uvicorn
@@ -471,6 +555,7 @@ def serve(host: str, port: int, session: str) -> None:
         # base install omits the web stack — point at the extra instead of a raw ImportError
         raise click.ClickException("web UI requires: pip install 'tg-messenger[web]'") from exc
 
+    session = _effective_session(ctx, session)
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
     click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
     uvicorn.run(build_app(session_name=session), host=host, port=port, log_config=None)
@@ -487,7 +572,8 @@ def tui(ctx: click.Context, session: str) -> None:
         raise click.ClickException("TUI requires: pip install 'tg-messenger[tui]'") from exc
 
     # stderr handler would corrupt the alternate screen — file log only
-    setup_logging(verbose=ctx.obj["verbose"], console=False)
+    setup_logging(verbose=ctx.obj["verbose"], console=False, profile=ctx.obj.get("profile"))
+    session = _effective_session(ctx, session)
     MessengerTUI(session_name=session).run()
 
 

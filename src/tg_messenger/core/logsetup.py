@@ -17,6 +17,8 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from tg_messenger.core.names import sanitize_profile_name
+
 DEFAULT_LOG_DIR = Path.home() / ".tg_messenger" / "logs"
 LOG_FILE_NAME = "tg_messenger.log"
 
@@ -43,8 +45,20 @@ def _resolve_log_dir(log_dir: Path | str | None) -> Path:
     return Path(os.environ.get("TG_LOG_DIR") or DEFAULT_LOG_DIR)
 
 
-def log_file_path(log_dir: Path | str | None = None) -> Path:
-    return _resolve_log_dir(log_dir) / LOG_FILE_NAME
+def _log_file_name(profile: str | None) -> str:
+    """``tg_messenger.log`` for the default profile, ``tg_messenger_<profile>.log`` otherwise.
+
+    Per-profile isolation keeps two concurrently running accounts (one process each)
+    from interleaving into a single log file.
+    """
+    safe_profile = sanitize_profile_name(profile) if profile else "default"
+    if safe_profile == "default":
+        return LOG_FILE_NAME
+    return f"tg_messenger_{safe_profile}.log"
+
+
+def log_file_path(log_dir: Path | str | None = None, *, profile: str | None = None) -> Path:
+    return _resolve_log_dir(log_dir) / _log_file_name(profile)
 
 
 def setup_logging(
@@ -53,16 +67,18 @@ def setup_logging(
     console: bool = True,
     console_skip_prefixes: tuple[str, ...] = (),
     log_dir: Path | str | None = None,
+    profile: str | None = None,
 ) -> Path:
     """Configure root logging; returns the log file path.
 
     Idempotent: handlers installed by a previous call are replaced, so the TUI
-    can re-run it with ``console=False`` without duplicating output.
+    can re-run it with ``console=False`` without duplicating output. A non-default
+    ``profile`` writes to its own ``tg_messenger_<profile>.log``.
     """
     resolved_dir = _resolve_log_dir(log_dir)
     resolved_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(resolved_dir, 0o700)
-    log_file = resolved_dir / LOG_FILE_NAME
+    log_file = resolved_dir / _log_file_name(profile)
 
     root = logging.getLogger()
     for handler in list(root.handlers):

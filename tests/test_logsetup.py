@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from tg_messenger.core.logsetup import LOG_FILE_NAME, setup_logging
+from tg_messenger.core.logsetup import LOG_FILE_NAME, log_file_path, setup_logging
 
 _MARKER = "_tg_messenger_handler"
 
@@ -129,3 +129,33 @@ def test_env_var_overrides_default_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("TG_LOG_DIR", str(tmp_path / "envlogs"))
     log_file = setup_logging()
     assert log_file.parent == tmp_path / "envlogs"
+
+
+def test_profile_gets_dedicated_log_file(tmp_path):
+    # per-profile isolation: a named profile must not write to the shared file
+    log_file = setup_logging(log_dir=tmp_path / "logs", profile="work")
+    assert log_file.name == "tg_messenger_work.log"
+    logging.getLogger("tg_messenger.test").warning("work-marker")
+    assert "work-marker" in log_file.read_text(encoding="utf-8")
+
+
+def test_profile_log_file_sanitizes_path_separators(tmp_path):
+    log_file = setup_logging(log_dir=tmp_path / "logs", profile="work/personal")
+    assert log_file.parent == tmp_path / "logs"
+    assert log_file.name == "tg_messenger_work_personal.log"
+    logging.getLogger("tg_messenger.test").warning("profile-marker")
+    assert "profile-marker" in log_file.read_text(encoding="utf-8")
+
+
+def test_default_profile_keeps_shared_file_name(tmp_path):
+    # the default profile keeps the historical shared file name
+    assert setup_logging(log_dir=tmp_path / "logs", profile="default").name == LOG_FILE_NAME
+    assert setup_logging(log_dir=tmp_path / "logs", profile=None).name == LOG_FILE_NAME
+
+
+def test_log_file_path_honours_profile(tmp_path):
+    assert log_file_path(tmp_path, profile="work").name == "tg_messenger_work.log"
+    assert log_file_path(tmp_path, profile="work/personal").name == (
+        "tg_messenger_work_personal.log"
+    )
+    assert log_file_path(tmp_path, profile="default").name == LOG_FILE_NAME

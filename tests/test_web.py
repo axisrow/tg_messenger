@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 import httpx
 import pytest_asyncio
+from telethon.sessions import StringSession
 
 from tg_messenger.core.events import EventBus
 from tg_messenger.core.models import Dialog, IncomingEvent, Message
@@ -52,7 +53,7 @@ class WebStubClient:
             yield ev
 
 
-def test_real_web_client_gets_session_encryption_key(monkeypatch):
+def test_real_web_client_gets_session_encryption_key(monkeypatch, tmp_path):
     from tg_messenger.web import app as web_app
 
     captured = {}
@@ -64,11 +65,13 @@ def test_real_web_client_gets_session_encryption_key(monkeypatch):
     monkeypatch.setenv("TG_API_ID", "123")
     monkeypatch.setenv("TG_API_HASH", "hash")
     monkeypatch.setenv("SESSION_ENCRYPTION_KEY", "shared-secret")
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
     monkeypatch.setattr("tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient)
 
     web_app._make_real_client("default")
 
     assert captured["session_name"] == "default"
+    assert captured["session_dir"] == str(tmp_path)
     assert captured["encryption_key"] == "shared-secret"
 
 
@@ -177,6 +180,29 @@ async def test_media_upload_calls_send_media(client_app):
     assert r.status_code == 200
     assert stub.sent == [(7, "media", "look")]
     assert "look" in r.text
+
+
+async def test_profiles_route_lists_saved_profiles(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    # a couple of saved sessions on disk (valid StringSessions)
+    store = SessionStore(tmp_path)
+    valid = StringSession().save()
+    store.save("alice", valid)
+    store.save("bob", valid)
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+
+    stub = WebStubClient()
+    app = build_app(client=stub, session_name="bob")
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/profiles")
+    assert r.status_code == 200
+    assert "alice" in r.text
+    assert "bob" in r.text
+    # the active profile is flagged so the UI can highlight it
+    assert "active" in r.text.lower()
 
 
 async def test_unauthorized_session_gives_401_with_hint():
