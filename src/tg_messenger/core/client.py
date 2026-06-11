@@ -345,6 +345,7 @@ class StandaloneTelegramClient:
         # #14: chat actions (joins/leaves/title/pin/photo), read receipts, reactions
         self._client.add_event_handler(self._on_chat_action, events.ChatAction())
         self._client.add_event_handler(self._on_message_read, events.MessageRead())
+        self._client.add_event_handler(self._on_message_read, events.MessageRead(inbox=True))
         # reactions arrive as a raw update (no high-level event for user accounts)
         self._client.add_event_handler(self._on_reaction, events.Raw(UpdateMessageReactions))
         self._handler_registered = True

@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 import pytest
+from telethon import events
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser
 
@@ -965,6 +966,15 @@ async def test_chat_action_publish_without_subscribers_is_noop(fake_client):
 
 
 # --- Цикл 73: поток read-receipt (listen_reads) ---
+
+
+async def test_message_read_registers_inbox_and_outbox_builders(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    read_builders = [
+        builder for _, builder in fake_client._handlers if isinstance(builder, events.MessageRead)
+    ]
+    assert [builder.inbox for builder in read_builders] == [False, True]
 
 
 async def test_message_read_inbox(fake_client):
