@@ -107,7 +107,10 @@
       btn.disabled = true;
       error.textContent = '';
       try {
-        const resp = await fetch('/dialogs/' + id + '/suggest');
+        const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/suggest', {
+          method: 'POST',
+          headers: { 'X-TG-Messenger-CSRF': '1' }
+        });
         const text = await resp.text();
         if (resp.ok) {
           document.getElementById('composer-text').value = text;
