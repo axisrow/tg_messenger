@@ -142,14 +142,17 @@ async def test_sign_in_before_code_raises(fake_client):
 class _FakeInnerLogin:
     """Raw Telethon stand-in for LoginSession tests (mirrors test_cli)."""
 
-    def __init__(self, sign_in_error=None, with_next_type=True):
+    def __init__(self, sign_in_error=None, with_next_type=True, send_code_error=None):
         self.sign_in_error = sign_in_error
         self.with_next_type = with_next_type
+        self.send_code_error = send_code_error
         self.signed_in = []
         self.code_requests = []
         self.resends = 0
 
     async def send_code_request(self, phone):
+        if self.send_code_error is not None:
+            raise self.send_code_error
         self.code_requests.append(phone)
         from tests.conftest import make_sent_code
 
@@ -203,6 +206,28 @@ async def test_login_session_wrong_code_keeps_state():
         await sess.submit_code("000")
     # state is preserved — the user can retry the code
     assert sess.state == "code"
+
+
+async def test_login_session_bad_phone_is_login_error_and_keeps_state():
+    # ошибки телефона нормализуются как и ошибки кода/2FA — web рендерит их
+    # в форму, а не 500 (#26)
+    from telethon.errors import PhoneNumberInvalidError
+
+    inner = _FakeInnerLogin(send_code_error=PhoneNumberInvalidError(None))
+    sess = auth.LoginSession(inner)
+    with pytest.raises(auth.LoginError):
+        await sess.submit_phone("not-a-phone")
+    assert sess.state == "phone"
+
+
+async def test_login_session_banned_phone_is_login_error():
+    from telethon.errors import PhoneNumberBannedError
+
+    inner = _FakeInnerLogin(send_code_error=PhoneNumberBannedError(None))
+    sess = auth.LoginSession(inner)
+    with pytest.raises(auth.LoginError):
+        await sess.submit_phone("+10000000000")
+    assert sess.state == "phone"
 
 
 async def test_login_session_resend():

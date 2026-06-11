@@ -246,7 +246,20 @@ class LoginSession:
         return self._state
 
     async def submit_phone(self, phone: str) -> CodeDelivery:
-        delivery = await self._flow.send_code(phone)
+        from telethon.errors import (
+            PhoneNumberBannedError,
+            PhoneNumberFloodError,
+            PhoneNumberInvalidError,
+        )
+
+        try:
+            delivery = await self._flow.send_code(phone)
+        except PhoneNumberInvalidError as exc:
+            raise LoginError("Invalid phone number — use the international format (+...).") from exc
+        except PhoneNumberBannedError as exc:
+            raise LoginError("This phone number is banned by Telegram.") from exc
+        except PhoneNumberFloodError as exc:
+            raise LoginError("Too many attempts for this number — try again later.") from exc
         self._state = "code"
         return delivery
 
