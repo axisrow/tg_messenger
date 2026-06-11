@@ -470,15 +470,76 @@ def login(ctx: click.Context, session: str, phone: str | None,
     _run(_do())
 
 
-@cli.command()
-def profiles() -> None:
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def profiles(ctx: click.Context) -> None:
     """List saved account profiles (sessions on disk)."""
+    if ctx.invoked_subcommand is not None:
+        return
     names = _session_store().list_profiles()
     if not names:
         click.echo("No profiles yet — run: tg-messenger --profile NAME login")
         return
     for name in names:
         click.echo(name)
+
+
+@profiles.command("remove")
+@click.argument("name")
+@click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+def profiles_remove(name: str, yes: bool) -> None:
+    """Delete a profile's session file WITHOUT logging out (for dead sessions).
+
+    To also invalidate the session on Telegram's side use `tg-messenger
+    --profile NAME logout`.
+    """
+    store = _session_store()
+    if not store.path_for(name).is_file():
+        raise click.ClickException(f"no saved session for profile {name!r}.")
+    if not yes:
+        click.confirm(f"Delete the session file for profile {name!r}?", abort=True)
+    store.delete(name)
+    click.echo(f"profile {name!r} removed.")
+
+
+@cli.command()
+@click.option("--session", default="default")
+@click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+@click.pass_context
+def logout(ctx: click.Context, session: str, yes: bool) -> None:
+    """Log out of Telegram (best-effort) and delete the profile's session file.
+
+    The Telegram-side log_out invalidates the auth key on the server; a dead or
+    revoked session does not block the local file removal.
+    """
+    session = _effective_session(ctx, session)
+    store = _session_store()
+    if not store.path_for(session).is_file():
+        raise click.ClickException(f"no saved session for profile {session!r}.")
+    if not yes:
+        click.confirm(
+            f"Log out profile {session!r} from Telegram and delete its session file?",
+            abort=True,
+        )
+
+    async def _do():
+        client = make_client(session_name=session)
+        await client.connect()
+        try:
+            await client.log_out()
+        finally:
+            await client.disconnect()
+
+    try:
+        _run(_do(), session=session)
+        click.echo("logged out of Telegram.")
+    except Exception as exc:
+        # best-effort by design: a dead session must not keep its file alive
+        logger.warning("telegram log_out failed for profile %r: %s", session, exc)
+        click.echo(f"⚠ Telegram log_out failed ({exc}) — deleting the local session anyway.",
+                   err=True)
+    store.delete(session)
+    click.echo(f"session file removed for profile {session!r}.")
 
 
 @cli.command()
@@ -1371,10 +1432,9 @@ def heartbeat_remove(ctx: click.Context, peer: int, session: str) -> None:
 @click.pass_context
 def heartbeat_run(ctx: click.Context, session: str) -> None:
     """Run the heartbeat scheduler: send stored plans' pings on schedule (Ctrl+C to stop)."""
-    from tg_messenger.core.heartbeat import HeartbeatService, register_heartbeat_migrations
-
     # суфлёрская фиксация read-receipts (#17, kv) — лёгкий модуль без LLM-стека
     from tg_messenger.agent.suggest import watch_read_receipts
+    from tg_messenger.core.heartbeat import HeartbeatService, register_heartbeat_migrations
     session = _effective_session(ctx, session)
 
     async def _do():

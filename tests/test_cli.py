@@ -32,10 +32,15 @@ class StubClient:
         self.history_items = None
         self.connected = False
         self.authorized = True
+        self.logged_out = False
         self.listen_interrupt = True  # emulate Ctrl+C after the first event
 
     async def is_authorized(self):
         return self.authorized
+
+    async def log_out(self):
+        self.logged_out = True
+        return True
 
     async def connect(self):
         self.connected = True
@@ -1514,6 +1519,79 @@ def test_multiple_profiles_non_interactive_errors(monkeypatch, tmp_path):
     result = CliRunner().invoke(cli_main.cli, ["dialogs"])
     assert result.exit_code != 0
     assert "--profile" in result.output
+
+
+# --- #11 (комментарий): logout + profiles remove ---
+
+
+def _profile_store(monkeypatch, tmp_path, *names):
+    from tg_messenger.core.auth import SessionStore
+
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    store = SessionStore(tmp_path)
+    for n in names:
+        store.save(n, _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    return store
+
+
+def test_logout_logs_out_and_removes_session(monkeypatch, tmp_path):
+    store = _profile_store(monkeypatch, tmp_path, "work")
+    stub = StubClient()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "logout", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert stub.logged_out is True
+    assert store.list_profiles() == []
+
+
+def test_logout_deletes_file_even_if_telegram_fails(monkeypatch, tmp_path):
+    # best-effort: мёртвая/отозванная сессия не должна мешать удалению файла
+    store = _profile_store(monkeypatch, tmp_path, "work")
+    stub = StubClient()
+
+    async def boom():
+        raise RuntimeError("AUTH_KEY_UNREGISTERED")
+
+    stub.log_out = boom
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "logout", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert store.list_profiles() == []
+
+
+def test_logout_asks_confirmation(monkeypatch, tmp_path):
+    store = _profile_store(monkeypatch, tmp_path, "work")
+    stub = StubClient()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "logout"], input="n\n")
+    assert result.exit_code != 0
+    assert store.list_profiles() == ["work"]
+    assert stub.logged_out is False
+
+
+def test_logout_missing_profile_errors(monkeypatch, tmp_path):
+    _profile_store(monkeypatch, tmp_path)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "ghost", "logout", "--yes"])
+    assert result.exit_code != 0
+    assert "ghost" in result.output
+
+
+def test_profiles_remove_deletes_file_without_network(monkeypatch, tmp_path):
+    # remove — для мёртвых сессий: только файл, клиент не строится вовсе
+    store = _profile_store(monkeypatch, tmp_path, "dead", "live")
+    network = []
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: network.append(kw))
+    result = CliRunner().invoke(cli_main.cli, ["profiles", "remove", "dead", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert store.list_profiles() == ["live"]
+    assert network == []
+
+
+def test_profiles_remove_missing_errors(monkeypatch, tmp_path):
+    _profile_store(monkeypatch, tmp_path)
+    result = CliRunner().invoke(cli_main.cli, ["profiles", "remove", "ghost", "--yes"])
+    assert result.exit_code != 0
 
 
 def test_explicit_default_session_skips_profile_picker(monkeypatch, tmp_path):

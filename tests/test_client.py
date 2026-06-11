@@ -1626,6 +1626,14 @@ async def test_is_admin_false_on_error(fake_client):
     assert await client.is_admin(-100200) is False
 
 
+async def test_log_out_calls_telethon(fake_client):
+    # #11 (комментарий): logout — best-effort log_out() перед удалением файла
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.log_out() is True
+    assert fake_client.logged_out is True
+
+
 # --- Цикл 120: check/set/clear username ---
 
 

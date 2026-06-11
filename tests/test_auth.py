@@ -351,3 +351,17 @@ def test_list_profiles_ignores_non_session_files(session_dir):
     (session_dir / "notes.txt").write_text("junk", encoding="utf-8")
     (session_dir / "subdir").mkdir()
     assert store.list_profiles() == ["real"]
+
+
+def test_delete_profile_removes_file(session_dir):
+    # жизненный цикл профиля (#11, комментарий): logout/remove удаляют файл
+    store = SessionStore(session_dir)
+    store.save("alice", VALID_SESSION)
+    assert store.delete("alice") is True
+    assert store.load("alice") is None
+    assert store.list_profiles() == []
+
+
+def test_delete_missing_profile_returns_false(session_dir):
+    store = SessionStore(session_dir)
+    assert store.delete("ghost") is False

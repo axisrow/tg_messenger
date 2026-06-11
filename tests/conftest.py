@@ -224,6 +224,11 @@ class FakeTelethonClient:
     async def is_user_authorized(self):
         return self._authorized
 
+    async def log_out(self):
+        self.logged_out = True
+        self._authorized = False
+        return True
+
     async def send_code_request(self, phone):
         self.code_requests.append(phone)
         # mimic telethon: SentCode.type tells where the code went (SentCodeTypeApp etc.)

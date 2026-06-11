@@ -190,6 +190,10 @@ class StandaloneTelegramClient:
     async def is_authorized(self) -> bool:
         return await run_with_flood_wait_retry(lambda: self._client.is_user_authorized(), operation="is_authorized")
 
+    async def log_out(self) -> bool:
+        """Log this session out of Telegram — the server invalidates the auth key (#11)."""
+        return await run_with_flood_wait_retry(lambda: self._client.log_out(), operation="log_out")
+
     def save_session(self) -> None:
         self._store.save(self._session_name, self._client.session.save())
 

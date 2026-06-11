@@ -108,6 +108,14 @@ class SessionStore:
             return []
         return sorted(p.stem for p in self.session_dir.glob("*.session") if p.is_file())
 
+    def delete(self, name: str) -> bool:
+        """Remove the profile's session file; True if it existed (#11 lifecycle)."""
+        path = self.path_for(name)
+        if not path.is_file():
+            return False
+        path.unlink()
+        return True
+
 
 class CodeDelivery(NamedTuple):
     """Where the login code went and what a resend would use."""
