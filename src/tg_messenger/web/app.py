@@ -88,6 +88,7 @@ def _make_real_client(session_name: str):
         session_name=session_name,
         session_dir=os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
         encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
+        send_rate_per_min=float(os.environ.get("TG_SEND_RATE", "0") or 0),
     )
 
 

@@ -114,6 +114,25 @@ def test_real_tui_client_gets_session_encryption_key(monkeypatch, tmp_path):
     assert captured["encryption_key"] == "shared-secret"
 
 
+def test_real_tui_client_gets_send_rate(monkeypatch):
+    from tg_messenger.tui import app as tui_app
+
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SEND_RATE", "20")
+    monkeypatch.setattr("tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    tui_app._make_real_client("default")
+
+    assert captured["send_rate_per_min"] == 20.0
+
+
 async def test_tui_mounts_and_lists_dialogs():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:

@@ -88,6 +88,25 @@ def test_real_web_client_gets_session_encryption_key(monkeypatch, tmp_path):
     assert captured["encryption_key"] == "shared-secret"
 
 
+def test_real_web_client_gets_send_rate(monkeypatch):
+    from tg_messenger.web import app as web_app
+
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SEND_RATE", "20")
+    monkeypatch.setattr("tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    web_app._make_real_client("default")
+
+    assert captured["send_rate_per_min"] == 20.0
+
+
 @pytest_asyncio.fixture
 async def client_app():
     stub = WebStubClient()
