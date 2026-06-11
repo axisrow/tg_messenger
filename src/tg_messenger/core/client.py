@@ -372,6 +372,7 @@ class StandaloneTelegramClient:
         await run_with_flood_wait_retry(
             lambda: self._client.send_read_acknowledge(peer), operation="mark_read"
         )
+        self._dialogs_cache.invalidate(_DIALOGS_CACHE_KEY)
 
     async def send_media(self, peer: int, file_path: str | Path, caption: str | None = None) -> Message:
         msg = await run_with_flood_wait_retry(

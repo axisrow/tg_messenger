@@ -546,7 +546,8 @@ best-effort `None` (raw-апдейт не несёт надёжного един
   missing/mismatched сообщения; `revoke=False` запрещён для channel/megagroup marked ids, потому что
   Telegram там удаляет для всех. Все через `run_with_flood_wait_retry`; инвалидируют history. Тесты:
   правильные вызовы фейка, safety rejects, инвалидация, non-transient flood → `HandledFloodWaitError`.
-- **79**: `mark_read(peer)` → `send_read_acknowledge` (retry, НЕ инвалидирует history);
+- **79**: `mark_read(peer)` → `send_read_acknowledge` (retry, НЕ инвалидирует history,
+  но инвалидирует dialogs cache после успешного ack, чтобы badge unread перечитался);
   регресс на `Dialog.unread` из telethon-диалога.
 - **80**: CLI — `send --reply-to`, команды `forward FROM IDS TO`, `edit PEER ID TEXT`,
   `delete PEER IDS [--for-me]` (revoke=False только там, где Telegram поддерживает локальное удаление),

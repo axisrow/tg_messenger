@@ -1365,6 +1365,21 @@ async def test_mark_read_calls_send_read_acknowledge(fake_client):
     assert fake_client.read_acks == [7]
 
 
+async def test_mark_read_invalidates_dialogs_cache(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.dialogs()
+    assert next(d for d in first if d.id == 7).unread == 2
+    assert fake_client.iter_dialogs_calls == 1
+
+    fake_client.dialogs[0].unread_count = 0
+    await client.mark_read(7)
+    second = await client.dialogs()
+    assert next(d for d in second if d.id == 7).unread == 0
+    assert fake_client.iter_dialogs_calls == 2
+
+
 async def test_mark_read_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
     flood_error = _flood_patch(monkeypatch)
@@ -1377,6 +1392,27 @@ async def test_mark_read_flood_is_handled(fake_client, monkeypatch):
     fake_client.send_read_acknowledge = boom
     with pytest.raises(HandledFloodWaitError):
         await client.mark_read(7)
+
+
+async def test_mark_read_flood_keeps_dialogs_cache(fake_client, monkeypatch):
+    from tg_messenger.core.flood import HandledFloodWaitError
+    flood_error = _flood_patch(monkeypatch)
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.dialogs()
+    assert next(d for d in first if d.id == 7).unread == 2
+
+    async def boom(peer):
+        raise flood_error(9999)
+
+    fake_client.dialogs[0].unread_count = 0
+    fake_client.send_read_acknowledge = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.mark_read(7)
+    second = await client.dialogs()
+    assert next(d for d in second if d.id == 7).unread == 2
+    assert fake_client.iter_dialogs_calls == 1
 
 
 async def test_dialog_unread_mapped_from_telethon(fake_client):
