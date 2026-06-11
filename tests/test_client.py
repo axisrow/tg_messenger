@@ -1011,8 +1011,14 @@ class FakeReactionResult:
         self.reaction = reaction
 
 
+class FakeRecentReaction:
+    def __init__(self, reaction):
+        self.reaction = reaction
+
+
 class FakeMessageReactions:
-    def __init__(self, results):
+    def __init__(self, results=None, recent_reactions=None):
+        self.recent_reactions = recent_reactions
         self.results = results
 
 
@@ -1029,13 +1035,25 @@ class FakeReactionUpdate:
 async def test_reaction_emoticon_mapped(fake_client):
     client = _build(fake_client)
     await client.connect()
-    reactions = FakeMessageReactions([FakeReactionResult(FakeReaction("👍"))])
+    reactions = FakeMessageReactions(
+        results=[FakeReactionResult(FakeReaction("👍"))],
+        recent_reactions=[FakeRecentReaction(FakeReaction("❤️"))],
+    )
     upd = FakeReactionUpdate(PeerUser(7), msg_id=55, reactions=reactions)
     out = await _collect_one(client.listen_reactions, fake_client.push_event, upd)
     assert isinstance(out, ReactionEvent)
     assert out.message_id == 55
-    assert out.emoticon == "👍"
+    assert out.emoticon == "❤️"
     assert out.dialog_id == 7
+
+
+async def test_reaction_aggregate_without_recent_omits_emoticon(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    reactions = FakeMessageReactions(results=[FakeReactionResult(FakeReaction("👍"))])
+    upd = FakeReactionUpdate(PeerUser(7), msg_id=55, reactions=reactions)
+    out = await _collect_one(client.listen_reactions, fake_client.push_event, upd)
+    assert out.emoticon is None
 
 
 async def test_reaction_custom_emoji_maps_to_none(fake_client):
@@ -1045,7 +1063,7 @@ async def test_reaction_custom_emoji_maps_to_none(fake_client):
     class CustomReaction:  # ReactionCustomEmoji — no .emoticon attribute
         document_id = 12345
 
-    reactions = FakeMessageReactions([FakeReactionResult(CustomReaction())])
+    reactions = FakeMessageReactions(recent_reactions=[FakeRecentReaction(CustomReaction())])
     upd = FakeReactionUpdate(PeerUser(7), msg_id=56, reactions=reactions)
     out = await _collect_one(client.listen_reactions, fake_client.push_event, upd)
     assert out.emoticon is None

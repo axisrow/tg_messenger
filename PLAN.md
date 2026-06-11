@@ -518,8 +518,10 @@ titles сам). Дисциплина username-резолва: дорогой (~5
   `chat_id`, `max_id`, `outbox`) + `listen_reads()`. Тесты: inbox vs outbox.
 - **74**: шина `_bus_reactions` + `_on_reaction` через `events.Raw(UpdateMessageReactions)`
   (реальный тип апдейта для user-аккаунтов; `dialog_id` через `telethon.utils.get_peer_id`,
-  `message_id=msg_id`, `emoticon` из первого `ReactionEmoji`, иначе `None`; `actor_id=None`
-  best-effort) + `listen_reactions()`. Неизвестная структура → `logger.warning` + пропуск.
+  `message_id=msg_id`, `emoticon` из первой `recent_reactions[].reaction` если это
+  стандартная `ReactionEmoji`, иначе `None`; aggregate `results` не используется как
+  источник изменившейся реакции; `actor_id=None` best-effort) + `listen_reactions()`.
+  Неизвестная структура → `logger.warning` + пропуск.
 - **75**: `IncomingEvent.album_id = message.grouped_id` в `_on_new_message`; `send_reaction`
   (`SendReactionRequest`+`ReactionEmoji` через `run_with_flood_wait_retry`). Тесты: album_id
   прокинут; запрос записан; non-transient flood → `HandledFloodWaitError`.
