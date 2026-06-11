@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import click
+from click.core import ParameterSource
 from telethon.errors import UnauthorizedError
 
 from tg_messenger.agent.config import langsmith_tracing_enabled
@@ -210,6 +211,11 @@ def _effective_session(ctx: click.Context | None, session: str) -> str:
     profile = ctx.obj.get("profile") if ctx is not None and ctx.obj else None
     if profile:
         return profile
+    if (
+        ctx is not None
+        and ctx.get_parameter_source("session") == ParameterSource.COMMANDLINE
+    ):
+        return session
     return _resolve_profile(session)
 
 

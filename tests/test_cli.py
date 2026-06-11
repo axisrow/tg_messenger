@@ -867,6 +867,27 @@ def test_multiple_profiles_non_interactive_errors(monkeypatch, tmp_path):
     assert "--profile" in result.output
 
 
+def test_explicit_default_session_skips_profile_picker(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    captured = {}
+
+    def fake_make_client(**kw):
+        captured.update(kw)
+        return StubClient()
+
+    store = SessionStore(tmp_path)
+    store.save("alice", _valid_session_for_import())
+    store.save("bob", _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    monkeypatch.setattr(cli_main, "make_client", fake_make_client)
+
+    result = CliRunner().invoke(cli_main.cli, ["dialogs", "--session", "default"])
+
+    assert result.exit_code == 0, result.output
+    assert captured.get("session_name") == "default"
+
+
 def test_profile_menu_picks_second(monkeypatch, tmp_path):
     from tg_messenger.core.auth import SessionStore
 
