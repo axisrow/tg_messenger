@@ -309,7 +309,8 @@ def build_app(
 
         @app.post("/login")
         async def login_submit(request: Request, password: str = Form("")):
-            if hmac.compare_digest(password, web_pass):
+            # compare bytes: compare_digest raises TypeError on non-ASCII str
+            if hmac.compare_digest(password.encode("utf-8"), web_pass.encode("utf-8")):
                 resp = RedirectResponse("/", status_code=303)
                 resp.set_cookie(
                     COOKIE_NAME,

@@ -86,6 +86,34 @@ async def test_wrong_password_401_delays_and_warns(secured_app, monkeypatch, cap
     assert any("login" in rec.message.lower() for rec in caplog.records)
 
 
+async def test_non_ascii_password_logs_in(monkeypatch):
+    # .env.example рекомендует кириллический пароль — он обязан работать
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("tg_messenger.web.app._login_delay", no_sleep)
+    app = build_app(client=WebStubClient(), web_pass="длинный-секретный-пароль")
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/login",
+                data={"password": "длинный-секретный-пароль"},
+                follow_redirects=False,
+            )
+            assert r.status_code in (302, 303)
+            assert COOKIE_NAME in r.cookies
+            assert (await ac.get("/dialogs")).status_code == 200
+
+
+async def test_non_ascii_attempt_is_401_not_500(secured_app):
+    # не-ASCII подбор против ASCII-пароля не должен ронять маршрут в 500
+    # (и обходить тем самым задержку/WARNING анти-брутфорса)
+    ac, _ = secured_app
+    r = await ac.post("/login", data={"password": "пароль"})
+    assert r.status_code == 401
+
+
 async def test_tampered_cookie_is_rejected(secured_app):
     ac, _ = secured_app
     ac.cookies.set(COOKIE_NAME, "9999999999:deadbeef")
