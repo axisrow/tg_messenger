@@ -119,21 +119,52 @@ def make_suggester(client, *, storage=None):
     from tg_messenger.agent.config import AgentConfig
 
     try:
-        cfg = AgentConfig.from_env()
+        cfg = AgentConfig.from_env(require_allowlist=False)
         return build_suggester(client, cfg, storage=storage)
-    except ValueError as exc:
+    except (ValueError, ImportError) as exc:
         raise click.ClickException(str(exc)) from exc
 
 
-def make_optional_suggester(client):
+class _StorageBackedSuggester:
+    """Lazily connect suggester storage for long-running web/TUI processes."""
+
+    def __init__(self, suggester, storage):
+        self._suggester = suggester
+        self._storage = storage
+        self._connected = False
+        self._lock = asyncio.Lock()
+
+    async def _ensure_connected(self) -> None:
+        if self._connected:
+            return
+        async with self._lock:
+            if not self._connected:
+                await self._storage.connect()
+                self._connected = True
+
+    async def suggest(self, dialog_id: int) -> str:
+        await self._ensure_connected()
+        return await self._suggester.suggest(dialog_id)
+
+    async def learn(self, dialog_id: int):
+        await self._ensure_connected()
+        return await self._suggester.learn(dialog_id)
+
+
+def make_optional_suggester(client, *, session: str = "default"):
     """Best-effort production suggester for web/TUI.
 
     Suggest is an optional [agent] feature. A missing extra or model should disable
     the draft endpoint/strip, not prevent the web UI or TUI from starting.
     """
     try:
-        return make_suggester(client)
-    except click.ClickException as exc:
+        from tg_messenger.agent.suggest import register_suggest_migrations
+
+        storage = make_storage(session)
+        register_suggest_migrations(storage)
+        suggester = make_suggester(client, storage=storage)
+        return _StorageBackedSuggester(suggester, storage)
+    except (click.ClickException, ImportError) as exc:
         logger.warning("reply suggester disabled: %s", exc)
         return None
 
@@ -894,7 +925,7 @@ def serve(ctx: click.Context, host: str, port: int, session: str) -> None:
 
     session = _effective_session(ctx, session)
     client = make_client(session_name=session)
-    suggester = make_optional_suggester(client)
+    suggester = make_optional_suggester(client, session=session)
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
     click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
     uvicorn.run(
@@ -919,7 +950,7 @@ def tui(ctx: click.Context, session: str) -> None:
     setup_logging(verbose=ctx.obj["verbose"], console=False, profile=ctx.obj.get("profile"))
     session = _effective_session(ctx, session)
     client = make_client(session_name=session)
-    suggester = make_optional_suggester(client)
+    suggester = make_optional_suggester(client, session=session)
     MessengerTUI(client=client, session_name=session, suggester=suggester).run()
 
 

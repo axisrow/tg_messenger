@@ -332,7 +332,7 @@ def serve_spy(monkeypatch):
     client = object()
     suggester = object()
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
-    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c: suggester)
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c, **kw: suggester)
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls["uvicorn"].append(kw))
     monkeypatch.setattr(
         "tg_messenger.web.app.build_app",
@@ -1235,7 +1235,7 @@ def test_serve_uses_global_profile_as_session(monkeypatch):
     client = object()
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
-    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c: object())
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c, **kw: object())
     monkeypatch.setattr(
         "tg_messenger.web.app.build_app",
         lambda **kw: captured.update(kw) or object(),
@@ -1249,9 +1249,15 @@ def test_serve_wires_suggester(monkeypatch):
     captured = {}
     client = object()
     suggester = object()
+    optional_kwargs = {}
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
-    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c: suggester)
+
+    def fake_make_optional_suggester(c, **kw):
+        optional_kwargs.update(kw)
+        return suggester
+
+    monkeypatch.setattr(cli_main, "make_optional_suggester", fake_make_optional_suggester)
     monkeypatch.setattr(
         "tg_messenger.web.app.build_app",
         lambda **kw: captured.update(kw) or object(),
@@ -1262,14 +1268,21 @@ def test_serve_wires_suggester(monkeypatch):
     assert result.exit_code == 0, result.output
     assert captured["client"] is client
     assert captured["suggester"] is suggester
+    assert optional_kwargs == {"session": "default"}
 
 
 def test_tui_uses_global_profile_as_session(monkeypatch):
     captured = {}
     client = object()
     suggester = object()
+    optional_kwargs = {}
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
-    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c: suggester)
+
+    def fake_make_optional_suggester(c, **kw):
+        optional_kwargs.update(kw)
+        return suggester
+
+    monkeypatch.setattr(cli_main, "make_optional_suggester", fake_make_optional_suggester)
 
     class FakeTUI:
         def __init__(self, *, client=None, session_name="default", suggester=None):
@@ -1286,3 +1299,4 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
     assert captured.get("session_name") == "work"
     assert captured["client"] is client
     assert captured["suggester"] is suggester
+    assert optional_kwargs == {"session": "work"}

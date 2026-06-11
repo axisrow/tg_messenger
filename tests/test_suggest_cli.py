@@ -49,11 +49,15 @@ class StubSuggester:
 
 
 class StubStorage:
+    def __init__(self):
+        self.connected = 0
+        self.migrations = []
+
     def register_migrations(self, statements):
-        pass
+        self.migrations.extend(statements)
 
     async def connect(self):
-        pass
+        self.connected += 1
 
     async def close(self):
         pass
@@ -106,6 +110,36 @@ def test_suggest_uses_requested_session_storage(suggest_cli):
     assert storage_profiles == ["work"]
 
 
+@pytest.mark.asyncio
+async def test_make_optional_suggester_wires_profile_storage(monkeypatch):
+    storage = StubStorage()
+    storage_profiles: list[str] = []
+    captured = {}
+    inner = StubSuggester()
+
+    monkeypatch.setattr(
+        cli_main,
+        "make_storage",
+        lambda profile="default": storage_profiles.append(profile) or storage,
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "make_suggester",
+        lambda c, **kw: captured.update(kw) or inner,
+    )
+
+    suggester = cli_main.make_optional_suggester(StubClient(), session="work")
+
+    assert storage_profiles == ["work"]
+    assert captured["storage"] is storage
+    assert suggester is not None
+
+    assert await suggester.suggest(42) == "draft text"
+    assert await suggester.suggest(43) == "draft text"
+    assert storage.connected == 1
+    assert inner.suggested == [42, 43]
+
+
 def test_suggest_listed_in_help(suggest_cli):
     r, *_ = suggest_cli
     result = r.invoke(cli_main.cli, ["--help"])
@@ -133,6 +167,46 @@ def test_make_suggester_requires_model(monkeypatch, tmp_path):
     with pytest.raises(click.ClickException) as exc:
         cli_main.make_suggester(StubClient())
     assert "TG_AGENT_MODEL" in str(exc.value)
+
+
+def test_make_suggester_does_not_require_agent_allowlist(monkeypatch, tmp_path):
+    factory = pytest.importorskip("tg_messenger.agent.factory")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_AGENT_MODEL", "openai:gpt-5.4")
+    monkeypatch.delenv("TG_AGENT_ALLOWLIST", raising=False)
+    built = {}
+
+    def fake_build_suggester(client, cfg, storage=None):
+        built["cfg"] = cfg
+        built["storage"] = storage
+        return StubSuggester()
+
+    monkeypatch.setattr(factory, "build_suggester", fake_build_suggester)
+
+    storage = StubStorage()
+    suggester = cli_main.make_suggester(StubClient(), storage=storage)
+
+    assert isinstance(suggester, StubSuggester)
+    assert built["cfg"].model == "openai:gpt-5.4"
+    assert built["cfg"].allow_ids == frozenset()
+    assert built["storage"] is storage
+
+
+def test_make_suggester_wraps_provider_import_error(monkeypatch, tmp_path):
+    factory = pytest.importorskip("tg_messenger.agent.factory")
+    import click
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_AGENT_MODEL", "openai:gpt-5.4")
+    monkeypatch.delenv("TG_AGENT_ALLOWLIST", raising=False)
+    monkeypatch.setattr(
+        factory,
+        "build_suggester",
+        lambda *a, **kw: (_ for _ in ()).throw(ImportError("missing provider")),
+    )
+
+    with pytest.raises(click.ClickException, match="missing provider"):
+        cli_main.make_suggester(StubClient())
 
 
 def test_suggest_missing_model_friendly_error(monkeypatch, tmp_path):
