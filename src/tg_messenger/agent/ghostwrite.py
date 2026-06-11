@@ -101,10 +101,8 @@ async def list_enabled(storage) -> list[int]:
 async def pause_dialog(storage, dialog_id: int, *, paused_until: float) -> None:
     """Pause an (enabled) dialog until ``paused_until`` on the engine's clock."""
     await storage.execute(
-        "INSERT INTO ghostwrite_dialogs (dialog_id, enabled, paused_until) "
-        "VALUES (?, 1, ?) "
-        "ON CONFLICT(dialog_id) DO UPDATE SET paused_until = excluded.paused_until",
-        (int(dialog_id), float(paused_until)),
+        "UPDATE ghostwrite_dialogs SET paused_until = ? WHERE dialog_id = ?",
+        (float(paused_until), int(dialog_id)),
     )
 
 
@@ -173,6 +171,7 @@ class GhostwriteEngine:
         self._own_cache_size = own_cache_size
         self._max_rate_dialogs = max_rate_dialogs
         self._enabled_dialogs: set[int] | None = None
+        self._sending: set[int] = set()
         # dialog_id -> sliding window of recent auto-reply times (bounded)
         self._rate: OrderedDict[int, deque[float]] = OrderedDict()
         # (dialog_id, message_id) we sent ourselves — recognise our own outgoing echo.
@@ -190,6 +189,19 @@ class GhostwriteEngine:
         if self._enabled_dialogs is None:
             self._enabled_dialogs = set(await list_enabled(self._storage))
         return self._enabled_dialogs
+
+    async def _is_enabled_dialog(self, dialog_id: int) -> bool:
+        enabled = await self._ensure_enabled_dialogs()
+        if dialog_id in enabled:
+            return True
+        row = await self._storage.fetchone(
+            "SELECT 1 FROM ghostwrite_dialogs WHERE dialog_id = ? AND enabled = 1",
+            (int(dialog_id),),
+        )
+        if row is None:
+            return False
+        enabled.add(int(dialog_id))
+        return True
 
     async def _consume_incoming(self) -> None:
         async for ev in self._client.listen():
@@ -257,17 +269,24 @@ class GhostwriteEngine:
 
     async def _dispatch(self, dialog_id: int, message: Message, reply: str) -> None:
         """Send (or, in dry-run, skip) one auto-reply; journal it; never kill the engine."""
+        if not await is_active(self._storage, dialog_id, now=self._clock()):
+            logger.info("ghostwrite skip dialog %s: became inactive while drafting", dialog_id)
+            return
         if not self._enforce:
             logger.info("would auto-reply in dialog %s (message %s): %r",
                         dialog_id, message.id, reply)
             await self._journal(dialog_id, message.id, reply, dry_run=True)
             return
         try:
-            sent = await self._client.send_text(dialog_id, reply)
+            self._sending.add(int(dialog_id))
+            try:
+                sent = await self._client.send_text(dialog_id, reply)
+                self._remember_own(dialog_id, getattr(sent, "id", None))
+            finally:
+                self._sending.discard(int(dialog_id))
         except Exception:
             logger.exception("ghostwrite failed to send reply in dialog %s", dialog_id)
             return
-        self._remember_own(dialog_id, getattr(sent, "id", None))
         await self._journal(dialog_id, message.id, reply, dry_run=False)
 
     def _remember_own(self, dialog_id: int, message_id) -> None:
@@ -289,9 +308,11 @@ class GhostwriteEngine:
         dialog_id = event.dialog_id
         message = event.message
         key = (int(dialog_id), int(message.id))
+        if int(dialog_id) in self._sending:
+            return  # our own in-flight send — not a human
         if self._own_sent.pop(key, None) is not None:
             return  # our own reply — not a human
-        if dialog_id not in await self._ensure_enabled_dialogs():
+        if not await self._is_enabled_dialog(dialog_id):
             return  # not a ghostwrite dialog — nothing to pause
         paused_until = self._clock() + self._pause_on_human_sec
         await pause_dialog(self._storage, dialog_id, paused_until=paused_until)

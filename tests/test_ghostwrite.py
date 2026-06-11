@@ -121,6 +121,16 @@ async def test_pause_then_resume(tmp_path):
         await storage.close()
 
 
+async def test_pause_unknown_dialog_is_noop_not_enable(tmp_path):
+    storage = await _storage(tmp_path)
+    try:
+        await pause_dialog(storage, DIALOG, paused_until=100.0)
+        assert await list_enabled(storage) == []
+        assert await is_active(storage, DIALOG, now=0.0) is False
+    finally:
+        await storage.close()
+
+
 async def test_pause_all(tmp_path):
     storage = await _storage(tmp_path)
     try:
@@ -314,6 +324,32 @@ async def test_not_active_sender_skipped(tmp_path):
         await storage.close()
 
 
+async def test_dispatch_rechecks_pause_after_suggester_await(tmp_path, caplog):
+    storage = Storage(tmp_path / "gw.db")
+    register_ghostwrite_migrations(storage)
+
+    class PausingSuggester:
+        async def suggest(self, dialog_id: int) -> str:
+            await pause_dialog(storage, dialog_id, paused_until=100.0)
+            return "late reply"
+
+    client = FakeGwClient()
+    t = {"now": 0.0}
+    engine = GhostwriteEngine(
+        client, PausingSuggester(), storage, enforce=True, clock=lambda: t["now"],
+    )
+    await storage.connect()
+    try:
+        await enable_dialog(storage, DIALOG)
+        with caplog.at_level(logging.INFO, logger="tg_messenger.agent.ghostwrite"):
+            await engine.process_incoming(_imsg())
+        assert client.sent == []
+        assert await storage.fetchall("SELECT * FROM ghostwrite_log") == []
+        assert any("became inactive" in r.message for r in caplog.records)
+    finally:
+        await storage.close()
+
+
 # --- Цикл D: авто-пауза при человеке -----------------------------------------------
 
 
@@ -348,6 +384,38 @@ async def test_engine_own_send_does_not_pause(tmp_path):
         await storage.close()
 
 
+async def test_inflight_own_send_echo_does_not_pause(tmp_path):
+    class EchoBeforeAckClient(FakeGwClient):
+        def __init__(self):
+            super().__init__()
+            self.engine: GhostwriteEngine | None = None
+
+        async def send_text(self, peer, text, reply_to=None):
+            self._next_id += 1
+            msg = _omsg(text=text, dialog_id=peer, msg_id=self._next_id)
+            assert self.engine is not None
+            await self.engine.on_outgoing(OutgoingEvent(dialog_id=peer, message=msg))
+            self.sent.append((peer, text))
+            return msg
+
+    storage = Storage(tmp_path / "gw.db")
+    register_ghostwrite_migrations(storage)
+    client = EchoBeforeAckClient()
+    t = {"now": 0.0}
+    engine = GhostwriteEngine(
+        client, FakeSuggester(), storage, enforce=True, clock=lambda: t["now"],
+    )
+    client.engine = engine
+    await storage.connect()
+    try:
+        await enable_dialog(storage, DIALOG)
+        await engine.process_incoming(_imsg())
+        assert client.sent == [(DIALOG, "auto reply")]
+        assert await is_active(storage, DIALOG, now=0.0) is True
+    finally:
+        await storage.close()
+
+
 async def test_outgoing_in_non_ghostwrite_dialog_ignored(tmp_path):
     engine, client, suggester, storage, t = _mk_engine(tmp_path, enforce=True)
     await storage.connect()
@@ -368,9 +436,31 @@ async def test_outgoing_uses_cached_enabled_dialogs(tmp_path, monkeypatch):
         return [DIALOG]
 
     monkeypatch.setattr(gw, "list_enabled", fake_list_enabled)
-    await engine.on_outgoing(OutgoingEvent(dialog_id=OTHER, message=_omsg(dialog_id=OTHER, msg_id=1)))
-    await engine.on_outgoing(OutgoingEvent(dialog_id=OTHER, message=_omsg(dialog_id=OTHER, msg_id=2)))
-    assert calls["count"] == 1
+    await storage.connect()
+    try:
+        await engine.on_outgoing(OutgoingEvent(dialog_id=OTHER, message=_omsg(dialog_id=OTHER, msg_id=1)))
+        await engine.on_outgoing(OutgoingEvent(dialog_id=OTHER, message=_omsg(dialog_id=OTHER, msg_id=2)))
+        assert calls["count"] == 1
+    finally:
+        await storage.close()
+
+
+async def test_outgoing_refreshes_runtime_enabled_dialog_on_cache_miss(tmp_path):
+    engine, client, suggester, storage, t = _mk_engine(tmp_path, enforce=True)
+    await storage.connect()
+    try:
+        await enable_dialog(storage, DIALOG)
+        assert await engine._ensure_enabled_dialogs() == {DIALOG}
+        await enable_dialog(storage, OTHER)
+        t["now"] = 0.0
+        await engine.on_outgoing(
+            OutgoingEvent(dialog_id=OTHER, message=_omsg(dialog_id=OTHER, msg_id=5))
+        )
+        assert OTHER in await engine._ensure_enabled_dialogs()
+        assert await is_active(storage, OTHER, now=0.0) is False
+        assert await is_active(storage, OTHER, now=engine._pause_on_human_sec + 1) is True
+    finally:
+        await storage.close()
 
 
 # --- Цикл E: деградация/ошибки -----------------------------------------------------
@@ -411,16 +501,21 @@ async def test_empty_suggestion_not_sent(tmp_path):
 async def test_run_fans_out_both_consumers(tmp_path):
     """run() fans out listen() (auto-reply) + listen_outgoing() (auto-pause) via gather.
 
-    Both streams end (finite generators) so run() returns; this asserts the wiring —
-    an incoming message is answered and a human outgoing pauses the dialog.
+    Both streams end (finite generators) so run() returns; this asserts the wiring
+    without racing a human pause against the incoming auto-reply.
     """
 
     class StreamClient(FakeGwClient):
+        def __init__(self):
+            super().__init__()
+            self.outgoing_seen = False
+
         async def listen(self):
             yield IncomingEvent(dialog_id=DIALOG, message=_imsg())
 
         async def listen_outgoing(self):
-            yield OutgoingEvent(dialog_id=DIALOG, message=_omsg(msg_id=999))
+            self.outgoing_seen = True
+            yield OutgoingEvent(dialog_id=OTHER, message=_omsg(dialog_id=OTHER, msg_id=999))
 
     storage = Storage(tmp_path / "gw.db")
     register_ghostwrite_migrations(storage)
@@ -432,7 +527,6 @@ async def test_run_fans_out_both_consumers(tmp_path):
         await engine.run()
         # the incoming message was auto-replied to
         assert client.sent == [(DIALOG, "auto reply")]
-        # the human outgoing (id 999, not the engine's send) paused the dialog
-        assert await is_active(storage, DIALOG, now=0.0) is False
+        assert client.outgoing_seen is True
     finally:
         await storage.close()
