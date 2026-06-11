@@ -9,6 +9,7 @@ suggester style profiles, heartbeat schedules, action logs (#16/#17/#19).
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
@@ -106,6 +107,26 @@ async def test_two_consumers_migrations_in_order(tmp_path):
         await storage.close()
 
 
+async def test_migrations_track_identity_not_registration_index(tmp_path):
+    db = tmp_path / "m.db"
+    async with Storage(db) as s1:
+        s1.register_migrations(["CREATE TABLE b (id INTEGER PRIMARY KEY)"])
+        await s1._apply_pending_migrations()
+
+    s2 = Storage(db)
+    s2.register_migrations([
+        "CREATE TABLE a (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY)",
+    ])
+    await s2.connect()
+    try:
+        await s2.execute("INSERT INTO a (id) VALUES (1)")
+        await s2.execute("INSERT INTO b (id) VALUES (1)")
+        assert await s2.user_version() == 2
+    finally:
+        await s2.close()
+
+
 async def test_failing_migration_rolls_back(tmp_path):
     storage = Storage(tmp_path / "m.db")
     storage.register_migrations([
@@ -114,12 +135,16 @@ async def test_failing_migration_rolls_back(tmp_path):
     ])
     with pytest.raises(Exception):
         await storage.connect()
+    await storage.close()
     # version did not advance past the good migration's failure boundary
     s2 = Storage(tmp_path / "m.db")
     await s2.connect()
     try:
         # the whole batch rolled back → version is 0 (nothing committed)
         assert await s2.user_version() == 0
+        assert await s2.fetchall(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'a'"
+        ) == []
     finally:
         await s2.close()
 
@@ -148,9 +173,37 @@ async def test_execute_fetchone_fetchall(tmp_path):
         assert [r[0] for r in rows] == [1, 2]
 
 
+async def test_close_waits_for_in_flight_operation(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "close.db")
+    await storage.connect()
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_execute(sql, params):
+        started.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(storage, "_execute_sync", blocked_execute)
+    op = asyncio.create_task(storage.execute("SELECT 1"))
+    assert await asyncio.to_thread(started.wait, 5)
+    close_task = asyncio.create_task(storage.close())
+    await asyncio.sleep(0)
+    assert not close_task.done()
+    release.set()
+    await op
+    await close_task
+    assert storage._conn is None
+
+
 # --- цикл 70: default path per-profile ---
 
 def test_default_db_path_per_profile():
     assert default_db_path("default").name == "default.db"
     assert default_db_path("work").name == "work.db"
     assert default_db_path("work").parent.name == ".tg_messenger"
+
+
+def test_default_db_path_sanitizes_profile_name():
+    root = default_db_path("default").parent
+    assert default_db_path("/tmp/x") == root / "tmp_x.db"
+    assert default_db_path("../work") == root / "work.db"
