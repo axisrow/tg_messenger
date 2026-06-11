@@ -541,7 +541,7 @@ best-effort `None` (raw-апдейт не несёт надёжного един
   `_to_message` маппит `reply_to_id` из `raw.reply_to.reply_to_msg_id` (best-effort getattr).
   Инвалидация history своего peer (как раньше).
 - **78**: `forward(from_peer, ids, to_peer)` → `forward_messages`, инвалидирует history ОБОИХ
-  peer'ов; `edit_text(peer, id, text)` → `edit_message`; `delete_messages(peer, ids, revoke=True)`
+  peer'ов, фильтрует и логирует частичные `None`-результаты от Telethon; `edit_text(peer, id, text)` → `edit_message`; `delete_messages(peer, ids, revoke=True)`
   → `delete_messages`. Перед удалением core fetch'ит ids из указанного peer и отвергает
   missing/mismatched сообщения; `revoke=False` запрещён для channel/megagroup marked ids, потому что
   Telegram там удаляет для всех. Все через `run_with_flood_wait_retry`; инвалидируют history. Тесты:

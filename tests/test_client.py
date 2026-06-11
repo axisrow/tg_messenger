@@ -1238,6 +1238,24 @@ async def test_forward_invalidates_both_peers(fake_client):
     assert fake_client.iter_messages_calls == 4
 
 
+async def test_forward_filters_partial_missing_results(fake_client, caplog):
+    client = _build(fake_client)
+    await client.connect()
+
+    async def partial_forward(to_peer, message_ids, from_peer):
+        return [
+            FakeMessage(id=101, sender_id=1, text="ok", out=True, peer_id=to_peer),
+            None,
+        ]
+
+    fake_client.forward_messages = partial_forward
+    with caplog.at_level(logging.WARNING):
+        result = await client.forward(7, [1, 999], 8)
+
+    assert [m.id for m in result] == [101]
+    assert any("forward returned 1 missing message(s)" in record.message for record in caplog.records)
+
+
 async def test_forward_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
     flood_error = _flood_patch(monkeypatch)

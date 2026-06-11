@@ -319,7 +319,16 @@ class StandaloneTelegramClient:
         )
         self._invalidate_history(from_peer)
         self._invalidate_history(to_peer)
-        return [self._to_message(m, dialog_id=int(to_peer)) for m in (sent or [])]
+        raw_sent = list(sent or [])
+        missing_count = sum(1 for m in raw_sent if m is None)
+        if missing_count:
+            logger.warning(
+                "forward returned %s missing message(s) for from_peer=%s to_peer=%s",
+                missing_count,
+                from_peer,
+                to_peer,
+            )
+        return [self._to_message(m, dialog_id=int(to_peer)) for m in raw_sent if m is not None]
 
     async def edit_text(self, peer: int, message_id: int, text: str) -> Message:
         msg = await run_with_flood_wait_retry(
