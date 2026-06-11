@@ -33,7 +33,7 @@ def _sanitize(name: str) -> str:
     return cleaned
 
 
-def _validate_session_string(session_string: str) -> str:
+def validate_session_string(session_string: str) -> str:
     """Ensure a StringSession parses (auth_key/dc_id present); raise ValueError if not."""
     try:
         StringSession(session_string)
@@ -42,29 +42,65 @@ def _validate_session_string(session_string: str) -> str:
     return session_string
 
 
-class SessionStore:
-    """Persist/load StringSession strings as private files."""
+# back-compat private alias (used internally below)
+_validate_session_string = validate_session_string
 
-    def __init__(self, session_dir: Path | str = DEFAULT_SESSION_DIR):
+
+class SessionStore:
+    """Persist/load StringSession strings as private files.
+
+    With an ``encryption_key`` (CLI/UIs pass ``SESSION_ENCRYPTION_KEY`` from env),
+    sessions are stored as ``enc:v2:`` Fernet tokens — byte-compatible with
+    tg_content_factory, so a shared key makes the two projects' sessions
+    interchangeable (SSO). Reading a plaintext file while a key is set lazily
+    rewrites it encrypted; reading an encrypted file with no key raises with a hint.
+    Session strings are never logged.
+    """
+
+    def __init__(
+        self,
+        session_dir: Path | str = DEFAULT_SESSION_DIR,
+        *,
+        encryption_key: str | None = None,
+    ):
         self.session_dir = Path(session_dir)
+        self._encryption_key = encryption_key or None  # treat "" as no key
 
     def path_for(self, name: str) -> Path:
         return self.session_dir / f"{_sanitize(name)}.session"
 
     def load(self, name: str) -> str | None:
+        from tg_messenger.core.session_cipher import decrypt_session, is_encrypted
+
         path = self.path_for(name)
         if not path.exists():
             return None
         raw = path.read_text(encoding="utf-8").strip()
         if not raw:
             return None
-        return _validate_session_string(raw)
+        if is_encrypted(raw) and not self._encryption_key:
+            raise ValueError(
+                f"session {name!r} is encrypted but SESSION_ENCRYPTION_KEY is not set"
+            )
+        plaintext = decrypt_session(raw, self._encryption_key) if self._encryption_key else raw
+        validated = _validate_session_string(plaintext)
+        # lazy migration: a plaintext file read under a key is rewritten encrypted
+        if self._encryption_key and not is_encrypted(raw):
+            self.save(name, validated)
+        return validated
 
     def save(self, name: str, session_string: str) -> Path:
+        from tg_messenger.core.session_cipher import encrypt_session
+
         self.session_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.session_dir, 0o700)
         path = self.path_for(name)
-        path.write_text(session_string, encoding="utf-8")
+        stored = (
+            encrypt_session(session_string, self._encryption_key)
+            if self._encryption_key
+            else session_string
+        )
+        path.write_text(stored, encoding="utf-8")
         os.chmod(path, 0o600)
         return path
 

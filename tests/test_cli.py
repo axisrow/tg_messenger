@@ -621,3 +621,135 @@ def test_tui_without_tui_extra_hints_install(monkeypatch):
     result = CliRunner().invoke(cli_main.cli, ["tui"])
     assert result.exit_code != 0
     assert "tg-messenger[tui]" in result.output
+
+
+# --- цикл 55: export/import session string (SSO) ---
+
+class ExportStubClient:
+    def __init__(self, session_string="EXPORTED-SESSION", authorized=True):
+        self._session_string = session_string
+        self._authorized = authorized
+        self.connected = False
+        self.imported = []
+
+    async def connect(self):
+        self.connected = True
+
+    async def disconnect(self):
+        self.connected = False
+
+    async def is_authorized(self):
+        return self._authorized
+
+    def export_session_string(self):
+        return self._session_string
+
+    def import_session_string(self, s):
+        self.imported.append(s)
+
+
+def test_login_export_session_prints_string_and_warning(monkeypatch):
+    stub = ExportStubClient(session_string="MY-SECRET-SESSION")
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["login", "--export-session"])
+    assert result.exit_code == 0
+    assert "MY-SECRET-SESSION" in result.output
+    assert "full access" in result.output.lower() or "полный доступ" in result.output.lower()
+
+
+def test_login_import_session_saves_valid_string(monkeypatch):
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
+    valid = _valid_session_for_import()
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
+    assert result.exit_code == 0, result.output
+    assert saved == [("default", valid)]
+
+
+def test_login_import_session_reads_piped_stdin_without_prompt(monkeypatch):
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    def prompt_must_not_run(*args, **kwargs):
+        raise AssertionError("piped import must read stdin directly")
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
+    monkeypatch.setattr(cli_main.click, "prompt", prompt_must_not_run)
+    valid = _valid_session_for_import()
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
+    assert result.exit_code == 0, result.output
+    assert saved == [("default", valid)]
+
+
+def test_login_import_session_rejects_garbage(monkeypatch):
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    # garbage must be rejected before it ever reaches the store
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input="not-a-session\n")
+    assert result.exit_code != 0
+    assert "invalid StringSession" in result.output
+    assert saved == []
+
+
+def test_login_import_session_rejects_empty_input(monkeypatch):
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=" \n")
+    assert result.exit_code != 0
+    assert "invalid StringSession" in result.output
+    assert saved == []
+
+
+def test_login_import_session_replaces_unreadable_existing_file(monkeypatch, session_dir):
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(session_dir)
+    store.session_dir.mkdir(parents=True, exist_ok=True)
+    store.path_for("default").write_text("not-a-valid-session", encoding="utf-8")
+    monkeypatch.setattr(cli_main, "_session_store", lambda: store)
+
+    valid = _valid_session_for_import()
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
+
+    assert result.exit_code == 0, result.output
+    assert store.load("default") == valid
+
+
+def test_export_session_not_in_log(monkeypatch, tmp_path):
+    import logging
+
+    stub = ExportStubClient(session_string="SHOULD-NOT-BE-LOGGED")
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    monkeypatch.setenv("TG_LOG_DIR", str(tmp_path))
+    CliRunner().invoke(cli_main.cli, ["-v", "login", "--export-session"])
+    logging.shutdown()
+    logs = "".join(p.read_text() for p in tmp_path.glob("*.log"))
+    assert "SHOULD-NOT-BE-LOGGED" not in logs
+
+
+def _valid_session_for_import():
+    from telethon.crypto import AuthKey
+    from telethon.sessions import StringSession
+
+    s = StringSession()
+    s.set_dc(2, "149.154.167.51", 443)
+    s.auth_key = AuthKey(b"\x00" * 256)
+    return s.save()

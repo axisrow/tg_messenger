@@ -109,12 +109,13 @@ class StandaloneTelegramClient:
         session_name: str = "default",
         external_session: str | None = None,
         session_dir: Path | str = DEFAULT_SESSION_DIR,
+        encryption_key: str | None = None,
         client_factory: Callable = _default_factory,
         dialogs_ttl: float = DEFAULT_DIALOGS_TTL_SEC,
         history_ttl: float = DEFAULT_HISTORY_TTL_SEC,
         clock: Callable[[], float] = time.monotonic,
     ):
-        self._store = SessionStore(session_dir)
+        self._store = SessionStore(session_dir, encryption_key=encryption_key)
         if external_session is not None:
             session_string = self._store.from_external(external_session)
         else:
@@ -148,6 +149,14 @@ class StandaloneTelegramClient:
 
     def save_session(self) -> None:
         self._store.save(self._session_name, self._client.session.save())
+
+    def export_session_string(self) -> str:
+        """Return the current plaintext StringSession — full account access; never log it."""
+        return self._client.session.save()
+
+    def import_session_string(self, session_string: str) -> None:
+        """Validate an externally supplied StringSession and persist it under this session name."""
+        self._store.save(self._session_name, self._store.from_external(session_string))
 
     async def get_me(self) -> User:
         raw = await run_with_flood_wait_retry(lambda: self._client.get_me(), operation="get_me")
