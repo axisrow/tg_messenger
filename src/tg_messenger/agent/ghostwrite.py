@@ -43,13 +43,14 @@ DEFAULT_MAX_PER_HOUR = 6
 DEFAULT_PAUSE_ON_HUMAN_SEC = 86_400  # a human reply pauses the dialog for a day
 RATE_WINDOW_SEC = 3600.0
 DEFAULT_OWN_CACHE_SIZE = 1000
+DEFAULT_MAX_RATE_DIALOGS = 10_000
 
 
 # --- storage (#13): per-dialog allowlist + auto-reply journal --------------------
 
 # Registered via storage.register_migrations BEFORE connect(); engine and CLI share the
-# schema. dialog_id is the PK so enable_dialog is an upsert. paused_until is a Unix-ish
-# float on the same monotonic clock the engine reads (NULL = not paused).
+# schema. dialog_id is the PK so enable_dialog is an upsert. paused_until is a
+# Unix timestamp from time.time() (NULL = not paused).
 GHOSTWRITE_MIGRATIONS = [
     "CREATE TABLE ghostwrite_dialogs ("
     " dialog_id INTEGER PRIMARY KEY,"
@@ -156,10 +157,11 @@ class GhostwriteEngine:
         storage,
         *,
         enforce: bool = False,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.time,
         max_per_hour: int = DEFAULT_MAX_PER_HOUR,
         pause_on_human_sec: int = DEFAULT_PAUSE_ON_HUMAN_SEC,
         own_cache_size: int = DEFAULT_OWN_CACHE_SIZE,
+        max_rate_dialogs: int = DEFAULT_MAX_RATE_DIALOGS,
     ):
         self._client = client
         self._suggester = suggester
@@ -169,6 +171,8 @@ class GhostwriteEngine:
         self._max_per_hour = max_per_hour
         self._pause_on_human_sec = pause_on_human_sec
         self._own_cache_size = own_cache_size
+        self._max_rate_dialogs = max_rate_dialogs
+        self._enabled_dialogs: set[int] | None = None
         # dialog_id -> sliding window of recent auto-reply times (bounded)
         self._rate: OrderedDict[int, deque[float]] = OrderedDict()
         # (dialog_id, message_id) we sent ourselves — recognise our own outgoing echo.
@@ -179,7 +183,13 @@ class GhostwriteEngine:
     async def run(self) -> None:
         # gather, не TaskGroup: TaskGroup оборачивает KeyboardInterrupt
         # в BaseExceptionGroup и ломает Ctrl+C-обработку в CLI
+        await self._ensure_enabled_dialogs()
         await asyncio.gather(self._consume_incoming(), self._consume_outgoing())
+
+    async def _ensure_enabled_dialogs(self) -> set[int]:
+        if self._enabled_dialogs is None:
+            self._enabled_dialogs = set(await list_enabled(self._storage))
+        return self._enabled_dialogs
 
     async def _consume_incoming(self) -> None:
         async for ev in self._client.listen():
@@ -229,7 +239,7 @@ class GhostwriteEngine:
         """Record an attempt, then report if the trailing hour already hit ``max_per_hour``.
 
         Called BEFORE the suggester so a maxed-out dialog never costs an LLM call. The
-        attempt is recorded regardless — a steady inbound stream stays capped.
+        attempt is recorded only while the dialog is under the limit.
         """
         window = self._rate.get(dialog_id)
         if window is None:
@@ -238,7 +248,7 @@ class GhostwriteEngine:
         self._rate.move_to_end(dialog_id)
         while window and now - window[0] > RATE_WINDOW_SEC:
             window.popleft()
-        while len(self._rate) > self._own_cache_size:
+        while len(self._rate) > self._max_rate_dialogs:
             self._rate.popitem(last=False)
         if len(window) >= self._max_per_hour:
             return True
@@ -281,7 +291,7 @@ class GhostwriteEngine:
         key = (int(dialog_id), int(message.id))
         if self._own_sent.pop(key, None) is not None:
             return  # our own reply — not a human
-        if dialog_id not in await list_enabled(self._storage):
+        if dialog_id not in await self._ensure_enabled_dialogs():
             return  # not a ghostwrite dialog — nothing to pause
         paused_until = self._clock() + self._pause_on_human_sec
         await pause_dialog(self._storage, dialog_id, paused_until=paused_until)

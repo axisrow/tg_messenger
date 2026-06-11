@@ -8,8 +8,10 @@ clock инжектится — никакого реального sleep (filter
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 
+from tg_messenger.agent import ghostwrite as gw
 from tg_messenger.agent.ghostwrite import (
     PAUSE_FOREVER,
     GhostwriteEngine,
@@ -167,7 +169,16 @@ class FakeGwClient:
         return _omsg(text=text, dialog_id=peer, msg_id=self._next_id)
 
 
-def _mk_engine(tmp_path, *, enforce=False, suggester=None, max_per_hour=10, clock=None):
+def _mk_engine(
+    tmp_path,
+    *,
+    enforce=False,
+    suggester=None,
+    max_per_hour=10,
+    clock=None,
+    own_cache_size=1000,
+    max_rate_dialogs=10_000,
+):
     storage = Storage(tmp_path / "gw.db")
     register_ghostwrite_migrations(storage)
     client = FakeGwClient()
@@ -177,11 +188,20 @@ def _mk_engine(tmp_path, *, enforce=False, suggester=None, max_per_hour=10, cloc
         client, suggester, storage,
         enforce=enforce, max_per_hour=max_per_hour,
         clock=clock or (lambda: t["now"]),
+        own_cache_size=own_cache_size,
+        max_rate_dialogs=max_rate_dialogs,
     )
     return engine, client, suggester, storage, t
 
 
 # --- Цикл B: движок dry-run --------------------------------------------------------
+
+
+async def test_default_clock_is_wall_time_for_persistent_pauses(tmp_path):
+    storage = Storage(tmp_path / "gw.db")
+    register_ghostwrite_migrations(storage)
+    engine = GhostwriteEngine(FakeGwClient(), FakeSuggester(), storage)
+    assert engine._clock is time.time
 
 
 async def test_dry_run_calls_suggester_not_send(tmp_path, caplog):
@@ -263,6 +283,25 @@ async def test_rate_window_slides_after_an_hour(tmp_path):
         await storage.close()
 
 
+async def test_rate_window_not_bounded_by_own_sent_cache(tmp_path):
+    engine, client, suggester, storage, t = _mk_engine(
+        tmp_path, enforce=True, max_per_hour=1, own_cache_size=1,
+    )
+    await storage.connect()
+    try:
+        await enable_dialog(storage, DIALOG)
+        await enable_dialog(storage, OTHER)
+        t["now"] = 0.0
+        await engine.process_incoming(_imsg(dialog_id=DIALOG, msg_id=1))
+        t["now"] = 1.0
+        await engine.process_incoming(_imsg(dialog_id=OTHER, msg_id=2))
+        t["now"] = 2.0
+        await engine.process_incoming(_imsg(dialog_id=DIALOG, msg_id=3))
+        assert client.sent == [(DIALOG, "auto reply"), (OTHER, "auto reply")]
+    finally:
+        await storage.close()
+
+
 async def test_not_active_sender_skipped(tmp_path):
     engine, client, suggester, storage, t = _mk_engine(tmp_path, enforce=True)
     await storage.connect()
@@ -318,6 +357,20 @@ async def test_outgoing_in_non_ghostwrite_dialog_ignored(tmp_path):
         assert await list_enabled(storage) == []
     finally:
         await storage.close()
+
+
+async def test_outgoing_uses_cached_enabled_dialogs(tmp_path, monkeypatch):
+    engine, client, suggester, storage, t = _mk_engine(tmp_path, enforce=True)
+    calls = {"count": 0}
+
+    async def fake_list_enabled(storage):
+        calls["count"] += 1
+        return [DIALOG]
+
+    monkeypatch.setattr(gw, "list_enabled", fake_list_enabled)
+    await engine.on_outgoing(OutgoingEvent(dialog_id=OTHER, message=_omsg(dialog_id=OTHER, msg_id=1)))
+    await engine.on_outgoing(OutgoingEvent(dialog_id=OTHER, message=_omsg(dialog_id=OTHER, msg_id=2)))
+    assert calls["count"] == 1
 
 
 # --- Цикл E: деградация/ошибки -----------------------------------------------------
