@@ -55,7 +55,7 @@ class TuiStubClient:
         yield  # pragma: no cover
 
 
-def test_real_tui_client_gets_session_encryption_key(monkeypatch):
+def test_real_tui_client_gets_session_encryption_key(monkeypatch, tmp_path):
     from tg_messenger.tui import app as tui_app
 
     captured = {}
@@ -67,11 +67,13 @@ def test_real_tui_client_gets_session_encryption_key(monkeypatch):
     monkeypatch.setenv("TG_API_ID", "123")
     monkeypatch.setenv("TG_API_HASH", "hash")
     monkeypatch.setenv("SESSION_ENCRYPTION_KEY", "shared-secret")
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
     monkeypatch.setattr("tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient)
 
     tui_app._make_real_client("default")
 
     assert captured["session_name"] == "default"
+    assert captured["session_dir"] == str(tmp_path)
     assert captured["encryption_key"] == "shared-secret"
 
 

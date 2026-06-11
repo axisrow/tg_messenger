@@ -65,6 +65,7 @@ def make_client(**kwargs) -> StandaloneTelegramClient:
     api_hash = os.environ.get("TG_API_HASH", "")
     # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
     kwargs.setdefault("encryption_key", _session_encryption_key())
+    kwargs.setdefault("session_dir", os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
 
 
@@ -406,8 +407,10 @@ def send(dialog_id: int, text: str | None, file_path: str | None, session: str) 
 
 @cli.command()
 @click.option("--session", default="default")
-def listen(session: str) -> None:
+@click.pass_context
+def listen(ctx: click.Context, session: str) -> None:
     """Print incoming messages live."""
+    session = _effective_session(ctx, session)
 
     async def _do():
         client = make_client(session_name=session)
@@ -428,9 +431,12 @@ def listen(session: str) -> None:
 
 @cli.command()
 @click.option("--session", default="default")
-def watch(session: str) -> None:
+@click.pass_context
+def watch(ctx: click.Context, session: str) -> None:
     """Back up your deleted messages (e.g. removed by group moderator bots) to Saved Messages."""
     from tg_messenger.core.watch import DeletionWatcher
+
+    session = _effective_session(ctx, session)
 
     async def _do():
         client = make_client(session_name=session)
@@ -451,8 +457,10 @@ def watch(session: str) -> None:
 @cli.command()
 @click.argument("dialog_id", type=int)
 @click.option("--session", default="default")
-def chat(dialog_id: int, session: str) -> None:
+@click.pass_context
+def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
     """Interactive REPL: see incoming and send replies."""
+    session = _effective_session(ctx, session)
 
     async def _do():
         client = make_client(session_name=session)
@@ -495,8 +503,10 @@ def chat(dialog_id: int, session: str) -> None:
 @click.option("--session", default="default")
 @click.option("--notify-errors", is_flag=True,
               help="Reply with a short notice when processing a message fails.")
-def agent(session: str, notify_errors: bool) -> None:
+@click.pass_context
+def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
     """AI assistant: auto-reply to incoming DMs, route tasks to a deep agent."""
+    session = _effective_session(ctx, session)
     # langchain/langgraph трассируются в LangSmith сами по LANGSMITH_* env —
     # здесь только fail-fast (включено без ключа) и видимый статус
     try:

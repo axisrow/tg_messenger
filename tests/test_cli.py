@@ -781,6 +781,56 @@ def test_global_profile_sets_session_name(profile_spy):
     assert profile_spy.get("session_name") == "work"
 
 
+def test_make_client_uses_tg_session_dir(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    monkeypatch.setattr(cli_main, "StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    cli_main.make_client(session_name="work")
+
+    assert captured["session_name"] == "work"
+    assert captured["session_dir"] == str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("args", "input_text"),
+    [
+        (["listen"], None),
+        (["watch"], None),
+        (["chat", "7"], ""),
+        (["agent"], None),
+    ],
+)
+def test_global_profile_reaches_direct_client_commands(
+    profile_spy, monkeypatch, args, input_text
+):
+    class FakeAgentRunner:
+        async def run(self):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        cli_main,
+        "make_agent_runner",
+        lambda client, *, notify_errors=False: FakeAgentRunner(),
+    )
+
+    result = CliRunner().invoke(
+        cli_main.cli,
+        ["--profile", "work", *args],
+        input=input_text,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert profile_spy.get("session_name") == "work"
+
+
 def test_profiles_command_lists_saved(monkeypatch, tmp_path):
     from tg_messenger.core.auth import SessionStore
 
