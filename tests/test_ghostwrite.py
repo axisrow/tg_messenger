@@ -416,6 +416,39 @@ async def test_inflight_own_send_echo_does_not_pause(tmp_path):
         await storage.close()
 
 
+async def test_inflight_human_message_still_pauses(tmp_path):
+    class HumanBeforeAckClient(FakeGwClient):
+        def __init__(self):
+            super().__init__()
+            self.engine: GhostwriteEngine | None = None
+
+        async def send_text(self, peer, text, reply_to=None):
+            assert self.engine is not None
+            await self.engine.on_outgoing(
+                OutgoingEvent(
+                    dialog_id=peer,
+                    message=_omsg(text="manual reply", dialog_id=peer, msg_id=888),
+                )
+            )
+            return await super().send_text(peer, text, reply_to=reply_to)
+
+    storage = Storage(tmp_path / "gw.db")
+    register_ghostwrite_migrations(storage)
+    client = HumanBeforeAckClient()
+    t = {"now": 0.0}
+    engine = GhostwriteEngine(
+        client, FakeSuggester(), storage, enforce=True, clock=lambda: t["now"],
+    )
+    client.engine = engine
+    await storage.connect()
+    try:
+        await enable_dialog(storage, DIALOG)
+        await engine.process_incoming(_imsg())
+        assert await is_active(storage, DIALOG, now=0.0) is False
+    finally:
+        await storage.close()
+
+
 async def test_outgoing_in_non_ghostwrite_dialog_ignored(tmp_path):
     engine, client, suggester, storage, t = _mk_engine(tmp_path, enforce=True)
     await storage.connect()
@@ -459,6 +492,37 @@ async def test_outgoing_refreshes_runtime_enabled_dialog_on_cache_miss(tmp_path)
         assert OTHER in await engine._ensure_enabled_dialogs()
         assert await is_active(storage, OTHER, now=0.0) is False
         assert await is_active(storage, OTHER, now=engine._pause_on_human_sec + 1) is True
+    finally:
+        await storage.close()
+
+
+async def test_human_outgoing_does_not_shorten_pause_all(tmp_path):
+    engine, client, suggester, storage, t = _mk_engine(tmp_path, enforce=True)
+    await storage.connect()
+    try:
+        await enable_dialog(storage, DIALOG)
+        await pause_all(storage)
+        t["now"] = 0.0
+        await engine.on_outgoing(OutgoingEvent(dialog_id=DIALOG, message=_omsg(msg_id=44)))
+        assert await is_active(storage, DIALOG, now=1e18) is False
+    finally:
+        await storage.close()
+
+
+async def test_outgoing_in_runtime_disabled_dialog_does_not_pause(tmp_path):
+    engine, client, suggester, storage, t = _mk_engine(tmp_path, enforce=True)
+    await storage.connect()
+    try:
+        await enable_dialog(storage, DIALOG)
+        assert await engine._ensure_enabled_dialogs() == {DIALOG}
+        await disable_dialog(storage, DIALOG)
+        t["now"] = 0.0
+        await engine.on_outgoing(OutgoingEvent(dialog_id=DIALOG, message=_omsg(msg_id=45)))
+        row = await storage.fetchone(
+            "SELECT enabled, paused_until FROM ghostwrite_dialogs WHERE dialog_id = ?",
+            (DIALOG,),
+        )
+        assert row == (0, None)
     finally:
         await storage.close()
 

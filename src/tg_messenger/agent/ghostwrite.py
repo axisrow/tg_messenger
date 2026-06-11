@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -171,7 +171,7 @@ class GhostwriteEngine:
         self._own_cache_size = own_cache_size
         self._max_rate_dialogs = max_rate_dialogs
         self._enabled_dialogs: set[int] | None = None
-        self._sending: set[int] = set()
+        self._sending: defaultdict[int, list[str]] = defaultdict(list)
         # dialog_id -> sliding window of recent auto-reply times (bounded)
         self._rate: OrderedDict[int, deque[float]] = OrderedDict()
         # (dialog_id, message_id) we sent ourselves — recognise our own outgoing echo.
@@ -278,12 +278,16 @@ class GhostwriteEngine:
             await self._journal(dialog_id, message.id, reply, dry_run=True)
             return
         try:
-            self._sending.add(int(dialog_id))
+            self._sending[int(dialog_id)].append(reply)
             try:
                 sent = await self._client.send_text(dialog_id, reply)
                 self._remember_own(dialog_id, getattr(sent, "id", None))
             finally:
-                self._sending.discard(int(dialog_id))
+                pending = self._sending.get(int(dialog_id), [])
+                if reply in pending:
+                    pending.remove(reply)
+                if not pending:
+                    self._sending.pop(int(dialog_id), None)
         except Exception:
             logger.exception("ghostwrite failed to send reply in dialog %s", dialog_id)
             return
@@ -308,13 +312,17 @@ class GhostwriteEngine:
         dialog_id = event.dialog_id
         message = event.message
         key = (int(dialog_id), int(message.id))
-        if int(dialog_id) in self._sending:
+        pending_sends = self._sending.get(int(dialog_id), [])
+        if message.text in pending_sends:
             return  # our own in-flight send — not a human
         if self._own_sent.pop(key, None) is not None:
             return  # our own reply — not a human
         if not await self._is_enabled_dialog(dialog_id):
             return  # not a ghostwrite dialog — nothing to pause
-        paused_until = self._clock() + self._pause_on_human_sec
+        now = self._clock()
+        if not await is_active(self._storage, dialog_id, now=now):
+            return  # already paused/disabled — do not shorten an existing pause
+        paused_until = now + self._pause_on_human_sec
         await pause_dialog(self._storage, dialog_id, paused_until=paused_until)
         logger.info(
             "ghostwrite paused dialog %s for %ss — a human replied",
