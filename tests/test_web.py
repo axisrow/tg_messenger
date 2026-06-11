@@ -520,6 +520,9 @@ class StubSuggester:
         self.closed += 1
 
 
+SUGGEST_HEADERS = {"X-TG-Messenger-CSRF": "1"}
+
+
 @pytest_asyncio.fixture
 async def suggest_app():
     stub = WebStubClient()
@@ -533,7 +536,7 @@ async def suggest_app():
 
 async def test_suggest_endpoint_returns_draft(suggest_app):
     ac, suggester = suggest_app
-    r = await ac.get("/dialogs/7/suggest")
+    r = await ac.post("/dialogs/7/suggest", headers=SUGGEST_HEADERS)
     assert r.status_code == 200
     assert "suggested reply" in r.text
     assert suggester.calls == [7]
@@ -542,7 +545,7 @@ async def test_suggest_endpoint_returns_draft(suggest_app):
 async def test_suggest_endpoint_does_not_escape_draft(suggest_app):
     ac, suggester = suggest_app
     suggester.draft = "you & me"
-    r = await ac.get("/dialogs/7/suggest")
+    r = await ac.post("/dialogs/7/suggest", headers=SUGGEST_HEADERS)
     assert r.status_code == 200
     assert r.text == "you & me"
 
@@ -550,15 +553,39 @@ async def test_suggest_endpoint_does_not_escape_draft(suggest_app):
 async def test_suggest_endpoint_returns_plain_text_for_markup(suggest_app):
     ac, suggester = suggest_app
     suggester.draft = "<script>alert(1)</script>"
-    r = await ac.get("/dialogs/7/suggest")
+    r = await ac.post("/dialogs/7/suggest", headers=SUGGEST_HEADERS)
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/plain")
     assert r.text == "<script>alert(1)</script>"
 
 
+async def test_suggest_endpoint_rejects_get_before_llm(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.get("/dialogs/7/suggest")
+    assert r.status_code == 405
+    assert suggester.calls == []
+
+
+async def test_suggest_endpoint_requires_csrf_header(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.post("/dialogs/7/suggest")
+    assert r.status_code == 403
+    assert suggester.calls == []
+
+
+async def test_suggest_endpoint_rejects_cross_origin(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.post(
+        "/dialogs/7/suggest",
+        headers={**SUGGEST_HEADERS, "Origin": "http://evil.example"},
+    )
+    assert r.status_code == 403
+    assert suggester.calls == []
+
+
 async def test_suggest_endpoint_negative_id(suggest_app):
     ac, suggester = suggest_app
-    r = await ac.get("/dialogs/-100200/suggest")
+    r = await ac.post("/dialogs/-100200/suggest", headers=SUGGEST_HEADERS)
     assert r.status_code == 403
     assert "DM" in r.text
     assert suggester.calls == []
@@ -566,7 +593,7 @@ async def test_suggest_endpoint_negative_id(suggest_app):
 
 async def test_suggest_endpoint_does_not_send_group_history_to_llm(suggest_app):
     ac, suggester = suggest_app
-    r = await ac.get("/dialogs/-100123/suggest")
+    r = await ac.post("/dialogs/-100123/suggest", headers=SUGGEST_HEADERS)
     assert r.status_code == 403
     assert suggester.calls == []
 
@@ -574,7 +601,7 @@ async def test_suggest_endpoint_does_not_send_group_history_to_llm(suggest_app):
 async def test_suggest_endpoint_404_when_no_suggester(client_app):
     """build_app без suggester — кнопка/эндпоинт отвечает понятной ошибкой, не 500."""
     ac, _ = client_app
-    r = await ac.get("/dialogs/7/suggest")
+    r = await ac.post("/dialogs/7/suggest", headers=SUGGEST_HEADERS)
     assert r.status_code == 503
     assert "TG_AGENT_MODEL" in r.text or "suggest" in r.text.lower()
 
@@ -584,6 +611,7 @@ async def test_index_has_suggest_button(suggest_app):
     r = await ac.get("/")
     assert "suggest" in r.text.lower()
     assert "suggest-error" in r.text
+    assert "X-TG-Messenger-CSRF" in r.text
 
 
 async def test_lifespan_closes_suggester():

@@ -96,6 +96,12 @@ def make_storage(profile: str = "default"):
     return Storage(default_db_path(profile))
 
 
+async def _ensure_dm_dialog(client, dialog_id: int) -> None:
+    dm_ids = {dialog.id for dialog in await client.dialogs()}
+    if dialog_id not in dm_ids:
+        raise click.ClickException("suggest is available for DM dialogs only.")
+
+
 def make_agent_runner(client, *, notify_errors: bool = False):
     """Build the AI agent runner; the second seam tests patch (next to ``make_client``)."""
     try:
@@ -982,6 +988,7 @@ def suggest(ctx: click.Context, dialog_id: int, do_send: bool, do_learn: bool, s
             await _ensure_authorized(client, session)
             await storage.connect()
             try:
+                await _ensure_dm_dialog(client, dialog_id)
                 if do_learn:
                     profile = await suggester.learn(dialog_id)
                     click.echo(
