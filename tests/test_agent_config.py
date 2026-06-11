@@ -64,6 +64,19 @@ def test_missing_or_empty_allowlist_raises_mentioning_star(allowlist):
         AgentConfig.from_env(env)
 
 
+@pytest.mark.parametrize("allowlist", [None, "", "  ", " , "])
+def test_allowlist_can_be_omitted_for_suggester(allowlist):
+    env = dict(VALID_ENV)
+    if allowlist is None:
+        del env["TG_AGENT_ALLOWLIST"]
+    else:
+        env["TG_AGENT_ALLOWLIST"] = allowlist
+    cfg = AgentConfig.from_env(env, require_allowlist=False)
+    assert cfg.allow_all is False
+    assert cfg.allow_ids == frozenset()
+    assert cfg.allow_usernames == frozenset()
+
+
 def test_unknown_search_provider_raises_listing_known_ones():
     with pytest.raises(ValueError, match="duckduckgo"):
         AgentConfig.from_env({**VALID_ENV, "TG_AGENT_SEARCH": "yahoo"})

@@ -76,10 +76,22 @@ class Worker:
             result = await self._execute(task)
         except Exception as exc:
             logger.exception("worker: task %s (%s) failed", task_id, task.get("type"))
-            await self._factory.fail_task(task_id, f"{type(exc).__name__}: {exc}")
+            await self._safe_fail_task(task_id, f"{type(exc).__name__}: {exc}")
             return True
-        await self._factory.complete_task(task_id, result)
+        await self._safe_complete_task(task_id, result)
         return True
+
+    async def _safe_complete_task(self, task_id: str, result: dict) -> None:
+        try:
+            await self._factory.complete_task(task_id, result)
+        except Exception:
+            logger.exception("worker: failed to report task %s completion", task_id)
+
+    async def _safe_fail_task(self, task_id: str, error: str) -> None:
+        try:
+            await self._factory.fail_task(task_id, error)
+        except Exception:
+            logger.exception("worker: failed to report task %s failure", task_id)
 
     async def _execute(self, task: dict) -> dict:
         task_type = task.get("type")

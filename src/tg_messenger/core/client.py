@@ -48,6 +48,28 @@ logger = logging.getLogger(__name__)
 DEFAULT_DIALOGS_TTL_SEC = 30.0
 DEFAULT_HISTORY_TTL_SEC = 15.0
 _DIALOGS_CACHE_KEY = "all"  # one entry: the full mapped list, dm_only filters from it
+_CHANNEL_ID_THRESHOLD = -1_000_000_000_000
+
+
+class MessageDeleteValidationError(ValueError):
+    """Raised before a delete call when Telegram could delete outside the intended peer."""
+
+
+def is_channel_or_megagroup_id(peer: int) -> bool:
+    """Telethon marks channels/supergroups as ``-(10^12 + channel_id)``."""
+    return int(peer) <= _CHANNEL_ID_THRESHOLD
+
+
+def _message_dialog_id(raw) -> int | None:
+    chat_id = getattr(raw, "chat_id", None)
+    if chat_id is not None:
+        return int(chat_id)
+    peer = getattr(raw, "peer_id", None)
+    if peer is None:
+        return None
+    if isinstance(peer, int):
+        return peer
+    return int(tl_utils.get_peer_id(peer))
 
 
 def _default_factory(session, api_id, api_hash):
@@ -316,7 +338,16 @@ class StandaloneTelegramClient:
         )
         self._invalidate_history(from_peer)
         self._invalidate_history(to_peer)
-        return [self._to_message(m, dialog_id=int(to_peer)) for m in (sent or [])]
+        raw_sent = list(sent or [])
+        missing_count = sum(1 for m in raw_sent if m is None)
+        if missing_count:
+            logger.warning(
+                "forward returned %s missing message(s) for from_peer=%s to_peer=%s",
+                missing_count,
+                from_peer,
+                to_peer,
+            )
+        return [self._to_message(m, dialog_id=int(to_peer)) for m in raw_sent if m is not None]
 
     async def edit_text(self, peer: int, message_id: int, text: str) -> Message:
         msg = await run_with_flood_wait_retry(
@@ -328,22 +359,64 @@ class StandaloneTelegramClient:
 
     async def delete_messages(self, peer: int, message_ids: list[int], revoke: bool = True) -> None:
         """Delete messages; ``revoke=True`` removes them for everyone (default)."""
+        if not revoke and is_channel_or_megagroup_id(peer):
+            raise MessageDeleteValidationError(
+                "--for-me is not supported for channels/supergroups; Telegram deletes there for everyone"
+            )
+        await self._validate_delete_messages(peer, message_ids)
         await run_with_flood_wait_retry(
             lambda: self._client.delete_messages(peer, message_ids, revoke=revoke),
             operation="delete_messages",
         )
         self._invalidate_history(peer)
 
+    async def _validate_delete_messages(self, peer: int, message_ids: list[int]) -> None:
+        wanted = {int(mid) for mid in message_ids}
+        if not wanted:
+            return
+        raw = await run_with_flood_wait_retry(
+            lambda: self._collect_messages_by_ids(peer, list(wanted)),
+            operation="delete_messages_validate",
+        )
+        by_id = {int(getattr(m, "id")): m for m in raw if m is not None and getattr(m, "id", None) is not None}
+        missing = wanted - set(by_id)
+        if missing:
+            joined = ", ".join(str(mid) for mid in sorted(missing))
+            raise MessageDeleteValidationError(
+                f"message ids not found in dialog {int(peer)}: {joined}"
+            )
+        for mid, msg in by_id.items():
+            dialog_id = _message_dialog_id(msg)
+            if dialog_id != int(peer):
+                raise MessageDeleteValidationError(
+                    f"message {mid} belongs to dialog {dialog_id}, not {int(peer)}"
+                )
+
+    async def _collect_messages_by_ids(self, peer, message_ids) -> list:
+        return [m async for m in self._client.iter_messages(peer, ids=message_ids)]
+
     async def mute_user(self, peer: int, user_id: int, until_sec: int) -> None:
         """Restrict a user from sending messages in ``peer`` for ``until_sec`` seconds.
 
-        Thin wrapper over Telethon ``edit_permissions`` (send_messages=False until a
-        future ``until_date``); the moderator engine calls it. Flood-wait retried.
+        Thin wrapper over Telethon ``edit_permissions``; omitted boolean permissions
+        mean "do not restrict", so every send-related permission is explicitly
+        revoked for the future ``until_date``. The moderator engine calls it.
+        Flood-wait retried.
         """
         until_date = datetime.now(timezone.utc) + timedelta(seconds=int(until_sec))
         await run_with_flood_wait_retry(
             lambda: self._client.edit_permissions(
-                peer, int(user_id), until_date, send_messages=False
+                peer,
+                int(user_id),
+                until_date,
+                send_messages=False,
+                send_media=False,
+                send_stickers=False,
+                send_gifs=False,
+                send_games=False,
+                send_inline=False,
+                send_polls=False,
+                embed_link_previews=False,
             ),
             operation="mute_user",
         )
@@ -355,30 +428,41 @@ class StandaloneTelegramClient:
             operation="ban_user",
         )
 
-    async def is_admin(self, peer: int) -> bool:
-        """Whether OUR account can moderate ``peer`` (admin with delete rights).
+    async def moderation_rights(self, peer: int) -> dict[str, bool]:
+        """Moderation-capable rights for OUR account in ``peer``.
 
         Best-effort: any failure (not a participant, not a group, network) → False,
         logged — never raises. The moderator uses it to disable rules in chats we
         can't act on instead of crashing.
         """
         try:
+            me = await run_with_flood_wait_retry(lambda: self._client.get_me(), operation="is_admin_me")
             perms = await run_with_flood_wait_retry(
-                lambda: self._client.get_permissions(peer), operation="is_admin"
+                lambda: self._client.get_permissions(peer, me), operation="is_admin"
             )
         except Exception:
             logger.warning("could not read permissions for chat %s — assuming not admin",
                            peer, exc_info=True)
-            return False
+            return {"delete_messages": False, "ban_users": False}
         if perms is None:
-            return False
-        return bool(getattr(perms, "is_admin", False) or getattr(perms, "delete_messages", False))
+            return {"delete_messages": False, "ban_users": False}
+        return {
+            "delete_messages": bool(getattr(perms, "delete_messages", False)),
+            "ban_users": bool(getattr(perms, "ban_users", False)),
+        }
 
-    async def mark_read(self, peer: int) -> None:
+    async def is_admin(self, peer: int) -> bool:
+        """Whether OUR account has any moderation-capable right in ``peer``."""
+        rights = await self.moderation_rights(peer)
+        return rights["delete_messages"] or rights["ban_users"]
+
+    async def mark_read(self, peer: int, max_id: int | None = None) -> None:
         """Mark a dialog read (clears its unread counter), routed through flood retry."""
         await run_with_flood_wait_retry(
-            lambda: self._client.send_read_acknowledge(peer), operation="mark_read"
+            lambda: self._client.send_read_acknowledge(peer, max_id=max_id),
+            operation="mark_read",
         )
+        self._dialogs_cache.invalidate(_DIALOGS_CACHE_KEY)
 
     async def check_username(self, username: str) -> bool:
         """Whether ``username`` is free for OUR account (True = available).
@@ -503,6 +587,7 @@ class StandaloneTelegramClient:
         # #14: chat actions (joins/leaves/title/pin/photo), read receipts, reactions
         self._client.add_event_handler(self._on_chat_action, events.ChatAction())
         self._client.add_event_handler(self._on_message_read, events.MessageRead())
+        self._client.add_event_handler(self._on_message_read, events.MessageRead(inbox=True))
         # reactions arrive as a raw update (no high-level event for user accounts)
         self._client.add_event_handler(self._on_reaction, events.Raw(UpdateMessageReactions))
         self._handler_registered = True
@@ -618,7 +703,7 @@ class StandaloneTelegramClient:
         try:
             peer = getattr(update, "peer", None)
             dialog_id = int(tl_utils.get_peer_id(peer)) if peer is not None else 0
-            emoticon = self._first_emoticon(getattr(update, "reactions", None))
+            emoticon = self._recent_emoticon(getattr(update, "reactions", None))
             self._bus_reactions.publish(
                 ReactionEvent(
                     dialog_id=dialog_id,
@@ -632,12 +717,12 @@ class StandaloneTelegramClient:
             logger.warning("failed to handle reaction update — skipping", exc_info=True)
 
     @staticmethod
-    def _first_emoticon(reactions) -> str | None:
-        """Pull the first standard-emoji reaction's emoticon; custom/premium → None."""
-        results = getattr(reactions, "results", None) or []
-        if not results:
+    def _recent_emoticon(reactions) -> str | None:
+        """Pull the changed standard-emoji reaction's emoticon; custom/premium → None."""
+        recent = getattr(reactions, "recent_reactions", None) or []
+        if not recent:
             return None
-        reaction = getattr(results[0], "reaction", None)
+        reaction = getattr(recent[0], "reaction", None)
         return getattr(reaction, "emoticon", None)  # ReactionCustomEmoji has no .emoticon
 
     async def listen(self) -> AsyncIterator[IncomingEvent]:

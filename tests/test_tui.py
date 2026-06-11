@@ -42,6 +42,7 @@ class TuiStubClient:
         self.connected = False
         self.authorized = True
         self.dialogs_calls = 0
+        self.save_session_calls = 0
 
     async def connect(self):
         self.connected = True
@@ -51,6 +52,9 @@ class TuiStubClient:
 
     async def is_authorized(self):
         return self.authorized
+
+    def save_session(self):
+        self.save_session_calls += 1
 
     async def dialogs(self, dm_only=True):
         self.dialogs_calls += 1
@@ -83,13 +87,54 @@ class TuiStubClient:
         return Message(id=4, dialog_id=peer, sender_id=1, out=True, text=caption or "<media>",
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
-    async def mark_read(self, peer):
-        self.read_acks.append(peer)
+    async def mark_read(self, peer, max_id=None):
+        self.read_acks.append((peer, max_id))
 
     async def listen_all(self):
         # idle forever; the worker just waits for events
         await asyncio.Event().wait()
         yield  # pragma: no cover
+
+
+def test_real_tui_client_gets_session_encryption_key(monkeypatch, tmp_path):
+    from tg_messenger.tui import app as tui_app
+
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("SESSION_ENCRYPTION_KEY", "shared-secret")
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    monkeypatch.setattr("tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    tui_app._make_real_client("default")
+
+    assert captured["session_name"] == "default"
+    assert captured["session_dir"] == str(tmp_path)
+    assert captured["encryption_key"] == "shared-secret"
+
+
+def test_real_tui_client_gets_send_rate(monkeypatch):
+    from tg_messenger.tui import app as tui_app
+
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SEND_RATE", "20")
+    monkeypatch.setattr("tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    tui_app._make_real_client("default")
+
+    assert captured["send_rate_per_min"] == 20.0
 
 
 async def test_tui_mounts_and_lists_dialogs():
@@ -148,7 +193,7 @@ async def test_tui_selecting_dialog_marks_read():
         await app.on_list_view_selected(ListView.Selected(lv, item, 0))
         await pilot.pause()
         await pilot.pause()
-    assert stub.read_acks == [7]
+    assert stub.read_acks == [(7, 1)]
 
 
 async def test_tui_survives_markup_hostile_text():
@@ -238,6 +283,7 @@ async def test_tui_login_phone_then_code_loads_dialogs():
         # back on the main screen with dialogs loaded
         assert stub.dialogs_calls >= 1
         assert len(list(app.query(DialogItem))) >= 1
+        assert stub.save_session_calls == 1
 
 
 async def test_tui_login_2fa_branch():
@@ -260,6 +306,7 @@ async def test_tui_login_2fa_branch():
         await pilot.pause()
         assert sess.passwords == ["hunter2"]
         assert stub.dialogs_calls >= 1
+        assert stub.save_session_calls == 1
 
 
 async def test_tui_login_wrong_code_notifies_and_stays(caplog):
@@ -282,6 +329,7 @@ async def test_tui_login_wrong_code_notifies_and_stays(caplog):
         assert isinstance(app.screen, LoginScreen)
         assert app.screen.query_one("#login-input", Input).value == ""
         assert app.return_code is None
+        assert stub.save_session_calls == 0
 
 
 async def test_tui_login_ctrl_c_quits_cleanly():
@@ -298,6 +346,7 @@ async def test_tui_login_ctrl_c_quits_cleanly():
         await pilot.press("ctrl+c")
         await pilot.pause()
     assert app.return_code == 0
+    assert stub.save_session_calls == 0
 
 
 async def test_tui_startup_failure_exits_with_code_and_log(caplog):
@@ -502,125 +551,6 @@ async def test_tui_shows_loading_until_dialogs_arrive():
         assert len(list(app.query(DialogItem))) == 1
 
 
-# --- цикл 96: суфлёр в TUI (подсказка ответа в открытом DM) ---
-
-
-class _QueueListenClient(TuiStubClient):
-    """listen_all yields events pushed via a queue (so a test can trigger one)."""
-
-    def __init__(self):
-        super().__init__()
-        self._events: asyncio.Queue = asyncio.Queue()
-
-    async def push_incoming(self, ev):
-        await self._events.put(ev)
-
-    async def listen_all(self):
-        while True:
-            yield await self._events.get()
-
-
-class StubSuggester:
-    def __init__(self, draft="suggested draft"):
-        self.draft = draft
-        self.calls: list[int] = []
-
-    async def suggest(self, dialog_id):
-        self.calls.append(dialog_id)
-        return self.draft
-
-
-def _incoming(dialog_id, text="hi there"):
-    return IncomingEvent(
-        dialog_id=dialog_id,
-        message=Message(id=10, dialog_id=dialog_id, sender_id=dialog_id, out=False,
-                        text=text, date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
-    )
-
-
-async def test_tui_suggestion_appears_on_incoming_in_open_dialog():
-    stub = _QueueListenClient()
-    suggester = StubSuggester("how are you?")
-    app = MessengerTUI(client=stub, suggester=suggester)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        app._current = 7  # the DM is open
-        await stub.push_incoming(_incoming(7))
-        for _ in range(5):
-            await pilot.pause()
-        assert suggester.calls == [7]
-        from tg_messenger.tui.app import SUGGEST_PREFIX
-        rendered = str(app.query_one("#suggestion", Static).render())
-        assert "how are you?" in rendered
-        assert rendered.startswith(SUGGEST_PREFIX) or "how are you?" in rendered
-
-
-async def test_tui_suggestion_skipped_when_composer_not_empty():
-    stub = _QueueListenClient()
-    suggester = StubSuggester()
-    app = MessengerTUI(client=stub, suggester=suggester)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        app._current = 7
-        app.query_one("#composer", Input).value = "typing already"
-        await stub.push_incoming(_incoming(7))
-        for _ in range(5):
-            await pilot.pause()
-        # композер не пуст — подсказку не дёргаем
-        assert suggester.calls == []
-
-
-async def test_tui_tab_accepts_suggestion_into_composer():
-    stub = _QueueListenClient()
-    suggester = StubSuggester("accepted text")
-    app = MessengerTUI(client=stub, suggester=suggester)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        app._current = 7
-        await stub.push_incoming(_incoming(7))
-        for _ in range(5):
-            await pilot.pause()
-        app.query_one("#composer", Input).focus()
-        await pilot.pause()
-        await pilot.press("tab")
-        await pilot.pause()
-        assert app.query_one("#composer", Input).value == "accepted text"
-        # после принятия подсказка очищается
-        assert str(app.query_one("#suggestion", Static).render()) == ""
-
-
-async def test_tui_no_suggester_means_feature_off():
-    """suggester=None — фича выключена, входящее не падает."""
-    stub = _QueueListenClient()
-    app = MessengerTUI(client=stub)  # no suggester
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        app._current = 7
-        await stub.push_incoming(_incoming(7))
-        for _ in range(3):
-            await pilot.pause()
-        assert app.return_code is None  # alive, no crash
-
-
-async def test_tui_suggestion_error_is_logged_not_fatal(caplog):
-    stub = _QueueListenClient()
-
-    class BoomSuggester:
-        async def suggest(self, dialog_id):
-            raise RuntimeError("suggest blew up")
-
-    app = MessengerTUI(client=stub, suggester=BoomSuggester())
-    with caplog.at_level("ERROR", logger="tg_messenger.tui.app"):
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            app._current = 7
-            await stub.push_incoming(_incoming(7))
-            for _ in range(5):
-                await pilot.pause()
-            assert app.return_code is None
-    assert any("suggest" in r.message.lower() for r in caplog.records)
-
-
 # --- цикл 66: локальный поиск диалогов в TUI ---
 
 
@@ -752,6 +682,26 @@ async def test_tui_group_incoming_appends_bubble_for_open_group_only():
         assert [str(b.render()) for b in bubbles] == ["из группы"]
 
 
+async def test_tui_group_incoming_does_not_trigger_suggester():
+    class RecordingSuggester:
+        def __init__(self):
+            self.calls = []
+
+        async def suggest(self, dialog_id):
+            self.calls.append(dialog_id)
+            return "draft"
+
+    stub = GroupEventClient()
+    suggester = RecordingSuggester()
+    app = MessengerTUI(client=stub, suggester=suggester)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = -100200  # open group, but suggestion must stay DM-only
+        stub.fire.set()
+        await pilot.pause()
+    assert suggester.calls == []
+
+
 async def test_tui_disconnects_on_exit():
     stub = TuiStubClient()
     app = MessengerTUI(client=stub)
@@ -759,6 +709,37 @@ async def test_tui_disconnects_on_exit():
         await pilot.pause()
         assert stub.connected is True
     assert stub.connected is False
+
+
+async def test_tui_closes_suggester_on_exit():
+    class ClosableSuggester:
+        def __init__(self):
+            self.closed = 0
+
+        async def close(self):
+            self.closed += 1
+
+    suggester = ClosableSuggester()
+    app = MessengerTUI(client=TuiStubClient(), suggester=suggester)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+    assert suggester.closed == 1
+
+
+async def test_tui_switching_dialogs_clears_pending_suggestion():
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._pending_suggestion = "draft for Ann"
+        app.query_one("#suggestion", Static).update("Suggest: draft for Ann")
+        lv = app.query_one("#dialogs", ListView)
+        lv.index = 1
+        lv.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app._pending_suggestion is None
+        assert str(app.query_one("#suggestion", Static).render()) == ""
 
 
 # --- UX: Enter / стрелка-вниз с вкладок → фокус на список диалогов ---

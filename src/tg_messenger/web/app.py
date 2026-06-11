@@ -2,6 +2,7 @@
 
 ``build_app(client=...)`` injects a client for tests; otherwise a real
 StandaloneTelegramClient is created from env and connected on startup.
+``suggester=...`` optionally enables the human-in-the-loop reply draft endpoint.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
@@ -90,6 +91,9 @@ def _make_real_client(session_name: str):
         api_id=int(os.environ.get("TG_API_ID", "0")),
         api_hash=os.environ.get("TG_API_HASH", ""),
         session_name=session_name,
+        session_dir=os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
+        encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
+        send_rate_per_min=float(os.environ.get("TG_SEND_RATE", "0") or 0),
     )
 
 
@@ -212,12 +216,26 @@ def _tg_login_password_fragment(*, error: str | None = None) -> str:
     )
 
 
+async def _mark_read_best_effort(client, dialog_id: int, max_id: int) -> None:
+    try:
+        await client.mark_read(dialog_id, max_id=max_id)
+    except Exception:
+        logger.warning("mark_read failed for dialog %s — continuing", dialog_id, exc_info=True)
+
+
+def _schedule_mark_read(app: FastAPI, client, dialog_id: int, max_id: int) -> None:
+    task = asyncio.create_task(_mark_read_best_effort(client, dialog_id, max_id))
+    app.state.background_tasks.add(task)
+    task.add_done_callback(app.state.background_tasks.discard)
+
+
 def build_app(
     *, client=None, session_name: str = "default", suggester=None, web_pass: str | None = None,
     login_session=None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        app.state.background_tasks = set()
         app.state.client = client or _make_real_client(session_name)
         # reply suggester (#17) — optional; None disables the /suggest endpoint
         app.state.suggester = suggester
@@ -230,8 +248,21 @@ def build_app(
         else:
             inner = getattr(app.state.client, "_client", app.state.client)
             app.state.login_session = LoginSession(inner)
-        yield
-        await app.state.client.disconnect()
+        try:
+            yield
+        finally:
+            tasks = set(app.state.background_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await app.state.client.disconnect()
+            close_suggester = getattr(app.state.suggester, "close", None)
+            if close_suggester is not None:
+                try:
+                    await close_suggester()
+                except Exception:
+                    logger.warning("suggester close failed", exc_info=True)
 
     app = FastAPI(lifespan=lifespan)
     # per-process random cookie-signing key — restart invalidates every session.
@@ -394,11 +425,9 @@ def build_app(
     async def messages(request: Request, dialog_id: int):
         client = request.app.state.client
         items = await client.history(dialog_id, limit=50)
-        # opening a dialog clears its unread counter — best-effort, never block the read
-        try:
-            await client.mark_read(dialog_id)
-        except Exception:
-            logger.warning("mark_read failed for dialog %s — continuing", dialog_id, exc_info=True)
+        # opening a dialog clears its unread counter, but it must never block rendering history
+        if items:
+            _schedule_mark_read(request.app, client, dialog_id, max(m.id for m in items))
         return HTMLResponse("".join(_message_div(m) for m in items))
 
     @app.post("/send", response_class=HTMLResponse)
@@ -441,7 +470,7 @@ def build_app(
             os.unlink(tmp_path)
         return HTMLResponse(_message_div(msg))
 
-    @app.get("/dialogs/{dialog_id}/suggest", response_class=HTMLResponse)
+    @app.get("/dialogs/{dialog_id}/suggest", response_class=PlainTextResponse)
     async def suggest(request: Request, dialog_id: int):
         # draft a reply for a human to review; the JS in chat.html drops it into
         # the composer input. 503 (not 500) when the feature is unconfigured.
@@ -452,8 +481,14 @@ def build_app(
                 " extra and TG_AGENT_MODEL.</div>",
                 status_code=503,
             )
+        dm_ids = {d.id for d in await request.app.state.client.dialogs()}
+        if dialog_id not in dm_ids:
+            return HTMLResponse(
+                '<div class="error">Suggest is available for DM dialogs only.</div>',
+                status_code=403,
+            )
         draft = await suggester.suggest(dialog_id)
-        return HTMLResponse(escape(draft))
+        return PlainTextResponse(draft)
 
     @app.get("/stream/{dialog_id}")
     async def stream(request: Request, dialog_id: int):
