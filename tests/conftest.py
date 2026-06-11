@@ -202,6 +202,10 @@ class FakeTelethonClient:
         self.code_requests: list[str] = []
         self.requests: list = []  # every raw RPC call (reactions, resend, ...)
         self.resend_requests: list = []
+        # username RPCs: CheckUsernameRequest / UpdateUsernameRequest
+        self.occupied_usernames: set[str] = set()
+        self.invalid_usernames: set[str] = set()
+        self.set_username_to: str | None = None
         self.signed_in_with: list = []
         # network-call counters: the TTL-cache tests assert how often we hit the wire
         self.iter_dialogs_calls = 0
@@ -230,6 +234,24 @@ class FakeTelethonClient:
         # client uses it for SendReactionRequest etc. — record every raw call.
         self.requests.append(request)
         self.resend_requests.append(request)
+        # username RPCs: dispatch by class name (avoid importing telethon types here)
+        cls = type(request).__name__
+        if cls == "CheckUsernameRequest":
+            uname = getattr(request, "username", "")
+            if uname in self.invalid_usernames:
+                from telethon.errors import UsernameInvalidError
+                raise UsernameInvalidError(request=request)
+            return uname not in self.occupied_usernames
+        if cls == "UpdateUsernameRequest":
+            uname = getattr(request, "username", "")
+            if uname in self.invalid_usernames:
+                from telethon.errors import UsernameInvalidError
+                raise UsernameInvalidError(request=request)
+            if uname and uname in self.occupied_usernames:
+                from telethon.errors import UsernameOccupiedError
+                raise UsernameOccupiedError(request=request)
+            self.set_username_to = uname
+            return FakeUser(id=1, first_name="Me", username=uname or None)
         return make_sent_code("Sms", "hash456")
 
     async def sign_in(self, phone=None, code=None, password=None, **kw):
