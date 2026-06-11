@@ -534,8 +534,16 @@ async def test_suggest_endpoint_returns_plain_text_for_markup(suggest_app):
 async def test_suggest_endpoint_negative_id(suggest_app):
     ac, suggester = suggest_app
     r = await ac.get("/dialogs/-100200/suggest")
-    assert r.status_code == 200
-    assert suggester.calls == [-100200]
+    assert r.status_code == 403
+    assert "DM" in r.text
+    assert suggester.calls == []
+
+
+async def test_suggest_endpoint_does_not_send_group_history_to_llm(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.get("/dialogs/-100123/suggest")
+    assert r.status_code == 403
+    assert suggester.calls == []
 
 
 async def test_suggest_endpoint_404_when_no_suggester(client_app):

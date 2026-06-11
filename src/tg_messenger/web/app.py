@@ -216,6 +216,12 @@ def build_app(*, client=None, session_name: str = "default", suggester=None) -> 
                 " extra and TG_AGENT_MODEL.</div>",
                 status_code=503,
             )
+        dm_ids = {d.id for d in await request.app.state.client.dialogs()}
+        if dialog_id not in dm_ids:
+            return HTMLResponse(
+                '<div class="error">Suggest is available for DM dialogs only.</div>',
+                status_code=403,
+            )
         draft = await suggester.suggest(dialog_id)
         return PlainTextResponse(draft)
 
