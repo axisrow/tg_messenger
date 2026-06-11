@@ -113,6 +113,8 @@ def _session_store() -> SessionStore:
 
 
 DEFAULT_MAX_UPLOAD_MB = 50
+# upload streaming chunk: bounds the per-read memory, not the file size
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 def _max_upload_mb() -> int:
@@ -469,23 +471,30 @@ def build_app(
         file: UploadFile = File(...),
         caption: str | None = Form(None),
     ):
-        data = await file.read()
-        if not data:
-            logger.warning("media upload for dialog %s rejected: empty file", dialog_id)
-            return HTMLResponse('<div class="error">Empty file.</div>', status_code=400)
         max_mb = _max_upload_mb()
-        if len(data) > max_mb * 1024 * 1024:
-            logger.warning("media upload for dialog %s rejected: %d bytes > %d MB",
-                           dialog_id, len(data), max_mb)
-            return HTMLResponse(
-                f'<div class="error">File too large (limit {max_mb} MB).</div>',
-                status_code=413,
-            )
+        max_bytes = max_mb * 1024 * 1024
         suffix = Path(file.filename or "").suffix
+        # stream to the temp file in bounded chunks — the whole upload never
+        # sits in memory; reading stops as soon as the limit is crossed
+        size = 0
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(data)
             tmp_path = tmp.name
+            while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
+                size += len(chunk)
+                if size > max_bytes:
+                    break
+                tmp.write(chunk)
         try:
+            if size > max_bytes:
+                logger.warning("media upload for dialog %s rejected: over %d MB",
+                               dialog_id, max_mb)
+                return HTMLResponse(
+                    f'<div class="error">File too large (limit {max_mb} MB).</div>',
+                    status_code=413,
+                )
+            if size == 0:
+                logger.warning("media upload for dialog %s rejected: empty file", dialog_id)
+                return HTMLResponse('<div class="error">Empty file.</div>', status_code=400)
             msg = await request.app.state.client.send_media(dialog_id, tmp_path, caption=caption)
         finally:
             os.unlink(tmp_path)

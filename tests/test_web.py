@@ -361,6 +361,35 @@ async def test_media_upload_over_limit_returns_413(client_app, monkeypatch):
     assert stub.sent == []
 
 
+async def test_media_upload_streams_in_bounded_chunks(client_app, monkeypatch):
+    # лимит должен резать поток ДО того, как файл целиком окажется в памяти:
+    # read() зовётся только ограниченными кусками и прекращается на лимите
+    from starlette.datastructures import UploadFile as StarletteUploadFile
+
+    monkeypatch.setenv("TG_WEB_MAX_UPLOAD_MB", "1")
+    reads: list[int] = []
+    orig_read = StarletteUploadFile.read
+
+    async def spy_read(self, size=-1):
+        reads.append(size)
+        return await orig_read(self, size)
+
+    monkeypatch.setattr(StarletteUploadFile, "read", spy_read)
+    ac, stub = client_app
+    big = b"x" * (3 * 1024 * 1024)  # 3 MiB > 1 MB limit
+    r = await ac.post(
+        "/dialogs/7/media",
+        files={"file": ("big.bin", big, "application/octet-stream")},
+    )
+    assert r.status_code == 413
+    assert stub.sent == []
+    assert reads, "the route must read through UploadFile.read"
+    # ни одного безразмерного read() (он буферизует весь файл в память)
+    assert all(size is not None and 0 < size <= 1024 * 1024 for size in reads)
+    # чтение остановилось на лимите, а не дочитало все 3 MiB
+    assert len(reads) <= 3
+
+
 async def test_media_upload_empty_file_returns_400(client_app):
     ac, stub = client_app
     r = await ac.post(
