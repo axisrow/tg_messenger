@@ -117,6 +117,24 @@ class CodeDelivery(NamedTuple):
     timeout: int | None = None  # seconds until resend is allowed, if Telegram said so
 
 
+_DELIVERY_HINTS = {
+    "app": "Код отправлен в приложение Telegram (проверьте чат «Telegram», отправитель 777000).",
+    "sms": "Код отправлен по SMS.",
+    "call": "Вам поступит звонок с кодом.",
+}
+
+
+def delivery_hint(delivery: CodeDelivery) -> str:
+    """Human-readable 'where the code went' line for the web/TUI login wizards.
+
+    The phone number is never part of this text — only the delivery channel.
+    """
+    msg = _DELIVERY_HINTS.get(delivery.kind, "Код отправлен — проверьте Telegram и SMS.")
+    if delivery.next_kind:
+        msg += f" Нет кода? Можно отправить повторно (канал: {delivery.next_kind})."
+    return msg
+
+
 def _kind_of(type_obj) -> str:
     name = type(type_obj).__name__.lower()
     for kind in ("app", "sms", "call"):
@@ -194,3 +212,77 @@ class LoginFlow:
         if self._phone is None:
             raise RuntimeError("send_code must be called before check_password")
         return await self._client.sign_in(password=password)
+
+
+class LoginError(Exception):
+    """A user-correctable login problem (wrong code / wrong 2FA password).
+
+    Carries a short, human-readable message; raising it does NOT advance the
+    LoginSession state machine, so the same step can simply be retried.
+    """
+
+
+class LoginSession:
+    """State machine wrapping ``LoginFlow`` for the web/TUI login wizards.
+
+    States: ``phone`` → ``code`` → (``password`` if 2FA) → ``done``. The whole
+    flow runs over ONE connected client (``phone_code_hash`` binds to it, see
+    LoginFlow) — steps must never be split across connections. Phone numbers and
+    codes are never logged. User-correctable errors (bad code / bad password)
+    raise :class:`LoginError` and leave the state untouched so the step can be
+    retried; calling a step out of order raises ``RuntimeError``.
+    """
+
+    def __init__(self, client_or_flow):
+        # accept either a raw Telethon client or a ready LoginFlow
+        if isinstance(client_or_flow, LoginFlow):
+            self._flow = client_or_flow
+        else:
+            self._flow = LoginFlow(client_or_flow)
+        self._state = "phone"
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    async def submit_phone(self, phone: str) -> CodeDelivery:
+        delivery = await self._flow.send_code(phone)
+        self._state = "code"
+        return delivery
+
+    async def resend(self) -> CodeDelivery:
+        if self._state not in ("code", "password"):
+            raise RuntimeError("submit_phone must be called before resend")
+        return await self._flow.resend_code()
+
+    async def submit_code(self, code: str) -> None:
+        from telethon.errors import (
+            PhoneCodeEmptyError,
+            PhoneCodeExpiredError,
+            PhoneCodeInvalidError,
+            SessionPasswordNeededError,
+        )
+
+        if self._state != "code":
+            raise RuntimeError("submit_phone must be called before submit_code")
+        try:
+            await self._flow.sign_in(code=code)
+        except SessionPasswordNeededError:
+            self._state = "password"
+            return
+        except (PhoneCodeInvalidError, PhoneCodeEmptyError) as exc:
+            raise LoginError("Wrong code — try again.") from exc
+        except PhoneCodeExpiredError as exc:
+            raise LoginError("Code expired — request a new one.") from exc
+        self._state = "done"
+
+    async def submit_password(self, password: str) -> None:
+        from telethon.errors import PasswordHashInvalidError
+
+        if self._state != "password":
+            raise RuntimeError("submit_code must reach the 2FA step before submit_password")
+        try:
+            await self._flow.check_password(password)
+        except PasswordHashInvalidError as exc:
+            raise LoginError("Wrong 2FA password — try again.") from exc
+        self._state = "done"

@@ -42,6 +42,7 @@ class TuiStubClient:
         self.connected = False
         self.authorized = True
         self.dialogs_calls = 0
+        self.save_session_calls = 0
 
     async def connect(self):
         self.connected = True
@@ -51,6 +52,9 @@ class TuiStubClient:
 
     async def is_authorized(self):
         return self.authorized
+
+    def save_session(self):
+        self.save_session_calls += 1
 
     async def dialogs(self, dm_only=True):
         self.dialogs_calls += 1
@@ -204,15 +208,145 @@ async def test_tui_survives_markup_hostile_text():
         assert len(bubbles) == 1
 
 
-async def test_tui_exits_with_hint_when_not_logged_in():
+# --- циклы 133-134: TUI-экран логина (телефон→код→2FA) ---
+
+
+class FakeTuiLoginSession:
+    """LoginSession stand-in for the TUI login screen."""
+
+    def __init__(self, *, needs_2fa=False, wrong_code=False):
+        from tg_messenger.core.auth import CodeDelivery
+
+        self.state = "phone"
+        self.phones = []
+        self.codes = []
+        self.passwords = []
+        self._needs_2fa = needs_2fa
+        self._wrong_code = wrong_code
+        self._delivery = CodeDelivery(kind="app", next_kind="sms")
+
+    async def submit_phone(self, phone):
+        self.phones.append(phone)
+        self.state = "code"
+        return self._delivery
+
+    async def submit_code(self, code):
+        from tg_messenger.core.auth import LoginError
+
+        self.codes.append(code)
+        if self._wrong_code:
+            raise LoginError("Wrong code — try again.")
+        if self._needs_2fa:
+            self.state = "password"
+            return
+        self.state = "done"
+
+    async def submit_password(self, password):
+        self.passwords.append(password)
+        self.state = "done"
+
+    async def resend(self):
+        return self._delivery
+
+
+async def test_tui_shows_login_screen_when_not_logged_in():
+    from tg_messenger.tui.app import LoginScreen
+
     stub = TuiStubClient()
     stub.authorized = False
-    app = MessengerTUI(client=stub)
+    sess = FakeTuiLoginSession()
+    app = MessengerTUI(client=stub, login_session=sess)
     async with app.run_test() as pilot:
         await pilot.pause()
-    assert app.return_code == 1
-    assert stub.dialogs_calls == 0  # dialogs were never requested
-    assert stub.connected is False
+        assert isinstance(app.screen, LoginScreen)
+        assert app.return_code is None  # not exited — login screen is shown instead
+
+
+async def test_tui_login_phone_then_code_loads_dialogs():
+    stub = TuiStubClient()
+    stub.authorized = False
+    sess = FakeTuiLoginSession()
+    app = MessengerTUI(client=stub, login_session=sess)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # phone step
+        app.screen.query_one("#login-input", Input).value = "+10000000000"
+        await pilot.press("enter")
+        await pilot.pause()
+        # code step
+        app.screen.query_one("#login-input", Input).value = "12345"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+        assert sess.phones == ["+10000000000"]
+        assert sess.codes == ["12345"]
+        # back on the main screen with dialogs loaded
+        assert stub.dialogs_calls >= 1
+        assert len(list(app.query(DialogItem))) >= 1
+        assert stub.save_session_calls == 1
+
+
+async def test_tui_login_2fa_branch():
+    stub = TuiStubClient()
+    stub.authorized = False
+    sess = FakeTuiLoginSession(needs_2fa=True)
+    app = MessengerTUI(client=stub, login_session=sess)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.query_one("#login-input", Input).value = "+10000000000"
+        await pilot.press("enter")
+        await pilot.pause()
+        app.screen.query_one("#login-input", Input).value = "12345"
+        await pilot.press("enter")
+        await pilot.pause()
+        # now on the password step
+        app.screen.query_one("#login-input", Input).value = "hunter2"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+        assert sess.passwords == ["hunter2"]
+        assert stub.dialogs_calls >= 1
+        assert stub.save_session_calls == 1
+
+
+async def test_tui_login_wrong_code_notifies_and_stays(caplog):
+    from tg_messenger.tui.app import LoginScreen
+
+    stub = TuiStubClient()
+    stub.authorized = False
+    sess = FakeTuiLoginSession(wrong_code=True)
+    app = MessengerTUI(client=stub, login_session=sess)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.query_one("#login-input", Input).value = "+10000000000"
+        await pilot.press("enter")
+        await pilot.pause()
+        app.screen.query_one("#login-input", Input).value = "000"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+        # still on the login screen, input cleared, app alive
+        assert isinstance(app.screen, LoginScreen)
+        assert app.screen.query_one("#login-input", Input).value == ""
+        assert app.return_code is None
+        assert stub.save_session_calls == 0
+
+
+async def test_tui_login_ctrl_c_quits_cleanly():
+    stub = TuiStubClient()
+    stub.authorized = False
+    sess = FakeTuiLoginSession()
+    app = MessengerTUI(client=stub, login_session=sess)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.query_one("#login-input", Input).value = "+10000000000"
+        await pilot.press("enter")
+        await pilot.pause()
+        # Ctrl+C on the code step exits cleanly
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+    assert app.return_code == 0
+    assert stub.save_session_calls == 0
 
 
 async def test_tui_startup_failure_exits_with_code_and_log(caplog):

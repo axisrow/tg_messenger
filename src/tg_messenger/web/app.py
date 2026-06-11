@@ -25,7 +25,13 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse,
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
-from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT, SessionStore
+from tg_messenger.core.auth import (
+    DEFAULT_SESSION_DIR,
+    LoginError,
+    LoginSession,
+    SessionStore,
+    delivery_hint,
+)
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.search import filter_dialogs
 
@@ -176,6 +182,60 @@ async def sse_event_stream(client, dialog_id: int):
         return
 
 
+def _tg_login_phone_fragment(*, error: str) -> str:
+    """HTMX fragment: re-render the phone step with an error (e.g. invalid number)."""
+    return (
+        '<div id="card">'
+        "<h1>Вход в Telegram</h1>"
+        f'<div class="error">{escape(error)}</div>'
+        '<form hx-post="/tg-login/phone" hx-target="#card" hx-swap="outerHTML">'
+        '<label for="phone">Phone</label>'
+        '<input id="phone" type="tel" name="phone" autofocus>'
+        '<button type="submit">Отправить код</button>'
+        "</form>"
+        "</div>"
+    )
+
+
+def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
+    """HTMX fragment: the code-entry step of the /tg-login wizard."""
+    hint = escape(delivery_hint(delivery)) if delivery is not None else ""
+    err = f'<div class="error">{escape(error)}</div>' if error else ""
+    return (
+        '<div id="card">'
+        "<h1>Введите код</h1>"
+        f'<p class="hint">{hint}</p>'
+        f"{err}"
+        '<form hx-post="/tg-login/code" hx-target="#card" hx-swap="outerHTML">'
+        '<label for="code">Code</label>'
+        '<input id="code" type="text" name="code" autofocus inputmode="numeric" '
+        'autocomplete="one-time-code">'
+        '<button type="submit">Войти</button>'
+        "</form>"
+        '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
+        '<button type="submit">Отправить код повторно</button>'
+        "</form>"
+        "</div>"
+    )
+
+
+def _tg_login_password_fragment(*, error: str | None = None) -> str:
+    """HTMX fragment: the 2FA-password step of the /tg-login wizard."""
+    err = f'<div class="error">{escape(error)}</div>' if error else ""
+    return (
+        '<div id="card">'
+        "<h1>Пароль 2FA</h1>"
+        f"{err}"
+        '<form hx-post="/tg-login/password" hx-target="#card" hx-swap="outerHTML">'
+        '<label for="password">2FA password</label>'
+        '<input id="password" type="password" name="password" autofocus '
+        'autocomplete="current-password">'
+        '<button type="submit">Войти</button>'
+        "</form>"
+        "</div>"
+    )
+
+
 async def _mark_read_best_effort(client, dialog_id: int, max_id: int) -> None:
     try:
         await client.mark_read(dialog_id, max_id=max_id)
@@ -190,7 +250,8 @@ def _schedule_mark_read(app: FastAPI, client, dialog_id: int, max_id: int) -> No
 
 
 def build_app(
-    *, client=None, session_name: str = "default", suggester=None, web_pass: str | None = None
+    *, client=None, session_name: str = "default", suggester=None, web_pass: str | None = None,
+    login_session=None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -199,6 +260,14 @@ def build_app(
         # reply suggester (#17) — optional; None disables the /suggest endpoint
         app.state.suggester = suggester
         await app.state.client.connect()
+        # one login wizard state machine per process, bound to the lifespan client
+        # (phone_code_hash binds to that single connection — see core.LoginSession).
+        # A test seam may inject a fake; otherwise build over the inner Telethon client.
+        if login_session is not None:
+            app.state.login_session = login_session
+        else:
+            inner = getattr(app.state.client, "_client", app.state.client)
+            app.state.login_session = LoginSession(inner)
         try:
             yield
         finally:
@@ -266,7 +335,68 @@ def build_app(
 
     @app.exception_handler(UnauthorizedError)
     async def unauthorized(request: Request, exc: UnauthorizedError):
-        return HTMLResponse(f'<div class="error">{LOGIN_HINT}</div>', status_code=401)
+        # The Telegram session isn't logged in — send the user to the login wizard
+        # instead of the old dead-end 401 fragment (#26). HTMX swap targets follow
+        # the redirect to the wizard's phone form.
+        logger.info("unauthorized Telegram session — redirecting to /tg-login")
+        return RedirectResponse("/tg-login", status_code=302)
+
+    @app.get("/tg-login", response_class=HTMLResponse)
+    async def tg_login_form(request: Request):
+        return TEMPLATES.TemplateResponse(request, "tg_login.html", {})
+
+    @app.post("/tg-login/phone", response_class=HTMLResponse)
+    async def tg_login_phone(request: Request, phone: str = Form("")):
+        session = request.app.state.login_session
+        # the phone number itself never reaches a log line
+        try:
+            delivery = await session.submit_phone(phone.strip())
+        except LoginError as exc:
+            # invalid/refused phone: re-render the phone step with the message (not a 500)
+            return HTMLResponse(_tg_login_phone_fragment(error=str(exc)))
+        return HTMLResponse(_tg_login_code_fragment(delivery))
+
+    @app.post("/tg-login/resend", response_class=HTMLResponse)
+    async def tg_login_resend(request: Request):
+        session = request.app.state.login_session
+        try:
+            delivery = await session.resend()
+        except LoginError as exc:
+            return HTMLResponse(_tg_login_code_fragment(error=str(exc)))
+        return HTMLResponse(_tg_login_code_fragment(delivery))
+
+    @app.post("/tg-login/code", response_class=HTMLResponse)
+    async def tg_login_code(request: Request, code: str = Form("")):
+        session = request.app.state.login_session
+        try:
+            await session.submit_code(code.strip())
+        except LoginError as exc:
+            # wrong/expired code: re-render the code step with the message (not a 500)
+            return HTMLResponse(_tg_login_code_fragment(error=str(exc)))
+        if session.state == "password":
+            return HTMLResponse(_tg_login_password_fragment())
+        _save_after_login(request)
+        return RedirectResponse("/", status_code=302)
+
+    @app.post("/tg-login/password", response_class=HTMLResponse)
+    async def tg_login_password(request: Request, password: str = Form("")):
+        session = request.app.state.login_session
+        try:
+            await session.submit_password(password)
+        except LoginError as exc:
+            return HTMLResponse(_tg_login_password_fragment(error=str(exc)))
+        _save_after_login(request)
+        return RedirectResponse("/", status_code=302)
+
+    def _save_after_login(request: Request) -> None:
+        # persist the freshly-authorized session; best-effort, logged, never 500s the redirect
+        save = getattr(request.app.state.client, "save_session", None)
+        if save is None:
+            return
+        try:
+            save()
+        except Exception:
+            logger.exception("save_session after web login failed")
 
     @app.exception_handler(HandledFloodWaitError)
     async def flood_wait(request: Request, exc: HandledFloodWaitError):
