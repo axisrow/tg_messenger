@@ -505,6 +505,21 @@ async def test_tui_disconnects_on_exit():
     assert stub.connected is False
 
 
+async def test_tui_closes_suggester_on_exit():
+    class ClosableSuggester:
+        def __init__(self):
+            self.closed = 0
+
+        async def close(self):
+            self.closed += 1
+
+    suggester = ClosableSuggester()
+    app = MessengerTUI(client=TuiStubClient(), suggester=suggester)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+    assert suggester.closed == 1
+
+
 # --- UX: Enter / стрелка-вниз с вкладок → фокус на список диалогов ---
 
 

@@ -150,6 +150,11 @@ class _StorageBackedSuggester:
         await self._ensure_connected()
         return await self._suggester.learn(dialog_id)
 
+    async def close(self) -> None:
+        if self._connected:
+            await self._storage.close()
+            self._connected = False
+
 
 def make_optional_suggester(client, *, session: str = "default"):
     """Best-effort production suggester for web/TUI.

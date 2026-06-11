@@ -213,6 +213,12 @@ class MessengerTUI(App):
     async def on_unmount(self) -> None:
         if self._client is not None:
             await self._client.disconnect()
+        close_suggester = getattr(self._suggester, "close", None)
+        if close_suggester is not None:
+            try:
+                await close_suggester()
+            except Exception:
+                logger.warning("suggester close failed", exc_info=True)
 
     async def _load_dialogs(self) -> None:
         if self._tab == "groups":

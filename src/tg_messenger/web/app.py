@@ -17,7 +17,7 @@ from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
@@ -112,6 +112,12 @@ def build_app(*, client=None, session_name: str = "default", suggester=None) -> 
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await app.state.client.disconnect()
+            close_suggester = getattr(app.state.suggester, "close", None)
+            if close_suggester is not None:
+                try:
+                    await close_suggester()
+                except Exception:
+                    logger.warning("suggester close failed", exc_info=True)
 
     app = FastAPI(lifespan=lifespan)
 
@@ -199,7 +205,7 @@ def build_app(*, client=None, session_name: str = "default", suggester=None) -> 
             os.unlink(tmp_path)
         return HTMLResponse(_message_div(msg))
 
-    @app.get("/dialogs/{dialog_id}/suggest", response_class=HTMLResponse)
+    @app.get("/dialogs/{dialog_id}/suggest", response_class=PlainTextResponse)
     async def suggest(request: Request, dialog_id: int):
         # draft a reply for a human to review; the JS in chat.html drops it into
         # the composer input. 503 (not 500) when the feature is unconfigured.
@@ -211,7 +217,7 @@ def build_app(*, client=None, session_name: str = "default", suggester=None) -> 
                 status_code=503,
             )
         draft = await suggester.suggest(dialog_id)
-        return HTMLResponse(draft)
+        return PlainTextResponse(draft)
 
     @app.get("/stream/{dialog_id}")
     async def stream(request: Request, dialog_id: int):

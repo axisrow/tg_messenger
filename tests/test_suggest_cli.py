@@ -51,6 +51,7 @@ class StubSuggester:
 class StubStorage:
     def __init__(self):
         self.connected = 0
+        self.closed = 0
         self.migrations = []
 
     def register_migrations(self, statements):
@@ -60,7 +61,7 @@ class StubStorage:
         self.connected += 1
 
     async def close(self):
-        pass
+        self.closed += 1
 
 
 @pytest.fixture
@@ -138,6 +139,9 @@ async def test_make_optional_suggester_wires_profile_storage(monkeypatch):
     assert await suggester.suggest(43) == "draft text"
     assert storage.connected == 1
     assert inner.suggested == [42, 43]
+
+    await suggester.close()
+    assert storage.closed == 1
 
 
 def test_suggest_listed_in_help(suggest_cli):
