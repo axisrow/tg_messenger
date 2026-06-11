@@ -188,6 +188,8 @@ def _import_session(session: str) -> None:
         raw = click.prompt("Paste StringSession", hide_input=True).strip()
     else:
         raw = click.get_text_stream("stdin").read().strip()
+    if not raw:
+        raise click.ClickException("invalid StringSession")
     try:
         # validate before touching the client so garbage is rejected up front
         validate_session_string(raw)

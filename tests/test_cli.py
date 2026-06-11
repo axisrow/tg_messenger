@@ -704,6 +704,20 @@ def test_login_import_session_rejects_garbage(monkeypatch):
     assert saved == []
 
 
+def test_login_import_session_rejects_empty_input(monkeypatch):
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=" \n")
+    assert result.exit_code != 0
+    assert "invalid StringSession" in result.output
+    assert saved == []
+
+
 def test_login_import_session_replaces_unreadable_existing_file(monkeypatch, session_dir):
     from tg_messenger.core.auth import SessionStore
 
