@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import OrderedDict, defaultdict, deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -171,7 +171,7 @@ class GhostwriteEngine:
         self._own_cache_size = own_cache_size
         self._max_rate_dialogs = max_rate_dialogs
         self._enabled_dialogs: set[int] | None = None
-        self._sending: defaultdict[int, list[str]] = defaultdict(list)
+        self._sending: dict[int, list[OutgoingEvent]] = {}
         # dialog_id -> sliding window of recent auto-reply times (bounded)
         self._rate: OrderedDict[int, deque[float]] = OrderedDict()
         # (dialog_id, message_id) we sent ourselves — recognise our own outgoing echo.
@@ -277,20 +277,21 @@ class GhostwriteEngine:
                         dialog_id, message.id, reply)
             await self._journal(dialog_id, message.id, reply, dry_run=True)
             return
+        sent_id = None
+        pending_events: list[OutgoingEvent] = []
         try:
-            self._sending[int(dialog_id)].append(reply)
+            self._sending[int(dialog_id)] = pending_events
             try:
                 sent = await self._client.send_text(dialog_id, reply)
-                self._remember_own(dialog_id, getattr(sent, "id", None))
+                sent_id = getattr(sent, "id", None)
+                self._remember_own(dialog_id, sent_id)
             finally:
-                pending = self._sending.get(int(dialog_id), [])
-                if reply in pending:
-                    pending.remove(reply)
-                if not pending:
-                    self._sending.pop(int(dialog_id), None)
+                self._sending.pop(int(dialog_id), None)
         except Exception:
             logger.exception("ghostwrite failed to send reply in dialog %s", dialog_id)
+            await self._handle_deferred_outgoing(pending_events, own_message_id=sent_id)
             return
+        await self._handle_deferred_outgoing(pending_events, own_message_id=sent_id)
         await self._journal(dialog_id, message.id, reply, dry_run=False)
 
     def _remember_own(self, dialog_id: int, message_id) -> None:
@@ -312,11 +313,30 @@ class GhostwriteEngine:
         dialog_id = event.dialog_id
         message = event.message
         key = (int(dialog_id), int(message.id))
-        pending_sends = self._sending.get(int(dialog_id), [])
-        if message.text in pending_sends:
-            return  # our own in-flight send — not a human
+        pending_events = self._sending.get(int(dialog_id))
+        if pending_events is not None:
+            pending_events.append(event)
+            return  # decide once send_text returns with the real message id
         if self._own_sent.pop(key, None) is not None:
             return  # our own reply — not a human
+        await self._pause_for_human_outgoing(event)
+
+    async def _handle_deferred_outgoing(
+        self, events: list[OutgoingEvent], *, own_message_id
+    ) -> None:
+        for event in events:
+            if own_message_id is not None and int(event.message.id) == int(own_message_id):
+                continue
+            try:
+                await self._pause_for_human_outgoing(event)
+            except Exception:
+                logger.exception(
+                    "ghostwrite failed to handle deferred outgoing message in dialog %s",
+                    getattr(event, "dialog_id", "?"),
+                )
+
+    async def _pause_for_human_outgoing(self, event: OutgoingEvent) -> None:
+        dialog_id = event.dialog_id
         if not await self._is_enabled_dialog(dialog_id):
             return  # not a ghostwrite dialog — nothing to pause
         now = self._clock()

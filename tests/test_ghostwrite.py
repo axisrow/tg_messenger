@@ -449,6 +449,39 @@ async def test_inflight_human_message_still_pauses(tmp_path):
         await storage.close()
 
 
+async def test_inflight_same_text_human_message_still_pauses(tmp_path):
+    class SameTextHumanBeforeAckClient(FakeGwClient):
+        def __init__(self):
+            super().__init__()
+            self.engine: GhostwriteEngine | None = None
+
+        async def send_text(self, peer, text, reply_to=None):
+            assert self.engine is not None
+            await self.engine.on_outgoing(
+                OutgoingEvent(
+                    dialog_id=peer,
+                    message=_omsg(text=text, dialog_id=peer, msg_id=888),
+                )
+            )
+            return await super().send_text(peer, text, reply_to=reply_to)
+
+    storage = Storage(tmp_path / "gw.db")
+    register_ghostwrite_migrations(storage)
+    client = SameTextHumanBeforeAckClient()
+    t = {"now": 0.0}
+    engine = GhostwriteEngine(
+        client, FakeSuggester(), storage, enforce=True, clock=lambda: t["now"],
+    )
+    client.engine = engine
+    await storage.connect()
+    try:
+        await enable_dialog(storage, DIALOG)
+        await engine.process_incoming(_imsg())
+        assert await is_active(storage, DIALOG, now=0.0) is False
+    finally:
+        await storage.close()
+
+
 async def test_outgoing_in_non_ghostwrite_dialog_ignored(tmp_path):
     engine, client, suggester, storage, t = _mk_engine(tmp_path, enforce=True)
     await storage.connect()
