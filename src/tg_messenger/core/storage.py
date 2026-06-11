@@ -5,15 +5,16 @@ and is serialised by an ``asyncio.Lock`` (one connection, ``check_same_thread=Fa
 so concurrent ``gather`` callers neither race nor deadlock. WAL mode, foreign keys on.
 
 Consumers (moderator #16, suggester #17, heartbeat #19) register their own tables as
-**migrations** (versioned by ``PRAGMA user_version``, applied in order inside one
-transaction — a failing batch rolls back and the version does not advance). A ``kv``
-table with JSON values covers small odds and ends. The TTL read cache does NOT live
-here — that stays in-memory (#8); ``client.py`` does not depend on this module.
+**migrations** (tracked by stable statement ids and applied inside one transaction —
+a failing batch rolls back and migration metadata does not advance). A ``kv`` table
+with JSON values covers small odds and ends. The TTL read cache does NOT live here —
+that stays in-memory (#8); ``client.py`` does not depend on this module.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -22,6 +23,10 @@ from tg_messenger.core.names import sanitize_profile_name
 
 # the kv table is always present; consumer migrations start applying on top of it
 _KV_MIGRATION = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+_SCHEMA_MIGRATIONS = (
+    "CREATE TABLE IF NOT EXISTS _tg_messenger_migrations "
+    "(id TEXT PRIMARY KEY, statement TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+)
 
 DEFAULT_DB_DIR = Path.home() / ".tg_messenger"
 
@@ -56,9 +61,10 @@ class Storage:
         return conn
 
     async def close(self) -> None:
-        if self._conn is not None:
-            conn, self._conn = self._conn, None
-            await asyncio.to_thread(conn.close)
+        async with self._lock:
+            if self._conn is not None:
+                conn, self._conn = self._conn, None
+                await asyncio.to_thread(conn.close)
 
     async def __aenter__(self) -> "Storage":
         await self.connect()
@@ -73,10 +79,10 @@ class Storage:
         return self._conn
 
     async def _apply_pending_migrations(self) -> None:
-        """Apply kv + every registered migration past ``user_version``, in one transaction.
+        """Apply kv + every unapplied registered migration in one transaction.
 
-        A failure rolls the whole batch back and leaves ``user_version`` unchanged, so a
-        broken migration never half-applies.
+        A failure rolls the whole batch back and leaves migration metadata unchanged, so
+        a broken migration never half-applies.
         """
         async with self._lock:
             await asyncio.to_thread(self._migrate_sync)
@@ -84,23 +90,42 @@ class Storage:
     def _migrate_sync(self) -> None:
         conn = self._require_conn()
         # kv always exists and is NOT versioned (idempotent CREATE IF NOT EXISTS);
-        # user_version counts only consumer-registered migrations (1..N).
+        # user_version mirrors the applied migration count for easy inspection.
         conn.execute(_KV_MIGRATION)
+        conn.execute(_SCHEMA_MIGRATIONS)
         conn.commit()
-        current = conn.execute("PRAGMA user_version").fetchone()[0]
-        target = len(self._migrations)
-        if current >= target:
+        applied = {
+            row[0]
+            for row in conn.execute("SELECT id FROM _tg_messenger_migrations").fetchall()
+        }
+        pending: list[tuple[str, str]] = []
+        seen = set(applied)
+        for statement in self._migrations:
+            migration_id = self._migration_id(statement)
+            if migration_id in seen:
+                continue
+            seen.add(migration_id)
+            pending.append((migration_id, statement))
+        if not pending:
             return
         try:
             conn.execute("BEGIN")
-            for i in range(current, target):
-                conn.execute(self._migrations[i])
+            for migration_id, statement in pending:
+                conn.execute(statement)
+                conn.execute(
+                    "INSERT INTO _tg_messenger_migrations (id, statement) VALUES (?, ?)",
+                    (migration_id, statement),
+                )
             # user_version can't be parameterised — target is our own int, not user input
-            conn.execute(f"PRAGMA user_version = {target}")
+            conn.execute(f"PRAGMA user_version = {len(seen)}")
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+
+    @staticmethod
+    def _migration_id(statement: str) -> str:
+        return hashlib.sha256(statement.encode("utf-8")).hexdigest()
 
     async def user_version(self) -> int:
         async with self._lock:
