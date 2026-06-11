@@ -35,6 +35,7 @@ class StubWorker:
         self.client = client
         self.factory = factory
         self.types = types
+        self.agent = agent
         self.runs = 0
         self.interrupt = False
         StubWorker.last = self
@@ -120,6 +121,49 @@ def test_worker_missing_extra_gives_pip_hint(monkeypatch, tmp_path):
     assert result.exit_code != 0
     assert "tg-messenger[interop]" in result.output
     assert "Traceback" not in result.output
+
+
+def test_worker_passes_agent_to_worker(monkeypatch, tmp_path):
+    # prompt-задачи фабрики должны уметь работать из продакшн-CLI: команда
+    # строит agent через seam make_worker_agent и передаёт его в Worker
+    _setup(monkeypatch, tmp_path)
+    sentinel = object()
+    monkeypatch.setattr(cli_main, "make_worker_agent", lambda client: sentinel)
+    result = CliRunner().invoke(cli_main.cli, ["worker", "--factory-url", "http://f"])
+    assert result.exit_code == 0, result.output
+    assert StubWorker.last.agent is sentinel
+
+
+def test_make_worker_agent_none_without_extra(monkeypatch):
+    # [agent] не установлен → None (prompt-задачи фейлятся с понятным текстом)
+    monkeypatch.setitem(sys.modules, "tg_messenger.agent.factory", None)
+    assert cli_main.make_worker_agent(StubClient()) is None
+
+
+def test_make_worker_agent_none_when_unconfigured(monkeypatch):
+    # extra есть, но TG_AGENT_MODEL не задан → None, без падения команды
+    import types as _types
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tg_messenger.agent.factory",
+        _types.SimpleNamespace(build_orchestrator=lambda client, cfg: object()),
+    )
+    monkeypatch.delenv("TG_AGENT_MODEL", raising=False)
+    assert cli_main.make_worker_agent(StubClient()) is None
+
+
+def test_make_worker_agent_builds_orchestrator(monkeypatch):
+    import types as _types
+
+    sentinel = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "tg_messenger.agent.factory",
+        _types.SimpleNamespace(build_orchestrator=lambda client, cfg: sentinel),
+    )
+    monkeypatch.setenv("TG_AGENT_MODEL", "openai:gpt-test")
+    assert cli_main.make_worker_agent(StubClient()) is sentinel
 
 
 def test_worker_listed_in_help(monkeypatch, tmp_path):

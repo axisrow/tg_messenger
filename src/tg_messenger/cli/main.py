@@ -104,6 +104,28 @@ async def _ensure_dm_dialog(client, dialog_id: int) -> None:
         raise click.ClickException("suggest is available for DM dialogs only.")
 
 
+def make_worker_agent(client):
+    """Optional agent for the worker's prompt tasks; the seam worker tests patch.
+
+    Best-effort: without the [agent] extra or TG_AGENT_MODEL it returns None
+    (the worker then fails prompt tasks with a clear message) — the worker's
+    fetch/dm_reply tasks must keep working on a plain [interop] install.
+    """
+    try:
+        from tg_messenger.agent.factory import build_orchestrator
+    except ImportError:
+        logger.info("worker: [agent] extra not installed — prompt tasks disabled")
+        return None
+    from tg_messenger.agent.config import AgentConfig
+
+    try:
+        cfg = AgentConfig.from_env(require_allowlist=False)
+        return build_orchestrator(client, cfg)
+    except ValueError as exc:
+        logger.info("worker: agent not configured (%s) — prompt tasks disabled", exc)
+        return None
+
+
 def make_agent_runner(client, *, notify_errors: bool = False):
     """Build the AI agent runner; the second seam tests patch (next to ``make_client``)."""
     try:
@@ -945,12 +967,14 @@ def worker(ctx: click.Context, session: str, factory_url: str | None, types: str
         await client.connect()
         try:
             await _ensure_authorized(client, session)
+            agent = make_worker_agent(client)
             click.echo(
                 f"Worker polling {factory_url} for {', '.join(task_types)} "
-                "(Ctrl+C to stop)..."
+                f"(prompt tasks {'on' if agent is not None else 'off'}; Ctrl+C to stop)..."
             )
             await Worker(
-                client, factory, types=task_types, sleep=_sleep, idle_sleep=interval
+                client, factory, types=task_types, sleep=_sleep, idle_sleep=interval,
+                agent=agent,
             ).run()
         finally:
             await client.disconnect()
