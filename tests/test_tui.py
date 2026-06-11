@@ -496,6 +496,26 @@ async def test_tui_group_incoming_appends_bubble_for_open_group_only():
         assert [str(b.render()) for b in bubbles] == ["из группы"]
 
 
+async def test_tui_group_incoming_does_not_trigger_suggester():
+    class RecordingSuggester:
+        def __init__(self):
+            self.calls = []
+
+        async def suggest(self, dialog_id):
+            self.calls.append(dialog_id)
+            return "draft"
+
+    stub = GroupEventClient()
+    suggester = RecordingSuggester()
+    app = MessengerTUI(client=stub, suggester=suggester)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = -100200  # open group, but suggestion must stay DM-only
+        stub.fire.set()
+        await pilot.pause()
+    assert suggester.calls == []
+
+
 async def test_tui_disconnects_on_exit():
     stub = TuiStubClient()
     app = MessengerTUI(client=stub)
@@ -518,6 +538,22 @@ async def test_tui_closes_suggester_on_exit():
     async with app.run_test() as pilot:
         await pilot.pause()
     assert suggester.closed == 1
+
+
+async def test_tui_switching_dialogs_clears_pending_suggestion():
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._pending_suggestion = "draft for Ann"
+        app.query_one("#suggestion", Static).update("Suggest: draft for Ann")
+        lv = app.query_one("#dialogs", ListView)
+        lv.index = 1
+        lv.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app._pending_suggestion is None
+        assert str(app.query_one("#suggestion", Static).render()) == ""
 
 
 # --- UX: Enter / стрелка-вниз с вкладок → фокус на список диалогов ---

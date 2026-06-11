@@ -115,11 +115,12 @@ class DialogListView(ListView):
 
 
 class DialogItem(ListItem):
-    def __init__(self, dialog_id: int, title: str, unread: int = 0):
+    def __init__(self, dialog_id: int, title: str, unread: int = 0, kind: str = "dm"):
         # markup=False: titles/messages are untrusted text, [brackets] must render literally
         badge = f" ({unread})" if unread else ""
         super().__init__(Static(f"{dialog_id} — {title}{badge}", markup=False))
         self.dialog_id = dialog_id
+        self.kind = kind
 
 
 class MessageBubble(Static):
@@ -240,7 +241,7 @@ class MessengerTUI(App):
         query = self.query_one("#search", Input).value
         await lv.clear()
         for d in filter_dialogs(self._all_dialogs, query):
-            await lv.append(DialogItem(d.id, d.title, d.unread))
+            await lv.append(DialogItem(d.id, d.title, d.unread, d.kind))
 
     async def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         # Tabs fires this once at mount, before the client exists — _started gates it.
@@ -267,6 +268,7 @@ class MessengerTUI(App):
         item = event.item
         if isinstance(item, DialogItem):
             self._current = item.dialog_id
+            self._clear_suggestion()
             # exclusive group: selecting another dialog cancels a still-loading history
             self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
 
@@ -352,9 +354,14 @@ class MessengerTUI(App):
         """
         if self._suggester is None:
             return
+        if not self._is_dm_dialog(dialog_id):
+            return
         if self.query_one("#composer", Input).value:
             return  # don't suggest over a draft the user is writing
         self.run_worker(self._suggest(dialog_id), group="suggest", exclusive=True)
+
+    def _is_dm_dialog(self, dialog_id: int) -> bool:
+        return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
 
     async def _suggest(self, dialog_id: int) -> None:
         try:
