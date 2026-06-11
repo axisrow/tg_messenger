@@ -671,6 +671,24 @@ def test_login_import_session_saves_valid_string(monkeypatch):
     assert saved == [("default", valid)]
 
 
+def test_login_import_session_reads_piped_stdin_without_prompt(monkeypatch):
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    def prompt_must_not_run(*args, **kwargs):
+        raise AssertionError("piped import must read stdin directly")
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
+    monkeypatch.setattr(cli_main.click, "prompt", prompt_must_not_run)
+    valid = _valid_session_for_import()
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
+    assert result.exit_code == 0, result.output
+    assert saved == [("default", valid)]
+
+
 def test_login_import_session_rejects_garbage(monkeypatch):
     saved = []
 

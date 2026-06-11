@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from pathlib import Path
 
 import click
@@ -183,7 +184,10 @@ def _export_session(session: str) -> None:
 
 def _import_session(session: str) -> None:
     """Read a StringSession from stdin (no echo), validate it, and save it under ``session``."""
-    raw = click.prompt("Paste StringSession", hide_input=True).strip()
+    if sys.stdin.isatty():
+        raw = click.prompt("Paste StringSession", hide_input=True).strip()
+    else:
+        raw = click.get_text_stream("stdin").read().strip()
     try:
         # validate before touching the client so garbage is rejected up front
         validate_session_string(raw)
