@@ -84,12 +84,13 @@ class Storage:
         # kv always exists and is NOT versioned (idempotent CREATE IF NOT EXISTS);
         # user_version counts only consumer-registered migrations (1..N).
         conn.execute(_KV_MIGRATION)
+        conn.commit()
         current = conn.execute("PRAGMA user_version").fetchone()[0]
         target = len(self._migrations)
         if current >= target:
-            conn.commit()
             return
         try:
+            conn.execute("BEGIN")
             for i in range(current, target):
                 conn.execute(self._migrations[i])
             # user_version can't be parameterised — target is our own int, not user input

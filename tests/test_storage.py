@@ -114,12 +114,16 @@ async def test_failing_migration_rolls_back(tmp_path):
     ])
     with pytest.raises(Exception):
         await storage.connect()
+    await storage.close()
     # version did not advance past the good migration's failure boundary
     s2 = Storage(tmp_path / "m.db")
     await s2.connect()
     try:
         # the whole batch rolled back → version is 0 (nothing committed)
         assert await s2.user_version() == 0
+        assert await s2.fetchall(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'a'"
+        ) == []
     finally:
         await s2.close()
 
