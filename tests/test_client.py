@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 import pytest
+from telethon import events
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser
 
@@ -15,7 +16,7 @@ from tests.conftest import (
     FakeMessageReadEvent,
     FakeUser,
 )
-from tg_messenger.core.client import StandaloneTelegramClient, _dialog_kind
+from tg_messenger.core.client import MessageDeleteValidationError, StandaloneTelegramClient, _dialog_kind
 from tg_messenger.core.models import (
     ChatActionEvent,
     Dialog,
@@ -967,6 +968,15 @@ async def test_chat_action_publish_without_subscribers_is_noop(fake_client):
 # --- Цикл 73: поток read-receipt (listen_reads) ---
 
 
+async def test_message_read_registers_inbox_and_outbox_builders(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    read_builders = [
+        builder for _, builder in fake_client._handlers if isinstance(builder, events.MessageRead)
+    ]
+    assert [builder.inbox for builder in read_builders] == [False, True]
+
+
 async def test_message_read_inbox(fake_client):
     client = _build(fake_client)
     await client.connect()
@@ -1001,8 +1011,14 @@ class FakeReactionResult:
         self.reaction = reaction
 
 
+class FakeRecentReaction:
+    def __init__(self, reaction):
+        self.reaction = reaction
+
+
 class FakeMessageReactions:
-    def __init__(self, results):
+    def __init__(self, results=None, recent_reactions=None):
+        self.recent_reactions = recent_reactions
         self.results = results
 
 
@@ -1019,13 +1035,25 @@ class FakeReactionUpdate:
 async def test_reaction_emoticon_mapped(fake_client):
     client = _build(fake_client)
     await client.connect()
-    reactions = FakeMessageReactions([FakeReactionResult(FakeReaction("👍"))])
+    reactions = FakeMessageReactions(
+        results=[FakeReactionResult(FakeReaction("👍"))],
+        recent_reactions=[FakeRecentReaction(FakeReaction("❤️"))],
+    )
     upd = FakeReactionUpdate(PeerUser(7), msg_id=55, reactions=reactions)
     out = await _collect_one(client.listen_reactions, fake_client.push_event, upd)
     assert isinstance(out, ReactionEvent)
     assert out.message_id == 55
-    assert out.emoticon == "👍"
+    assert out.emoticon == "❤️"
     assert out.dialog_id == 7
+
+
+async def test_reaction_aggregate_without_recent_omits_emoticon(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    reactions = FakeMessageReactions(results=[FakeReactionResult(FakeReaction("👍"))])
+    upd = FakeReactionUpdate(PeerUser(7), msg_id=55, reactions=reactions)
+    out = await _collect_one(client.listen_reactions, fake_client.push_event, upd)
+    assert out.emoticon is None
 
 
 async def test_reaction_custom_emoji_maps_to_none(fake_client):
@@ -1035,7 +1063,7 @@ async def test_reaction_custom_emoji_maps_to_none(fake_client):
     class CustomReaction:  # ReactionCustomEmoji — no .emoticon attribute
         document_id = 12345
 
-    reactions = FakeMessageReactions([FakeReactionResult(CustomReaction())])
+    reactions = FakeMessageReactions(recent_reactions=[FakeRecentReaction(CustomReaction())])
     upd = FakeReactionUpdate(PeerUser(7), msg_id=56, reactions=reactions)
     out = await _collect_one(client.listen_reactions, fake_client.push_event, upd)
     assert out.emoticon is None
@@ -1181,6 +1209,13 @@ def _flood_patch(monkeypatch):
     return FakeFloodWaitError
 
 
+def _seed_delete_messages(fake_client, peer: int = 7, ids=(1, 2)) -> None:
+    fake_client.messages[int(peer)] = [
+        FakeMessage(id=mid, sender_id=1, text=f"m{mid}", out=True, peer_id=int(peer))
+        for mid in ids
+    ]
+
+
 async def test_forward_calls_telethon_and_returns_messages(fake_client):
     client = _build(fake_client)
     await client.connect()
@@ -1201,6 +1236,24 @@ async def test_forward_invalidates_both_peers(fake_client):
     await client.history(7, limit=10)  # refetch
     await client.history(8, limit=10)  # refetch
     assert fake_client.iter_messages_calls == 4
+
+
+async def test_forward_filters_partial_missing_results(fake_client, caplog):
+    client = _build(fake_client)
+    await client.connect()
+
+    async def partial_forward(to_peer, message_ids, from_peer):
+        return [
+            FakeMessage(id=101, sender_id=1, text="ok", out=True, peer_id=to_peer),
+            None,
+        ]
+
+    fake_client.forward_messages = partial_forward
+    with caplog.at_level(logging.WARNING):
+        result = await client.forward(7, [1, 999], 8)
+
+    assert [m.id for m in result] == [101]
+    assert any("forward returned 1 missing message(s)" in record.message for record in caplog.records)
 
 
 async def test_forward_flood_is_handled(fake_client, monkeypatch):
@@ -1251,6 +1304,7 @@ async def test_edit_text_flood_is_handled(fake_client, monkeypatch):
 
 
 async def test_delete_messages_calls_telethon_with_revoke(fake_client):
+    _seed_delete_messages(fake_client)
     client = _build(fake_client)
     await client.connect()
     await client.delete_messages(7, [1, 2])
@@ -1258,6 +1312,7 @@ async def test_delete_messages_calls_telethon_with_revoke(fake_client):
 
 
 async def test_delete_messages_for_me_passes_revoke_false(fake_client):
+    _seed_delete_messages(fake_client, ids=(1,))
     client = _build(fake_client)
     await client.connect()
     await client.delete_messages(7, [1], revoke=False)
@@ -1266,17 +1321,19 @@ async def test_delete_messages_for_me_passes_revoke_false(fake_client):
 
 async def test_delete_messages_invalidates_history(fake_client):
     _seed_dm(fake_client)
+    _seed_delete_messages(fake_client, ids=(1,))
     client = _build(fake_client)
     await client.connect()
     await client.history(7, limit=10)
     await client.delete_messages(7, [1])
     await client.history(7, limit=10)
-    assert fake_client.iter_messages_calls == 2
+    assert fake_client.iter_messages_calls == 3  # history + validation + refetch
 
 
 async def test_delete_messages_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
     flood_error = _flood_patch(monkeypatch)
+    _seed_delete_messages(fake_client, ids=(1,))
     client = _build(fake_client)
     await client.connect()
 
@@ -1288,6 +1345,34 @@ async def test_delete_messages_flood_is_handled(fake_client, monkeypatch):
         await client.delete_messages(7, [1])
 
 
+async def test_delete_messages_rejects_missing_ids_before_delete(fake_client):
+    _seed_delete_messages(fake_client, ids=(1,))
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(MessageDeleteValidationError, match="not found"):
+        await client.delete_messages(7, [1, 2])
+    assert fake_client.deleted == []
+
+
+async def test_delete_messages_rejects_messages_from_other_peer(fake_client):
+    fake_client.messages[7] = [
+        FakeMessage(id=1, sender_id=1, text="wrong", out=True, peer_id=8)
+    ]
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(MessageDeleteValidationError, match="belongs to dialog 8"):
+        await client.delete_messages(7, [1])
+    assert fake_client.deleted == []
+
+
+async def test_delete_messages_for_me_rejects_channels_before_delete(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(MessageDeleteValidationError, match="not supported"):
+        await client.delete_messages(-1000000000123, [1], revoke=False)
+    assert fake_client.deleted == []
+
+
 # --- Цикл 79: mark_read + unread ---
 
 
@@ -1295,7 +1380,29 @@ async def test_mark_read_calls_send_read_acknowledge(fake_client):
     client = _build(fake_client)
     await client.connect()
     await client.mark_read(7)
-    assert fake_client.read_acks == [7]
+    assert fake_client.read_acks == [{"peer": 7, "max_id": None}]
+
+
+async def test_mark_read_passes_max_id(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await client.mark_read(7, max_id=42)
+    assert fake_client.read_acks == [{"peer": 7, "max_id": 42}]
+
+
+async def test_mark_read_invalidates_dialogs_cache(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.dialogs()
+    assert next(d for d in first if d.id == 7).unread == 2
+    assert fake_client.iter_dialogs_calls == 1
+
+    fake_client.dialogs[0].unread_count = 0
+    await client.mark_read(7)
+    second = await client.dialogs()
+    assert next(d for d in second if d.id == 7).unread == 0
+    assert fake_client.iter_dialogs_calls == 2
 
 
 async def test_mark_read_flood_is_handled(fake_client, monkeypatch):
@@ -1304,12 +1411,33 @@ async def test_mark_read_flood_is_handled(fake_client, monkeypatch):
     client = _build(fake_client)
     await client.connect()
 
-    async def boom(peer):
+    async def boom(peer, max_id=None):
         raise flood_error(9999)
 
     fake_client.send_read_acknowledge = boom
     with pytest.raises(HandledFloodWaitError):
         await client.mark_read(7)
+
+
+async def test_mark_read_flood_keeps_dialogs_cache(fake_client, monkeypatch):
+    from tg_messenger.core.flood import HandledFloodWaitError
+    flood_error = _flood_patch(monkeypatch)
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.dialogs()
+    assert next(d for d in first if d.id == 7).unread == 2
+
+    async def boom(peer, max_id=None):
+        raise flood_error(9999)
+
+    fake_client.dialogs[0].unread_count = 0
+    fake_client.send_read_acknowledge = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.mark_read(7)
+    second = await client.dialogs()
+    assert next(d for d in second if d.id == 7).unread == 2
+    assert fake_client.iter_dialogs_calls == 1
 
 
 async def test_dialog_unread_mapped_from_telethon(fake_client):
@@ -1329,7 +1457,16 @@ async def test_mute_user_restricts_send_messages(fake_client):
     await client.mute_user(-100200, 7, 300)
     call = fake_client.permissions[-1]
     assert call["entity"] == -100200 and call["user"] == 7
-    assert call["rights"].get("send_messages") is False
+    assert call["rights"] == {
+        "send_messages": False,
+        "send_media": False,
+        "send_stickers": False,
+        "send_gifs": False,
+        "send_games": False,
+        "send_inline": False,
+        "send_polls": False,
+        "embed_link_previews": False,
+    }
     assert call["until_date"] is not None  # muted until a future time
 
 
@@ -1377,19 +1514,26 @@ async def test_is_admin_true_when_can_delete(fake_client):
         is_admin = True
         delete_messages = True
 
+    seen = {}
+
     async def perms(entity, user=None):
+        seen["entity"] = entity
+        seen["user"] = user
         return Perms()
 
     fake_client.get_permissions = perms
     client = _build(fake_client)
     await client.connect()
     assert await client.is_admin(-100200) is True
+    assert seen["entity"] == -100200
+    assert getattr(seen["user"], "id", None) == 1
 
 
 async def test_is_admin_false_when_not_admin(fake_client):
     class Perms:
-        is_admin = False
+        is_admin = True
         delete_messages = False
+        ban_users = False
 
     async def perms(entity, user=None):
         return Perms()
@@ -1398,6 +1542,21 @@ async def test_is_admin_false_when_not_admin(fake_client):
     client = _build(fake_client)
     await client.connect()
     assert await client.is_admin(-100200) is False
+
+
+async def test_is_admin_true_when_can_ban(fake_client):
+    class Perms:
+        is_admin = True
+        delete_messages = False
+        ban_users = True
+
+    async def perms(entity, user=None):
+        return Perms()
+
+    fake_client.get_permissions = perms
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.is_admin(-100200) is True
 
 
 async def test_is_admin_false_on_error(fake_client):

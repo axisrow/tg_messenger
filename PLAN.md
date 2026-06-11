@@ -491,12 +491,14 @@ titles сам). Дисциплина username-резолва: дорогой (~5
 переезжает (in-memory из #8). `tests/test_storage.py`:
 - **67**: connect/close создаёт файл; kv-roundtrip (str/dict/list); get отсутствующего→None;
   context manager закрывает и данные персистятся.
-- **68**: миграции через `PRAGMA user_version` (растёт по числу зарегистрированных);
-  повторный connect не перенакатывает; две пачки от разных потребителей по порядку;
-  ошибка в миграции → rollback всего батча, version не растёт.
+- **68**: миграции трекаются по стабильному id SQL-миграции в `_tg_messenger_migrations`
+  (`PRAGMA user_version` только зеркалит число применённых); повторный connect не
+  перенакатывает; две пачки от разных потребителей не зависят от порядка регистрации;
+  ошибка в миграции → rollback всего батча, metadata/version не растут.
 - **69**: `asyncio.gather` из 20 set/get без потерь (один conn + `asyncio.Lock` +
-  `asyncio.to_thread`, `check_same_thread=False`); execute/fetchone/fetchall параметризованы.
-- **70**: `default_db_path(profile)` = `~/.tg_messenger/<profile>.db`; CLAUDE.md/PLAN.md.
+  `asyncio.to_thread`, `check_same_thread=False`); execute/fetchone/fetchall параметризованы;
+  `close()` ждёт in-flight операцию через тот же lock.
+- **70**: `default_db_path(profile)` = `~/.tg_messenger/<safe-profile>.db`; CLAUDE.md/PLAN.md.
 
 ## Циклы 71–76 — event-потоки (#14, сделано)
 
@@ -516,8 +518,10 @@ titles сам). Дисциплина username-резолва: дорогой (~5
   `chat_id`, `max_id`, `outbox`) + `listen_reads()`. Тесты: inbox vs outbox.
 - **74**: шина `_bus_reactions` + `_on_reaction` через `events.Raw(UpdateMessageReactions)`
   (реальный тип апдейта для user-аккаунтов; `dialog_id` через `telethon.utils.get_peer_id`,
-  `message_id=msg_id`, `emoticon` из первого `ReactionEmoji`, иначе `None`; `actor_id=None`
-  best-effort) + `listen_reactions()`. Неизвестная структура → `logger.warning` + пропуск.
+  `message_id=msg_id`, `emoticon` из первой `recent_reactions[].reaction` если это
+  стандартная `ReactionEmoji`, иначе `None`; aggregate `results` не используется как
+  источник изменившейся реакции; `actor_id=None` best-effort) + `listen_reactions()`.
+  Неизвестная структура → `logger.warning` + пропуск.
 - **75**: `IncomingEvent.album_id = message.grouped_id` в `_on_new_message`; `send_reaction`
   (`SendReactionRequest`+`ReactionEmoji` через `run_with_flood_wait_retry`). Тесты: album_id
   прокинут; запрос записан; non-transient flood → `HandledFloodWaitError`.
@@ -537,20 +541,25 @@ best-effort `None` (raw-апдейт не несёт надёжного един
   `_to_message` маппит `reply_to_id` из `raw.reply_to.reply_to_msg_id` (best-effort getattr).
   Инвалидация history своего peer (как раньше).
 - **78**: `forward(from_peer, ids, to_peer)` → `forward_messages`, инвалидирует history ОБОИХ
-  peer'ов; `edit_text(peer, id, text)` → `edit_message`; `delete_messages(peer, ids, revoke=True)`
-  → `delete_messages`. Все через `run_with_flood_wait_retry`; инвалидируют history. Тесты:
-  правильные вызовы фейка, инвалидация, non-transient flood → `HandledFloodWaitError`.
-- **79**: `mark_read(peer)` → `send_read_acknowledge` (retry, НЕ инвалидирует history);
+  peer'ов, фильтрует и логирует частичные `None`-результаты от Telethon; `edit_text(peer, id, text)` → `edit_message`; `delete_messages(peer, ids, revoke=True)`
+  → `delete_messages`. Перед удалением core fetch'ит ids из указанного peer и отвергает
+  missing/mismatched сообщения; `revoke=False` запрещён для channel/megagroup marked ids, потому что
+  Telegram там удаляет для всех. Все через `run_with_flood_wait_retry`; инвалидируют history. Тесты:
+  правильные вызовы фейка, safety rejects, инвалидация, non-transient flood → `HandledFloodWaitError`.
+- **79**: `mark_read(peer, max_id=None)` → `send_read_acknowledge` (retry, НЕ инвалидирует history,
+  но инвалидирует dialogs cache после успешного ack, чтобы badge unread перечитался);
   регресс на `Dialog.unread` из telethon-диалога.
 - **80**: CLI — `send --reply-to`, команды `forward FROM IDS TO`, `edit PEER ID TEXT`,
-  `delete PEER IDS [--for-me]` (revoke=False), `mark-read PEER`. IDS через запятую (`_parse_ids`,
-  битый токен → `ClickException`). `read` остаётся печатью истории — отметка прочитанным вынесена
-  в отдельную команду `mark-read`, чтобы не ломать существующую.
+  `delete PEER IDS [--for-me]` (revoke=False только там, где Telegram поддерживает локальное удаление),
+  `mark-read PEER`. IDS через запятую (`_parse_ids`, битый токен → `ClickException`); channel/
+  megagroup `--for-me` получает ClickException до подключения клиента. `read` остаётся печатью истории —
+  отметка прочитанным вынесена в отдельную команду `mark-read`, чтобы не ломать существующую.
 - **81**: web — бейдж `<span class="unread">N</span>` в `_dialog_li`; открытие диалога
-  (`GET .../messages`) зовёт `mark_read` best-effort (ошибка → `logger.warning`, история всё равно
-  отдаётся); `/send` принимает `reply_to` (Form) и прокидывает в `send_text`. TUI — `(N)` в
-  `DialogItem`; `on_list_view_selected` запускает `_mark_read` воркером (best-effort, без await
-  в хендлере).
+  (`GET .../messages`) планирует `mark_read(..., max_id=<latest rendered id>)` best-effort в tracked
+  background task (ошибка → `logger.warning`, история отдаётся без ожидания read ack, новые сообщения
+  после snapshot остаются unread); `/send` принимает `reply_to` (Form) и прокидывает в `send_text`.
+  TUI — `(N)` в `DialogItem`; после загрузки history запускает `_mark_read` воркером с max_id
+  отрендеренного snapshot (best-effort, без await в хендлере).
 - **82**: CLAUDE.md (блок про действия в client.py) + PLAN.md этот блок.
 
 v1-компромиссы (в рамках плана): в TUI нет выбора сообщения, поэтому reply/forward/edit/delete
@@ -575,10 +584,13 @@ SQLite. Деструктивен по природе → **dry-run по умол
 - **87**: enforce — delete/mute/ban/warn зовут методы клиента; ошибка одного действия
   `logger.exception` и движок жив; журнал `dry_run=0`; первое сматчившееся правило выигрывает.
 - **88**: тонкие обёртки в `client.py` — `mute_user`/`ban_user` поверх `edit_permissions`
-  (через `run_with_flood_wait_retry`), плюс `is_admin(peer)` поверх `get_permissions`
-  (best-effort → `False`).
+  (через `run_with_flood_wait_retry`), плюс `moderation_rights(peer)` поверх
+  `get_permissions(peer, me)` (`delete_messages`/`ban_users`, best-effort → false) и
+  совместимый boolean `is_admin(peer)`.
 - **89**: CLI — `moderate [--enforce]` (паттерн `watch`, Ctrl+C чисто; на старте
-  `check_admin_rights` → чаты без прав отключаются предупреждением) и группа
+  `check_admin_rights` проверяет права по actions правил: delete требует `delete_messages`,
+  mute/ban требуют `ban_users`, warn-only не требует admin; чаты без нужных прав отключаются
+  предупреждением) и группа
   `moderate-rules list/add/remove` (`add` читает JSON-файл; отрицательный chat_id — через `--`).
   `moderation.json.example` в корне.
 - **90**: CLAUDE.md (core: `moderation.py` + обёртки клиента) + PLAN.md этот блок.
@@ -586,42 +598,6 @@ SQLite. Деструктивен по природе → **dry-run по умол
 v1-компромиссы: `is_forward` всегда `False` (флаг события пока не прокинут в
 `process_message`); журнал/правила — per-profile SQLite; admin-проверка best-effort
 (чат без прав молча пропускается в рантайме, не валит сервис).
-
-## Циклы 91–98 — суфлёр (#17, сделано)
-
-`agent/suggest.py` — черновик ответа в стиле прошлых переписок для ЧЕЛОВЕКА (не автоответ;
-полная автоматизация — отдельное #18). Агент-слой: LLM ТОЛЬКО через инъекцию (`suggest_fn`),
-сам `suggest.py` langchain НЕ импортирует — поэтому Suggester/профиль/storage зелёные на голом
-`[dev]` (без `importorskip`). `factory.make_suggest_fn`/`build_suggester` — единственное место
-с `init_chat_model`.
-
-- **91**: `Suggester(client, suggest_fn, storage=None, history_limit=30)` — `suggest(dialog_id)`
-  собирает `history` хронологически, размечает свой/чужой (`out`), грузит профиль если есть
-  storage, зовёт `suggest_fn(context, profile)` → текст.
-- **92**: `build_style_profile(messages) -> StyleProfile` (чистая) — агрегаты avg_length /
-  emoji_freq / greetings / signatures + до 10 примеров (свой ответ сразу ПОСЛЕ входящего);
-  пустая история → заглушка нулями.
-- **93**: хранение — таблица `style_profiles` (PK `dialog_id`, JSON), `register_suggest_migrations`,
-  `save_style_profile`/`load_style_profile` (roundtrip, перезапись).
-- **94**: деградация — профиль None → suggest работает; `suggest_fn` бросает → `logger.exception`
-  и наружу (UI показывают ошибку, не падают молча).
-- **95**: CLI — `make_suggester` seam (через `factory.build_suggester`, требует `TG_AGENT_MODEL`,
-  fail-fast `ClickException`); `suggest PEER` печатает черновик, `--send` шлёт, `--learn` строит
-  и сохраняет профиль (один history-проход, per-peer, не фон).
-- **96**: TUI — входящее в открытом DM → worker зовёт `suggester.suggest`, подсказка в
-  `#suggestion` Static (Tab принимает в композер; смягчение — только при пустом композере;
-  ввод сбрасывает); `suggester=None` → фича выключена, не падает; сеть/LLM только в `run_worker`.
-- **97**: web — `build_app(suggester=)`, `GET /dialogs/{id}/suggest` → текст черновика (503 если
-  не сконфигурирован), кнопка 💡 Suggest у композера (`chat.html`, fetch → вставка в input).
-- **98**: фиксация last_read — `record_last_read`/`watch_read_receipts` пишут outbox-квитанции
-  (`listen_reads`, `outbox=True`) в kv (v1 только пишет, не действует). `.env.example`
-  (`TG_SUGGEST_HISTORY=30` + приватность), README (абзац суфлёра + приватность),
-  CLAUDE.md (agent: `suggest.py`), PLAN.md этот блок.
-
-v1-компромиссы: суфлёр сам не действует (только черновик; квитанции записаны, но не используются);
-`build_style_profile` — лёгкие эвристики (greetings/signatures по словарю, emoji по диапазонам
-codepoint, без grapheme-точности); профили/last_read — per-profile SQLite; история уходит в LLM
-целиком (приватность задокументирована).
 
 ## Финальная верификация (после зелёных циклов)
 

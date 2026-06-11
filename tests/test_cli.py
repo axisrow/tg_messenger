@@ -102,8 +102,8 @@ class StubClient:
     async def delete_messages(self, peer, message_ids, revoke=True):
         self.deleted_calls.append((peer, list(message_ids), revoke))
 
-    async def mark_read(self, peer):
-        self.read_acks.append(peer)
+    async def mark_read(self, peer, max_id=None):
+        self.read_acks.append((peer, max_id))
 
     async def send_media(self, peer, file_path, caption=None):
         self.sent.append((peer, "file", str(file_path), caption))
@@ -128,6 +128,9 @@ class StubClient:
 
     async def is_admin(self, peer):
         return self.admin
+
+    async def moderation_rights(self, peer):
+        return {"delete_messages": self.admin, "ban_users": self.admin}
 
     async def listen_all(self):
         if False:  # pragma: no cover — empty async generator, then idle
@@ -290,6 +293,14 @@ def test_delete_command_for_me_keeps_revoke_false(runner):
     assert stub.deleted_calls == [(7, [1], False)]
 
 
+def test_delete_command_for_me_rejects_channel_marked_id(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["delete", "--for-me", "--", "-1000000000123", "1"])
+    assert result.exit_code != 0
+    assert "--for-me is not supported" in result.output
+    assert stub.deleted_calls == []
+
+
 def test_delete_command_rejects_bad_ids(runner):
     r, _ = runner
     result = r.invoke(cli_main.cli, ["delete", "7", "nope"])
@@ -301,7 +312,7 @@ def test_mark_read_command_marks_read(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["mark-read", "7"])
     assert result.exit_code == 0, result.output
-    assert stub.read_acks == [7]
+    assert stub.read_acks == [(7, None)]
 
 
 def test_flood_wait_friendly_message(runner, monkeypatch):
@@ -607,16 +618,20 @@ def mod_runner(monkeypatch, tmp_path):
     from tg_messenger.core.storage import Storage
 
     stub = StubClient()
-    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    seen: dict[str, list[str]] = {"clients": [], "storages": []}
+
+    def _make_client(**kw):
+        seen["clients"].append(kw.get("session_name", "default"))
+        return stub
 
     def _make_storage(profile="default"):
-        s = Storage(tmp_path / "mod.db")
-        # the CLI re-registers migrations on its own handle; here we return a bare one
-        return s
+        seen["storages"].append(profile)
+        return Storage(tmp_path / f"{profile}.db")
 
+    monkeypatch.setattr(cli_main, "make_client", _make_client)
     # register_moderation_migrations is called by the CLI; bare Storage is fine
-    monkeypatch.setattr(cli_main, "make_storage", lambda profile="default": Storage(tmp_path / "mod.db"))
-    return CliRunner(), stub, tmp_path, register_moderation_migrations
+    monkeypatch.setattr(cli_main, "make_storage", _make_storage)
+    return CliRunner(), stub, tmp_path, register_moderation_migrations, seen
 
 
 _RULE_JSON = """{
@@ -628,7 +643,7 @@ _RULE_JSON = """{
 
 
 def test_moderate_rules_add_list_remove(mod_runner, tmp_path):
-    r, stub, _tp, _ = mod_runner
+    r, stub, _tp, _, _seen = mod_runner
     rule_file = tmp_path / "rule.json"
     rule_file.write_text(_RULE_JSON, encoding="utf-8")
 
@@ -647,8 +662,15 @@ def test_moderate_rules_add_list_remove(mod_runner, tmp_path):
     assert "No rules." in lst2.output
 
 
+def test_moderate_rules_remove_missing_errors(mod_runner):
+    r, _stub, _tp, _, _seen = mod_runner
+    result = r.invoke(cli_main.cli, ["moderate-rules", "remove", "--", "-100200", "missing"])
+    assert result.exit_code != 0
+    assert "not found" in result.output
+
+
 def test_moderate_rules_add_rejects_bad_json(mod_runner, tmp_path):
-    r, _stub, _tp, _ = mod_runner
+    r, _stub, _tp, _, _seen = mod_runner
     bad = tmp_path / "bad.json"
     bad.write_text("{not json", encoding="utf-8")
     result = r.invoke(cli_main.cli, ["moderate-rules", "add", str(bad)])
@@ -657,7 +679,7 @@ def test_moderate_rules_add_rejects_bad_json(mod_runner, tmp_path):
 
 
 def test_moderate_runs_and_stops_on_ctrl_c(mod_runner):
-    r, stub, _tp, _ = mod_runner
+    r, stub, _tp, _, _seen = mod_runner
     result = r.invoke(cli_main.cli, ["moderate"])
     assert result.exit_code == 0
     assert "dry-run" in result.output
@@ -666,14 +688,22 @@ def test_moderate_runs_and_stops_on_ctrl_c(mod_runner):
 
 
 def test_moderate_enforce_flag_shown(mod_runner):
-    r, _stub, _tp, _ = mod_runner
+    r, _stub, _tp, _, _seen = mod_runner
     result = r.invoke(cli_main.cli, ["moderate", "--enforce"])
     assert result.exit_code == 0
     assert "ENFORCING" in result.output
 
 
+def test_moderate_uses_global_profile(mod_runner):
+    r, _stub, _tp, _, seen = mod_runner
+    result = r.invoke(cli_main.cli, ["--profile", "work", "moderate"])
+    assert result.exit_code == 0
+    assert seen["clients"][-1] == "work"
+    assert seen["storages"][-1] == "work"
+
+
 def test_moderate_without_admin_warns(mod_runner, tmp_path):
-    r, stub, _tp, _ = mod_runner
+    r, stub, _tp, _, _seen = mod_runner
     stub.admin = False  # no rights anywhere
     rule_file = tmp_path / "rule.json"
     rule_file.write_text(_RULE_JSON, encoding="utf-8")
@@ -684,11 +714,29 @@ def test_moderate_without_admin_warns(mod_runner, tmp_path):
 
 
 def test_moderate_without_login_gives_hint(mod_runner):
-    r, stub, _tp, _ = mod_runner
+    r, stub, _tp, _, _seen = mod_runner
     stub.authorized = False
     result = r.invoke(cli_main.cli, ["moderate"])
     assert result.exit_code != 0
     assert "tg-messenger login" in result.output
+
+
+def test_moderate_rules_use_global_profile(mod_runner, tmp_path):
+    r, _stub, _tp, _, seen = mod_runner
+    rule_file = tmp_path / "rule.json"
+    rule_file.write_text(_RULE_JSON, encoding="utf-8")
+
+    add = r.invoke(cli_main.cli, ["--profile", "work", "moderate-rules", "add", str(rule_file)])
+    assert add.exit_code == 0, add.output
+    assert seen["storages"][-1] == "work"
+
+    default_list = r.invoke(cli_main.cli, ["moderate-rules", "list"])
+    assert default_list.exit_code == 0
+    assert "No rules." in default_list.output
+
+    work_list = r.invoke(cli_main.cli, ["--profile", "work", "moderate-rules", "list"])
+    assert work_list.exit_code == 0
+    assert "no-spam" in work_list.output
 
 
 def test_revoked_session_mid_command_gives_hint(runner, monkeypatch):
@@ -900,22 +948,79 @@ def test_login_export_session_prints_string_and_warning(monkeypatch):
 
 
 def test_login_import_session_saves_valid_string(monkeypatch):
-    stub = ExportStubClient()
-    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
     valid = _valid_session_for_import()
     result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
     assert result.exit_code == 0, result.output
-    assert stub.imported == [valid]
+    assert saved == [("default", valid)]
+
+
+def test_login_import_session_reads_piped_stdin_without_prompt(monkeypatch):
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    def prompt_must_not_run(*args, **kwargs):
+        raise AssertionError("piped import must read stdin directly")
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
+    monkeypatch.setattr(cli_main.click, "prompt", prompt_must_not_run)
+    valid = _valid_session_for_import()
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
+    assert result.exit_code == 0, result.output
+    assert saved == [("default", valid)]
 
 
 def test_login_import_session_rejects_garbage(monkeypatch):
-    stub = ExportStubClient()
-    # garbage must be rejected before it ever reaches the client
-    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    # garbage must be rejected before it ever reaches the store
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
     result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input="not-a-session\n")
     assert result.exit_code != 0
     assert "invalid StringSession" in result.output
-    assert stub.imported == []
+    assert saved == []
+
+
+def test_login_import_session_rejects_empty_input(monkeypatch):
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=" \n")
+    assert result.exit_code != 0
+    assert "invalid StringSession" in result.output
+    assert saved == []
+
+
+def test_login_import_session_replaces_unreadable_existing_file(monkeypatch, session_dir):
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(session_dir)
+    store.session_dir.mkdir(parents=True, exist_ok=True)
+    store.path_for("default").write_text("not-a-valid-session", encoding="utf-8")
+    monkeypatch.setattr(cli_main, "_session_store", lambda: store)
+
+    valid = _valid_session_for_import()
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
+
+    assert result.exit_code == 0, result.output
+    assert store.load("default") == valid
 
 
 def test_export_session_not_in_log(monkeypatch, tmp_path):
@@ -966,6 +1071,56 @@ def test_global_profile_sets_session_name(profile_spy):
     assert profile_spy.get("session_name") == "work"
 
 
+def test_make_client_uses_tg_session_dir(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    monkeypatch.setattr(cli_main, "StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    cli_main.make_client(session_name="work")
+
+    assert captured["session_name"] == "work"
+    assert captured["session_dir"] == str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("args", "input_text"),
+    [
+        (["listen"], None),
+        (["watch"], None),
+        (["chat", "7"], ""),
+        (["agent"], None),
+    ],
+)
+def test_global_profile_reaches_direct_client_commands(
+    profile_spy, monkeypatch, args, input_text
+):
+    class FakeAgentRunner:
+        async def run(self):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        cli_main,
+        "make_agent_runner",
+        lambda client, *, notify_errors=False: FakeAgentRunner(),
+    )
+
+    result = CliRunner().invoke(
+        cli_main.cli,
+        ["--profile", "work", *args],
+        input=input_text,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert profile_spy.get("session_name") == "work"
+
+
 def test_profiles_command_lists_saved(monkeypatch, tmp_path):
     from tg_messenger.core.auth import SessionStore
 
@@ -980,6 +1135,15 @@ def test_profiles_command_lists_saved(monkeypatch, tmp_path):
     assert "bob" in result.output
 
 
+def test_profiles_command_empty_hint_uses_global_profile_position(monkeypatch, tmp_path):
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli_main.cli, ["profiles"])
+
+    assert result.exit_code == 0, result.output
+    assert "tg-messenger --profile NAME login" in result.output
+
+
 def test_multiple_profiles_non_interactive_errors(monkeypatch, tmp_path):
     from tg_messenger.core.auth import SessionStore
 
@@ -991,6 +1155,27 @@ def test_multiple_profiles_non_interactive_errors(monkeypatch, tmp_path):
     result = CliRunner().invoke(cli_main.cli, ["dialogs"])
     assert result.exit_code != 0
     assert "--profile" in result.output
+
+
+def test_explicit_default_session_skips_profile_picker(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    captured = {}
+
+    def fake_make_client(**kw):
+        captured.update(kw)
+        return StubClient()
+
+    store = SessionStore(tmp_path)
+    store.save("alice", _valid_session_for_import())
+    store.save("bob", _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    monkeypatch.setattr(cli_main, "make_client", fake_make_client)
+
+    result = CliRunner().invoke(cli_main.cli, ["dialogs", "--session", "default"])
+
+    assert result.exit_code == 0, result.output
+    assert captured.get("session_name") == "default"
 
 
 def test_profile_menu_picks_second(monkeypatch, tmp_path):

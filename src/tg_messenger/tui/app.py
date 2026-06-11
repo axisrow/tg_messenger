@@ -16,7 +16,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 
-from tg_messenger.core.auth import LOGIN_HINT
+from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,8 @@ def _make_real_client(session_name: str):
         api_id=int(os.environ.get("TG_API_ID", "0")),
         api_hash=os.environ.get("TG_API_HASH", ""),
         session_name=session_name,
+        session_dir=os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
+        encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
     )
 
 
@@ -143,7 +145,7 @@ class MessengerTUI(App):
     """
 
     def __init__(self, *, client=None, session_name: str = "default",
-                 profiles: list[str] | None = None, client_factory=None, suggester=None):
+                 profiles: list[str] | None = None, client_factory=None):
         super().__init__()
         self._client = client
         self._session_name = session_name
@@ -154,9 +156,6 @@ class MessengerTUI(App):
         self._tab = "dm"
         self._started = False  # gates tab events until _startup finished
         self._all_dialogs: list = []  # full loaded list; search filters it locally
-        # reply suggester (#17) — None disables the feature; pending draft text below
-        self._suggester = suggester
-        self._pending_suggestion: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -271,6 +270,12 @@ class MessengerTUI(App):
         except Exception:
             logger.warning("mark_read failed (dialog %s) — continuing", dialog_id, exc_info=True)
 
+    async def _mark_read(self, dialog_id: int, max_id: int) -> None:
+        try:
+            await self._client.mark_read(dialog_id, max_id=max_id)
+        except Exception:
+            logger.warning("mark_read failed (dialog %s) — continuing", dialog_id, exc_info=True)
+
     async def _show_history(self, dialog_id: int) -> None:
         pane = self.query_one("#messages", Vertical)
         await pane.remove_children()
@@ -284,6 +289,20 @@ class MessengerTUI(App):
             return
         pane.loading = False
         await pane.mount(*(MessageBubble(m.text or "<media>", m.out) for m in messages))
+        if messages:
+            # Acknowledge exactly the loaded snapshot; messages arriving later stay unread.
+            self.run_worker(
+                self._mark_read(dialog_id, max(m.id for m in messages)),
+                group="mark_read",
+                exclusive=False,
+            )
+
+    async def on_input_changed(self, event: Input.Changed) -> None:
+        # only the search box filters; the composer's own changes are ignored.
+        # Filtering is local (over self._all_dialogs) — no network, safe to await here.
+        if event.input.id != "search":
+            return
+        await self._render_dialogs()
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "composer":
