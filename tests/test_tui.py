@@ -5,7 +5,34 @@ import pytest
 from textual.widgets import Input, ListView, Static, Tabs
 
 from tg_messenger.core.models import Dialog, IncomingEvent, Message
-from tg_messenger.tui.app import DialogItem, MessageBubble, MessengerTUI, ProfileItem
+from tg_messenger.tui.app import (
+    DialogItem,
+    MessageBubble,
+    MessengerTUI,
+    ProfileItem,
+    parse_media_command,
+)
+
+
+def test_parse_media_simple():
+    assert parse_media_command("@a.jpg") == ("a.jpg", None)
+
+
+def test_parse_media_quoted_path_with_caption():
+    assert parse_media_command('@"с пробелом.png" подпись') == ("с пробелом.png", "подпись")
+
+
+def test_parse_media_path_and_caption():
+    assert parse_media_command("@/path/x.jpg caption here") == ("/path/x.jpg", "caption here")
+
+
+def test_parse_media_non_at_is_none():
+    assert parse_media_command("hello world") is None
+
+
+def test_parse_media_empty_after_at_is_none():
+    assert parse_media_command("@") is None
+    assert parse_media_command("@   ") is None
 
 
 class TuiStubClient:
@@ -15,6 +42,7 @@ class TuiStubClient:
         self.connected = False
         self.authorized = True
         self.dialogs_calls = 0
+        self.save_session_calls = 0
 
     async def connect(self):
         self.connected = True
@@ -24,6 +52,9 @@ class TuiStubClient:
 
     async def is_authorized(self):
         return self.authorized
+
+    def save_session(self):
+        self.save_session_calls += 1
 
     async def dialogs(self, dm_only=True):
         self.dialogs_calls += 1
@@ -48,6 +79,12 @@ class TuiStubClient:
     async def send_text(self, peer, text, reply_to=None):
         self.sent.append((peer, text, reply_to))
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
+                       date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    async def send_media(self, peer, file_path, *, caption=None, voice_note=False,
+                         video_note=False, force_document=False):
+        self.media_sent = (peer, str(file_path), caption)
+        return Message(id=4, dialog_id=peer, sender_id=1, out=True, text=caption or "<media>",
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
     async def mark_read(self, peer, max_id=None):
@@ -79,6 +116,25 @@ def test_real_tui_client_gets_session_encryption_key(monkeypatch, tmp_path):
     assert captured["session_name"] == "default"
     assert captured["session_dir"] == str(tmp_path)
     assert captured["encryption_key"] == "shared-secret"
+
+
+def test_real_tui_client_gets_send_rate(monkeypatch):
+    from tg_messenger.tui import app as tui_app
+
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SEND_RATE", "20")
+    monkeypatch.setattr("tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    tui_app._make_real_client("default")
+
+    assert captured["send_rate_per_min"] == 20.0
 
 
 async def test_tui_mounts_and_lists_dialogs():
@@ -152,15 +208,145 @@ async def test_tui_survives_markup_hostile_text():
         assert len(bubbles) == 1
 
 
-async def test_tui_exits_with_hint_when_not_logged_in():
+# --- циклы 133-134: TUI-экран логина (телефон→код→2FA) ---
+
+
+class FakeTuiLoginSession:
+    """LoginSession stand-in for the TUI login screen."""
+
+    def __init__(self, *, needs_2fa=False, wrong_code=False):
+        from tg_messenger.core.auth import CodeDelivery
+
+        self.state = "phone"
+        self.phones = []
+        self.codes = []
+        self.passwords = []
+        self._needs_2fa = needs_2fa
+        self._wrong_code = wrong_code
+        self._delivery = CodeDelivery(kind="app", next_kind="sms")
+
+    async def submit_phone(self, phone):
+        self.phones.append(phone)
+        self.state = "code"
+        return self._delivery
+
+    async def submit_code(self, code):
+        from tg_messenger.core.auth import LoginError
+
+        self.codes.append(code)
+        if self._wrong_code:
+            raise LoginError("Wrong code — try again.")
+        if self._needs_2fa:
+            self.state = "password"
+            return
+        self.state = "done"
+
+    async def submit_password(self, password):
+        self.passwords.append(password)
+        self.state = "done"
+
+    async def resend(self):
+        return self._delivery
+
+
+async def test_tui_shows_login_screen_when_not_logged_in():
+    from tg_messenger.tui.app import LoginScreen
+
     stub = TuiStubClient()
     stub.authorized = False
-    app = MessengerTUI(client=stub)
+    sess = FakeTuiLoginSession()
+    app = MessengerTUI(client=stub, login_session=sess)
     async with app.run_test() as pilot:
         await pilot.pause()
-    assert app.return_code == 1
-    assert stub.dialogs_calls == 0  # dialogs were never requested
-    assert stub.connected is False
+        assert isinstance(app.screen, LoginScreen)
+        assert app.return_code is None  # not exited — login screen is shown instead
+
+
+async def test_tui_login_phone_then_code_loads_dialogs():
+    stub = TuiStubClient()
+    stub.authorized = False
+    sess = FakeTuiLoginSession()
+    app = MessengerTUI(client=stub, login_session=sess)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # phone step
+        app.screen.query_one("#login-input", Input).value = "+10000000000"
+        await pilot.press("enter")
+        await pilot.pause()
+        # code step
+        app.screen.query_one("#login-input", Input).value = "12345"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+        assert sess.phones == ["+10000000000"]
+        assert sess.codes == ["12345"]
+        # back on the main screen with dialogs loaded
+        assert stub.dialogs_calls >= 1
+        assert len(list(app.query(DialogItem))) >= 1
+        assert stub.save_session_calls == 1
+
+
+async def test_tui_login_2fa_branch():
+    stub = TuiStubClient()
+    stub.authorized = False
+    sess = FakeTuiLoginSession(needs_2fa=True)
+    app = MessengerTUI(client=stub, login_session=sess)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.query_one("#login-input", Input).value = "+10000000000"
+        await pilot.press("enter")
+        await pilot.pause()
+        app.screen.query_one("#login-input", Input).value = "12345"
+        await pilot.press("enter")
+        await pilot.pause()
+        # now on the password step
+        app.screen.query_one("#login-input", Input).value = "hunter2"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+        assert sess.passwords == ["hunter2"]
+        assert stub.dialogs_calls >= 1
+        assert stub.save_session_calls == 1
+
+
+async def test_tui_login_wrong_code_notifies_and_stays(caplog):
+    from tg_messenger.tui.app import LoginScreen
+
+    stub = TuiStubClient()
+    stub.authorized = False
+    sess = FakeTuiLoginSession(wrong_code=True)
+    app = MessengerTUI(client=stub, login_session=sess)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.query_one("#login-input", Input).value = "+10000000000"
+        await pilot.press("enter")
+        await pilot.pause()
+        app.screen.query_one("#login-input", Input).value = "000"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+        # still on the login screen, input cleared, app alive
+        assert isinstance(app.screen, LoginScreen)
+        assert app.screen.query_one("#login-input", Input).value == ""
+        assert app.return_code is None
+        assert stub.save_session_calls == 0
+
+
+async def test_tui_login_ctrl_c_quits_cleanly():
+    stub = TuiStubClient()
+    stub.authorized = False
+    sess = FakeTuiLoginSession()
+    app = MessengerTUI(client=stub, login_session=sess)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.screen.query_one("#login-input", Input).value = "+10000000000"
+        await pilot.press("enter")
+        await pilot.pause()
+        # Ctrl+C on the code step exits cleanly
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+    assert app.return_code == 0
+    assert stub.save_session_calls == 0
 
 
 async def test_tui_startup_failure_exits_with_code_and_log(caplog):
@@ -496,6 +682,26 @@ async def test_tui_group_incoming_appends_bubble_for_open_group_only():
         assert [str(b.render()) for b in bubbles] == ["из группы"]
 
 
+async def test_tui_group_incoming_does_not_trigger_suggester():
+    class RecordingSuggester:
+        def __init__(self):
+            self.calls = []
+
+        async def suggest(self, dialog_id):
+            self.calls.append(dialog_id)
+            return "draft"
+
+    stub = GroupEventClient()
+    suggester = RecordingSuggester()
+    app = MessengerTUI(client=stub, suggester=suggester)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = -100200  # open group, but suggestion must stay DM-only
+        stub.fire.set()
+        await pilot.pause()
+    assert suggester.calls == []
+
+
 async def test_tui_disconnects_on_exit():
     stub = TuiStubClient()
     app = MessengerTUI(client=stub)
@@ -503,6 +709,37 @@ async def test_tui_disconnects_on_exit():
         await pilot.pause()
         assert stub.connected is True
     assert stub.connected is False
+
+
+async def test_tui_closes_suggester_on_exit():
+    class ClosableSuggester:
+        def __init__(self):
+            self.closed = 0
+
+        async def close(self):
+            self.closed += 1
+
+    suggester = ClosableSuggester()
+    app = MessengerTUI(client=TuiStubClient(), suggester=suggester)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+    assert suggester.closed == 1
+
+
+async def test_tui_switching_dialogs_clears_pending_suggestion():
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._pending_suggestion = "draft for Ann"
+        app.query_one("#suggestion", Static).update("Suggest: draft for Ann")
+        lv = app.query_one("#dialogs", ListView)
+        lv.index = 1
+        lv.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app._pending_suggestion is None
+        assert str(app.query_one("#suggestion", Static).render()) == ""
 
 
 # --- UX: Enter / стрелка-вниз с вкладок → фокус на список диалогов ---
@@ -628,3 +865,34 @@ async def test_tui_single_profile_skips_screen():
         assert list(app.query(ProfileItem)) == []  # no selection screen
         assert list(app.query(DialogItem))  # went straight to dialogs
     assert captured.get("session_name") == "solo"
+
+
+async def test_tui_at_command_sends_media(tmp_path):
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, f"@{f} cap"))
+        await pilot.pause()
+        await pilot.pause()
+        assert getattr(stub, "media_sent", None) == (7, str(f), "cap")
+        bubbles = list(app.query(MessageBubble))
+        assert any("cap" in str(b.render()) for b in bubbles)
+
+
+async def test_tui_at_command_missing_file_notifies(tmp_path):
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        missing = str(tmp_path / "nope.jpg")
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, f"@{missing}"))
+        await pilot.pause()
+        assert getattr(stub, "media_sent", None) is None
+        assert app.return_code is None  # still alive

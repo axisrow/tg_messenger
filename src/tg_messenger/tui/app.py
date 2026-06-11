@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -16,9 +17,58 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 
-from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT
+from tg_messenger.core.auth import (
+    DEFAULT_SESSION_DIR,
+    LoginError,
+    LoginSession,
+    delivery_hint,
+)
 
 logger = logging.getLogger(__name__)
+
+# shown before a draft in the suggestion strip; Tab accepts it into the composer
+SUGGEST_PREFIX = "💡 Tab: "
+
+
+def parse_media_command(text: str) -> tuple[str, str | None] | None:
+    """Parse a composer ``@PATH [caption]`` media command.
+
+    Pure (no filesystem). Returns ``(path, caption)`` or ``None`` when ``text`` is
+    not a media command (doesn't start with ``@`` or has no path after it).
+    The path may be quoted (``@"with spaces.png" cap``); the rest is the caption.
+    """
+    if not text.startswith("@"):
+        return None
+    rest = text[1:]
+    if not rest.strip():
+        return None
+    try:
+        # split off only the first token (the path), keep the remainder verbatim
+        tokens = shlex.split(rest, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    path = tokens[0]
+    if not path:
+        return None
+    # caption = everything after the first token, re-derived from the raw text so
+    # internal quoting/spacing of the caption is preserved literally
+    remainder = _strip_first_token(rest)
+    caption = remainder.strip() or None
+    return path, caption
+
+
+def _strip_first_token(s: str) -> str:
+    """Return ``s`` with its first shlex token (quoted or not) removed."""
+    lexer = shlex.shlex(s, posix=True)
+    lexer.whitespace_split = True
+    try:
+        lexer.get_token()  # consume the first token
+    except ValueError:
+        return ""
+    # lexer.instream holds the unconsumed tail
+    return lexer.instream.read()
 
 
 def _make_real_client(session_name: str):
@@ -30,6 +80,7 @@ def _make_real_client(session_name: str):
         session_name=session_name,
         session_dir=os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
         encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
+        send_rate_per_min=float(os.environ.get("TG_SEND_RATE", "0") or 0),
     )
 
 
@@ -67,6 +118,87 @@ class ProfileScreen(ModalScreen[str]):
         item = event.item
         if isinstance(item, ProfileItem):
             self.dismiss(item.profile)
+
+
+class LoginScreen(ModalScreen[bool]):
+    """Telegram login wizard: phone → code → (2FA password) → done.
+
+    Drives a core ``LoginSession`` (the state machine that keeps phone_code_hash
+    bound to the one connected client). Network steps run through ``run_worker``
+    — never awaited in a handler — so the message pump never stalls. Dismisses
+    with ``True`` once the session reaches ``done``; the app then continues its
+    normal startup (loads dialogs). Phone numbers and codes are never logged.
+    """
+
+    BINDINGS = [
+        # Ctrl+C must quit cleanly even mid-login (priority: focus sits in Input)
+        Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
+    ]
+
+    def __init__(self, login_session):
+        super().__init__()
+        self._session = login_session
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="login-box"):
+            yield Label("Войти в Telegram", id="login-title")
+            yield Label("Номер телефона (международный формат):", id="login-prompt")
+            yield Input(id="login-input", placeholder="+10000000000")
+
+    def on_mount(self) -> None:
+        self.query_one("#login-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # never await network in a handler — hand each step to a worker
+        value = event.value.strip()
+        if not value:
+            return
+        self.query_one("#login-input", Input).value = ""
+        state = self._session.state
+        if state == "phone":
+            self.run_worker(self._do_phone(value), exclusive=True)
+        elif state == "code":
+            self.run_worker(self._do_code(value), exclusive=True)
+        elif state == "password":
+            self.run_worker(self._do_password(value), exclusive=True)
+
+    async def _do_phone(self, phone: str) -> None:
+        try:
+            delivery = await self._session.submit_phone(phone)
+        except Exception as exc:
+            logger.exception("login: submit_phone failed")  # phone stays out of the log
+            self.notify(f"Не удалось отправить код: {exc}", severity="error")
+            return
+        self.query_one("#login-prompt", Label).update(delivery_hint(delivery))
+        self.query_one("#login-input", Input).placeholder = "Код"
+
+    async def _do_code(self, code: str) -> None:
+        try:
+            await self._session.submit_code(code)
+        except LoginError as exc:
+            self.notify(str(exc), severity="error")  # state preserved — retry
+            return
+        except Exception as exc:
+            logger.exception("login: submit_code failed")
+            self.notify(f"Ошибка входа: {exc}", severity="error")
+            return
+        if self._session.state == "password":
+            self.query_one("#login-prompt", Label).update("Пароль 2FA:")
+            self.query_one("#login-input", Input).placeholder = "Пароль 2FA"
+            return
+        self.dismiss(True)
+
+    async def _do_password(self, password: str) -> None:
+        try:
+            await self._session.submit_password(password)
+        except LoginError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        except Exception as exc:
+            logger.exception("login: submit_password failed")
+            self.notify(f"Ошибка входа: {exc}", severity="error")
+            return
+        self.dismiss(True)
 
 
 class SidebarTabs(Tabs):
@@ -112,11 +244,12 @@ class DialogListView(ListView):
 
 
 class DialogItem(ListItem):
-    def __init__(self, dialog_id: int, title: str, unread: int = 0):
+    def __init__(self, dialog_id: int, title: str, unread: int = 0, kind: str = "dm"):
         # markup=False: titles/messages are untrusted text, [brackets] must render literally
         badge = f" ({unread})" if unread else ""
         super().__init__(Static(f"{dialog_id} — {title}{badge}", markup=False))
         self.dialog_id = dialog_id
+        self.kind = kind
 
 
 class MessageBubble(Static):
@@ -125,28 +258,39 @@ class MessageBubble(Static):
 
 
 class MessengerTUI(App):
-    # priority: quitting must work even while focus sits in the composer Input
-    BINDINGS = [Binding("ctrl+c", "quit", "Quit", priority=True)]
+    # priority: quitting must work even while focus sits in the composer Input.
+    # Tab accepts a pending reply suggestion (priority so the Input doesn't eat it
+    # for focus traversal); the binding is a no-op when there's nothing to accept.
+    BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit", priority=True),
+        Binding("tab", "accept_suggestion", "Accept suggestion", priority=True, show=False),
+    ]
 
     CSS = """
     #sidebar { width: 32; border-right: solid $primary; }
     .out { color: $accent; text-align: right; }
     .in { color: $text; }
+    #suggestion { dock: bottom; color: $text-muted; height: auto; }
     #composer { dock: bottom; }
     """
 
     def __init__(self, *, client=None, session_name: str = "default",
-                 profiles: list[str] | None = None, client_factory=None):
+                 profiles: list[str] | None = None, client_factory=None, suggester=None,
+                 login_session=None):
         super().__init__()
         self._client = client
         self._session_name = session_name
         self._profiles = profiles or []
+        # login wizard state machine (test seam); built from the client otherwise
+        self._login_session = login_session
         # how a client is built once a profile is chosen (injectable for tests)
         self._client_factory = client_factory or _make_real_client
         self._current: int | None = None
         self._tab = "dm"
         self._started = False  # gates tab events until _startup finished
         self._all_dialogs: list = []  # full loaded list; search filters it locally
+        self._suggester = suggester
+        self._pending_suggestion: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -156,6 +300,7 @@ class MessengerTUI(App):
                 yield DialogListView(id="dialogs")
             with Vertical():
                 yield Vertical(id="messages")
+                yield Static("", id="suggestion", markup=False)
                 yield Input(placeholder="Message…", id="composer")
 
     async def on_mount(self) -> None:
@@ -186,8 +331,21 @@ class MessengerTUI(App):
         try:
             await self._client.connect()
             if not await self._client.is_authorized():
-                self.exit(return_code=1, message=LOGIN_HINT)
-                return
+                # show the login wizard instead of exiting; on success continue startup
+                session = self._login_session
+                if session is None:
+                    inner = getattr(self._client, "_client", self._client)
+                    session = LoginSession(inner)
+                ok = await self.push_screen_wait(LoginScreen(session))
+                if not ok:
+                    self.exit(return_code=1)
+                    return
+                save_session = getattr(self._client, "save_session", None)
+                if save_session is not None:
+                    try:
+                        save_session()
+                    except Exception:
+                        logger.warning("TUI login succeeded but session save failed", exc_info=True)
             await self._load_dialogs()
         except Exception as exc:
             logger.exception("TUI startup failed")
@@ -200,6 +358,12 @@ class MessengerTUI(App):
     async def on_unmount(self) -> None:
         if self._client is not None:
             await self._client.disconnect()
+        close_suggester = getattr(self._suggester, "close", None)
+        if close_suggester is not None:
+            try:
+                await close_suggester()
+            except Exception:
+                logger.warning("suggester close failed", exc_info=True)
 
     async def _load_dialogs(self) -> None:
         if self._tab == "groups":
@@ -221,7 +385,7 @@ class MessengerTUI(App):
         query = self.query_one("#search", Input).value
         await lv.clear()
         for d in filter_dialogs(self._all_dialogs, query):
-            await lv.append(DialogItem(d.id, d.title, d.unread))
+            await lv.append(DialogItem(d.id, d.title, d.unread, d.kind))
 
     async def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         # Tabs fires this once at mount, before the client exists — _started gates it.
@@ -248,6 +412,7 @@ class MessengerTUI(App):
         item = event.item
         if isinstance(item, DialogItem):
             self._current = item.dialog_id
+            self._clear_suggestion()
             # exclusive group: selecting another dialog cancels a still-loading history
             self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
 
@@ -279,6 +444,11 @@ class MessengerTUI(App):
             )
 
     async def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "composer":
+            # the user is typing their own reply — a stale suggestion must go
+            if self._pending_suggestion is not None and event.value != self._pending_suggestion:
+                self._clear_suggestion()
+            return
         # only the search box filters; the composer's own changes are ignored.
         # Filtering is local (over self._all_dialogs) — no network, safe to await here.
         if event.input.id != "search":
@@ -292,6 +462,19 @@ class MessengerTUI(App):
         if self._current is None or not event.value.strip():
             return
         text = event.value
+        parsed = parse_media_command(text)
+        if parsed is not None:
+            path, caption = parsed
+            if not os.path.isfile(path):
+                # validate BEFORE the worker/network; surface, don't send
+                logger.warning("media path not found: %s (dialog %s)", path, self._current)
+                self.notify(f"File not found: {path}", severity="error")
+                return
+            event.input.value = ""  # clear optimistically; restored on failure
+            self.run_worker(
+                self._send_media(self._current, path, caption), exclusive=False
+            )
+            return
         event.input.value = ""  # clear optimistically; restored on failure
         self.run_worker(self._send_text(self._current, text), exclusive=False)
 
@@ -309,12 +492,69 @@ class MessengerTUI(App):
             pane = self.query_one("#messages", Vertical)
             await pane.mount(MessageBubble(text, out=True))
 
+    async def _send_media(self, peer: int, path: str, caption: str | None) -> None:
+        try:
+            await self._client.send_media(peer, path, caption=caption)
+        except Exception as exc:
+            logger.exception("send media failed (dialog %s, %s)", peer, path)
+            self.notify(f"Send failed: {exc}", severity="error")
+            return
+        if peer == self._current:  # user may have switched dialogs mid-send
+            pane = self.query_one("#messages", Vertical)
+            label = caption or f"📎 {os.path.basename(path)}"
+            await pane.mount(MessageBubble(label, out=True))
+
     async def _drain_incoming(self) -> None:
         try:
             async for ev in self._client.listen_all():  # groups too, not just DMs
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
                     await pane.mount(MessageBubble(ev.message.text or "<media>", out=False))
+                    self._maybe_suggest(ev.dialog_id)
         except Exception:
             logger.exception("incoming listener failed")
             self.notify("Incoming listener failed — see log.", severity="error")
+
+    def _maybe_suggest(self, dialog_id: int) -> None:
+        """Kick off a reply suggestion for an incoming message in the open dialog.
+
+        No-op when the feature is off (no suggester) or the user is already typing
+        — we never clobber a half-written reply. Network/LLM runs in a worker.
+        """
+        if self._suggester is None:
+            return
+        if not self._is_dm_dialog(dialog_id):
+            return
+        if self.query_one("#composer", Input).value:
+            return  # don't suggest over a draft the user is writing
+        self.run_worker(self._suggest(dialog_id), group="suggest", exclusive=True)
+
+    def _is_dm_dialog(self, dialog_id: int) -> bool:
+        return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
+
+    async def _suggest(self, dialog_id: int) -> None:
+        try:
+            draft = await self._suggester.suggest(dialog_id)
+        except Exception:
+            logger.exception("suggest failed (dialog %s)", dialog_id)
+            return
+        # the user may have switched dialogs or started typing while we waited
+        if dialog_id != self._current or self.query_one("#composer", Input).value:
+            return
+        self._pending_suggestion = draft
+        self.query_one("#suggestion", Static).update(f"{SUGGEST_PREFIX}{draft}" if draft else "")
+
+    def action_accept_suggestion(self) -> None:
+        """Tab — move a pending suggestion into the composer (else fall through)."""
+        if not self._pending_suggestion:
+            # nothing to accept: hand Tab back to normal focus traversal
+            self.screen.focus_next()
+            return
+        composer = self.query_one("#composer", Input)
+        composer.value = self._pending_suggestion
+        self._clear_suggestion()
+        composer.focus()
+
+    def _clear_suggestion(self) -> None:
+        self._pending_suggestion = None
+        self.query_one("#suggestion", Static).update("")

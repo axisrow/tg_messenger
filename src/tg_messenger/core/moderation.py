@@ -374,6 +374,8 @@ class ModerationEngine:
         except Exception:
             logger.exception("moderation action %s failed in chat %s (rule %r)",
                              action, message.dialog_id, rule.name)
+            # the failure is journaled too (cycle 87) — the audit trail stays complete
+            await self._journal(rule, message, f"{action}:failed", dry_run=False)
             return  # engine survives — other actions/messages keep going
         await self._journal(rule, message, action, dry_run=False)
 

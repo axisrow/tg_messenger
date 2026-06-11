@@ -202,6 +202,10 @@ class FakeTelethonClient:
         self.code_requests: list[str] = []
         self.requests: list = []  # every raw RPC call (reactions, resend, ...)
         self.resend_requests: list = []
+        # username RPCs: CheckUsernameRequest / UpdateUsernameRequest
+        self.occupied_usernames: set[str] = set()
+        self.invalid_usernames: set[str] = set()
+        self.set_username_to: str | None = None
         self.signed_in_with: list = []
         # network-call counters: the TTL-cache tests assert how often we hit the wire
         self.iter_dialogs_calls = 0
@@ -220,6 +224,11 @@ class FakeTelethonClient:
     async def is_user_authorized(self):
         return self._authorized
 
+    async def log_out(self):
+        self.logged_out = True
+        self._authorized = False
+        return True
+
     async def send_code_request(self, phone):
         self.code_requests.append(phone)
         # mimic telethon: SentCode.type tells where the code went (SentCodeTypeApp etc.)
@@ -230,6 +239,24 @@ class FakeTelethonClient:
         # client uses it for SendReactionRequest etc. — record every raw call.
         self.requests.append(request)
         self.resend_requests.append(request)
+        # username RPCs: dispatch by class name (avoid importing telethon types here)
+        cls = type(request).__name__
+        if cls == "CheckUsernameRequest":
+            uname = getattr(request, "username", "")
+            if uname in self.invalid_usernames:
+                from telethon.errors import UsernameInvalidError
+                raise UsernameInvalidError(request=request)
+            return uname not in self.occupied_usernames
+        if cls == "UpdateUsernameRequest":
+            uname = getattr(request, "username", "")
+            if uname in self.invalid_usernames:
+                from telethon.errors import UsernameInvalidError
+                raise UsernameInvalidError(request=request)
+            if uname and uname in self.occupied_usernames:
+                from telethon.errors import UsernameOccupiedError
+                raise UsernameOccupiedError(request=request)
+            self.set_username_to = uname
+            return FakeUser(id=1, first_name="Me", username=uname or None)
         return make_sent_code("Sms", "hash456")
 
     async def sign_in(self, phone=None, code=None, password=None, **kw):
@@ -278,15 +305,21 @@ class FakeTelethonClient:
         return FakeUser(id=int(peer))
 
     # --- sending ---
-    async def send_message(self, peer, text, reply_to=None):
+    async def send_message(self, peer, text, reply_to=None, schedule=None):
         msg = FakeMessage(id=999, sender_id=1, text=text, out=True, peer_id=int(peer),
                           reply_to=reply_to)
-        self.sent.append({"peer": int(peer), "text": text, "reply_to": reply_to})
+        self.sent.append({"peer": int(peer), "text": text, "reply_to": reply_to,
+                          "schedule": schedule})
         return msg
 
-    async def send_file(self, peer, file, caption=None):
+    async def send_file(self, peer, file, caption=None, voice_note=False,
+                        video_note=False, force_document=False):
         msg = FakeMessage(id=998, sender_id=1, text=caption, out=True, peer_id=int(peer))
-        self.sent.append({"peer": int(peer), "file": str(file), "caption": caption})
+        self.sent.append({
+            "peer": int(peer), "file": str(file), "caption": caption,
+            "voice_note": voice_note, "video_note": video_note,
+            "force_document": force_document,
+        })
         return msg
 
     async def forward_messages(self, to_peer, message_ids, from_peer):

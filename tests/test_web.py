@@ -49,8 +49,10 @@ class WebStubClient:
     async def mark_read(self, peer, max_id=None):
         self.read_acks.append((peer, max_id))
 
-    async def send_media(self, peer, file_path, caption=None):
+    async def send_media(self, peer, file_path, *, caption=None, voice_note=False,
+                         video_note=False, force_document=False):
         self.sent.append((peer, "media", caption))
+        self.media_path = str(file_path)
         return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption or "<media>",
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
@@ -84,6 +86,25 @@ def test_real_web_client_gets_session_encryption_key(monkeypatch, tmp_path):
     assert captured["session_name"] == "default"
     assert captured["session_dir"] == str(tmp_path)
     assert captured["encryption_key"] == "shared-secret"
+
+
+def test_real_web_client_gets_send_rate(monkeypatch):
+    from tg_messenger.web import app as web_app
+
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SEND_RATE", "20")
+    monkeypatch.setattr("tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    web_app._make_real_client("default")
+
+    assert captured["send_rate_per_min"] == 20.0
 
 
 @pytest_asyncio.fixture
@@ -324,7 +345,59 @@ async def test_media_upload_calls_send_media(client_app):
     )
     assert r.status_code == 200
     assert stub.sent == [(7, "media", "look")]
+    assert stub.media_path  # a real temp path was passed through
     assert "look" in r.text
+
+
+async def test_media_upload_over_limit_returns_413(client_app, monkeypatch):
+    monkeypatch.setenv("TG_WEB_MAX_UPLOAD_MB", "1")
+    ac, stub = client_app
+    big = b"x" * (2 * 1024 * 1024)  # 2 MiB > 1 MB limit
+    r = await ac.post(
+        "/dialogs/7/media",
+        files={"file": ("big.bin", big, "application/octet-stream")},
+    )
+    assert r.status_code == 413
+    assert stub.sent == []
+
+
+async def test_media_upload_streams_in_bounded_chunks(client_app, monkeypatch):
+    # лимит должен резать поток ДО того, как файл целиком окажется в памяти:
+    # read() зовётся только ограниченными кусками и прекращается на лимите
+    from starlette.datastructures import UploadFile as StarletteUploadFile
+
+    monkeypatch.setenv("TG_WEB_MAX_UPLOAD_MB", "1")
+    reads: list[int] = []
+    orig_read = StarletteUploadFile.read
+
+    async def spy_read(self, size=-1):
+        reads.append(size)
+        return await orig_read(self, size)
+
+    monkeypatch.setattr(StarletteUploadFile, "read", spy_read)
+    ac, stub = client_app
+    big = b"x" * (3 * 1024 * 1024)  # 3 MiB > 1 MB limit
+    r = await ac.post(
+        "/dialogs/7/media",
+        files={"file": ("big.bin", big, "application/octet-stream")},
+    )
+    assert r.status_code == 413
+    assert stub.sent == []
+    assert reads, "the route must read through UploadFile.read"
+    # ни одного безразмерного read() (он буферизует весь файл в память)
+    assert all(size is not None and 0 < size <= 1024 * 1024 for size in reads)
+    # чтение остановилось на лимите, а не дочитало все 3 MiB
+    assert len(reads) <= 3
+
+
+async def test_media_upload_empty_file_returns_400(client_app):
+    ac, stub = client_app
+    r = await ac.post(
+        "/dialogs/7/media",
+        files={"file": ("empty.bin", b"", "application/octet-stream")},
+    )
+    assert r.status_code == 400
+    assert stub.sent == []
 
 
 async def test_profiles_route_lists_saved_profiles(monkeypatch, tmp_path):
@@ -350,7 +423,9 @@ async def test_profiles_route_lists_saved_profiles(monkeypatch, tmp_path):
     assert "active" in r.text.lower()
 
 
-async def test_unauthorized_session_gives_401_with_hint():
+async def test_unauthorized_session_redirects_to_tg_login():
+    # not-logged-in Telegram session: ordinary routes now bounce to the login
+    # wizard instead of the old dead-end 401 fragment (#26).
     from telethon.errors.rpcerrorlist import AuthKeyUnregisteredError
 
     stub = WebStubClient()
@@ -363,9 +438,9 @@ async def test_unauthorized_session_gives_401_with_hint():
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-            r = await ac.get("/dialogs")
-    assert r.status_code == 401
-    assert "tg-messenger login" in r.text
+            r = await ac.get("/dialogs", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/tg-login"
 
 
 async def test_unhandled_error_returns_500_fragment_and_is_logged(caplog):
@@ -476,3 +551,299 @@ async def test_stream_yields_group_frame():
     payload = json.loads(frame.removeprefix("data: ").strip())
     assert payload == {"id": 11, "text": "в группе"}  # не DM-событие, а групповое
     await gen.aclose()
+
+
+# --- цикл 97: суфлёр в web (черновик ответа по кнопке Suggest) ---
+
+
+class StubSuggester:
+    def __init__(self, draft="suggested reply"):
+        self.draft = draft
+        self.calls = []
+        self.closed = 0
+
+    async def suggest(self, dialog_id):
+        self.calls.append(dialog_id)
+        return self.draft
+
+    async def close(self):
+        self.closed += 1
+
+
+SUGGEST_HEADERS = {"X-TG-Messenger-CSRF": "1"}
+
+
+@pytest_asyncio.fixture
+async def suggest_app():
+    stub = WebStubClient()
+    suggester = StubSuggester()
+    app = build_app(client=stub, suggester=suggester)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac, suggester
+
+
+async def test_suggest_endpoint_returns_draft(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.post("/dialogs/7/suggest", headers=SUGGEST_HEADERS)
+    assert r.status_code == 200
+    assert "suggested reply" in r.text
+    assert suggester.calls == [7]
+
+
+async def test_suggest_endpoint_does_not_escape_draft(suggest_app):
+    ac, suggester = suggest_app
+    suggester.draft = "you & me"
+    r = await ac.post("/dialogs/7/suggest", headers=SUGGEST_HEADERS)
+    assert r.status_code == 200
+    assert r.text == "you & me"
+
+
+async def test_suggest_endpoint_returns_plain_text_for_markup(suggest_app):
+    ac, suggester = suggest_app
+    suggester.draft = "<script>alert(1)</script>"
+    r = await ac.post("/dialogs/7/suggest", headers=SUGGEST_HEADERS)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert r.text == "<script>alert(1)</script>"
+
+
+async def test_suggest_endpoint_rejects_get_before_llm(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.get("/dialogs/7/suggest")
+    assert r.status_code == 405
+    assert suggester.calls == []
+
+
+async def test_suggest_endpoint_requires_csrf_header(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.post("/dialogs/7/suggest")
+    assert r.status_code == 403
+    assert suggester.calls == []
+
+
+async def test_suggest_endpoint_rejects_cross_origin(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.post(
+        "/dialogs/7/suggest",
+        headers={**SUGGEST_HEADERS, "Origin": "http://evil.example"},
+    )
+    assert r.status_code == 403
+    assert suggester.calls == []
+
+
+async def test_suggest_endpoint_negative_id(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.post("/dialogs/-100200/suggest", headers=SUGGEST_HEADERS)
+    assert r.status_code == 403
+    assert "DM" in r.text
+    assert suggester.calls == []
+
+
+async def test_suggest_endpoint_does_not_send_group_history_to_llm(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.post("/dialogs/-100123/suggest", headers=SUGGEST_HEADERS)
+    assert r.status_code == 403
+    assert suggester.calls == []
+
+
+async def test_suggest_endpoint_404_when_no_suggester(client_app):
+    """build_app без suggester — кнопка/эндпоинт отвечает понятной ошибкой, не 500."""
+    ac, _ = client_app
+    r = await ac.post("/dialogs/7/suggest", headers=SUGGEST_HEADERS)
+    assert r.status_code == 503
+    assert "TG_AGENT_MODEL" in r.text or "suggest" in r.text.lower()
+
+
+async def test_index_has_suggest_button(suggest_app):
+    ac, _ = suggest_app
+    r = await ac.get("/")
+    assert "suggest" in r.text.lower()
+    assert "suggest-error" in r.text
+    assert "X-TG-Messenger-CSRF" in r.text
+
+
+# --- циклы 131-132: web-мастер логина Telegram (/tg-login) ---
+
+from tg_messenger.core.auth import CodeDelivery, LoginError  # noqa: E402
+
+
+class FakeLoginSession:
+    """Stand-in for core.LoginSession driving the web/TUI login wizard."""
+
+    def __init__(self, *, needs_2fa=False, wrong_code=False):
+        self.state = "phone"
+        self.phones = []
+        self.codes = []
+        self.passwords = []
+        self.resends = 0
+        self._needs_2fa = needs_2fa
+        self._wrong_code = wrong_code
+
+    async def submit_phone(self, phone):
+        self.phones.append(phone)
+        if getattr(self, "_wrong_phone", False):
+            raise LoginError("Invalid phone number.")
+        self.state = "code"
+        return CodeDelivery(kind="app", next_kind="sms", timeout=60)
+
+    async def resend(self):
+        self.resends += 1
+        return CodeDelivery(kind="sms")
+
+    async def submit_code(self, code):
+        self.codes.append(code)
+        if self._wrong_code:
+            raise LoginError("Wrong code — try again.")
+        if self._needs_2fa:
+            self.state = "password"
+            return
+        self.state = "done"
+
+    async def submit_password(self, password):
+        self.passwords.append(password)
+        self.state = "done"
+
+
+def _login_app(session, *, web_pass=None, save_hook=None):
+    stub = WebStubClient()
+    if save_hook is not None:
+        stub.save_session = save_hook
+    return build_app(client=stub, login_session=session, web_pass=web_pass)
+
+
+async def _login_client(app):
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+
+
+async def test_tg_login_get_shows_phone_form():
+    app = _login_app(FakeLoginSession())
+    async for ac in _login_client(app):
+        r = await ac.get("/tg-login")
+        assert r.status_code == 200
+        assert "phone" in r.text.lower()
+
+
+async def test_tg_login_phone_returns_code_fragment_with_hint():
+    sess = FakeLoginSession()
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        r = await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        assert r.status_code == 200
+        assert sess.phones == ["+10000000000"]
+        assert "Telegram" in r.text  # подсказка: код в приложении Telegram
+        assert "code" in r.text.lower()
+
+
+async def test_tg_login_code_done_redirects_to_chat():
+    sess = FakeLoginSession()
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        r = await ac.post("/tg-login/code", data={"code": "12345"})
+        assert r.status_code in (302, 303)
+        assert r.headers["location"] == "/"
+        assert sess.codes == ["12345"]
+
+
+async def test_tg_login_code_2fa_returns_password_fragment():
+    sess = FakeLoginSession(needs_2fa=True)
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        r = await ac.post("/tg-login/code", data={"code": "12345"})
+        assert r.status_code == 200
+        assert "password" in r.text.lower()
+
+
+async def test_tg_login_password_redirects():
+    sess = FakeLoginSession(needs_2fa=True)
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        await ac.post("/tg-login/code", data={"code": "12345"})
+        r = await ac.post("/tg-login/password", data={"password": "hunter2"})
+        assert r.status_code in (302, 303)
+        assert r.headers["location"] == "/"
+        assert sess.passwords == ["hunter2"]
+
+
+async def test_tg_login_wrong_code_shows_error_not_500():
+    sess = FakeLoginSession(wrong_code=True)
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        r = await ac.post("/tg-login/code", data={"code": "000"})
+        assert r.status_code == 200
+        assert "Wrong code" in r.text
+        # state stays at code so the user can retry
+        assert sess.state == "code"
+
+
+async def test_tg_login_bad_phone_shows_error_not_500():
+    sess = FakeLoginSession()
+    sess._wrong_phone = True
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        r = await ac.post("/tg-login/phone", data={"phone": "not-a-phone"})
+        assert r.status_code == 200  # error rendered in the form, not a 500
+        assert "Invalid phone" in r.text
+        assert sess.state == "phone"  # can retry the phone step
+
+
+async def test_tg_login_success_saves_session():
+    saved = []
+    sess = FakeLoginSession()
+
+    def save_hook():
+        saved.append(True)
+
+    app = _login_app(sess, save_hook=save_hook)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        await ac.post("/tg-login/code", data={"code": "12345"})
+    assert saved == [True]
+
+
+async def test_unauthorized_routes_redirect_to_tg_login():
+    from telethon.errors.rpcerrorlist import AuthKeyUnregisteredError
+
+    stub = WebStubClient()
+
+    async def boom(dm_only=True):
+        raise AuthKeyUnregisteredError(None)
+
+    stub.dialogs = boom
+    app = build_app(client=stub, login_session=FakeLoginSession())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/dialogs", follow_redirects=False)
+    assert r.status_code in (302, 303)
+    assert r.headers["location"] == "/tg-login"
+
+
+async def test_tg_login_behind_web_pass():
+    # /tg-login is reachable only for an authenticated web user (#24): without
+    # the cookie the auth gate redirects to /login, not /tg-login.
+    app = _login_app(FakeLoginSession(), web_pass="s3cret")
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/tg-login", headers={"accept": "text/html"},
+                             follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/login"
+
+
+async def test_lifespan_closes_suggester():
+    stub = WebStubClient()
+    suggester = StubSuggester()
+    app = build_app(client=stub, suggester=suggester)
+    async with app.router.lifespan_context(app):
+        pass
+    assert suggester.closed == 1

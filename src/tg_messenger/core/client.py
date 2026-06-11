@@ -16,7 +16,9 @@ from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon import utils as tl_utils
+from telethon.errors import UsernameInvalidError, UsernameOccupiedError
 from telethon.sessions import StringSession
+from telethon.tl.functions.account import CheckUsernameRequest, UpdateUsernameRequest
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
@@ -37,6 +39,7 @@ from tg_messenger.core.models import (
     ReactionEvent,
     User,
 )
+from tg_messenger.core.ratelimit import TokenBucket
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +145,7 @@ class StandaloneTelegramClient:
         client_factory: Callable = _default_factory,
         dialogs_ttl: float = DEFAULT_DIALOGS_TTL_SEC,
         history_ttl: float = DEFAULT_HISTORY_TTL_SEC,
+        send_rate_per_min: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
     ):
         self._store = SessionStore(session_dir, encryption_key=encryption_key)
@@ -169,6 +173,11 @@ class StandaloneTelegramClient:
         self._history_cache: TTLCache[tuple[int, int, int], list[Message]] = TTLCache(
             history_ttl, maxsize=64, clock=clock
         )
+        # one global cap on outgoing sends across every caller (#25); 0 = disabled.
+        # burst = the rate (1 minute's worth) so a quiet account isn't throttled.
+        self._send_bucket = TokenBucket(
+            send_rate_per_min, burst=max(1, int(send_rate_per_min)), clock=clock
+        )
 
     # --- connection ---
     async def connect(self) -> None:
@@ -180,6 +189,10 @@ class StandaloneTelegramClient:
 
     async def is_authorized(self) -> bool:
         return await run_with_flood_wait_retry(lambda: self._client.is_user_authorized(), operation="is_authorized")
+
+    async def log_out(self) -> bool:
+        """Log this session out of Telegram — the server invalidates the auth key (#11)."""
+        return await run_with_flood_wait_retry(lambda: self._client.log_out(), operation="log_out")
 
     def save_session(self) -> None:
         self._store.save(self._session_name, self._client.session.save())
@@ -300,9 +313,17 @@ class StandaloneTelegramClient:
         return [m async for m in self._client.iter_messages(peer, search=query, limit=limit)]
 
     # --- sending ---
-    async def send_text(self, peer: int, text: str, reply_to: int | None = None) -> Message:
+    async def send_text(
+        self,
+        peer: int,
+        text: str,
+        reply_to: int | None = None,
+        schedule: timedelta | datetime | None = None,
+    ) -> Message:
+        """Send ``text`` to ``peer``; ``schedule`` (a delay or absolute time) defers it server-side."""
+        await self._send_bucket.acquire()  # global outgoing cap (#25), before the retry loop
         msg = await run_with_flood_wait_retry(
-            lambda: self._client.send_message(peer, text, reply_to=reply_to),
+            lambda: self._client.send_message(peer, text, reply_to=reply_to, schedule=schedule),
             operation="send_text",
         )
         self._invalidate_history(peer)  # the new message must show on reopen
@@ -314,6 +335,7 @@ class StandaloneTelegramClient:
         Invalidates the history cache of BOTH peers (source can change too via
         Telegram's own behaviour, and the destination gains the new messages).
         """
+        await self._send_bucket.acquire()  # global outgoing cap (#25)
         sent = await run_with_flood_wait_retry(
             lambda: self._client.forward_messages(to_peer, message_ids, from_peer),
             operation="forward",
@@ -446,9 +468,70 @@ class StandaloneTelegramClient:
         )
         self._dialogs_cache.invalidate(_DIALOGS_CACHE_KEY)
 
-    async def send_media(self, peer: int, file_path: str | Path, caption: str | None = None) -> Message:
+    async def check_username(self, username: str) -> bool:
+        """Whether ``username`` is free for OUR account (True = available).
+
+        Telethon ``account.CheckUsernameRequest`` through flood-wait retry.
+        An invalid username maps to ``ValueError`` (clear message, not a raw
+        Telethon traceback); occupied/unavailable returns ``False``.
+        """
+        try:
+            return bool(
+                await run_with_flood_wait_retry(
+                    lambda: self._client(CheckUsernameRequest(username=username)),
+                    operation="check_username",
+                )
+            )
+        except UsernameInvalidError as exc:
+            raise ValueError(f"invalid username: {username}") from exc
+
+    async def set_username(self, username: str) -> None:
+        """Set OUR account's public username; flood-wait retried.
+
+        Occupied or invalid usernames map to ``ValueError`` with a clear message.
+        """
+        try:
+            await run_with_flood_wait_retry(
+                lambda: self._client(UpdateUsernameRequest(username=username)),
+                operation="set_username",
+            )
+        except UsernameOccupiedError as exc:
+            raise ValueError(f"username already taken: {username}") from exc
+        except UsernameInvalidError as exc:
+            raise ValueError(f"invalid username: {username}") from exc
+
+    async def clear_username(self) -> None:
+        """Remove OUR account's public username (sets it to empty), flood-wait retried."""
+        await run_with_flood_wait_retry(
+            lambda: self._client(UpdateUsernameRequest(username="")),
+            operation="clear_username",
+        )
+
+    async def send_media(
+        self,
+        peer: int,
+        file_path: str | Path,
+        *,
+        caption: str | None = None,
+        voice_note: bool = False,
+        video_note: bool = False,
+        force_document: bool = False,
+    ) -> Message:
+        """Upload ``file_path`` to ``peer``.
+
+        ``voice_note``/``video_note``/``force_document`` map straight onto Telethon
+        ``send_file``. The path is validated BEFORE any network call — a missing path
+        or a directory raises ``ValueError`` (no FloodWait budget burned on a typo).
+        """
+        path = Path(file_path)
+        if not path.is_file():
+            raise ValueError(f"file not found: {file_path}")
+        await self._send_bucket.acquire()  # global outgoing cap (#25), after the cheap path check
         msg = await run_with_flood_wait_retry(
-            lambda: self._client.send_file(peer, str(file_path), caption=caption),
+            lambda: self._client.send_file(
+                peer, str(path), caption=caption, voice_note=voice_note,
+                video_note=video_note, force_document=force_document,
+            ),
             operation="send_media",
         )
         self._invalidate_history(peer)
@@ -456,6 +539,7 @@ class StandaloneTelegramClient:
 
     async def send_reaction(self, peer: int, message_id: int, emoticon: str) -> None:
         """React to a message with a standard emoji, routed through flood-wait retry."""
+        await self._send_bucket.acquire()  # global outgoing cap (#25)
         await run_with_flood_wait_retry(
             lambda: self._client(
                 SendReactionRequest(

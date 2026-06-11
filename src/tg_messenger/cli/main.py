@@ -7,6 +7,7 @@ Commands: login, dialogs, read, send, listen, chat, serve, tui.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -71,7 +72,24 @@ def make_client(**kwargs) -> StandaloneTelegramClient:
     # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
     kwargs.setdefault("encryption_key", _session_encryption_key())
     kwargs.setdefault("session_dir", os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
+    # global outgoing rate cap (#25): TG_SEND_RATE sends/min, 0/unset = off
+    kwargs.setdefault("send_rate_per_min", float(os.environ.get("TG_SEND_RATE", "0") or 0))
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
+
+
+def make_factory_client(*, base_url: str, password: str | None = None):
+    """Build the interop FactoryClient; the seam worker tests patch.
+
+    Lazy import: httpx (the [interop] extra) lives only inside interop/ — a base
+    install without the extra raises a friendly ClickException pointing at it.
+    """
+    try:
+        from tg_messenger.interop.factory_client import FactoryClient
+    except ImportError as exc:
+        raise click.ClickException(
+            "interop requires: pip install 'tg-messenger[interop]'"
+        ) from exc
+    return FactoryClient(base_url=base_url, password=password or "")
 
 
 def make_storage(profile: str = "default"):
@@ -79,6 +97,34 @@ def make_storage(profile: str = "default"):
     from tg_messenger.core.storage import Storage, default_db_path
 
     return Storage(default_db_path(profile))
+
+
+async def _ensure_dm_dialog(client, dialog_id: int) -> None:
+    dm_ids = {dialog.id for dialog in await client.dialogs()}
+    if dialog_id not in dm_ids:
+        raise click.ClickException("suggest is available for DM dialogs only.")
+
+
+def make_worker_agent(client):
+    """Optional agent for the worker's prompt tasks; the seam worker tests patch.
+
+    Best-effort: without the [agent] extra or TG_AGENT_MODEL it returns None
+    (the worker then fails prompt tasks with a clear message) — the worker's
+    fetch/dm_reply tasks must keep working on a plain [interop] install.
+    """
+    try:
+        from tg_messenger.agent.factory import build_orchestrator
+    except ImportError:
+        logger.info("worker: [agent] extra not installed — prompt tasks disabled")
+        return None
+    from tg_messenger.agent.config import AgentConfig
+
+    try:
+        cfg = AgentConfig.from_env(require_allowlist=False)
+        return build_orchestrator(client, cfg)
+    except ValueError as exc:
+        logger.info("worker: agent not configured (%s) — prompt tasks disabled", exc)
+        return None
 
 
 def make_agent_runner(client, *, notify_errors: bool = False):
@@ -103,6 +149,75 @@ def make_agent_runner(client, *, notify_errors: bool = False):
     if cfg.intents:
         click.echo("Custom intents: " + ", ".join(spec.name for spec in cfg.intents))
     return AgentRunner(client, orchestrator, config=cfg, notify_errors=notify_errors)
+
+
+def make_suggester(client, *, storage=None):
+    """Build the reply Suggester (#17); the seam suggest tests patch.
+
+    Like make_agent_runner: needs the [agent] extra + TG_AGENT_MODEL (fail-fast).
+    """
+    try:
+        from tg_messenger.agent.factory import build_suggester
+    except ImportError as exc:
+        raise click.ClickException(
+            'Agent dependencies are not installed — pip install "tg-messenger[agent]"'
+        ) from exc
+    from tg_messenger.agent.config import AgentConfig
+
+    try:
+        cfg = AgentConfig.from_env(require_allowlist=False)
+        return build_suggester(client, cfg, storage=storage)
+    except (ValueError, ImportError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+class _StorageBackedSuggester:
+    """Lazily connect suggester storage for long-running web/TUI processes."""
+
+    def __init__(self, suggester, storage):
+        self._suggester = suggester
+        self._storage = storage
+        self._connected = False
+        self._lock = asyncio.Lock()
+
+    async def _ensure_connected(self) -> None:
+        if self._connected:
+            return
+        async with self._lock:
+            if not self._connected:
+                await self._storage.connect()
+                self._connected = True
+
+    async def suggest(self, dialog_id: int) -> str:
+        await self._ensure_connected()
+        return await self._suggester.suggest(dialog_id)
+
+    async def learn(self, dialog_id: int):
+        await self._ensure_connected()
+        return await self._suggester.learn(dialog_id)
+
+    async def close(self) -> None:
+        if self._connected:
+            await self._storage.close()
+            self._connected = False
+
+
+def make_optional_suggester(client, *, session: str = "default"):
+    """Best-effort production suggester for web/TUI.
+
+    Suggest is an optional [agent] feature. A missing extra or model should disable
+    the draft endpoint/strip, not prevent the web UI or TUI from starting.
+    """
+    try:
+        from tg_messenger.agent.suggest import register_suggest_migrations
+
+        storage = make_storage(session)
+        register_suggest_migrations(storage)
+        suggester = make_suggester(client, storage=storage)
+        return _StorageBackedSuggester(suggester, storage)
+    except (click.ClickException, ImportError) as exc:
+        logger.warning("reply suggester disabled: %s", exc)
+        return None
 
 
 _CODE_DELIVERY_HINTS = {
@@ -355,15 +470,76 @@ def login(ctx: click.Context, session: str, phone: str | None,
     _run(_do())
 
 
-@cli.command()
-def profiles() -> None:
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def profiles(ctx: click.Context) -> None:
     """List saved account profiles (sessions on disk)."""
+    if ctx.invoked_subcommand is not None:
+        return
     names = _session_store().list_profiles()
     if not names:
         click.echo("No profiles yet — run: tg-messenger --profile NAME login")
         return
     for name in names:
         click.echo(name)
+
+
+@profiles.command("remove")
+@click.argument("name")
+@click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+def profiles_remove(name: str, yes: bool) -> None:
+    """Delete a profile's session file WITHOUT logging out (for dead sessions).
+
+    To also invalidate the session on Telegram's side use `tg-messenger
+    --profile NAME logout`.
+    """
+    store = _session_store()
+    if not store.path_for(name).is_file():
+        raise click.ClickException(f"no saved session for profile {name!r}.")
+    if not yes:
+        click.confirm(f"Delete the session file for profile {name!r}?", abort=True)
+    store.delete(name)
+    click.echo(f"profile {name!r} removed.")
+
+
+@cli.command()
+@click.option("--session", default="default")
+@click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+@click.pass_context
+def logout(ctx: click.Context, session: str, yes: bool) -> None:
+    """Log out of Telegram (best-effort) and delete the profile's session file.
+
+    The Telegram-side log_out invalidates the auth key on the server; a dead or
+    revoked session does not block the local file removal.
+    """
+    session = _effective_session(ctx, session)
+    store = _session_store()
+    if not store.path_for(session).is_file():
+        raise click.ClickException(f"no saved session for profile {session!r}.")
+    if not yes:
+        click.confirm(
+            f"Log out profile {session!r} from Telegram and delete its session file?",
+            abort=True,
+        )
+
+    async def _do():
+        client = make_client(session_name=session)
+        await client.connect()
+        try:
+            await client.log_out()
+        finally:
+            await client.disconnect()
+
+    try:
+        _run(_do(), session=session)
+        click.echo("logged out of Telegram.")
+    except Exception as exc:
+        # best-effort by design: a dead session must not keep its file alive
+        logger.warning("telegram log_out failed for profile %r: %s", session, exc)
+        click.echo(f"⚠ Telegram log_out failed ({exc}) — deleting the local session anyway.",
+                   err=True)
+    store.delete(session)
+    click.echo(f"session file removed for profile {session!r}.")
 
 
 @cli.command()
@@ -436,16 +612,35 @@ def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> 
 @click.argument("dialog_id", type=int)
 @click.argument("text", required=False)
 @click.option("--file", "file_path", default=None, help="Send a file/photo instead of text.")
+@click.option("--caption", "caption", default=None,
+              help="Caption for --file (overrides the positional TEXT).")
+@click.option("--voice", "voice", is_flag=True, help="Send --file as a voice note.")
+@click.option("--video-note", "video_note", is_flag=True,
+              help="Send --file as a round video note.")
+@click.option("--as-file", "as_file", is_flag=True,
+              help="Send --file as a plain document (no media preview).")
 @click.option("--reply-to", "reply_to", type=int, default=None,
               help="Reply to this message id.")
 @click.option("--session", default="default")
-def send(dialog_id: int, text: str | None, file_path: str | None,
+def send(dialog_id: int, text: str | None, file_path: str | None, caption: str | None,
+         voice: bool, video_note: bool, as_file: bool,
          reply_to: int | None, session: str) -> None:
-    """Send a text message (or a file with --file); --reply-to to quote a message."""
+    """Send a text message (or a file with --file); --reply-to to quote a message.
+
+    --voice / --video-note / --as-file are mutually exclusive media modifiers.
+    Caption comes from --caption or, failing that, the positional TEXT.
+    """
+    if sum([voice, video_note, as_file]) > 1:
+        raise click.ClickException(
+            "--voice, --video-note and --as-file are mutually exclusive"
+        )
 
     async def _do(client):
         if file_path:
-            return await client.send_media(dialog_id, file_path, caption=text)
+            return await client.send_media(
+                dialog_id, file_path, caption=caption or text,
+                voice_note=voice, video_note=video_note, force_document=as_file,
+            )
         return await client.send_text(dialog_id, text or "", reply_to=reply_to)
 
     _run(_with_client(session, _do), session=session)
@@ -795,12 +990,560 @@ def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
 
 
 @cli.command()
+@click.option("--session", default="default")
+@click.option("--factory-url", "factory_url", default=lambda: os.environ.get("TG_FACTORY_URL"),
+              help="tg_content_factory base URL (env TG_FACTORY_URL).")
+@click.option("--types", "types", default="dm_reply,chat_answer",
+              help="Comma-separated task types to claim.")
+@click.option("--interval", "interval", type=float, default=5.0,
+              help="Seconds to wait between empty polls.")
+@click.pass_context
+def worker(ctx: click.Context, session: str, factory_url: str | None, types: str, interval: float) -> None:
+    """Run a worker for tg_content_factory: claim tasks, execute them, report back.
+
+    The factory is the agent's memory + search; this worker is its hands —
+    dm_reply/chat_answer send messages, fetch_history/fetch_dialogs read them.
+    """
+    session = _effective_session(ctx, session)
+    if not factory_url:
+        raise click.ClickException(
+            "--factory-url is required (or set TG_FACTORY_URL)."
+        )
+    try:
+        from tg_messenger.interop.worker import Worker
+    except ImportError as exc:
+        raise click.ClickException(
+            "interop requires: pip install 'tg-messenger[interop]'"
+        ) from exc
+
+    task_types = [t.strip() for t in types.split(",") if t.strip()]
+    factory = make_factory_client(
+        base_url=factory_url, password=os.environ.get("TG_FACTORY_PASSWORD")
+    )
+
+    async def _sleep(seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+    async def _do():
+        client = make_client(session_name=session)
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            agent = make_worker_agent(client)
+            click.echo(
+                f"Worker polling {factory_url} for {', '.join(task_types)} "
+                f"(prompt tasks {'on' if agent is not None else 'off'}; Ctrl+C to stop)..."
+            )
+            await Worker(
+                client, factory, types=task_types, sleep=_sleep, idle_sleep=interval,
+                agent=agent,
+            ).run()
+        finally:
+            await client.disconnect()
+
+    try:
+        _run(_do(), session=session)
+    except KeyboardInterrupt:
+        click.echo("stopped.")
+
+
+@cli.command()
+@click.argument("dialog_id", type=int)
+@click.option("--send", "do_send", is_flag=True,
+              help="Send the draft instead of just printing it.")
+@click.option("--learn", "do_learn", is_flag=True,
+              help="Build and persist the contact's style profile (one history pass).")
+@click.option("--session", default="default")
+@click.pass_context
+def suggest(ctx: click.Context, dialog_id: int, do_send: bool, do_learn: bool, session: str) -> None:
+    """Draft a reply for DIALOG_ID in the style of past messages (#17).
+
+    Human-in-the-loop: prints a draft you review/edit. --send sends it as-is;
+    --learn (re)builds the style profile from this dialog's history.
+    """
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        client = make_client(session_name=session)
+        from tg_messenger.agent.suggest import register_suggest_migrations
+
+        storage = make_storage(session)
+        register_suggest_migrations(storage)
+        # build the suggester (LLM stack) before the network — config errors show first
+        suggester = make_suggester(client, storage=storage)
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            await storage.connect()
+            try:
+                await _ensure_dm_dialog(client, dialog_id)
+                if do_learn:
+                    profile = await suggester.learn(dialog_id)
+                    click.echo(
+                        f"learned style profile for {dialog_id} "
+                        f"({len(profile.examples)} examples)."
+                    )
+                    return
+                draft = await suggester.suggest(dialog_id)
+                if do_send:
+                    await client.send_text(dialog_id, draft)
+                    click.echo("sent.")
+                else:
+                    click.echo(draft)
+            finally:
+                await storage.close()
+        finally:
+            await client.disconnect()
+
+    _run(_do(), session=session)
+
+
+# --- ghostwrite (#18): auto-reply in your style in explicitly enabled DMs ---------
+
+
+@cli.command()
+@click.option("--session", default="default")
+@click.option("--enforce", is_flag=True,
+              help="Actually send replies (default is dry-run: log only).")
+@click.pass_context
+def ghostwrite(ctx: click.Context, session: str, enforce: bool) -> None:
+    """Auto-reply in your style in explicitly enabled DMs (dry-run unless --enforce).
+
+    Destructive (sends from your account) and per-dialog opt-in only — enable dialogs with
+    `ghostwrite-dialogs enable`. Safeties: hourly rate cap, auto-pause when you reply by
+    hand, and `ghostwrite-dialogs pause-all` as a kill switch.
+    """
+    from tg_messenger.agent.ghostwrite import (
+        GhostwriteEngine,
+        list_enabled,
+        register_ghostwrite_migrations,
+    )
+    from tg_messenger.agent.suggest import register_suggest_migrations, watch_read_receipts
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        client = make_client(session_name=session)
+        storage = make_storage(session)
+        register_ghostwrite_migrations(storage)
+        register_suggest_migrations(storage)  # the suggester reads style profiles from here
+        # build the suggester (LLM stack) before the network — config errors show first
+        suggester = make_suggester(client, storage=storage)
+        await storage.connect()
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            enabled = await list_enabled(storage)
+            if enabled:
+                click.echo("Ghostwrite enabled for dialogs: "
+                           + ", ".join(str(d) for d in enabled))
+            else:
+                click.echo("⚠ no dialogs enabled — use 'ghostwrite-dialogs enable PEER'",
+                           err=True)
+            engine = GhostwriteEngine(client, suggester, storage, enforce=enforce)
+            mode = "ENFORCING" if enforce else "dry-run"
+            click.echo(f"Ghostwriting ({mode}) — Ctrl+C to stop...")
+            # цикл 98 (#17): рядом с движком пишем read-receipts (last_read
+            # per dialog, kv) — сигнал «прочитал и молчит» для #18/#19.
+            # Фоновая задача + cancel в finally, не gather: KeyboardInterrupt
+            # из движка не должен бросать вечный watcher недобитым.
+            watcher = asyncio.create_task(watch_read_receipts(client, storage))
+            try:
+                await engine.run()
+            finally:
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watcher
+        finally:
+            await client.disconnect()
+            await storage.close()
+
+    try:
+        _run(_do(), session=session)
+    except KeyboardInterrupt:
+        click.echo("stopped.")
+
+
+@cli.group("ghostwrite-dialogs")
+def ghostwrite_dialogs() -> None:
+    """Manage the ghostwrite per-dialog allowlist (enable / disable / list / pause)."""
+
+
+def _open_ghostwrite_storage(session: str):
+    from tg_messenger.agent.ghostwrite import register_ghostwrite_migrations
+
+    storage = make_storage(session)
+    register_ghostwrite_migrations(storage)
+    return storage
+
+
+@ghostwrite_dialogs.command("enable")
+@click.argument("peer")
+@click.option("--session", default="default")
+@click.pass_context
+def ghostwrite_dialogs_enable(ctx: click.Context, peer: str, session: str) -> None:
+    """Turn ghostwrite ON for a DM by PEER (numeric id). '*' is rejected by design."""
+    if peer.strip() == "*":
+        raise click.ClickException(
+            "'*' (everyone) is not allowed for ghostwrite — enable each dialog explicitly."
+        )
+    try:
+        dialog_id = int(peer)
+    except ValueError as exc:
+        raise click.ClickException(f"PEER must be a numeric dialog id, got {peer!r}") from exc
+    from tg_messenger.agent.ghostwrite import enable_dialog
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        storage = _open_ghostwrite_storage(session)
+        await storage.connect()
+        try:
+            await enable_dialog(storage, dialog_id)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"ghostwrite enabled for dialog {dialog_id}.")
+
+
+@ghostwrite_dialogs.command("disable")
+@click.argument("dialog_id", type=int)
+@click.option("--session", default="default")
+@click.pass_context
+def ghostwrite_dialogs_disable(ctx: click.Context, dialog_id: int, session: str) -> None:
+    """Turn ghostwrite OFF for a dialog."""
+    from tg_messenger.agent.ghostwrite import disable_dialog
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        storage = _open_ghostwrite_storage(session)
+        await storage.connect()
+        try:
+            await disable_dialog(storage, dialog_id)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"ghostwrite disabled for dialog {dialog_id}.")
+
+
+@ghostwrite_dialogs.command("list")
+@click.option("--session", default="default")
+@click.pass_context
+def ghostwrite_dialogs_list(ctx: click.Context, session: str) -> None:
+    """List dialogs where ghostwrite is enabled."""
+    from tg_messenger.agent.ghostwrite import list_enabled
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        storage = _open_ghostwrite_storage(session)
+        await storage.connect()
+        try:
+            return await list_enabled(storage)
+        finally:
+            await storage.close()
+
+    enabled = _run(_do(), session=session)
+    if not enabled:
+        click.echo("No dialogs enabled.")
+        return
+    for dialog_id in enabled:
+        click.echo(str(dialog_id))
+
+
+@ghostwrite_dialogs.command("pause-all")
+@click.option("--session", default="default")
+@click.pass_context
+def ghostwrite_dialogs_pause_all(ctx: click.Context, session: str) -> None:
+    """Kill switch: pause every enabled dialog (resume one with 'resume PEER')."""
+    from tg_messenger.agent.ghostwrite import pause_all
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        storage = _open_ghostwrite_storage(session)
+        await storage.connect()
+        try:
+            await pause_all(storage)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo("ghostwrite paused for all enabled dialogs.")
+
+
+@ghostwrite_dialogs.command("resume")
+@click.argument("dialog_id", type=int)
+@click.option("--session", default="default")
+@click.pass_context
+def ghostwrite_dialogs_resume(ctx: click.Context, dialog_id: int, session: str) -> None:
+    """Clear a dialog's pause (re-arm it after pause-all or an auto-pause)."""
+    from tg_messenger.agent.ghostwrite import resume_dialog
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        storage = _open_ghostwrite_storage(session)
+        await storage.connect()
+        try:
+            await resume_dialog(storage, dialog_id)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"ghostwrite resumed for dialog {dialog_id}.")
+
+
+# --- heartbeat (#19): scheduled pings with templates and safeties ---------------
+
+
+def _open_heartbeat_storage(session: str):
+    from tg_messenger.core.heartbeat import register_heartbeat_migrations
+
+    storage = make_storage(session)
+    register_heartbeat_migrations(storage)
+    return storage
+
+
+def _parse_at(at: str):
+    """Parse ``HH:MM`` into the next future local datetime (today, or tomorrow if past)."""
+    from datetime import datetime, timedelta
+
+    try:
+        hh, mm = (int(p) for p in at.split(":", 1))
+    except ValueError as exc:
+        raise click.ClickException(f"--at must be HH:MM, got {at!r}") from exc
+    now = datetime.now()
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
+@cli.group()
+def heartbeat() -> None:
+    """Scheduled pings: one-shot (--at) or recurring stored plans (--interval)."""
+
+
+@heartbeat.command("plan")
+@click.argument("peer", type=int)
+@click.option("--at", "at", default=None, help="One-shot HH:MM (server-side scheduled send).")
+@click.option("--interval", "interval_hours", type=float, default=None,
+              help="Recurring: hours between pings (stores a plan).")
+@click.option("--template", "templates", multiple=True, help="Ping text (repeatable).")
+@click.option("--jitter", "jitter_minutes", type=float, default=0.0,
+              help="Random +0..N minutes added to each interval.")
+@click.option("--quiet-start", type=int, default=None, help="Quiet window open hour (local).")
+@click.option("--quiet-end", type=int, default=None, help="Quiet window close hour (local).")
+@click.option("--max-per-day", type=int, default=1, help="Daily ping cap (recurring plans).")
+@click.option("--session", default="default")
+@click.pass_context
+def heartbeat_plan(ctx: click.Context, peer: int, at: str | None, interval_hours: float | None,
+                   templates: tuple[str, ...], jitter_minutes: float,
+                   quiet_start: int | None, quiet_end: int | None,
+                   max_per_day: int, session: str) -> None:
+    """Schedule pings to PEER: --at for a one-shot native send, --interval for a stored plan."""
+    session = _effective_session(ctx, session)
+    if not templates:
+        raise click.ClickException("at least one --template is required.")
+    if at is None and interval_hours is None:
+        raise click.ClickException("provide --at (one-shot) or --interval (recurring plan).")
+    if at is not None and interval_hours is not None:
+        raise click.ClickException("--at and --interval are mutually exclusive.")
+
+    if at is not None:
+        # one-shot: native server-side scheduled send (no stored plan)
+        when = _parse_at(at)
+        text = templates[0]
+
+        async def _do_oneshot(client):
+            await client.send_text(peer, text, schedule=when)
+
+        _run(_with_client(session, _do_oneshot), session=session)
+        click.echo(f"scheduled one-shot ping to {peer} at {when:%Y-%m-%d %H:%M}.")
+        return
+
+    # recurring: store a plan
+    from tg_messenger.core.heartbeat import HeartbeatPlan, add_plan
+
+    plan = HeartbeatPlan(
+        peer=peer, templates=list(templates), interval_hours=interval_hours,
+        jitter_minutes=jitter_minutes, quiet_start=quiet_start, quiet_end=quiet_end,
+        max_per_day=max_per_day,
+    )
+
+    async def _do():
+        storage = _open_heartbeat_storage(session)
+        await storage.connect()
+        try:
+            await add_plan(storage, plan)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"heartbeat plan stored for peer {peer} (every {interval_hours}h).")
+
+
+@heartbeat.command("list")
+@click.option("--session", default="default")
+@click.pass_context
+def heartbeat_list(ctx: click.Context, session: str) -> None:
+    """List stored heartbeat plans."""
+    from tg_messenger.core.heartbeat import list_plans
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        storage = _open_heartbeat_storage(session)
+        await storage.connect()
+        try:
+            return await list_plans(storage)
+        finally:
+            await storage.close()
+
+    plans = _run(_do(), session=session)
+    if not plans:
+        click.echo("No plans.")
+        return
+    for p in plans:
+        state = "on" if p.enabled else "off"
+        click.echo(f"{p.peer}\tevery {p.interval_hours}h\t[{state}]\t{p.templates}")
+
+
+@heartbeat.command("remove")
+@click.argument("peer", type=int)
+@click.option("--session", default="default")
+@click.pass_context
+def heartbeat_remove(ctx: click.Context, peer: int, session: str) -> None:
+    """Remove a stored heartbeat plan by PEER."""
+    from tg_messenger.core.heartbeat import remove_plan
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        storage = _open_heartbeat_storage(session)
+        await storage.connect()
+        try:
+            await remove_plan(storage, peer)
+        finally:
+            await storage.close()
+
+    _run(_do(), session=session)
+    click.echo(f"heartbeat plan removed for peer {peer}.")
+
+
+@heartbeat.command("run")
+@click.option("--session", default="default")
+@click.pass_context
+def heartbeat_run(ctx: click.Context, session: str) -> None:
+    """Run the heartbeat scheduler: send stored plans' pings on schedule (Ctrl+C to stop)."""
+    # суфлёрская фиксация read-receipts (#17, kv) — лёгкий модуль без LLM-стека
+    from tg_messenger.agent.suggest import watch_read_receipts
+    from tg_messenger.core.heartbeat import HeartbeatService, register_heartbeat_migrations
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        client = make_client(session_name=session)
+        storage = make_storage(session)
+        register_heartbeat_migrations(storage)
+        await storage.connect()
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            click.echo("Heartbeat scheduler running — Ctrl+C to stop...")
+            # сигнал «прочитал и молчит»: last_read пишется и здесь (#17/#19);
+            # фоновая задача + cancel в finally — см. комментарий в ghostwrite
+            watcher = asyncio.create_task(watch_read_receipts(client, storage))
+            try:
+                await HeartbeatService(client, storage).run()
+            finally:
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watcher
+        finally:
+            await client.disconnect()
+            await storage.close()
+
+    try:
+        _run(_do(), session=session)
+    except KeyboardInterrupt:
+        click.echo("stopped.")
+
+
+@cli.group()
+def username() -> None:
+    """Generate / check / set this account's public @username (#22)."""
+
+
+@username.command("suggest")
+@click.argument("base")
+@click.option("--limit", default=10, help="Max number of available usernames to return.")
+@click.option("--session", default="default")
+def username_suggest(base: str, limit: int, session: str) -> None:
+    """Suggest available usernames derived from BASE (checks candidates sequentially)."""
+    from tg_messenger.core.usernames import find_available
+
+    async def _do(client):
+        return await find_available(client, base, limit=limit)
+
+    found = _run(_with_client(session, _do), session=session)
+    if not found:
+        click.echo("No available usernames found — try a different base.")
+        return
+    for name in found:
+        click.echo(name)
+
+
+@username.command("set")
+@click.argument("name")
+@click.option("--session", default="default")
+def username_set(name: str, session: str) -> None:
+    """Set this account's public username to NAME (fails if invalid or taken)."""
+
+    async def _do(client):
+        try:
+            available = await client.check_username(name)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if not available:
+            raise click.ClickException(f"username '{name}' is not available.")
+        try:
+            await client.set_username(name)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    _run(_with_client(session, _do), session=session)
+    click.echo(f"username set to @{name}.")
+
+
+@username.command("clear")
+@click.option("--session", default="default")
+def username_clear(session: str) -> None:
+    """Remove this account's public username."""
+
+    async def _do(client):
+        await client.clear_username()
+
+    _run(_with_client(session, _do), session=session)
+    click.echo("username cleared.")
+
+
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _is_local_host(host: str) -> bool:
+    """True for loopback-only binds (127.0.0.1 / localhost / ::1)."""
+    return host in _LOCAL_HOSTS
+
+
+@cli.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=lambda: int(os.environ.get("TG_WEB_PORT", "8090")), type=int)
 @click.option("--session", default="default")
+@click.option("--insecure", is_flag=True,
+              help="Serve a non-localhost host without TG_WEB_PASS (anyone can connect).")
 @click.pass_context
-def serve(ctx: click.Context, host: str, port: int, session: str) -> None:
-    """Launch the web interface."""
+def serve(ctx: click.Context, host: str, port: int, session: str, insecure: bool) -> None:
+    """Launch the web interface.
+
+    Set ``TG_WEB_PASS`` to require a password (HMAC-cookie session). Binding to a
+    non-localhost host without it is refused unless ``--insecure`` is passed.
+    """
     try:
         import uvicorn
 
@@ -809,10 +1552,25 @@ def serve(ctx: click.Context, host: str, port: int, session: str) -> None:
         # base install omits the web stack — point at the extra instead of a raw ImportError
         raise click.ClickException("web UI requires: pip install 'tg-messenger[web]'") from exc
 
+    web_pass = os.environ.get("TG_WEB_PASS") or None
+    if not _is_local_host(host) and not web_pass and not insecure:
+        raise click.ClickException(
+            f"refusing to serve on {host} without TG_WEB_PASS — set it or pass --insecure"
+        )
+    if not _is_local_host(host) and not web_pass and insecure:
+        logger.warning("serving on %s without TG_WEB_PASS (--insecure) — anyone can connect", host)
+
     session = _effective_session(ctx, session)
+    client = make_client(session_name=session)
+    suggester = make_optional_suggester(client, session=session)
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
     click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
-    uvicorn.run(build_app(session_name=session), host=host, port=port, log_config=None)
+    uvicorn.run(
+        build_app(client=client, session_name=session, suggester=suggester, web_pass=web_pass),
+        host=host,
+        port=port,
+        log_config=None,
+    )
 
 
 @cli.command()
@@ -828,7 +1586,9 @@ def tui(ctx: click.Context, session: str) -> None:
     # stderr handler would corrupt the alternate screen — file log only
     setup_logging(verbose=ctx.obj["verbose"], console=False, profile=ctx.obj.get("profile"))
     session = _effective_session(ctx, session)
-    MessengerTUI(session_name=session).run()
+    client = make_client(session_name=session)
+    suggester = make_optional_suggester(client, session=session)
+    MessengerTUI(client=client, session_name=session, suggester=suggester).run()
 
 
 if __name__ == "__main__":

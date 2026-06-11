@@ -47,7 +47,9 @@ class EventBus(Generic[T]):
                         self._maxsize,
                     )
                 except asyncio.QueueEmpty:
-                    pass
+                    # full() raced with a consumer that drained the queue —
+                    # nothing was dropped after all (no-silent-failures: logged)
+                    logger.debug("subscriber queue drained concurrently; nothing dropped")
             queue.put_nowait(event)
 
     async def subscribe(self) -> AsyncIterator[T]:

@@ -224,7 +224,8 @@ async def test_send_text_records_and_returns_message(fake_client):
     client = _build(fake_client)
     await client.connect()
     msg = await client.send_text(7, "hello")
-    assert fake_client.sent[-1] == {"peer": 7, "text": "hello", "reply_to": None}
+    assert fake_client.sent[-1] == {"peer": 7, "text": "hello", "reply_to": None,
+                                    "schedule": None}
     assert isinstance(msg, Message)
     assert msg.out is True
 
@@ -763,14 +764,50 @@ async def test_send_text_invalidates_peer_history(fake_client):
     assert fake_client.iter_messages_calls == 3
 
 
-async def test_send_media_invalidates_peer_history(fake_client):
+async def test_send_media_invalidates_peer_history(fake_client, tmp_path):
     _seed_dm(fake_client)
     client = _build(fake_client)
     await client.connect()
+    f = tmp_path / "x.jpg"
+    f.write_bytes(b"x")
     await client.history(7, limit=10)
-    await client.send_media(7, "/tmp/x.jpg")
+    await client.send_media(7, str(f))
     await client.history(7, limit=10)
     assert fake_client.iter_messages_calls == 2
+
+
+async def test_send_media_passes_flags_to_telethon(fake_client, tmp_path):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    f = tmp_path / "note.ogg"
+    f.write_bytes(b"x")
+    await client.send_media(7, str(f), caption="cap", voice_note=True,
+                            video_note=False, force_document=True)
+    rec = fake_client.sent[-1]
+    assert rec["file"] == str(f)
+    assert rec["caption"] == "cap"
+    assert rec["voice_note"] is True
+    assert rec["video_note"] is False
+    assert rec["force_document"] is True
+
+
+async def test_send_media_missing_path_raises_before_network(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(ValueError, match="file not found"):
+        await client.send_media(7, "/no/such/file.jpg")
+    assert fake_client.sent == []
+
+
+async def test_send_media_directory_raises_before_network(fake_client, tmp_path):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(ValueError, match="file not found"):
+        await client.send_media(7, str(tmp_path))
+    assert fake_client.sent == []
 
 
 async def test_incoming_event_invalidates_history(fake_client):
@@ -1194,6 +1231,26 @@ async def test_send_text_reply_invalidates_history(fake_client):
     assert fake_client.iter_messages_calls == 2
 
 
+# --- цикл 99: schedule= в send_text (серверные отложенные) ---
+
+
+async def test_send_text_schedule_passed_to_telethon(fake_client):
+    from datetime import timedelta
+
+    client = _build(fake_client)
+    await client.connect()
+    delay = timedelta(hours=2)
+    await client.send_text(7, "later", schedule=delay)
+    assert fake_client.sent[-1]["schedule"] == delay
+
+
+async def test_send_text_no_schedule_by_default(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await client.send_text(7, "now")
+    assert fake_client.sent[-1]["schedule"] is None
+
+
 # --- Цикл 78: forward / edit / delete ---
 
 
@@ -1567,3 +1624,141 @@ async def test_is_admin_false_on_error(fake_client):
     client = _build(fake_client)
     await client.connect()
     assert await client.is_admin(-100200) is False
+
+
+async def test_log_out_calls_telethon(fake_client):
+    # #11 (комментарий): logout — best-effort log_out() перед удалением файла
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.log_out() is True
+    assert fake_client.logged_out is True
+
+
+# --- Цикл 120: check/set/clear username ---
+
+
+async def test_check_username_free_returns_true(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.check_username("freename1") is True
+
+
+async def test_check_username_occupied_returns_false(fake_client):
+    fake_client.occupied_usernames.add("takenname")
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.check_username("takenname") is False
+
+
+async def test_check_username_invalid_raises_value_error(fake_client):
+    fake_client.invalid_usernames.add("bad!")
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(ValueError):
+        await client.check_username("bad!")
+
+
+async def test_check_username_issues_request(fake_client):
+    from telethon.tl.functions.account import CheckUsernameRequest
+
+    client = _build(fake_client)
+    await client.connect()
+    await client.check_username("freename1")
+    reqs = [r for r in fake_client.requests if isinstance(r, CheckUsernameRequest)]
+    assert reqs and reqs[-1].username == "freename1"
+
+
+async def test_set_username_writes(fake_client):
+    from telethon.tl.functions.account import UpdateUsernameRequest
+
+    client = _build(fake_client)
+    await client.connect()
+    await client.set_username("mynewname")
+    assert fake_client.set_username_to == "mynewname"
+    reqs = [r for r in fake_client.requests if isinstance(r, UpdateUsernameRequest)]
+    assert reqs and reqs[-1].username == "mynewname"
+
+
+async def test_set_username_occupied_raises_value_error(fake_client):
+    fake_client.occupied_usernames.add("takenname")
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(ValueError):
+        await client.set_username("takenname")
+
+
+async def test_set_username_invalid_raises_value_error(fake_client):
+    fake_client.invalid_usernames.add("bad!")
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(ValueError):
+        await client.set_username("bad!")
+
+
+async def test_clear_username_sends_empty(fake_client):
+    from telethon.tl.functions.account import UpdateUsernameRequest
+
+    client = _build(fake_client)
+    await client.connect()
+    await client.clear_username()
+    reqs = [r for r in fake_client.requests if isinstance(r, UpdateUsernameRequest)]
+    assert reqs and reqs[-1].username == ""
+    assert fake_client.set_username_to == ""
+
+
+async def test_check_username_flood_is_handled(fake_client, monkeypatch):
+    import tg_messenger.core.flood as flood
+    from tg_messenger.core.flood import HandledFloodWaitError
+
+    class FakeFloodWaitError(Exception):
+        def __init__(self, seconds):
+            super().__init__(f"flood {seconds}s")
+            self.seconds = seconds
+
+    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    client = _build(fake_client)
+    await client.connect()
+
+    async def boom(request):
+        raise FakeFloodWaitError(9999)
+
+    monkeypatch.setattr(type(fake_client), "__call__", lambda self, req: boom(req))
+    with pytest.raises(HandledFloodWaitError):
+        await client.check_username("freename1")
+
+
+# --- цикл 128: интеграция token-bucket в отправку (#25) ---
+
+async def test_send_rate_limit_waits_when_exhausted(fake_client, caplog):
+    _seed_dm(fake_client)
+    t = {"now": 0.0}
+    slept = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+        t["now"] += s
+
+    # rate 60/min = 1/sec, burst 1: first send instant, second must wait ~1s.
+    # swap in a burst=1 bucket with the fake clock+sleep (the default burst = 1 minute).
+    from tg_messenger.core.ratelimit import TokenBucket
+
+    client = _build(fake_client)
+    client._send_bucket = TokenBucket(60.0, burst=1, clock=lambda: t["now"], sleep=fake_sleep)
+    await client.connect()
+    with caplog.at_level("WARNING", logger="tg_messenger.core.ratelimit"):
+        await client.send_text(7, "first")
+        await client.send_text(7, "second")
+    assert len(slept) == 1
+    assert abs(slept[0] - 1.0) < 0.01
+    assert any("rate limit" in r.message for r in caplog.records)
+
+
+async def test_send_rate_limit_disabled_by_default(fake_client):
+    # default send_rate_per_min=0 → no throttling (regression: existing send tests unaffected)
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    assert client._send_bucket.enabled is False
+    for i in range(50):
+        await client.send_text(7, f"msg{i}")  # never blocks
+    assert len(fake_client.sent) == 50

@@ -32,10 +32,15 @@ class StubClient:
         self.history_items = None
         self.connected = False
         self.authorized = True
+        self.logged_out = False
         self.listen_interrupt = True  # emulate Ctrl+C after the first event
 
     async def is_authorized(self):
         return self.authorized
+
+    async def log_out(self):
+        self.logged_out = True
+        return True
 
     async def connect(self):
         self.connected = True
@@ -51,6 +56,12 @@ class StubClient:
         )
         if self.listen_interrupt:
             raise KeyboardInterrupt
+        await asyncio.Event().wait()
+
+    async def listen_reads(self):
+        from tg_messenger.core.models import MessageReadEvent
+
+        yield MessageReadEvent(dialog_id=7, max_id=10, outbox=True)
         await asyncio.Event().wait()
 
     async def dialogs(self, dm_only=True):
@@ -84,8 +95,8 @@ class StubClient:
         self.downloaded.append((message_id, str(dest)))
         return str(dest)
 
-    async def send_text(self, peer, text, reply_to=None):
-        self.sent.append((peer, text, reply_to))
+    async def send_text(self, peer, text, reply_to=None, schedule=None):
+        self.sent.append((peer, text, reply_to, schedule))
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
@@ -105,8 +116,11 @@ class StubClient:
     async def mark_read(self, peer, max_id=None):
         self.read_acks.append((peer, max_id))
 
-    async def send_media(self, peer, file_path, caption=None):
+    async def send_media(self, peer, file_path, *, caption=None, voice_note=False,
+                         video_note=False, force_document=False):
         self.sent.append((peer, "file", str(file_path), caption))
+        self.media_kwargs = {"voice_note": voice_note, "video_note": video_note,
+                             "force_document": force_document}
         return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
@@ -115,6 +129,22 @@ class StubClient:
 
     async def entity_title(self, peer):
         return "My Group"
+
+    # username (#22): override .occupied to mark names taken
+    occupied: set = frozenset()
+    set_username_to = None
+    cleared = False
+
+    async def check_username(self, username):
+        return username not in self.occupied
+
+    async def set_username(self, username):
+        if username in self.occupied:
+            raise ValueError(f"username already taken: {username}")
+        self.set_username_to = username
+
+    async def clear_username(self):
+        self.cleared = True
 
     async def listen_outgoing(self):
         yield OutgoingEvent(
@@ -236,7 +266,7 @@ def test_send_calls_client(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["send", "7", "hello"])
     assert result.exit_code == 0
-    assert stub.sent == [(7, "hello", None)]
+    assert stub.sent == [(7, "hello", None, None)]
 
 
 def test_send_file_uses_send_media(runner, tmp_path):
@@ -248,6 +278,52 @@ def test_send_file_uses_send_media(runner, tmp_path):
     assert stub.sent[-1] == (7, "file", str(f), "caption")
 
 
+def test_send_file_caption_option(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--caption", "cap"])
+    assert result.exit_code == 0, result.output
+    assert stub.sent[-1] == (7, "file", str(f), "cap")
+
+
+def test_send_file_voice_flag(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "note.ogg"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--voice"])
+    assert result.exit_code == 0, result.output
+    assert stub.media_kwargs == {"voice_note": True, "video_note": False,
+                                 "force_document": False}
+
+
+def test_send_file_video_note_flag(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "v.mp4"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--video-note"])
+    assert result.exit_code == 0, result.output
+    assert stub.media_kwargs["video_note"] is True
+
+
+def test_send_file_as_file_flag(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--as-file"])
+    assert result.exit_code == 0, result.output
+    assert stub.media_kwargs["force_document"] is True
+
+
+def test_send_file_conflicting_flags_error(runner, tmp_path):
+    r, stub = runner
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--voice", "--as-file"])
+    assert result.exit_code != 0
+    assert stub.sent == []
+
+
 # --- цикл 80: reply/forward/edit/delete/read команды ---
 
 
@@ -255,7 +331,7 @@ def test_send_reply_to_passed(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["send", "7", "re", "--reply-to", "42"])
     assert result.exit_code == 0, result.output
-    assert stub.sent == [(7, "re", 42)]
+    assert stub.sent == [(7, "re", 42, None)]
 
 
 def test_forward_command_calls_client(runner):
@@ -328,9 +404,16 @@ def test_flood_wait_friendly_message(runner, monkeypatch):
 
 @pytest.fixture
 def serve_spy(monkeypatch):
-    calls = []
-    monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls.append(kw))
-    monkeypatch.setattr("tg_messenger.web.app.build_app", lambda **kw: object())
+    calls = {"uvicorn": [], "build": []}
+    client = object()
+    suggester = object()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c, **kw: suggester)
+    monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls["uvicorn"].append(kw))
+    monkeypatch.setattr(
+        "tg_messenger.web.app.build_app",
+        lambda **kw: calls["build"].append(kw) or object(),
+    )
     return calls
 
 
@@ -338,21 +421,21 @@ def test_serve_defaults_to_8090(serve_spy, monkeypatch):
     monkeypatch.delenv("TG_WEB_PORT", raising=False)
     result = CliRunner().invoke(cli_main.cli, ["serve"])
     assert result.exit_code == 0
-    assert serve_spy[0]["port"] == 8090
+    assert serve_spy["uvicorn"][0]["port"] == 8090
 
 
 def test_serve_reads_env_port(serve_spy, monkeypatch):
     monkeypatch.setenv("TG_WEB_PORT", "9099")
     result = CliRunner().invoke(cli_main.cli, ["serve"])
     assert result.exit_code == 0
-    assert serve_spy[0]["port"] == 9099
+    assert serve_spy["uvicorn"][0]["port"] == 9099
 
 
 def test_serve_flag_overrides_env(serve_spy, monkeypatch):
     monkeypatch.setenv("TG_WEB_PORT", "9099")
     result = CliRunner().invoke(cli_main.cli, ["serve", "--port", "1234"])
     assert result.exit_code == 0
-    assert serve_spy[0]["port"] == 1234
+    assert serve_spy["uvicorn"][0]["port"] == 1234
 
 
 def test_read_download_saves_media(runner, tmp_path):
@@ -397,7 +480,7 @@ def test_chat_sends_and_disconnects_on_eof(runner):
     stub.listen_interrupt = False  # printer just idles; EOF on stdin ends the REPL
     result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
     assert result.exit_code == 0
-    assert (7, "hello", None) in stub.sent
+    assert (7, "hello", None, None) in stub.sent
     assert stub.connected is False
 
 
@@ -591,7 +674,7 @@ def test_watch_notifies_saved_messages(runner):
     result = r.invoke(cli_main.cli, ["watch"])
     assert result.exit_code == 0
     assert "Watching" in result.output
-    (peer, text, _reply), = stub.sent
+    (peer, text, _reply, _schedule), = stub.sent
     assert peer == 1  # Saved Messages = собственный id
     assert "удалят меня" in text
     assert "My Group" in text
@@ -754,6 +837,287 @@ def test_revoked_session_mid_command_gives_hint(runner, monkeypatch):
     assert "Traceback" not in result.output
 
 
+# --- Цикл F (#18): команды ghostwrite + ghostwrite-dialogs ---
+
+
+class FakeSuggesterCli:
+    """Stub Suggester for the ghostwrite CLI: never touches an LLM."""
+
+    async def suggest(self, dialog_id):
+        return "auto reply"
+
+
+@pytest.fixture
+def gw_runner(monkeypatch, tmp_path):
+    """CLI runner whose ghostwrite storage is a fresh tmp SQLite db; no LLM."""
+    from tg_messenger.core.storage import Storage
+
+    stub = StubClient()
+    seen = {"clients": [], "storages": []}
+
+    def fake_make_client(**kw):
+        seen["clients"].append(kw.get("session_name"))
+        return stub
+
+    def fake_make_storage(profile="default"):
+        seen["storages"].append(profile)
+        return Storage(tmp_path / f"{profile}.db")
+
+    monkeypatch.setattr(cli_main, "make_client", fake_make_client)
+    monkeypatch.setattr(cli_main, "make_storage", fake_make_storage)
+    monkeypatch.setattr(cli_main, "make_suggester", lambda client, storage=None: FakeSuggesterCli())
+    return CliRunner(), stub, tmp_path, seen
+
+
+def test_ghostwrite_dialogs_enable_list_disable(gw_runner):
+    r, _stub, _tp, _seen = gw_runner
+    en = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    assert en.exit_code == 0, en.output
+
+    lst = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "list"])
+    assert lst.exit_code == 0
+    assert "7" in lst.output
+
+    dis = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "disable", "7"])
+    assert dis.exit_code == 0
+
+    lst2 = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "list"])
+    assert "No dialogs" in lst2.output or "7" not in lst2.output
+
+
+def test_ghostwrite_enable_star_is_rejected(gw_runner):
+    r, _stub, _tp, _seen = gw_runner
+    result = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "*"])
+    assert result.exit_code != 0
+    assert "*" in result.output
+
+
+def test_ghostwrite_pause_all_and_resume(gw_runner):
+    r, _stub, _tp, _seen = gw_runner
+    r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    pa = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "pause-all"])
+    assert pa.exit_code == 0, pa.output
+    res = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "resume", "7"])
+    assert res.exit_code == 0, res.output
+
+
+def test_ghostwrite_runs_and_stops_on_ctrl_c(gw_runner):
+    r, stub, _tp, _seen = gw_runner
+    r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    result = r.invoke(cli_main.cli, ["ghostwrite"])
+    assert result.exit_code == 0, result.output
+    assert "dry-run" in result.output
+    assert "stopped." in result.output
+    assert stub.connected is False
+    # dry-run: nothing was actually sent
+    assert stub.sent == []
+
+
+def test_ghostwrite_watches_read_receipts(gw_runner, monkeypatch):
+    # цикл 98 (#17): фиксация last_read из listen_reads живёт в долгоживущем
+    # ghostwrite-цикле — иначе сигнал никогда не пишется
+    r, stub, _tp, _seen = gw_runner
+    calls = []
+
+    async def spy(client, storage):
+        calls.append(client)
+
+    monkeypatch.setattr("tg_messenger.agent.suggest.watch_read_receipts", spy)
+    r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    result = r.invoke(cli_main.cli, ["ghostwrite"])
+    assert result.exit_code == 0, result.output
+    assert calls and calls[0] is stub
+
+
+def test_ghostwrite_enforce_flag_shown(gw_runner):
+    r, stub, _tp, _seen = gw_runner
+    r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    result = r.invoke(cli_main.cli, ["ghostwrite", "--enforce"])
+    assert result.exit_code == 0, result.output
+    assert "ENFORCING" in result.output
+
+
+def test_ghostwrite_without_login_gives_hint(gw_runner):
+    r, stub, _tp, _seen = gw_runner
+    stub.authorized = False
+    result = r.invoke(cli_main.cli, ["ghostwrite"])
+    assert result.exit_code != 0
+    assert "tg-messenger login" in result.output
+
+
+def test_ghostwrite_uses_global_profile(gw_runner):
+    r, _stub, _tp, seen = gw_runner
+    enabled = r.invoke(cli_main.cli, ["--profile", "work", "ghostwrite-dialogs", "enable", "7"])
+    assert enabled.exit_code == 0, enabled.output
+
+    result = r.invoke(cli_main.cli, ["--profile", "work", "ghostwrite"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["clients"][-1] == "work"
+    assert seen["storages"][-1] == "work"
+
+
+def test_ghostwrite_dialogs_use_global_profile(gw_runner):
+    r, _stub, _tp, seen = gw_runner
+    enabled = r.invoke(cli_main.cli, ["--profile", "work", "ghostwrite-dialogs", "enable", "7"])
+    assert enabled.exit_code == 0, enabled.output
+    assert seen["storages"][-1] == "work"
+
+    default_list = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "list"])
+    assert default_list.exit_code == 0, default_list.output
+    assert "No dialogs" in default_list.output
+
+    work_list = r.invoke(cli_main.cli, ["--profile", "work", "ghostwrite-dialogs", "list"])
+    assert work_list.exit_code == 0, work_list.output
+    assert "7" in work_list.output
+    assert seen["storages"][-1] == "work"
+
+
+# --- Цикл 104 (#19): команды heartbeat + heartbeat plan/list/remove ---
+
+
+@pytest.fixture
+def hb_runner(monkeypatch, tmp_path):
+    """CLI runner whose heartbeat storage is a fresh tmp SQLite db; no LLM."""
+    from tg_messenger.core.storage import Storage
+
+    stub = StubClient()
+    seen = {"clients": [], "storages": []}
+
+    def fake_make_client(**kw):
+        seen["clients"].append(kw.get("session_name"))
+        return stub
+
+    def fake_make_storage(profile="default"):
+        seen["storages"].append(profile)
+        return Storage(tmp_path / f"{profile}.db")
+
+    monkeypatch.setattr(cli_main, "make_client", fake_make_client)
+    monkeypatch.setattr(cli_main, "make_storage", fake_make_storage)
+    return CliRunner(), stub, tmp_path, seen
+
+
+def test_heartbeat_plan_add_list_remove(hb_runner):
+    r, _stub, _tp, _seen = hb_runner
+    add = r.invoke(cli_main.cli, ["heartbeat", "plan", "7",
+                                  "--interval", "24", "--template", "ping",
+                                  "--template", "yo"])
+    assert add.exit_code == 0, add.output
+
+    lst = r.invoke(cli_main.cli, ["heartbeat", "list"])
+    assert lst.exit_code == 0
+    assert "7" in lst.output
+
+    rm = r.invoke(cli_main.cli, ["heartbeat", "remove", "7"])
+    assert rm.exit_code == 0
+
+    lst2 = r.invoke(cli_main.cli, ["heartbeat", "list"])
+    assert "No plans" in lst2.output
+
+
+def test_heartbeat_plan_at_sends_scheduled_one_shot(hb_runner):
+    r, stub, _tp, _seen = hb_runner
+    result = r.invoke(cli_main.cli, ["heartbeat", "plan", "7",
+                                     "--at", "18:00", "--template", "evening ping"])
+    assert result.exit_code == 0, result.output
+    # one-shot native schedule: a single send_text with a non-None schedule
+    assert len(stub.sent) == 1
+    peer, text, _reply, schedule = stub.sent[0]
+    assert peer == 7
+    assert text == "evening ping"
+    assert schedule is not None
+    # and it did NOT create a recurring stored plan
+    lst = r.invoke(cli_main.cli, ["heartbeat", "list"])
+    assert "No plans" in lst.output
+
+
+def test_heartbeat_plan_requires_at_or_interval(hb_runner):
+    r, _stub, _tp, _seen = hb_runner
+    result = r.invoke(cli_main.cli, ["heartbeat", "plan", "7", "--template", "x"])
+    assert result.exit_code != 0
+    assert "--at" in result.output or "--interval" in result.output
+
+
+def test_heartbeat_run_stops_on_ctrl_c(hb_runner, monkeypatch):
+    r, stub, _tp, _seen = hb_runner
+    # enable a plan so the tick has work; history raises Ctrl+C to break the loop
+    r.invoke(cli_main.cli, ["heartbeat", "plan", "7", "--interval", "24", "--template", "ping"])
+
+    async def boom(peer, limit=1):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(stub, "history", boom)
+    result = r.invoke(cli_main.cli, ["heartbeat", "run"])
+    assert result.exit_code == 0, result.output
+    assert "stopped." in result.output
+    assert stub.connected is False
+
+
+def test_heartbeat_run_watches_read_receipts(hb_runner, monkeypatch):
+    # сигнал «прочитал и молчит» (#17/#19) пишется и из heartbeat run
+    r, stub, _tp, _seen = hb_runner
+    calls = []
+
+    async def spy(client, storage):
+        calls.append(client)
+
+    monkeypatch.setattr("tg_messenger.agent.suggest.watch_read_receipts", spy)
+    r.invoke(cli_main.cli, ["heartbeat", "plan", "7", "--interval", "24", "--template", "ping"])
+
+    async def boom(peer, limit=1):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(stub, "history", boom)
+    result = r.invoke(cli_main.cli, ["heartbeat", "run"])
+    assert result.exit_code == 0, result.output
+    assert calls and calls[0] is stub
+
+
+def test_heartbeat_run_without_login_gives_hint(hb_runner):
+    r, stub, _tp, _seen = hb_runner
+    stub.authorized = False
+    result = r.invoke(cli_main.cli, ["heartbeat", "run"])
+    assert result.exit_code != 0
+    assert "tg-messenger login" in result.output
+
+
+def test_heartbeat_plan_list_remove_use_global_profile(hb_runner):
+    r, _stub, _tp, seen = hb_runner
+    add = r.invoke(
+        cli_main.cli,
+        ["--profile", "work", "heartbeat", "plan", "7", "--interval", "24", "--template", "ping"],
+    )
+    assert add.exit_code == 0, add.output
+    assert seen["storages"][-1] == "work"
+
+    default_list = r.invoke(cli_main.cli, ["heartbeat", "list"])
+    assert default_list.exit_code == 0, default_list.output
+    assert "No plans" in default_list.output
+
+    work_list = r.invoke(cli_main.cli, ["--profile", "work", "heartbeat", "list"])
+    assert work_list.exit_code == 0, work_list.output
+    assert "7" in work_list.output
+    assert seen["storages"][-1] == "work"
+
+    removed = r.invoke(cli_main.cli, ["--profile", "work", "heartbeat", "remove", "7"])
+    assert removed.exit_code == 0, removed.output
+    assert seen["storages"][-1] == "work"
+
+
+def test_heartbeat_run_uses_global_profile(hb_runner, monkeypatch):
+    r, stub, _tp, seen = hb_runner
+    r.invoke(cli_main.cli, ["--profile", "work", "heartbeat", "plan", "7", "--interval", "24", "--template", "ping"])
+
+    async def boom(peer, limit=1):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(stub, "history", boom)
+    result = r.invoke(cli_main.cli, ["--profile", "work", "heartbeat", "run"])
+    assert result.exit_code == 0, result.output
+    assert seen["clients"][-1] == "work"
+    assert seen["storages"][-1] == "work"
+
+
 def test_dotenv_autoloaded_for_commands(runner, tmp_path, monkeypatch):
     # isolate os.environ so the test can't leak TG_API_ID into the session
     monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
@@ -835,7 +1199,7 @@ def test_chat_listener_failure_is_reported(runner, monkeypatch, caplog):
     with caplog.at_level("ERROR", logger="tg_messenger.cli.main"):
         result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
     assert result.exit_code == 0  # the REPL itself still worked
-    assert (7, "hello", None) in stub.sent
+    assert (7, "hello", None, None) in stub.sent
     assert "listener failed" in result.output
     errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
     assert errors and errors[0].exc_info is not None
@@ -844,7 +1208,7 @@ def test_chat_listener_failure_is_reported(runner, monkeypatch, caplog):
 def test_serve_unifies_uvicorn_logging(serve_spy):
     result = CliRunner().invoke(cli_main.cli, ["serve"])
     assert result.exit_code == 0
-    assert serve_spy[0]["log_config"] is None
+    assert serve_spy["uvicorn"][0]["log_config"] is None
 
 
 def test_serve_announces_url(serve_spy, monkeypatch):
@@ -1157,6 +1521,79 @@ def test_multiple_profiles_non_interactive_errors(monkeypatch, tmp_path):
     assert "--profile" in result.output
 
 
+# --- #11 (комментарий): logout + profiles remove ---
+
+
+def _profile_store(monkeypatch, tmp_path, *names):
+    from tg_messenger.core.auth import SessionStore
+
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    store = SessionStore(tmp_path)
+    for n in names:
+        store.save(n, _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    return store
+
+
+def test_logout_logs_out_and_removes_session(monkeypatch, tmp_path):
+    store = _profile_store(monkeypatch, tmp_path, "work")
+    stub = StubClient()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "logout", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert stub.logged_out is True
+    assert store.list_profiles() == []
+
+
+def test_logout_deletes_file_even_if_telegram_fails(monkeypatch, tmp_path):
+    # best-effort: мёртвая/отозванная сессия не должна мешать удалению файла
+    store = _profile_store(monkeypatch, tmp_path, "work")
+    stub = StubClient()
+
+    async def boom():
+        raise RuntimeError("AUTH_KEY_UNREGISTERED")
+
+    stub.log_out = boom
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "logout", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert store.list_profiles() == []
+
+
+def test_logout_asks_confirmation(monkeypatch, tmp_path):
+    store = _profile_store(monkeypatch, tmp_path, "work")
+    stub = StubClient()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "logout"], input="n\n")
+    assert result.exit_code != 0
+    assert store.list_profiles() == ["work"]
+    assert stub.logged_out is False
+
+
+def test_logout_missing_profile_errors(monkeypatch, tmp_path):
+    _profile_store(monkeypatch, tmp_path)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "ghost", "logout", "--yes"])
+    assert result.exit_code != 0
+    assert "ghost" in result.output
+
+
+def test_profiles_remove_deletes_file_without_network(monkeypatch, tmp_path):
+    # remove — для мёртвых сессий: только файл, клиент не строится вовсе
+    store = _profile_store(monkeypatch, tmp_path, "dead", "live")
+    network = []
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: network.append(kw))
+    result = CliRunner().invoke(cli_main.cli, ["profiles", "remove", "dead", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert store.list_profiles() == ["live"]
+    assert network == []
+
+
+def test_profiles_remove_missing_errors(monkeypatch, tmp_path):
+    _profile_store(monkeypatch, tmp_path)
+    result = CliRunner().invoke(cli_main.cli, ["profiles", "remove", "ghost", "--yes"])
+    assert result.exit_code != 0
+
+
 def test_explicit_default_session_skips_profile_picker(monkeypatch, tmp_path):
     from tg_messenger.core.auth import SessionStore
 
@@ -1225,7 +1662,10 @@ def test_profile_menu_reprompts_on_out_of_range(monkeypatch, tmp_path):
 
 def test_serve_uses_global_profile_as_session(monkeypatch):
     captured = {}
+    client = object()
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c, **kw: object())
     monkeypatch.setattr(
         "tg_messenger.web.app.build_app",
         lambda **kw: captured.update(kw) or object(),
@@ -1235,12 +1675,50 @@ def test_serve_uses_global_profile_as_session(monkeypatch):
     assert captured.get("session_name") == "work"
 
 
+def test_serve_wires_suggester(monkeypatch):
+    captured = {}
+    client = object()
+    suggester = object()
+    optional_kwargs = {}
+    monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+
+    def fake_make_optional_suggester(c, **kw):
+        optional_kwargs.update(kw)
+        return suggester
+
+    monkeypatch.setattr(cli_main, "make_optional_suggester", fake_make_optional_suggester)
+    monkeypatch.setattr(
+        "tg_messenger.web.app.build_app",
+        lambda **kw: captured.update(kw) or object(),
+    )
+
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["client"] is client
+    assert captured["suggester"] is suggester
+    assert optional_kwargs == {"session": "default"}
+
+
 def test_tui_uses_global_profile_as_session(monkeypatch):
     captured = {}
+    client = object()
+    suggester = object()
+    optional_kwargs = {}
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+
+    def fake_make_optional_suggester(c, **kw):
+        optional_kwargs.update(kw)
+        return suggester
+
+    monkeypatch.setattr(cli_main, "make_optional_suggester", fake_make_optional_suggester)
 
     class FakeTUI:
-        def __init__(self, *, session_name="default"):
+        def __init__(self, *, client=None, session_name="default", suggester=None):
+            captured["client"] = client
             captured["session_name"] = session_name
+            captured["suggester"] = suggester
 
         def run(self):
             pass
@@ -1249,3 +1727,107 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
     result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "tui"])
     assert result.exit_code == 0, result.output
     assert captured.get("session_name") == "work"
+    assert captured["client"] is client
+    assert captured["suggester"] is suggester
+    assert optional_kwargs == {"session": "work"}
+
+
+# --- Цикл 122: username suggest / set / clear ---
+
+
+def test_username_suggest_prints_available(runner, monkeypatch):
+    cli, stub = runner
+    # generate a deterministic candidate list and mark some occupied
+    import random
+
+    from tg_messenger.core.usernames import generate_candidates
+
+    cands = generate_candidates("Ann", count=20, rng=random.Random(0))
+    stub.occupied = set(cands[:2])
+    result = cli.invoke(cli_main.cli, ["username", "suggest", "Ann", "--limit", "5"])
+    assert result.exit_code == 0, result.output
+    lines = [ln.strip() for ln in result.output.splitlines() if ln.strip()]
+    assert lines, "expected at least one suggested username"
+    for ln in lines:
+        assert ln not in stub.occupied
+
+
+def test_username_set_confirms(runner):
+    cli, stub = runner
+    result = cli.invoke(cli_main.cli, ["username", "set", "mynewhandle"])
+    assert result.exit_code == 0, result.output
+    assert stub.set_username_to == "mynewhandle"
+    assert "mynewhandle" in result.output
+
+
+def test_username_set_occupied_errors(runner):
+    cli, stub = runner
+    stub.occupied = {"takenname"}
+    result = cli.invoke(cli_main.cli, ["username", "set", "takenname"])
+    assert result.exit_code != 0
+    assert stub.set_username_to is None
+
+
+def test_username_clear_confirms(runner):
+    cli, stub = runner
+    result = cli.invoke(cli_main.cli, ["username", "clear"])
+    assert result.exit_code == 0, result.output
+    assert stub.cleared is True
+
+
+# --- Цикл 125: режимы запуска serve (web-auth #24) ---
+
+
+@pytest.fixture
+def serve_capture(monkeypatch):
+    """Like serve_spy but captures build_app kwargs too."""
+    client = object()
+    suggester = object()
+    calls = {"uvicorn": [], "build_app": [], "optional_suggester": []}
+    monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls["uvicorn"].append(kw))
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    monkeypatch.setattr(
+        cli_main,
+        "make_optional_suggester",
+        lambda c, **kw: calls["optional_suggester"].append((c, kw)) or suggester,
+    )
+    monkeypatch.setattr(
+        "tg_messenger.web.app.build_app",
+        lambda **kw: calls["build_app"].append(kw) or object(),
+    )
+    return calls
+
+
+def test_serve_public_host_without_pass_refuses(serve_capture, monkeypatch):
+    monkeypatch.delenv("TG_WEB_PASS", raising=False)
+    result = CliRunner().invoke(cli_main.cli, ["serve", "--host", "0.0.0.0"])
+    assert result.exit_code != 0
+    assert "TG_WEB_PASS" in result.output
+    assert not serve_capture["uvicorn"]  # never started
+
+
+def test_serve_public_host_insecure_starts_with_warning(serve_capture, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.delenv("TG_WEB_PASS", raising=False)
+    with caplog.at_level(logging.WARNING, logger="tg_messenger.cli.main"):
+        result = CliRunner().invoke(cli_main.cli, ["serve", "--host", "0.0.0.0", "--insecure"])
+    assert result.exit_code == 0, result.output
+    assert serve_capture["uvicorn"]  # started
+    assert any("insecure" in rec.message.lower() or "without" in rec.message.lower()
+               for rec in caplog.records)
+
+
+def test_serve_localhost_without_pass_starts(serve_capture, monkeypatch):
+    monkeypatch.delenv("TG_WEB_PASS", raising=False)
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code == 0, result.output
+    assert serve_capture["uvicorn"]
+    assert serve_capture["build_app"][0].get("web_pass") is None
+
+
+def test_serve_passes_web_pass_from_env(serve_capture, monkeypatch):
+    monkeypatch.setenv("TG_WEB_PASS", "hunter2")
+    result = CliRunner().invoke(cli_main.cli, ["serve", "--host", "0.0.0.0"])
+    assert result.exit_code == 0, result.output
+    assert serve_capture["build_app"][0].get("web_pass") == "hunter2"

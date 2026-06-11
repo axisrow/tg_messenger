@@ -524,6 +524,24 @@ async def test_action_error_keeps_engine_alive(tmp_path, caplog):
         await storage.close()
 
 
+async def test_failed_enforce_action_is_journaled(tmp_path):
+    # цикл 87: упавшее действие тоже попадает в журнал — аудит не слепнет
+    engine, client, storage, t = _mk_engine(tmp_path, enforce=True)
+    client.fail_action = "delete"
+    await storage.connect()
+    try:
+        await add_rule(storage, ModerationRule(
+            chat_id=CHAT, name="spam",
+            conditions=RuleConditions(pattern="bad"),
+            actions=RuleActions(delete=True),
+        ))
+        await engine.process_message(_imsg(text="bad", msg_id=5))
+        log = await storage.fetchall("SELECT action, dry_run FROM moderation_log")
+        assert log == [("delete:failed", 0)]
+    finally:
+        await storage.close()
+
+
 async def test_first_matching_rule_wins(tmp_path):
     engine, client, storage, t = _mk_engine(tmp_path, enforce=True)
     await storage.connect()
