@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 import httpx
@@ -225,6 +226,32 @@ async def test_opening_messages_marks_read(client_app):
     # цикл 81: открытие диалога помечает его прочитанным (best-effort)
     ac, stub = client_app
     await ac.get("/dialogs/7/messages")
+    await asyncio.sleep(0)
+    assert stub.read_acks == [7]
+
+
+async def test_messages_mark_read_does_not_block_response():
+    stub = WebStubClient()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_mark_read(peer):
+        started.set()
+        await release.wait()
+        stub.read_acks.append(peer)
+
+    stub.mark_read = slow_mark_read
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await asyncio.wait_for(ac.get("/dialogs/7/messages"), timeout=1)
+            assert r.status_code == 200
+            assert "hi" in r.text
+            await asyncio.wait_for(started.wait(), timeout=1)
+            assert stub.read_acks == []
+            release.set()
+            await asyncio.sleep(0)
     assert stub.read_acks == [7]
 
 
@@ -244,6 +271,7 @@ async def test_messages_mark_read_failure_does_not_break(caplog):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
             with caplog.at_level(logging.WARNING):
                 r = await ac.get("/dialogs/7/messages")
+                await asyncio.sleep(0)
     assert r.status_code == 200
     assert "hi" in r.text
     assert any("mark_read" in rec.message or "nope" in str(rec.message) for rec in caplog.records)

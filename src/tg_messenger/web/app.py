@@ -6,6 +6,7 @@ StandaloneTelegramClient is created from env and connected on startup.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -80,13 +81,34 @@ async def sse_event_stream(client, dialog_id: int):
         return
 
 
+async def _mark_read_best_effort(client, dialog_id: int) -> None:
+    try:
+        await client.mark_read(dialog_id)
+    except Exception:
+        logger.warning("mark_read failed for dialog %s — continuing", dialog_id, exc_info=True)
+
+
+def _schedule_mark_read(app: FastAPI, client, dialog_id: int) -> None:
+    task = asyncio.create_task(_mark_read_best_effort(client, dialog_id))
+    app.state.background_tasks.add(task)
+    task.add_done_callback(app.state.background_tasks.discard)
+
+
 def build_app(*, client=None, session_name: str = "default") -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        app.state.background_tasks = set()
         app.state.client = client or _make_real_client(session_name)
         await app.state.client.connect()
-        yield
-        await app.state.client.disconnect()
+        try:
+            yield
+        finally:
+            tasks = set(app.state.background_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await app.state.client.disconnect()
 
     app = FastAPI(lifespan=lifespan)
 
@@ -141,11 +163,8 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
     async def messages(request: Request, dialog_id: int):
         client = request.app.state.client
         items = await client.history(dialog_id, limit=50)
-        # opening a dialog clears its unread counter — best-effort, never block the read
-        try:
-            await client.mark_read(dialog_id)
-        except Exception:
-            logger.warning("mark_read failed for dialog %s — continuing", dialog_id, exc_info=True)
+        # opening a dialog clears its unread counter, but it must never block rendering history
+        _schedule_mark_read(request.app, client, dialog_id)
         return HTMLResponse("".join(_message_div(m) for m in items))
 
     @app.post("/send", response_class=HTMLResponse)

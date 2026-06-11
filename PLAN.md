@@ -554,8 +554,9 @@ best-effort `None` (raw-апдейт не несёт надёжного един
   megagroup `--for-me` получает ClickException до подключения клиента. `read` остаётся печатью истории —
   отметка прочитанным вынесена в отдельную команду `mark-read`, чтобы не ломать существующую.
 - **81**: web — бейдж `<span class="unread">N</span>` в `_dialog_li`; открытие диалога
-  (`GET .../messages`) зовёт `mark_read` best-effort (ошибка → `logger.warning`, история всё равно
-  отдаётся); `/send` принимает `reply_to` (Form) и прокидывает в `send_text`. TUI — `(N)` в
+  (`GET .../messages`) планирует `mark_read` best-effort в tracked background task (ошибка →
+  `logger.warning`, история отдаётся без ожидания read ack); `/send` принимает `reply_to` (Form)
+  и прокидывает в `send_text`. TUI — `(N)` в
   `DialogItem`; `on_list_view_selected` запускает `_mark_read` воркером (best-effort, без await
   в хендлере).
 - **82**: CLAUDE.md (блок про действия в client.py) + PLAN.md этот блок.
