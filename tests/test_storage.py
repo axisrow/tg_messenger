@@ -158,3 +158,9 @@ def test_default_db_path_per_profile():
     assert default_db_path("default").name == "default.db"
     assert default_db_path("work").name == "work.db"
     assert default_db_path("work").parent.name == ".tg_messenger"
+
+
+def test_default_db_path_sanitizes_profile_name():
+    root = default_db_path("default").parent
+    assert default_db_path("/tmp/x") == root / "tmp_x.db"
+    assert default_db_path("../work") == root / "work.db"

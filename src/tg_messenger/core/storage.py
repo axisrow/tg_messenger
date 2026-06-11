@@ -18,6 +18,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+from tg_messenger.core.names import sanitize_profile_name
+
 # the kv table is always present; consumer migrations start applying on top of it
 _KV_MIGRATION = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
 
@@ -25,8 +27,8 @@ DEFAULT_DB_DIR = Path.home() / ".tg_messenger"
 
 
 def default_db_path(profile: str = "default") -> Path:
-    """``~/.tg_messenger/<profile>.db`` — one DB file per account profile (#11)."""
-    return DEFAULT_DB_DIR / f"{profile}.db"
+    """``~/.tg_messenger/<safe-profile>.db`` — one DB file per account profile (#11)."""
+    return DEFAULT_DB_DIR / f"{sanitize_profile_name(profile)}.db"
 
 
 class Storage:
