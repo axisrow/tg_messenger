@@ -21,6 +21,7 @@ from telethon.errors import UnauthorizedError
 
 from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT, SessionStore
 from tg_messenger.core.flood import HandledFloodWaitError
+from tg_messenger.core.search import filter_dialogs
 
 logger = logging.getLogger(__name__)
 
@@ -122,11 +123,19 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
         )
 
     @app.get("/dialogs", response_class=HTMLResponse)
-    async def dialogs(request: Request, tab: str = "dm"):
+    async def dialogs(request: Request, tab: str = "dm", q: str = ""):
         # unknown tab falls back to dm — HTMX-friendly, never a 400
         client = request.app.state.client
         items = await (client.group_dialogs() if tab == "groups" else client.dialogs())
+        # q фильтрует уже загруженный список локально (поверх #8-кэша, без сети)
+        items = filter_dialogs(items, q)
         return HTMLResponse("".join(_dialog_li(d) for d in items))
+
+    @app.get("/dialogs/{dialog_id}/search", response_class=HTMLResponse)
+    async def search_dialog(request: Request, dialog_id: int, q: str = ""):
+        # серверный поиск сообщений внутри диалога (Telegram search=)
+        items = await request.app.state.client.search_messages(dialog_id, q)
+        return HTMLResponse("".join(_message_div(m) for m in items))
 
     @app.get("/dialogs/{dialog_id}/messages", response_class=HTMLResponse)
     async def messages(request: Request, dialog_id: int):

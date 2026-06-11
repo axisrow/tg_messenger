@@ -58,6 +58,31 @@ asyncio.run(main())
 The public surface (`tg_messenger.__all__`) also exports `SessionStore`, `LoginFlow`,
 `LOGIN_HINT`, `EventBus`, `run_with_flood_wait_retry` and `HandledFloodWaitError`.
 
+## Search
+
+Every dialog shows its id (`id — title`), and every front-end can search.
+
+**Find a dialog** (by title, `@username`, or id — filtered locally over the
+already-loaded list, no extra request):
+
+```bash
+tg-messenger dialogs --find ann        # DMs whose title/username/id matches "ann"
+tg-messenger dialogs --groups --find dev
+```
+
+The web UI has a search box above the dialog list; the TUI filters the list as you
+type into its search field.
+
+**Search messages inside a dialog** (Telegram's own server-side search):
+
+```bash
+tg-messenger search 7 "invoice"        # last messages in dialog 7 matching "invoice"
+tg-messenger search -1001234567 "lunch" --limit 50
+```
+
+The web UI exposes the same via `GET /dialogs/{id}/search?q=`. There is intentionally
+no global content search across all chats — that belongs to `tg_content_factory`.
+
 ## Multiple accounts (profiles)
 
 Each saved login is a *profile* (a session file under `~/.tg_messenger/sessions/`).

@@ -145,10 +145,12 @@ class MessengerTUI(App):
         self._current: int | None = None
         self._tab = "dm"
         self._started = False  # gates tab events until _startup finished
+        self._all_dialogs: list = []  # full loaded list; search filters it locally
 
     def compose(self) -> ComposeResult:
         with Horizontal():
             with Vertical(id="sidebar"):
+                yield Input(placeholder="Поиск…", id="search")
                 yield SidebarTabs(Tab("DM", id="dm"), Tab("Группы", id="groups"), id="tabs")
                 yield DialogListView(id="dialogs")
             with Vertical():
@@ -199,12 +201,25 @@ class MessengerTUI(App):
             await self._client.disconnect()
 
     async def _load_dialogs(self) -> None:
-        lv = self.query_one("#dialogs", ListView)
         if self._tab == "groups":
             items = await self._client.group_dialogs()
         else:
             items = await self._client.dialogs()
-        for d in items:
+        self._all_dialogs = list(items)  # keep the full list for local search
+        await self._render_dialogs()
+
+    async def _render_dialogs(self) -> None:
+        """Redraw the dialog list from the cached full list, applying the search filter.
+
+        Local and network-free: filtering happens over ``self._all_dialogs`` (already
+        fetched), never re-querying the client.
+        """
+        from tg_messenger.core.search import filter_dialogs
+
+        lv = self.query_one("#dialogs", ListView)
+        query = self.query_one("#search", Input).value
+        await lv.clear()
+        for d in filter_dialogs(self._all_dialogs, query):
             await lv.append(DialogItem(d.id, d.title))
 
     async def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
@@ -249,7 +264,17 @@ class MessengerTUI(App):
         pane.loading = False
         await pane.mount(*(MessageBubble(m.text or "<media>", m.out) for m in messages))
 
+    async def on_input_changed(self, event: Input.Changed) -> None:
+        # only the search box filters; the composer's own changes are ignored.
+        # Filtering is local (over self._all_dialogs) — no network, safe to await here.
+        if event.input.id != "search":
+            return
+        await self._render_dialogs()
+
     async def on_input_submitted(self, event: Input.Submitted) -> None:
+        # the search box submits nothing — only the composer sends messages
+        if event.input.id == "search":
+            return
         if self._current is None or not event.value.strip():
             return
         text = event.value

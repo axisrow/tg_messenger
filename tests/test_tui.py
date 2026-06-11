@@ -2,7 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 
 import pytest
-from textual.widgets import Input, ListView, Tabs
+from textual.widgets import Input, ListView, Static, Tabs
 
 from tg_messenger.core.models import Dialog, IncomingEvent, Message
 from tg_messenger.tui.app import DialogItem, MessageBubble, MessengerTUI, ProfileItem
@@ -84,6 +84,17 @@ async def test_tui_mounts_and_lists_dialogs():
         items = list(app.query(DialogItem))
         assert len(items) == 1
         assert items[0].dialog_id == 7
+
+
+async def test_tui_dialog_item_shows_id():
+    # цикл 63: DialogItem рендерит "id — title", id виден пользователю
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        item = list(app.query(DialogItem))[0]
+        # Static внутри DialogItem рендерит "7 — Ann [/x" литерально
+        rendered = str(item.query_one(Static).render())
+        assert rendered.startswith("7 — ")
 
 
 async def test_tui_survives_markup_hostile_text():
@@ -309,6 +320,50 @@ async def test_tui_shows_loading_until_dialogs_arrive():
         await pilot.pause()
         assert app.query_one("#dialogs", ListView).loading is False
         assert len(list(app.query(DialogItem))) == 1
+
+
+# --- цикл 66: локальный поиск диалогов в TUI ---
+
+
+async def test_tui_search_filters_dialogs():
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert {item.dialog_id for item in app.query(DialogItem)} == {7, 8}
+        search = app.query_one("#search", Input)
+        search.value = "Bob"
+        await app.on_input_changed(Input.Changed(search, "Bob"))
+        await pilot.pause()
+        # только Bob (id=8) остаётся видимым
+        assert [item.dialog_id for item in app.query(DialogItem)] == [8]
+
+
+async def test_tui_search_clear_restores_full_list():
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.value = "Bob"
+        await app.on_input_changed(Input.Changed(search, "Bob"))
+        await pilot.pause()
+        search.value = ""
+        await app.on_input_changed(Input.Changed(search, ""))
+        await pilot.pause()
+        assert {item.dialog_id for item in app.query(DialogItem)} == {7, 8}
+
+
+async def test_tui_search_does_not_hit_network():
+    stub = TwoDmClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        calls_before = stub.dialogs_calls
+        search = app.query_one("#search", Input)
+        search.value = "Bob"
+        await app.on_input_changed(Input.Changed(search, "Bob"))
+        await pilot.pause()
+        # фильтрация локальная — поверх уже загруженного списка, без запроса
+        assert stub.dialogs_calls == calls_before
 
 
 # --- Цикл 36: вкладки DM / Группы ---
