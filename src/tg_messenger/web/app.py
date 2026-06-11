@@ -2,6 +2,7 @@
 
 ``build_app(client=...)`` injects a client for tests; otherwise a real
 StandaloneTelegramClient is created from env and connected on startup.
+``suggester=...`` optionally enables the human-in-the-loop reply draft endpoint.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
@@ -27,6 +28,7 @@ from tg_messenger.core.search import filter_dialogs
 logger = logging.getLogger(__name__)
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+SUGGEST_CSRF_HEADER = "x-tg-messenger-csrf"
 
 
 def _make_real_client(session_name: str):
@@ -67,6 +69,25 @@ def _message_div(m) -> str:
     return f'<div class="msg {cls}" data-id="{m.id}">{body}</div>'
 
 
+def _same_origin_error(request: Request) -> HTMLResponse | None:
+    if request.headers.get(SUGGEST_CSRF_HEADER) != "1":
+        return HTMLResponse(
+            '<div class="error">Suggest requires a same-origin request.</div>',
+            status_code=403,
+        )
+    origin = request.headers.get("origin")
+    if origin is None:
+        return None
+    host = request.headers.get("host") or request.url.netloc
+    expected = f"{request.url.scheme}://{host}"
+    if origin != expected:
+        return HTMLResponse(
+            '<div class="error">Suggest requires a same-origin request.</div>',
+            status_code=403,
+        )
+    return None
+
+
 async def sse_event_stream(client, dialog_id: int):
     """Yield SSE frames for incoming messages of one dialog (any kind — groups too)."""
     try:
@@ -94,11 +115,13 @@ def _schedule_mark_read(app: FastAPI, client, dialog_id: int, max_id: int) -> No
     task.add_done_callback(app.state.background_tasks.discard)
 
 
-def build_app(*, client=None, session_name: str = "default") -> FastAPI:
+def build_app(*, client=None, session_name: str = "default", suggester=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.background_tasks = set()
         app.state.client = client or _make_real_client(session_name)
+        # reply suggester (#17) — optional; None disables the /suggest endpoint
+        app.state.suggester = suggester
         await app.state.client.connect()
         try:
             yield
@@ -109,6 +132,12 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await app.state.client.disconnect()
+            close_suggester = getattr(app.state.suggester, "close", None)
+            if close_suggester is not None:
+                try:
+                    await close_suggester()
+                except Exception:
+                    logger.warning("suggester close failed", exc_info=True)
 
     app = FastAPI(lifespan=lifespan)
 
@@ -195,6 +224,29 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
         finally:
             os.unlink(tmp_path)
         return HTMLResponse(_message_div(msg))
+
+    @app.post("/dialogs/{dialog_id}/suggest", response_class=PlainTextResponse)
+    async def suggest(request: Request, dialog_id: int):
+        # draft a reply for a human to review; the JS in chat.html drops it into
+        # the composer input. 503 (not 500) when the feature is unconfigured.
+        same_origin_error = _same_origin_error(request)
+        if same_origin_error is not None:
+            return same_origin_error
+        suggester = request.app.state.suggester
+        if suggester is None:
+            return HTMLResponse(
+                '<div class="error">Suggest is not configured — needs the [agent]'
+                " extra and TG_AGENT_MODEL.</div>",
+                status_code=503,
+            )
+        dm_ids = {d.id for d in await request.app.state.client.dialogs()}
+        if dialog_id not in dm_ids:
+            return HTMLResponse(
+                '<div class="error">Suggest is available for DM dialogs only.</div>',
+                status_code=403,
+            )
+        draft = await suggester.suggest(dialog_id)
+        return PlainTextResponse(draft)
 
     @app.get("/stream/{dialog_id}")
     async def stream(request: Request, dialog_id: int):

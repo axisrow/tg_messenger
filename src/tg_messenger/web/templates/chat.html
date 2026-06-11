@@ -21,6 +21,7 @@
     .msg.out { background: #cfe9ff; margin-left: auto; }
     #composer { display: flex; border-top: 1px solid #ccc; padding: 8px; }
     #composer input { flex: 1; padding: 8px; }
+    #suggest-error { color: #b00020; padding: 0 8px; align-self: center; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -45,7 +46,9 @@
     <form id="composer" hx-post="/send" hx-target="#messages" hx-swap="beforeend"
           hx-on::after-request="this.reset()">
       <input type="hidden" name="dialog_id" id="dialog_id" value="">
-      <input type="text" name="text" placeholder="Message…" autocomplete="off" required>
+      <input type="text" name="text" id="composer-text" placeholder="Message…" autocomplete="off" required>
+      <button type="button" id="suggest-btn" title="Suggest a reply">💡 Suggest</button>
+      <span id="suggest-error" role="status"></span>
     </form>
   </main>
   <script>
@@ -73,6 +76,32 @@
         div.textContent = data.text || '<media>';
         document.getElementById('messages').appendChild(div);
       };
+    });
+    // Suggest: fetch a draft for the open dialog and drop it into the composer.
+    document.getElementById('suggest-btn').addEventListener('click', async () => {
+      const id = document.getElementById('dialog_id').value;
+      if (!id) return;
+      const btn = document.getElementById('suggest-btn');
+      const error = document.getElementById('suggest-error');
+      btn.disabled = true;
+      error.textContent = '';
+      try {
+        const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/suggest', {
+          method: 'POST',
+          headers: { 'X-TG-Messenger-CSRF': '1' }
+        });
+        const text = await resp.text();
+        if (resp.ok) {
+          document.getElementById('composer-text').value = text;
+        } else {
+          const doc = new DOMParser().parseFromString(text, 'text/html');
+          error.textContent = (doc.body.textContent || '').trim() || 'Suggest failed.';
+        }
+      } catch (err) {
+        error.textContent = 'Suggest failed.';
+      } finally {
+        btn.disabled = false;
+      }
     });
   </script>
 </body>

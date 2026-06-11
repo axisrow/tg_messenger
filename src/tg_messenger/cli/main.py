@@ -81,6 +81,12 @@ def make_storage(profile: str = "default"):
     return Storage(default_db_path(profile))
 
 
+async def _ensure_dm_dialog(client, dialog_id: int) -> None:
+    dm_ids = {dialog.id for dialog in await client.dialogs()}
+    if dialog_id not in dm_ids:
+        raise click.ClickException("suggest is available for DM dialogs only.")
+
+
 def make_agent_runner(client, *, notify_errors: bool = False):
     """Build the AI agent runner; the second seam tests patch (next to ``make_client``)."""
     try:
@@ -103,6 +109,75 @@ def make_agent_runner(client, *, notify_errors: bool = False):
     if cfg.intents:
         click.echo("Custom intents: " + ", ".join(spec.name for spec in cfg.intents))
     return AgentRunner(client, orchestrator, config=cfg, notify_errors=notify_errors)
+
+
+def make_suggester(client, *, storage=None):
+    """Build the reply Suggester (#17); the seam suggest tests patch.
+
+    Like make_agent_runner: needs the [agent] extra + TG_AGENT_MODEL (fail-fast).
+    """
+    try:
+        from tg_messenger.agent.factory import build_suggester
+    except ImportError as exc:
+        raise click.ClickException(
+            'Agent dependencies are not installed — pip install "tg-messenger[agent]"'
+        ) from exc
+    from tg_messenger.agent.config import AgentConfig
+
+    try:
+        cfg = AgentConfig.from_env(require_allowlist=False)
+        return build_suggester(client, cfg, storage=storage)
+    except (ValueError, ImportError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+class _StorageBackedSuggester:
+    """Lazily connect suggester storage for long-running web/TUI processes."""
+
+    def __init__(self, suggester, storage):
+        self._suggester = suggester
+        self._storage = storage
+        self._connected = False
+        self._lock = asyncio.Lock()
+
+    async def _ensure_connected(self) -> None:
+        if self._connected:
+            return
+        async with self._lock:
+            if not self._connected:
+                await self._storage.connect()
+                self._connected = True
+
+    async def suggest(self, dialog_id: int) -> str:
+        await self._ensure_connected()
+        return await self._suggester.suggest(dialog_id)
+
+    async def learn(self, dialog_id: int):
+        await self._ensure_connected()
+        return await self._suggester.learn(dialog_id)
+
+    async def close(self) -> None:
+        if self._connected:
+            await self._storage.close()
+            self._connected = False
+
+
+def make_optional_suggester(client, *, session: str = "default"):
+    """Best-effort production suggester for web/TUI.
+
+    Suggest is an optional [agent] feature. A missing extra or model should disable
+    the draft endpoint/strip, not prevent the web UI or TUI from starting.
+    """
+    try:
+        from tg_messenger.agent.suggest import register_suggest_migrations
+
+        storage = make_storage(session)
+        register_suggest_migrations(storage)
+        suggester = make_suggester(client, storage=storage)
+        return _StorageBackedSuggester(suggester, storage)
+    except (click.ClickException, ImportError) as exc:
+        logger.warning("reply suggester disabled: %s", exc)
+        return None
 
 
 _CODE_DELIVERY_HINTS = {
@@ -795,6 +870,57 @@ def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
 
 
 @cli.command()
+@click.argument("dialog_id", type=int)
+@click.option("--send", "do_send", is_flag=True,
+              help="Send the draft instead of just printing it.")
+@click.option("--learn", "do_learn", is_flag=True,
+              help="Build and persist the contact's style profile (one history pass).")
+@click.option("--session", default="default")
+@click.pass_context
+def suggest(ctx: click.Context, dialog_id: int, do_send: bool, do_learn: bool, session: str) -> None:
+    """Draft a reply for DIALOG_ID in the style of past messages (#17).
+
+    Human-in-the-loop: prints a draft you review/edit. --send sends it as-is;
+    --learn (re)builds the style profile from this dialog's history.
+    """
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        client = make_client(session_name=session)
+        from tg_messenger.agent.suggest import register_suggest_migrations
+
+        storage = make_storage(session)
+        register_suggest_migrations(storage)
+        # build the suggester (LLM stack) before the network — config errors show first
+        suggester = make_suggester(client, storage=storage)
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            await storage.connect()
+            try:
+                await _ensure_dm_dialog(client, dialog_id)
+                if do_learn:
+                    profile = await suggester.learn(dialog_id)
+                    click.echo(
+                        f"learned style profile for {dialog_id} "
+                        f"({len(profile.examples)} examples)."
+                    )
+                    return
+                draft = await suggester.suggest(dialog_id)
+                if do_send:
+                    await client.send_text(dialog_id, draft)
+                    click.echo("sent.")
+                else:
+                    click.echo(draft)
+            finally:
+                await storage.close()
+        finally:
+            await client.disconnect()
+
+    _run(_do(), session=session)
+
+
+@cli.command()
 @click.option("--host", default="127.0.0.1")
 @click.option("--port", default=lambda: int(os.environ.get("TG_WEB_PORT", "8090")), type=int)
 @click.option("--session", default="default")
@@ -810,9 +936,16 @@ def serve(ctx: click.Context, host: str, port: int, session: str) -> None:
         raise click.ClickException("web UI requires: pip install 'tg-messenger[web]'") from exc
 
     session = _effective_session(ctx, session)
+    client = make_client(session_name=session)
+    suggester = make_optional_suggester(client, session=session)
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
     click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
-    uvicorn.run(build_app(session_name=session), host=host, port=port, log_config=None)
+    uvicorn.run(
+        build_app(client=client, session_name=session, suggester=suggester),
+        host=host,
+        port=port,
+        log_config=None,
+    )
 
 
 @cli.command()
@@ -828,7 +961,9 @@ def tui(ctx: click.Context, session: str) -> None:
     # stderr handler would corrupt the alternate screen — file log only
     setup_logging(verbose=ctx.obj["verbose"], console=False, profile=ctx.obj.get("profile"))
     session = _effective_session(ctx, session)
-    MessengerTUI(session_name=session).run()
+    client = make_client(session_name=session)
+    suggester = make_optional_suggester(client, session=session)
+    MessengerTUI(client=client, session_name=session, suggester=suggester).run()
 
 
 if __name__ == "__main__":
