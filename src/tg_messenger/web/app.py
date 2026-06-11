@@ -2,6 +2,7 @@
 
 ``build_app(client=...)`` injects a client for tests; otherwise a real
 StandaloneTelegramClient is created from env and connected on startup.
+``suggester=...`` optionally enables the human-in-the-loop reply draft endpoint.
 """
 
 from __future__ import annotations
@@ -94,7 +95,7 @@ def _schedule_mark_read(app: FastAPI, client, dialog_id: int, max_id: int) -> No
     task.add_done_callback(app.state.background_tasks.discard)
 
 
-def build_app(*, client=None, session_name: str = "default") -> FastAPI:
+def build_app(*, client=None, session_name: str = "default", suggester=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.background_tasks = set()
@@ -210,7 +211,7 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
                 status_code=503,
             )
         draft = await suggester.suggest(dialog_id)
-        return HTMLResponse(escape(draft))
+        return HTMLResponse(draft)
 
     @app.get("/stream/{dialog_id}")
     async def stream(request: Request, dialog_id: int):

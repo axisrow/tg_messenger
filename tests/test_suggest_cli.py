@@ -64,14 +64,19 @@ def suggest_cli(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     client = StubClient()
     suggester = StubSuggester()
+    storage_profiles: list[str] = []
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
-    monkeypatch.setattr(cli_main, "make_storage", lambda *a, **kw: StubStorage())
+    monkeypatch.setattr(
+        cli_main,
+        "make_storage",
+        lambda profile="default": storage_profiles.append(profile) or StubStorage(),
+    )
     monkeypatch.setattr(cli_main, "make_suggester", lambda c, **kw: suggester)
-    return CliRunner(), client, suggester
+    return CliRunner(), client, suggester, storage_profiles
 
 
 def test_suggest_prints_draft(suggest_cli):
-    r, client, suggester = suggest_cli
+    r, client, suggester, _ = suggest_cli
     result = r.invoke(cli_main.cli, ["suggest", "42"])
     assert result.exit_code == 0, result.output
     assert "draft text" in result.output
@@ -80,18 +85,25 @@ def test_suggest_prints_draft(suggest_cli):
 
 
 def test_suggest_send_sends_via_client(suggest_cli):
-    r, client, suggester = suggest_cli
+    r, client, suggester, _ = suggest_cli
     result = r.invoke(cli_main.cli, ["suggest", "42", "--send"])
     assert result.exit_code == 0, result.output
     assert client.sent == [{"peer": 42, "text": "draft text"}]
 
 
 def test_suggest_learn_builds_and_saves(suggest_cli):
-    r, client, suggester = suggest_cli
+    r, client, suggester, _ = suggest_cli
     result = r.invoke(cli_main.cli, ["suggest", "--learn", "42"])
     assert result.exit_code == 0, result.output
     assert suggester.learned == [42]
     assert suggester.suggested == []  # --learn не зовёт suggest
+
+
+def test_suggest_uses_requested_session_storage(suggest_cli):
+    r, _, _, storage_profiles = suggest_cli
+    result = r.invoke(cli_main.cli, ["--profile", "work", "suggest", "42"])
+    assert result.exit_code == 0, result.output
+    assert storage_profiles == ["work"]
 
 
 def test_suggest_listed_in_help(suggest_cli):
@@ -101,7 +113,7 @@ def test_suggest_listed_in_help(suggest_cli):
 
 
 def test_suggest_requires_login(suggest_cli):
-    r, client, suggester = suggest_cli
+    r, client, suggester, _ = suggest_cli
     client.authorized = False
     result = r.invoke(cli_main.cli, ["suggest", "42"])
     assert result.exit_code != 0

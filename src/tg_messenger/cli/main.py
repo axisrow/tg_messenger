@@ -821,17 +821,20 @@ def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
 @click.option("--learn", "do_learn", is_flag=True,
               help="Build and persist the contact's style profile (one history pass).")
 @click.option("--session", default="default")
-def suggest(dialog_id: int, do_send: bool, do_learn: bool, session: str) -> None:
+@click.pass_context
+def suggest(ctx: click.Context, dialog_id: int, do_send: bool, do_learn: bool, session: str) -> None:
     """Draft a reply for DIALOG_ID in the style of past messages (#17).
 
     Human-in-the-loop: prints a draft you review/edit. --send sends it as-is;
     --learn (re)builds the style profile from this dialog's history.
     """
+    session = _effective_session(ctx, session)
+
     async def _do():
         client = make_client(session_name=session)
         from tg_messenger.agent.suggest import register_suggest_migrations
 
-        storage = make_storage()
+        storage = make_storage(session)
         register_suggest_migrations(storage)
         # build the suggester (LLM stack) before the network — config errors show first
         suggester = make_suggester(client, storage=storage)

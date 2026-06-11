@@ -510,6 +510,14 @@ async def test_suggest_endpoint_returns_draft(suggest_app):
     assert suggester.calls == [7]
 
 
+async def test_suggest_endpoint_does_not_escape_draft(suggest_app):
+    ac, suggester = suggest_app
+    suggester.draft = "you & me"
+    r = await ac.get("/dialogs/7/suggest")
+    assert r.status_code == 200
+    assert r.text == "you & me"
+
+
 async def test_suggest_endpoint_negative_id(suggest_app):
     ac, suggester = suggest_app
     r = await ac.get("/dialogs/-100200/suggest")

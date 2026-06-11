@@ -145,7 +145,8 @@ class MessengerTUI(App):
     """
 
     def __init__(self, *, client=None, session_name: str = "default",
-                 profiles: list[str] | None = None, client_factory=None):
+                 profiles: list[str] | None = None, client_factory=None,
+                 suggester=None):
         super().__init__()
         self._client = client
         self._session_name = session_name
@@ -156,6 +157,8 @@ class MessengerTUI(App):
         self._tab = "dm"
         self._started = False  # gates tab events until _startup finished
         self._all_dialogs: list = []  # full loaded list; search filters it locally
+        self._suggester = suggester
+        self._pending_suggestion: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -260,15 +263,6 @@ class MessengerTUI(App):
             self._current = item.dialog_id
             # exclusive group: selecting another dialog cancels a still-loading history
             self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
-            # opening a dialog clears its unread counter — best-effort, via a worker
-            # (never await network in a handler; the message pump must stay free)
-            self.run_worker(self._mark_read(item.dialog_id), group="mark_read", exclusive=False)
-
-    async def _mark_read(self, dialog_id: int) -> None:
-        try:
-            await self._client.mark_read(dialog_id)
-        except Exception:
-            logger.warning("mark_read failed (dialog %s) — continuing", dialog_id, exc_info=True)
 
     async def _mark_read(self, dialog_id: int, max_id: int) -> None:
         try:
@@ -296,13 +290,6 @@ class MessengerTUI(App):
                 group="mark_read",
                 exclusive=False,
             )
-
-    async def on_input_changed(self, event: Input.Changed) -> None:
-        # only the search box filters; the composer's own changes are ignored.
-        # Filtering is local (over self._all_dialogs) — no network, safe to await here.
-        if event.input.id != "search":
-            return
-        await self._render_dialogs()
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "composer":
