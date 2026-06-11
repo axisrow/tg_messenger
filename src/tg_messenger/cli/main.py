@@ -15,7 +15,7 @@ import click
 from telethon.errors import UnauthorizedError
 
 from tg_messenger.agent.config import langsmith_tracing_enabled
-from tg_messenger.core.auth import LOGIN_HINT
+from tg_messenger.core.auth import LOGIN_HINT, SessionStore, validate_session_string
 from tg_messenger.core.client import StandaloneTelegramClient
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.logsetup import log_file_path, setup_logging
@@ -47,11 +47,19 @@ def _load_dotenv(path: Path | str = ".env") -> None:
         os.environ.setdefault(key, value)
 
 
+def _session_encryption_key() -> str | None:
+    return os.environ.get("SESSION_ENCRYPTION_KEY") or None
+
+
+def _session_store() -> SessionStore:
+    return SessionStore(encryption_key=_session_encryption_key())
+
+
 def make_client(**kwargs) -> StandaloneTelegramClient:
     api_id = int(os.environ.get("TG_API_ID", "0"))
     api_hash = os.environ.get("TG_API_HASH", "")
     # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
-    kwargs.setdefault("encryption_key", os.environ.get("SESSION_ENCRYPTION_KEY") or None)
+    kwargs.setdefault("encryption_key", _session_encryption_key())
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
 
 
@@ -175,15 +183,13 @@ def _export_session(session: str) -> None:
 
 def _import_session(session: str) -> None:
     """Read a StringSession from stdin (no echo), validate it, and save it under ``session``."""
-    from tg_messenger.core.auth import validate_session_string
-
     raw = click.prompt("Paste StringSession", hide_input=True).strip()
     try:
         # validate before touching the client so garbage is rejected up front
         validate_session_string(raw)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
-    make_client(session_name=session).import_session_string(raw)
+    _session_store().save(session, raw)
     click.echo(f"Session '{session}' imported and saved.")
 
 

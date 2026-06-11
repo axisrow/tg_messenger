@@ -658,22 +658,47 @@ def test_login_export_session_prints_string_and_warning(monkeypatch):
 
 
 def test_login_import_session_saves_valid_string(monkeypatch):
-    stub = ExportStubClient()
-    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
     valid = _valid_session_for_import()
     result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
     assert result.exit_code == 0, result.output
-    assert stub.imported == [valid]
+    assert saved == [("default", valid)]
 
 
 def test_login_import_session_rejects_garbage(monkeypatch):
-    stub = ExportStubClient()
-    # garbage must be rejected before it ever reaches the client
-    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    # garbage must be rejected before it ever reaches the store
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
     result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input="not-a-session\n")
     assert result.exit_code != 0
     assert "invalid StringSession" in result.output
-    assert stub.imported == []
+    assert saved == []
+
+
+def test_login_import_session_replaces_unreadable_existing_file(monkeypatch, session_dir):
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(session_dir)
+    store.session_dir.mkdir(parents=True, exist_ok=True)
+    store.path_for("default").write_text("not-a-valid-session", encoding="utf-8")
+    monkeypatch.setattr(cli_main, "_session_store", lambda: store)
+
+    valid = _valid_session_for_import()
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
+
+    assert result.exit_code == 0, result.output
+    assert store.load("default") == valid
 
 
 def test_export_session_not_in_log(monkeypatch, tmp_path):
