@@ -11,6 +11,7 @@ from tg_messenger.tui.app import DialogItem, MessageBubble, MessengerTUI, Profil
 class TuiStubClient:
     def __init__(self):
         self.sent = []
+        self.read_acks = []
         self.connected = False
         self.authorized = True
         self.dialogs_calls = 0
@@ -44,10 +45,13 @@ class TuiStubClient:
                         text="oops [/bad] [red",
                         date=datetime(2024, 1, 1, tzinfo=timezone.utc))]
 
-    async def send_text(self, peer, text):
-        self.sent.append((peer, text))
+    async def send_text(self, peer, text, reply_to=None):
+        self.sent.append((peer, text, reply_to))
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    async def mark_read(self, peer, max_id=None):
+        self.read_acks.append((peer, max_id))
 
     async def listen_all(self):
         # idle forever; the worker just waits for events
@@ -95,6 +99,45 @@ async def test_tui_dialog_item_shows_id():
         # Static внутри DialogItem рендерит "7 — Ann [/x" литерально
         rendered = str(item.query_one(Static).render())
         assert rendered.startswith("7 — ")
+
+
+class UnreadClient(TuiStubClient):
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        return [Dialog(id=7, title="Ann", username="ann", unread=3)]
+
+
+async def test_tui_dialog_item_shows_unread_count():
+    # цикл 81: непрочитанные показываются как "(N)" в строке диалога
+    app = MessengerTUI(client=UnreadClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        item = list(app.query(DialogItem))[0]
+        rendered = str(item.query_one(Static).render())
+        assert "(3)" in rendered
+
+
+async def test_tui_no_unread_marker_when_zero():
+    app = MessengerTUI(client=TuiStubClient())  # Ann has unread=0
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        item = list(app.query(DialogItem))[0]
+        rendered = str(item.query_one(Static).render())
+        assert "(" not in rendered.split("—", 1)[1]  # no "(N)" badge after the title
+
+
+async def test_tui_selecting_dialog_marks_read():
+    # цикл 81: открытие диалога помечает прочитанным (через worker, best-effort)
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        item = list(app.query(DialogItem))[0]
+        await app.on_list_view_selected(ListView.Selected(lv, item, 0))
+        await pilot.pause()
+        await pilot.pause()
+    assert stub.read_acks == [(7, 1)]
 
 
 async def test_tui_survives_markup_hostile_text():

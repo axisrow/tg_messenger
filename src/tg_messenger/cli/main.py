@@ -18,7 +18,11 @@ from telethon.errors import UnauthorizedError
 
 from tg_messenger.agent.config import langsmith_tracing_enabled
 from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT, SessionStore, validate_session_string
-from tg_messenger.core.client import StandaloneTelegramClient
+from tg_messenger.core.client import (
+    MessageDeleteValidationError,
+    StandaloneTelegramClient,
+    is_channel_or_megagroup_id,
+)
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.logsetup import log_file_path, setup_logging
 from tg_messenger.core.models import message_line
@@ -132,6 +136,8 @@ def _run(coro, session: str = "default"):
     except HandledFloodWaitError as exc:
         logger.warning("%s: flood wait %ss", exc.operation, exc.wait_seconds)
         raise click.ClickException(exc.user_message) from exc
+    except MessageDeleteValidationError as exc:
+        raise click.ClickException(str(exc)) from exc
     except UnauthorizedError as exc:
         # session missing or revoked mid-command
         raise click.ClickException(_login_hint(session)) from exc
@@ -423,17 +429,93 @@ def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> 
 @click.argument("dialog_id", type=int)
 @click.argument("text", required=False)
 @click.option("--file", "file_path", default=None, help="Send a file/photo instead of text.")
+@click.option("--reply-to", "reply_to", type=int, default=None,
+              help="Reply to this message id.")
 @click.option("--session", default="default")
-def send(dialog_id: int, text: str | None, file_path: str | None, session: str) -> None:
-    """Send a text message (or a file with --file)."""
+def send(dialog_id: int, text: str | None, file_path: str | None,
+         reply_to: int | None, session: str) -> None:
+    """Send a text message (or a file with --file); --reply-to to quote a message."""
 
     async def _do(client):
         if file_path:
             return await client.send_media(dialog_id, file_path, caption=text)
-        return await client.send_text(dialog_id, text or "")
+        return await client.send_text(dialog_id, text or "", reply_to=reply_to)
 
     _run(_with_client(session, _do), session=session)
     click.echo("sent.")
+
+
+def _parse_ids(raw: str) -> list[int]:
+    """Parse a comma-separated message-id list; a bad token is a ClickException."""
+    try:
+        return [int(p.strip()) for p in raw.split(",") if p.strip()]
+    except ValueError as exc:
+        raise click.ClickException(f"invalid message id list: {raw!r}") from exc
+
+
+@cli.command()
+@click.argument("from_peer", type=int)
+@click.argument("ids")
+@click.argument("to_peer", type=int)
+@click.option("--session", default="default")
+def forward(from_peer: int, ids: str, to_peer: int, session: str) -> None:
+    """Forward messages (comma-separated IDS) from FROM_PEER to TO_PEER."""
+    message_ids = _parse_ids(ids)
+
+    async def _do(client):
+        return await client.forward(from_peer, message_ids, to_peer)
+
+    _run(_with_client(session, _do), session=session)
+    click.echo("forwarded.")
+
+
+@cli.command()
+@click.argument("dialog_id", type=int)
+@click.argument("message_id", type=int)
+@click.argument("text")
+@click.option("--session", default="default")
+def edit(dialog_id: int, message_id: int, text: str, session: str) -> None:
+    """Edit the text of one of your messages."""
+
+    async def _do(client):
+        return await client.edit_text(dialog_id, message_id, text)
+
+    _run(_with_client(session, _do), session=session)
+    click.echo("edited.")
+
+
+@cli.command()
+@click.argument("dialog_id", type=int)
+@click.argument("ids")
+@click.option("--for-me", "for_me", is_flag=True,
+              help="Delete only for yourself (don't revoke for everyone).")
+@click.option("--session", default="default")
+def delete(dialog_id: int, ids: str, for_me: bool, session: str) -> None:
+    """Delete messages (comma-separated IDS); --for-me to keep them for others."""
+    message_ids = _parse_ids(ids)
+    if for_me and is_channel_or_megagroup_id(dialog_id):
+        raise click.ClickException(
+            "--for-me is not supported for channels/supergroups; Telegram deletes there for everyone"
+        )
+
+    async def _do(client):
+        return await client.delete_messages(dialog_id, message_ids, revoke=not for_me)
+
+    _run(_with_client(session, _do), session=session)
+    click.echo("deleted.")
+
+
+@cli.command("mark-read")
+@click.argument("dialog_id", type=int)
+@click.option("--session", default="default")
+def mark_read(dialog_id: int, session: str) -> None:
+    """Mark a dialog as read (clears its unread counter)."""
+
+    async def _do(client):
+        return await client.mark_read(dialog_id)
+
+    _run(_with_client(session, _do), session=session)
+    click.echo("marked read.")
 
 
 @cli.command()

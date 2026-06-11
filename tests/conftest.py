@@ -82,10 +82,17 @@ class FakeDocument:
         self.mime_type = mime_type
 
 
+class FakeReplyTo:
+    """Telethon message.reply_to header — only reply_to_msg_id is read."""
+
+    def __init__(self, reply_to_msg_id):
+        self.reply_to_msg_id = reply_to_msg_id
+
+
 class FakeMessage:
     def __init__(
         self, id, sender_id, text=None, out=False, date=None, media=None, peer_id=None,
-        photo=None, document=None, voice=None, file=None, grouped_id=None,
+        photo=None, document=None, voice=None, file=None, grouped_id=None, reply_to=None,
     ):
         self.id = id
         self.grouped_id = grouped_id
@@ -101,6 +108,8 @@ class FakeMessage:
         self.voice = voice
         self.file = file
         self.peer_id = peer_id
+        # Telethon: .reply_to is a MessageReplyHeader (or None); .reply_to_msg_id on it
+        self.reply_to = FakeReplyTo(reply_to) if reply_to is not None else None
 
 
 def _marked_id(entity) -> int:
@@ -181,6 +190,10 @@ class FakeTelethonClient:
         self.dialogs: list[FakeDialog] = []
         self.messages: dict[int, list[FakeMessage]] = {}
         self.sent: list[dict] = []
+        self.forwarded: list[dict] = []
+        self.edited: list[dict] = []
+        self.deleted: list[dict] = []
+        self.read_acks: list[dict] = []
         self.downloads: list[dict] = []
         self.actions_active: list[tuple] = []
         self.actions_log: list[tuple] = []
@@ -264,15 +277,39 @@ class FakeTelethonClient:
         return FakeUser(id=int(peer))
 
     # --- sending ---
-    async def send_message(self, peer, text):
-        msg = FakeMessage(id=999, sender_id=1, text=text, out=True, peer_id=int(peer))
-        self.sent.append({"peer": int(peer), "text": text})
+    async def send_message(self, peer, text, reply_to=None):
+        msg = FakeMessage(id=999, sender_id=1, text=text, out=True, peer_id=int(peer),
+                          reply_to=reply_to)
+        self.sent.append({"peer": int(peer), "text": text, "reply_to": reply_to})
         return msg
 
     async def send_file(self, peer, file, caption=None):
         msg = FakeMessage(id=998, sender_id=1, text=caption, out=True, peer_id=int(peer))
         self.sent.append({"peer": int(peer), "file": str(file), "caption": caption})
         return msg
+
+    async def forward_messages(self, to_peer, message_ids, from_peer):
+        ids = message_ids if isinstance(message_ids, (list, tuple)) else [message_ids]
+        self.forwarded.append(
+            {"to_peer": int(to_peer), "message_ids": list(ids), "from_peer": int(from_peer)}
+        )
+        return [
+            FakeMessage(id=900 + i, sender_id=1, text=f"fwd{mid}", out=True, peer_id=int(to_peer))
+            for i, mid in enumerate(ids)
+        ]
+
+    async def edit_message(self, peer, message_id, text):
+        self.edited.append({"peer": int(peer), "message_id": int(message_id), "text": text})
+        return FakeMessage(id=int(message_id), sender_id=1, text=text, out=True, peer_id=int(peer))
+
+    async def delete_messages(self, peer, message_ids, revoke=True):
+        ids = message_ids if isinstance(message_ids, (list, tuple)) else [message_ids]
+        self.deleted.append({"peer": int(peer), "message_ids": list(ids), "revoke": revoke})
+        return None
+
+    async def send_read_acknowledge(self, peer, max_id=None):
+        self.read_acks.append({"peer": int(peer), "max_id": max_id})
+        return True
 
     async def download_media(self, message, file):
         self.downloads.append({"message_id": getattr(message, "id", None), "dest": str(file)})

@@ -23,6 +23,10 @@ from tg_messenger.core.models import (
 class StubClient:
     def __init__(self, **kw):
         self.sent = []
+        self.forwarded = []
+        self.edited = []
+        self.deleted_calls = []
+        self.read_acks = []
         self.downloaded = []
         self.searched = []
         self.history_items = None
@@ -80,10 +84,26 @@ class StubClient:
         self.downloaded.append((message_id, str(dest)))
         return str(dest)
 
-    async def send_text(self, peer, text):
-        self.sent.append((peer, text))
+    async def send_text(self, peer, text, reply_to=None):
+        self.sent.append((peer, text, reply_to))
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    async def forward(self, from_peer, message_ids, to_peer):
+        self.forwarded.append((from_peer, list(message_ids), to_peer))
+        return [Message(id=m, dialog_id=to_peer, sender_id=1, out=True, text="fwd",
+                        date=datetime(2024, 1, 1, tzinfo=timezone.utc)) for m in message_ids]
+
+    async def edit_text(self, peer, message_id, text):
+        self.edited.append((peer, message_id, text))
+        return Message(id=message_id, dialog_id=peer, sender_id=1, out=True, text=text,
+                       date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    async def delete_messages(self, peer, message_ids, revoke=True):
+        self.deleted_calls.append((peer, list(message_ids), revoke))
+
+    async def mark_read(self, peer, max_id=None):
+        self.read_acks.append((peer, max_id))
 
     async def send_media(self, peer, file_path, caption=None):
         self.sent.append((peer, "file", str(file_path), caption))
@@ -198,7 +218,7 @@ def test_send_calls_client(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["send", "7", "hello"])
     assert result.exit_code == 0
-    assert stub.sent == [(7, "hello")]
+    assert stub.sent == [(7, "hello", None)]
 
 
 def test_send_file_uses_send_media(runner, tmp_path):
@@ -210,10 +230,77 @@ def test_send_file_uses_send_media(runner, tmp_path):
     assert stub.sent[-1] == (7, "file", str(f), "caption")
 
 
+# --- цикл 80: reply/forward/edit/delete/read команды ---
+
+
+def test_send_reply_to_passed(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["send", "7", "re", "--reply-to", "42"])
+    assert result.exit_code == 0, result.output
+    assert stub.sent == [(7, "re", 42)]
+
+
+def test_forward_command_calls_client(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["forward", "7", "1,2", "8"])
+    assert result.exit_code == 0, result.output
+    assert stub.forwarded == [(7, [1, 2], 8)]
+
+
+def test_forward_command_rejects_bad_ids(runner):
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["forward", "7", "1,x", "8"])
+    assert result.exit_code != 0
+    assert "id" in result.output.lower()
+
+
+def test_edit_command_calls_client(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["edit", "7", "5", "fixed"])
+    assert result.exit_code == 0, result.output
+    assert stub.edited == [(7, 5, "fixed")]
+
+
+def test_delete_command_revokes_by_default(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["delete", "7", "1,2"])
+    assert result.exit_code == 0, result.output
+    assert stub.deleted_calls == [(7, [1, 2], True)]
+
+
+def test_delete_command_for_me_keeps_revoke_false(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["delete", "7", "1", "--for-me"])
+    assert result.exit_code == 0, result.output
+    assert stub.deleted_calls == [(7, [1], False)]
+
+
+def test_delete_command_for_me_rejects_channel_marked_id(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["delete", "--for-me", "--", "-1000000000123", "1"])
+    assert result.exit_code != 0
+    assert "--for-me is not supported" in result.output
+    assert stub.deleted_calls == []
+
+
+def test_delete_command_rejects_bad_ids(runner):
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["delete", "7", "nope"])
+    assert result.exit_code != 0
+    assert "id" in result.output.lower()
+
+
+def test_mark_read_command_marks_read(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["mark-read", "7"])
+    assert result.exit_code == 0, result.output
+    assert stub.read_acks == [(7, None)]
+
+
 def test_flood_wait_friendly_message(runner, monkeypatch):
     r, stub = runner
 
-    async def boom(peer, text):
+    async def boom(peer, text, reply_to=None):
         raise HandledFloodWaitError("send_text", 9999)
 
     monkeypatch.setattr(stub, "send_text", boom)
@@ -292,7 +379,7 @@ def test_chat_sends_and_disconnects_on_eof(runner):
     stub.listen_interrupt = False  # printer just idles; EOF on stdin ends the REPL
     result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
     assert result.exit_code == 0
-    assert (7, "hello") in stub.sent
+    assert (7, "hello", None) in stub.sent
     assert stub.connected is False
 
 
@@ -486,7 +573,7 @@ def test_watch_notifies_saved_messages(runner):
     result = r.invoke(cli_main.cli, ["watch"])
     assert result.exit_code == 0
     assert "Watching" in result.output
-    (peer, text), = stub.sent
+    (peer, text, _reply), = stub.sent
     assert peer == 1  # Saved Messages = собственный id
     assert "удалят меня" in text
     assert "My Group" in text
@@ -578,7 +665,7 @@ def test_flood_wait_is_logged_to_file(runner, monkeypatch):
 
     r, stub = runner
 
-    async def boom(peer, text):
+    async def boom(peer, text, reply_to=None):
         raise HandledFloodWaitError("send_text", 9999)
 
     monkeypatch.setattr(stub, "send_text", boom)
@@ -599,7 +686,7 @@ def test_chat_listener_failure_is_reported(runner, monkeypatch, caplog):
     with caplog.at_level("ERROR", logger="tg_messenger.cli.main"):
         result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
     assert result.exit_code == 0  # the REPL itself still worked
-    assert (7, "hello") in stub.sent
+    assert (7, "hello", None) in stub.sent
     assert "listener failed" in result.output
     errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
     assert errors and errors[0].exc_info is not None

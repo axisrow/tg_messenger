@@ -16,7 +16,7 @@ from tests.conftest import (
     FakeMessageReadEvent,
     FakeUser,
 )
-from tg_messenger.core.client import StandaloneTelegramClient, _dialog_kind
+from tg_messenger.core.client import MessageDeleteValidationError, StandaloneTelegramClient, _dialog_kind
 from tg_messenger.core.models import (
     ChatActionEvent,
     Dialog,
@@ -224,7 +224,7 @@ async def test_send_text_records_and_returns_message(fake_client):
     client = _build(fake_client)
     await client.connect()
     msg = await client.send_text(7, "hello")
-    assert fake_client.sent[-1] == {"peer": 7, "text": "hello"}
+    assert fake_client.sent[-1] == {"peer": 7, "text": "hello", "reply_to": None}
     assert isinstance(msg, Message)
     assert msg.out is True
 
@@ -1146,3 +1146,304 @@ async def test_send_reaction_flood_is_handled(fake_client, monkeypatch):
     monkeypatch.setattr(type(fake_client), "__call__", lambda self, req: boom(req))
     with pytest.raises(HandledFloodWaitError):
         await client.send_reaction(7, 55, "👍")
+
+
+# --- Цикл 77: reply_to в send_text ---
+
+
+async def test_send_text_reply_to_passed_to_telethon(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await client.send_text(7, "re", reply_to=42)
+    assert fake_client.sent[-1]["reply_to"] == 42
+
+
+async def test_send_text_no_reply_to_by_default(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await client.send_text(7, "plain")
+    assert fake_client.sent[-1]["reply_to"] is None
+
+
+async def test_send_text_reply_maps_reply_to_id(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    msg = await client.send_text(7, "re", reply_to=42)
+    assert msg.reply_to_id == 42
+
+
+async def test_to_message_maps_reply_to_id_from_raw():
+    raw = FakeMessage(id=1, sender_id=7, text="hi", reply_to=99)
+    msg = StandaloneTelegramClient._to_message(raw, dialog_id=7)
+    assert msg.reply_to_id == 99
+
+
+async def test_to_message_reply_to_id_none_when_absent():
+    raw = FakeMessage(id=1, sender_id=7, text="hi")
+    msg = StandaloneTelegramClient._to_message(raw, dialog_id=7)
+    assert msg.reply_to_id is None
+
+
+async def test_send_text_reply_invalidates_history(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.send_text(7, "re", reply_to=1)
+    await client.history(7, limit=10)  # must refetch
+    assert fake_client.iter_messages_calls == 2
+
+
+# --- Цикл 78: forward / edit / delete ---
+
+
+def _flood_patch(monkeypatch):
+    import tg_messenger.core.flood as flood
+
+    class FakeFloodWaitError(Exception):
+        def __init__(self, seconds):
+            super().__init__(f"flood {seconds}s")
+            self.seconds = seconds
+
+    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    return FakeFloodWaitError
+
+
+def _seed_delete_messages(fake_client, peer: int = 7, ids=(1, 2)) -> None:
+    fake_client.messages[int(peer)] = [
+        FakeMessage(id=mid, sender_id=1, text=f"m{mid}", out=True, peer_id=int(peer))
+        for mid in ids
+    ]
+
+
+async def test_forward_calls_telethon_and_returns_messages(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    result = await client.forward(7, [1, 2], 8)
+    assert fake_client.forwarded[-1] == {"to_peer": 8, "message_ids": [1, 2], "from_peer": 7}
+    assert all(isinstance(m, Message) for m in result)
+    assert len(result) == 2
+
+
+async def test_forward_invalidates_both_peers(fake_client):
+    _seed_dm(fake_client)
+    fake_client.messages[8] = [FakeMessage(id=3, sender_id=8, text="other")]
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.history(8, limit=10)
+    await client.forward(7, [1], 8)
+    await client.history(7, limit=10)  # refetch
+    await client.history(8, limit=10)  # refetch
+    assert fake_client.iter_messages_calls == 4
+
+
+async def test_forward_filters_partial_missing_results(fake_client, caplog):
+    client = _build(fake_client)
+    await client.connect()
+
+    async def partial_forward(to_peer, message_ids, from_peer):
+        return [
+            FakeMessage(id=101, sender_id=1, text="ok", out=True, peer_id=to_peer),
+            None,
+        ]
+
+    fake_client.forward_messages = partial_forward
+    with caplog.at_level(logging.WARNING):
+        result = await client.forward(7, [1, 999], 8)
+
+    assert [m.id for m in result] == [101]
+    assert any("forward returned 1 missing message(s)" in record.message for record in caplog.records)
+
+
+async def test_forward_flood_is_handled(fake_client, monkeypatch):
+    from tg_messenger.core.flood import HandledFloodWaitError
+    flood_error = _flood_patch(monkeypatch)
+    client = _build(fake_client)
+    await client.connect()
+
+    async def boom(to_peer, message_ids, from_peer):
+        raise flood_error(9999)
+
+    fake_client.forward_messages = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.forward(7, [1], 8)
+
+
+async def test_edit_text_calls_telethon_and_returns_message(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    msg = await client.edit_text(7, 5, "edited")
+    assert fake_client.edited[-1] == {"peer": 7, "message_id": 5, "text": "edited"}
+    assert isinstance(msg, Message)
+    assert msg.text == "edited"
+
+
+async def test_edit_text_invalidates_history(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.edit_text(7, 1, "x")
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 2
+
+
+async def test_edit_text_flood_is_handled(fake_client, monkeypatch):
+    from tg_messenger.core.flood import HandledFloodWaitError
+    flood_error = _flood_patch(monkeypatch)
+    client = _build(fake_client)
+    await client.connect()
+
+    async def boom(peer, message_id, text):
+        raise flood_error(9999)
+
+    fake_client.edit_message = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.edit_text(7, 1, "x")
+
+
+async def test_delete_messages_calls_telethon_with_revoke(fake_client):
+    _seed_delete_messages(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.delete_messages(7, [1, 2])
+    assert fake_client.deleted[-1] == {"peer": 7, "message_ids": [1, 2], "revoke": True}
+
+
+async def test_delete_messages_for_me_passes_revoke_false(fake_client):
+    _seed_delete_messages(fake_client, ids=(1,))
+    client = _build(fake_client)
+    await client.connect()
+    await client.delete_messages(7, [1], revoke=False)
+    assert fake_client.deleted[-1]["revoke"] is False
+
+
+async def test_delete_messages_invalidates_history(fake_client):
+    _seed_dm(fake_client)
+    _seed_delete_messages(fake_client, ids=(1,))
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10)
+    await client.delete_messages(7, [1])
+    await client.history(7, limit=10)
+    assert fake_client.iter_messages_calls == 3  # history + validation + refetch
+
+
+async def test_delete_messages_flood_is_handled(fake_client, monkeypatch):
+    from tg_messenger.core.flood import HandledFloodWaitError
+    flood_error = _flood_patch(monkeypatch)
+    _seed_delete_messages(fake_client, ids=(1,))
+    client = _build(fake_client)
+    await client.connect()
+
+    async def boom(peer, message_ids, revoke=True):
+        raise flood_error(9999)
+
+    fake_client.delete_messages = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.delete_messages(7, [1])
+
+
+async def test_delete_messages_rejects_missing_ids_before_delete(fake_client):
+    _seed_delete_messages(fake_client, ids=(1,))
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(MessageDeleteValidationError, match="not found"):
+        await client.delete_messages(7, [1, 2])
+    assert fake_client.deleted == []
+
+
+async def test_delete_messages_rejects_messages_from_other_peer(fake_client):
+    fake_client.messages[7] = [
+        FakeMessage(id=1, sender_id=1, text="wrong", out=True, peer_id=8)
+    ]
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(MessageDeleteValidationError, match="belongs to dialog 8"):
+        await client.delete_messages(7, [1])
+    assert fake_client.deleted == []
+
+
+async def test_delete_messages_for_me_rejects_channels_before_delete(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    with pytest.raises(MessageDeleteValidationError, match="not supported"):
+        await client.delete_messages(-1000000000123, [1], revoke=False)
+    assert fake_client.deleted == []
+
+
+# --- Цикл 79: mark_read + unread ---
+
+
+async def test_mark_read_calls_send_read_acknowledge(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await client.mark_read(7)
+    assert fake_client.read_acks == [{"peer": 7, "max_id": None}]
+
+
+async def test_mark_read_passes_max_id(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await client.mark_read(7, max_id=42)
+    assert fake_client.read_acks == [{"peer": 7, "max_id": 42}]
+
+
+async def test_mark_read_invalidates_dialogs_cache(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.dialogs()
+    assert next(d for d in first if d.id == 7).unread == 2
+    assert fake_client.iter_dialogs_calls == 1
+
+    fake_client.dialogs[0].unread_count = 0
+    await client.mark_read(7)
+    second = await client.dialogs()
+    assert next(d for d in second if d.id == 7).unread == 0
+    assert fake_client.iter_dialogs_calls == 2
+
+
+async def test_mark_read_flood_is_handled(fake_client, monkeypatch):
+    from tg_messenger.core.flood import HandledFloodWaitError
+    flood_error = _flood_patch(monkeypatch)
+    client = _build(fake_client)
+    await client.connect()
+
+    async def boom(peer, max_id=None):
+        raise flood_error(9999)
+
+    fake_client.send_read_acknowledge = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.mark_read(7)
+
+
+async def test_mark_read_flood_keeps_dialogs_cache(fake_client, monkeypatch):
+    from tg_messenger.core.flood import HandledFloodWaitError
+    flood_error = _flood_patch(monkeypatch)
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.dialogs()
+    assert next(d for d in first if d.id == 7).unread == 2
+
+    async def boom(peer, max_id=None):
+        raise flood_error(9999)
+
+    fake_client.dialogs[0].unread_count = 0
+    fake_client.send_read_acknowledge = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.mark_read(7)
+    second = await client.dialogs()
+    assert next(d for d in second if d.id == 7).unread == 2
+    assert fake_client.iter_dialogs_calls == 1
+
+
+async def test_dialog_unread_mapped_from_telethon(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    dialogs = await client.dialogs()
+    ann = next(d for d in dialogs if d.id == 7)
+    assert ann.unread == 2

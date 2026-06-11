@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 import httpx
@@ -14,6 +15,7 @@ class WebStubClient:
         self.bus = EventBus()
         self.sent = []
         self.searched = []
+        self.read_acks = []
 
     async def connect(self):
         pass
@@ -39,10 +41,13 @@ class WebStubClient:
         return [Message(id=1, dialog_id=peer, sender_id=peer, out=False, text="hi",
                         date=datetime(2024, 1, 1, tzinfo=timezone.utc))]
 
-    async def send_text(self, peer, text):
-        self.sent.append((peer, text))
+    async def send_text(self, peer, text, reply_to=None):
+        self.sent.append((peer, text, reply_to))
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    async def mark_read(self, peer, max_id=None):
+        self.read_acks.append((peer, max_id))
 
     async def send_media(self, peer, file_path, caption=None):
         self.sent.append((peer, "media", caption))
@@ -207,7 +212,93 @@ async def test_send_returns_fragment(client_app):
     r = await ac.post("/send", data={"dialog_id": "7", "text": "hello"})
     assert r.status_code == 200
     assert "hello" in r.text
-    assert stub.sent == [(7, "hello")]
+    assert stub.sent == [(7, "hello", None)]
+
+
+async def test_dialogs_show_unread_badge(client_app):
+    # цикл 81: непрочитанные показываются бейджем
+    ac, _ = client_app
+    r = await ac.get("/dialogs")
+    assert '<span class="unread">1</span>' in r.text
+
+
+async def test_opening_messages_marks_read(client_app):
+    # цикл 81: открытие диалога помечает его прочитанным (best-effort)
+    ac, stub = client_app
+    await ac.get("/dialogs/7/messages")
+    await asyncio.sleep(0)
+    assert stub.read_acks == [(7, 1)]
+
+
+async def test_messages_mark_read_does_not_block_response():
+    stub = WebStubClient()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_mark_read(peer, max_id=None):
+        started.set()
+        await release.wait()
+        stub.read_acks.append((peer, max_id))
+
+    stub.mark_read = slow_mark_read
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await asyncio.wait_for(ac.get("/dialogs/7/messages"), timeout=1)
+            assert r.status_code == 200
+            assert "hi" in r.text
+            await asyncio.wait_for(started.wait(), timeout=1)
+            assert stub.read_acks == []
+            release.set()
+            await asyncio.sleep(0)
+    assert stub.read_acks == [(7, 1)]
+
+
+async def test_messages_empty_history_does_not_mark_read():
+    stub = WebStubClient()
+
+    async def empty_history(peer, limit=50, offset_id=0):
+        return []
+
+    stub.history = empty_history
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/dialogs/7/messages")
+            await asyncio.sleep(0)
+    assert r.status_code == 200
+    assert stub.read_acks == []
+
+
+async def test_messages_mark_read_failure_does_not_break(caplog):
+    # mark_read best-effort: ошибка логируется, история всё равно отдаётся
+    import logging
+
+    stub = WebStubClient()
+
+    async def boom(peer, max_id=None):
+        raise RuntimeError("nope")
+
+    stub.mark_read = boom
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            with caplog.at_level(logging.WARNING):
+                r = await ac.get("/dialogs/7/messages")
+                await asyncio.sleep(0)
+    assert r.status_code == 200
+    assert "hi" in r.text
+    assert any("mark_read" in rec.message or "nope" in str(rec.message) for rec in caplog.records)
+
+
+async def test_send_reply_to_reaches_client(client_app):
+    ac, stub = client_app
+    r = await ac.post("/send", data={"dialog_id": "7", "text": "re", "reply_to": "42"})
+    assert r.status_code == 200
+    assert stub.sent == [(7, "re", 42)]
 
 
 async def test_send_empty_text_returns_400(client_app):

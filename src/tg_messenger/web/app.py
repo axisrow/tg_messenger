@@ -6,6 +6,7 @@ StandaloneTelegramClient is created from env and connected on startup.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -80,13 +81,34 @@ async def sse_event_stream(client, dialog_id: int):
         return
 
 
+async def _mark_read_best_effort(client, dialog_id: int, max_id: int) -> None:
+    try:
+        await client.mark_read(dialog_id, max_id=max_id)
+    except Exception:
+        logger.warning("mark_read failed for dialog %s — continuing", dialog_id, exc_info=True)
+
+
+def _schedule_mark_read(app: FastAPI, client, dialog_id: int, max_id: int) -> None:
+    task = asyncio.create_task(_mark_read_best_effort(client, dialog_id, max_id))
+    app.state.background_tasks.add(task)
+    task.add_done_callback(app.state.background_tasks.discard)
+
+
 def build_app(*, client=None, session_name: str = "default") -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        app.state.background_tasks = set()
         app.state.client = client or _make_real_client(session_name)
         await app.state.client.connect()
-        yield
-        await app.state.client.disconnect()
+        try:
+            yield
+        finally:
+            tasks = set(app.state.background_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await app.state.client.disconnect()
 
     app = FastAPI(lifespan=lifespan)
 
@@ -139,16 +161,22 @@ def build_app(*, client=None, session_name: str = "default") -> FastAPI:
 
     @app.get("/dialogs/{dialog_id}/messages", response_class=HTMLResponse)
     async def messages(request: Request, dialog_id: int):
-        items = await request.app.state.client.history(dialog_id, limit=50)
+        client = request.app.state.client
+        items = await client.history(dialog_id, limit=50)
+        # opening a dialog clears its unread counter, but it must never block rendering history
+        if items:
+            _schedule_mark_read(request.app, client, dialog_id, max(m.id for m in items))
         return HTMLResponse("".join(_message_div(m) for m in items))
 
     @app.post("/send", response_class=HTMLResponse)
-    async def send(request: Request, dialog_id: str = Form(""), text: str = Form("")):
+    async def send(request: Request, dialog_id: str = Form(""), text: str = Form(""),
+                   reply_to: str = Form("")):
         if not dialog_id.strip().lstrip("-").isdigit():
             return HTMLResponse('<div class="error">Select a dialog first.</div>', status_code=400)
         if not text.strip():
             return HTMLResponse('<div class="error">Cannot send an empty message.</div>', status_code=400)
-        msg = await request.app.state.client.send_text(int(dialog_id), text)
+        reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
+        msg = await request.app.state.client.send_text(int(dialog_id), text, reply_to=reply_to_id)
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/media", response_class=HTMLResponse)
