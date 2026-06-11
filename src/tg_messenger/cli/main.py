@@ -886,12 +886,14 @@ def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
               help="Comma-separated task types to claim.")
 @click.option("--interval", "interval", type=float, default=5.0,
               help="Seconds to wait between empty polls.")
-def worker(session: str, factory_url: str | None, types: str, interval: float) -> None:
+@click.pass_context
+def worker(ctx: click.Context, session: str, factory_url: str | None, types: str, interval: float) -> None:
     """Run a worker for tg_content_factory: claim tasks, execute them, report back.
 
     The factory is the agent's memory + search; this worker is its hands —
     dm_reply/chat_answer send messages, fetch_history/fetch_dialogs read them.
     """
+    session = _effective_session(ctx, session)
     if not factory_url:
         raise click.ClickException(
             "--factory-url is required (or set TG_FACTORY_URL)."

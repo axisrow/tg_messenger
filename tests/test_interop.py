@@ -232,10 +232,12 @@ def test_interop_task_model_validates():
 class StubFactory:
     """In-memory FactoryClient stand-in for worker tests (no httpx)."""
 
-    def __init__(self):
+    def __init__(self, *, complete_raises=False, fail_raises=False):
         self._queue: list[dict] = []
         self.completed: list[tuple[str, dict]] = []
         self.failed: list[tuple[str, str]] = []
+        self.complete_raises = complete_raises
+        self.fail_raises = fail_raises
 
     def enqueue(self, task: dict) -> None:
         self._queue.append(task)
@@ -247,9 +249,13 @@ class StubFactory:
         return None
 
     async def complete_task(self, task_id, result_payload):
+        if self.complete_raises:
+            raise RuntimeError("complete report blew up")
         self.completed.append((task_id, result_payload))
 
     async def fail_task(self, task_id, error):
+        if self.fail_raises:
+            raise RuntimeError("fail report blew up")
         self.failed.append((task_id, error))
 
 
@@ -336,6 +342,68 @@ async def test_worker_send_failure_fails_task_and_loop_survives(caplog):
     worker._client = StubCoreClient()
     await worker.process_once()
     assert worker._client.sent == [(8, "y")]
+
+
+async def test_worker_fail_task_report_failure_does_not_stop_next_task(caplog):
+    import logging as _logging
+
+    factory = StubFactory(fail_raises=True)
+    client = StubCoreClient(send_raises=True)
+    factory.enqueue({
+        "id": "bad-report", "type": "dm_reply",
+        "payload": {"v": 1, "peer": 7, "text": "x"}, "status": "claimed",
+        "result_payload": None,
+    })
+    factory.enqueue({
+        "id": "good", "type": "chat_answer",
+        "payload": {"v": 1, "peer": 8, "text": "y"}, "status": "claimed",
+        "result_payload": None,
+    })
+    worker = _make_worker(factory, client)
+
+    with caplog.at_level(_logging.ERROR, logger="tg_messenger.interop.worker"):
+        await worker.process_once()
+
+    assert factory.failed == []
+    assert any("failed to report task bad-report failure" in r.getMessage() for r in caplog.records)
+
+    factory.fail_raises = False
+    worker._client = StubCoreClient()
+    await worker.process_once()
+
+    assert worker._client.sent == [(8, "y")]
+    assert factory.completed == [("good", {"sent": 12345})]
+
+
+async def test_worker_complete_task_report_failure_does_not_stop_next_task(caplog):
+    import logging as _logging
+
+    factory = StubFactory(complete_raises=True)
+    client = StubCoreClient()
+    factory.enqueue({
+        "id": "bad-report", "type": "dm_reply",
+        "payload": {"v": 1, "peer": 7, "text": "x"}, "status": "claimed",
+        "result_payload": None,
+    })
+    factory.enqueue({
+        "id": "good", "type": "chat_answer",
+        "payload": {"v": 1, "peer": 8, "text": "y"}, "status": "claimed",
+        "result_payload": None,
+    })
+    worker = _make_worker(factory, client)
+
+    with caplog.at_level(_logging.ERROR, logger="tg_messenger.interop.worker"):
+        await worker.process_once()
+
+    assert client.sent == [(7, "x")]
+    assert factory.completed == []
+    assert any("failed to report task bad-report completion" in r.getMessage() for r in caplog.records)
+
+    factory.complete_raises = False
+    await worker.process_once()
+
+    assert client.sent == [(7, "x"), (8, "y")]
+    assert factory.completed == [("good", {"sent": 12345})]
 
 
 # --- цикл 108: fetch_history / fetch_dialogs ---
