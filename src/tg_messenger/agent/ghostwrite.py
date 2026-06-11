@@ -231,6 +231,8 @@ class GhostwriteEngine:
         now = self._clock()
         if not await is_active(self._storage, dialog_id, now=now):
             return  # not enabled, or paused — the suggester is never even asked
+        # Record the rate slot before the LLM call so maxed dialogs skip generation.
+        # Trade-off: the slot is consumed even if _dispatch later bails post-pause.
         if self._over_rate_limit(dialog_id, now):
             logger.warning(
                 "ghostwrite skip in dialog %s: per-hour limit (%s) reached",
@@ -289,6 +291,8 @@ class GhostwriteEngine:
                 self._sending.pop(int(dialog_id), None)
         except Exception:
             logger.exception("ghostwrite failed to send reply in dialog %s", dialog_id)
+            # send_text failed, so no own id is trustworthy; deferred outgoing events
+            # are treated as human intervention, which is conservative and safe.
             await self._handle_deferred_outgoing(pending_events, own_message_id=sent_id)
             return
         await self._handle_deferred_outgoing(pending_events, own_message_id=sent_id)
