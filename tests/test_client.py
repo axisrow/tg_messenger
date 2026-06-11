@@ -170,22 +170,17 @@ async def test_search_messages_limit_passed(fake_client):
 
 async def test_search_messages_flood_is_handled(fake_client, monkeypatch):
     # search routes through run_with_flood_wait_retry like every other read
-    import tg_messenger.core.flood as flood
+    from tests.conftest import patch_flood_error
     from tg_messenger.core.flood import HandledFloodWaitError
 
-    class FakeFloodWaitError(Exception):
-        def __init__(self, seconds):
-            super().__init__(f"flood {seconds}s")
-            self.seconds = seconds
-
-    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    flood_error = patch_flood_error(monkeypatch)
     _seed_dm(fake_client)
     client = _build(fake_client)
     await client.connect()
 
     def boom(*a, **k):
         async def gen():
-            raise FakeFloodWaitError(9999)  # non-transient → HandledFloodWaitError
+            raise flood_error(9999)  # non-transient → HandledFloodWaitError
             yield  # pragma: no cover
 
         return gen()
@@ -878,15 +873,10 @@ async def test_default_factory_disables_silent_flood_sleep():
 
 
 async def test_dialogs_flood_raises_handled_and_leaves_cache_empty(fake_client, monkeypatch):
-    import tg_messenger.core.flood as flood
+    from tests.conftest import patch_flood_error
     from tg_messenger.core.flood import HandledFloodWaitError
 
-    class FakeFloodWaitError(Exception):
-        def __init__(self, seconds):
-            super().__init__(f"flood {seconds}s")
-            self.seconds = seconds
-
-    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    flood_error = patch_flood_error(monkeypatch)
     _seed_dm(fake_client)
     client = _build(fake_client)
     await client.connect()
@@ -897,7 +887,7 @@ async def test_dialogs_flood_raises_handled_and_leaves_cache_empty(fake_client, 
         calls["n"] += 1
 
         async def gen():
-            raise FakeFloodWaitError(9999)
+            raise flood_error(9999)
             yield  # pragma: no cover
 
         return gen()
@@ -1164,20 +1154,15 @@ async def test_send_reaction_sends_request(fake_client):
 
 
 async def test_send_reaction_flood_is_handled(fake_client, monkeypatch):
-    import tg_messenger.core.flood as flood
+    from tests.conftest import patch_flood_error
     from tg_messenger.core.flood import HandledFloodWaitError
 
-    class FakeFloodWaitError(Exception):
-        def __init__(self, seconds):
-            super().__init__(f"flood {seconds}s")
-            self.seconds = seconds
-
-    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    flood_error = patch_flood_error(monkeypatch)
     client = _build(fake_client)
     await client.connect()
 
     async def boom(request):
-        raise FakeFloodWaitError(9999)  # non-transient → HandledFloodWaitError
+        raise flood_error(9999)  # non-transient → HandledFloodWaitError
 
     fake_client.__call__ = boom
     monkeypatch.setattr(type(fake_client), "__call__", lambda self, req: boom(req))
@@ -1255,15 +1240,9 @@ async def test_send_text_no_schedule_by_default(fake_client):
 
 
 def _flood_patch(monkeypatch):
-    import tg_messenger.core.flood as flood
+    from tests.conftest import patch_flood_error
 
-    class FakeFloodWaitError(Exception):
-        def __init__(self, seconds):
-            super().__init__(f"flood {seconds}s")
-            self.seconds = seconds
-
-    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
-    return FakeFloodWaitError
+    return patch_flood_error(monkeypatch)
 
 
 def _seed_delete_messages(fake_client, peer: int = 7, ids=(1, 2)) -> None:
@@ -1707,20 +1686,15 @@ async def test_clear_username_sends_empty(fake_client):
 
 
 async def test_check_username_flood_is_handled(fake_client, monkeypatch):
-    import tg_messenger.core.flood as flood
+    from tests.conftest import patch_flood_error
     from tg_messenger.core.flood import HandledFloodWaitError
 
-    class FakeFloodWaitError(Exception):
-        def __init__(self, seconds):
-            super().__init__(f"flood {seconds}s")
-            self.seconds = seconds
-
-    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    flood_error = patch_flood_error(monkeypatch)
     client = _build(fake_client)
     await client.connect()
 
     async def boom(request):
-        raise FakeFloodWaitError(9999)
+        raise flood_error(9999)
 
     monkeypatch.setattr(type(fake_client), "__call__", lambda self, req: boom(req))
     with pytest.raises(HandledFloodWaitError):

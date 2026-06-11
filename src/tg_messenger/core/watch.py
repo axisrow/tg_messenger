@@ -16,15 +16,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
+from tg_messenger.core.client import is_channel_or_megagroup_id
 from tg_messenger.core.models import MessagesDeletedEvent, OutgoingEvent
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_SIZE = 1000
-# marked id канала/супергруппы: -(10^12 + channel_id). Событие БЕЗ chat_id Telegram
-# шлёт только для ЛС/малых групп, где message id глобальны — канальные записи кэша
-# с их пер-канальными id обязаны быть отсечены, иначе ложный матч по совпадению id.
-CHANNEL_ID_THRESHOLD = -1_000_000_000_000
 MEDIA_PLACEHOLDER = "<медиа/без текста>"
 NOTIFY_HEADER = "🗑 Удалено в «{title}» (id {dialog_id}):"
 
@@ -51,7 +48,8 @@ class DeletionWatcher:
         self._cache_size = cache_size
         self._echo = echo or (lambda line: None)
         self._cache: OrderedDict[tuple[int, int], CachedMessage] = OrderedDict()
-        self._titles: dict[int, str] = {}
+        # bounded like _cache — a long-running watcher must not grow without limit
+        self._titles: OrderedDict[int, str] = OrderedDict()
         self._self_id: int = 0
 
     async def run(self) -> None:
@@ -84,11 +82,14 @@ class DeletionWatcher:
         if ev.chat_id is not None:
             hits = [self._cache.pop((ev.chat_id, mid), None) for mid in ev.message_ids]
             return [h for h in hits if h is not None]
+        # Событие БЕЗ chat_id Telegram шлёт только для ЛС/малых групп, где message id
+        # глобальны — канальные записи кэша с их пер-канальными id обязаны быть
+        # отсечены, иначе ложный матч по совпадению id.
         ids = set(ev.message_ids)
         keys = [
             key
             for key, entry in self._cache.items()
-            if entry.message_id in ids and entry.dialog_id > CHANNEL_ID_THRESHOLD
+            if entry.message_id in ids and not is_channel_or_megagroup_id(entry.dialog_id)
         ]
         return [self._cache.pop(key) for key in keys]
 
@@ -119,4 +120,6 @@ class DeletionWatcher:
             except Exception:
                 logger.warning("could not resolve title for dialog %s — using the id", dialog_id)
                 self._titles[dialog_id] = str(dialog_id)
+            while len(self._titles) > self._cache_size:
+                self._titles.popitem(last=False)
         return self._titles[dialog_id]

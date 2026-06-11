@@ -75,11 +75,6 @@ _SIGNATURE_WORDS = frozenset({
 })
 
 
-def _first_word(text: str) -> str:
-    stripped = text.strip().lower().lstrip("!?.,")
-    return stripped.split()[0] if stripped.split() else ""
-
-
 def build_style_profile(messages: list[Message]) -> StyleProfile:
     """Build a :class:`StyleProfile` from a dialog history (chronological).
 

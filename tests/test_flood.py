@@ -1,5 +1,6 @@
 import pytest
 
+from tests.conftest import FakeFloodWaitError, patch_flood_error
 from tg_messenger.core.flood import (
     HandledFloodWaitError,
     is_transient_flood_wait_seconds,
@@ -7,20 +8,10 @@ from tg_messenger.core.flood import (
 )
 
 
-class FakeFloodWaitError(Exception):
-    """Mimics telethon.errors.FloodWaitError (.seconds attribute)."""
-
-    def __init__(self, seconds):
-        super().__init__(f"flood {seconds}s")
-        self.seconds = seconds
-
-
 @pytest.fixture(autouse=True)
 def _patch_flood_error(monkeypatch):
     # core.flood catches telethon's FloodWaitError; point it at our fake.
-    import tg_messenger.core.flood as flood
-
-    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    patch_flood_error(monkeypatch)
 
 
 def test_transient_classification():

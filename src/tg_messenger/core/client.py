@@ -9,6 +9,7 @@ All network calls route through the vendored flood-wait retry.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
@@ -207,12 +208,7 @@ class StandaloneTelegramClient:
 
     async def get_me(self) -> User:
         raw = await run_with_flood_wait_retry(lambda: self._client.get_me(), operation="get_me")
-        return User(
-            id=getattr(raw, "id", 0),
-            first_name=getattr(raw, "first_name", None),
-            last_name=getattr(raw, "last_name", None),
-            username=getattr(raw, "username", None),
-        )
+        return self._to_user(raw) or User(id=0)
 
     async def entity_title(self, peer: int) -> str:
         """Human-readable name of a user/group/channel (group title wins)."""
@@ -447,7 +443,7 @@ class StandaloneTelegramClient:
         except Exception:
             logger.warning("could not read permissions for chat %s — assuming not admin",
                            peer, exc_info=True)
-            return {"delete_messages": False, "ban_users": False}
+            perms = None
         if perms is None:
             return {"delete_messages": False, "ban_users": False}
         return {
@@ -570,14 +566,12 @@ class StandaloneTelegramClient:
         Returns the saved path, or ``None`` if the message carries no media.
         """
         raw = await run_with_flood_wait_retry(
-            lambda: self._collect_history_ids(peer, message_id), operation="download_message_media"
+            lambda: self._collect_messages_by_ids(peer, message_id),
+            operation="download_message_media",
         )
         if not raw or getattr(raw[0], "media", None) is None:
             return None
         return await self.download_media(raw[0], dest)
-
-    async def _collect_history_ids(self, peer, message_id) -> list:
-        return [m async for m in self._client.iter_messages(peer, ids=message_id)]
 
     # --- realtime ---
     def _ensure_handler(self) -> None:
@@ -802,3 +796,20 @@ class StandaloneTelegramClient:
             reply_to_id=int(reply_to_id) if reply_to_id is not None else None,
             is_forward=getattr(raw, "forward", None) is not None,
         )
+
+
+def client_from_env(**kwargs) -> StandaloneTelegramClient:
+    """Build a client from the environment — the single env→client plumbing for
+    CLI/web/TUI (``TG_API_ID``, ``TG_API_HASH``, ``TG_SESSION_DIR``,
+    ``SESSION_ENCRYPTION_KEY``, ``TG_SEND_RATE``). Explicit kwargs win over env.
+    """
+    # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
+    kwargs.setdefault("encryption_key", os.environ.get("SESSION_ENCRYPTION_KEY") or None)
+    kwargs.setdefault("session_dir", os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
+    # global outgoing rate cap (#25): TG_SEND_RATE sends/min, 0/unset = off
+    kwargs.setdefault("send_rate_per_min", float(os.environ.get("TG_SEND_RATE", "0") or 0))
+    return StandaloneTelegramClient(
+        api_id=int(os.environ.get("TG_API_ID", "0")),
+        api_hash=os.environ.get("TG_API_HASH", ""),
+        **kwargs,
+    )

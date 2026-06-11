@@ -47,6 +47,22 @@ def _builder_matches(builder, event) -> bool:
     return True
 
 
+class FakeFloodWaitError(Exception):
+    """Mimics telethon.errors.FloodWaitError (.seconds attribute)."""
+
+    def __init__(self, seconds):
+        super().__init__(f"flood {seconds}s")
+        self.seconds = seconds
+
+
+def patch_flood_error(monkeypatch) -> type[FakeFloodWaitError]:
+    """Point core.flood at the fake FloodWaitError; returns the class to raise."""
+    import tg_messenger.core.flood as flood
+
+    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
+    return FakeFloodWaitError
+
+
 class FakeUser:
     def __init__(self, id, first_name=None, last_name=None, username=None, bot=False):
         self.id = id
