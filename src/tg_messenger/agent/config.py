@@ -116,7 +116,12 @@ class AgentConfig:
     suggest_history_limit: int = 30  # сколько сообщений диалога уходит суфлёру (#17)
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> AgentConfig:
+    def from_env(
+        cls,
+        env: Mapping[str, str] | None = None,
+        *,
+        require_allowlist: bool = True,
+    ) -> AgentConfig:
         if env is None:
             env = os.environ
 
@@ -133,7 +138,7 @@ class AgentConfig:
 
         raw_allow = (env.get("TG_AGENT_ALLOWLIST") or "").strip()
         entries = [e.strip() for e in raw_allow.split(",") if e.strip()]
-        if not entries:
+        if not entries and require_allowlist:
             # no safe silent default: replying to everyone must be an explicit '*'
             raise ValueError(
                 "TG_AGENT_ALLOWLIST is not set — use '*' to reply to everyone,"
