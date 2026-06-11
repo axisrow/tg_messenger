@@ -382,6 +382,7 @@ class StandaloneTelegramClient:
         # #14: chat actions (joins/leaves/title/pin/photo), read receipts, reactions
         self._client.add_event_handler(self._on_chat_action, events.ChatAction())
         self._client.add_event_handler(self._on_message_read, events.MessageRead())
+        self._client.add_event_handler(self._on_message_read, events.MessageRead(inbox=True))
         # reactions arrive as a raw update (no high-level event for user accounts)
         self._client.add_event_handler(self._on_reaction, events.Raw(UpdateMessageReactions))
         self._handler_registered = True
@@ -497,7 +498,7 @@ class StandaloneTelegramClient:
         try:
             peer = getattr(update, "peer", None)
             dialog_id = int(tl_utils.get_peer_id(peer)) if peer is not None else 0
-            emoticon = self._first_emoticon(getattr(update, "reactions", None))
+            emoticon = self._recent_emoticon(getattr(update, "reactions", None))
             self._bus_reactions.publish(
                 ReactionEvent(
                     dialog_id=dialog_id,
@@ -511,12 +512,12 @@ class StandaloneTelegramClient:
             logger.warning("failed to handle reaction update — skipping", exc_info=True)
 
     @staticmethod
-    def _first_emoticon(reactions) -> str | None:
-        """Pull the first standard-emoji reaction's emoticon; custom/premium → None."""
-        results = getattr(reactions, "results", None) or []
-        if not results:
+    def _recent_emoticon(reactions) -> str | None:
+        """Pull the changed standard-emoji reaction's emoticon; custom/premium → None."""
+        recent = getattr(reactions, "recent_reactions", None) or []
+        if not recent:
             return None
-        reaction = getattr(results[0], "reaction", None)
+        reaction = getattr(recent[0], "reaction", None)
         return getattr(reaction, "emoticon", None)  # ReactionCustomEmoji has no .emoticon
 
     async def listen(self) -> AsyncIterator[IncomingEvent]:

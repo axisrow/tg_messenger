@@ -63,6 +63,28 @@ class WebStubClient:
             yield ev
 
 
+def test_real_web_client_gets_session_encryption_key(monkeypatch, tmp_path):
+    from tg_messenger.web import app as web_app
+
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("SESSION_ENCRYPTION_KEY", "shared-secret")
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    monkeypatch.setattr("tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    web_app._make_real_client("default")
+
+    assert captured["session_name"] == "default"
+    assert captured["session_dir"] == str(tmp_path)
+    assert captured["encryption_key"] == "shared-secret"
+
+
 @pytest_asyncio.fixture
 async def client_app():
     stub = WebStubClient()

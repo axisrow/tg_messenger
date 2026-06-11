@@ -26,7 +26,10 @@ def _builder_matches(builder, event) -> bool:
     if isinstance(builder, _tg_events.ChatAction):
         return getattr(event, "_is_chat_action", False)
     if isinstance(builder, _tg_events.MessageRead):
-        return getattr(event, "_is_message_read", False)
+        return (
+            getattr(event, "_is_message_read", False)
+            and bool(getattr(builder, "inbox", False)) != bool(getattr(event, "outbox", False))
+        )
     if isinstance(builder, _tg_events.NewMessage):
         if hasattr(event, "deleted_ids"):
             return False

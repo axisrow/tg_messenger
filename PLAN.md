@@ -491,12 +491,14 @@ titles сам). Дисциплина username-резолва: дорогой (~5
 переезжает (in-memory из #8). `tests/test_storage.py`:
 - **67**: connect/close создаёт файл; kv-roundtrip (str/dict/list); get отсутствующего→None;
   context manager закрывает и данные персистятся.
-- **68**: миграции через `PRAGMA user_version` (растёт по числу зарегистрированных);
-  повторный connect не перенакатывает; две пачки от разных потребителей по порядку;
-  ошибка в миграции → rollback всего батча, version не растёт.
+- **68**: миграции трекаются по стабильному id SQL-миграции в `_tg_messenger_migrations`
+  (`PRAGMA user_version` только зеркалит число применённых); повторный connect не
+  перенакатывает; две пачки от разных потребителей не зависят от порядка регистрации;
+  ошибка в миграции → rollback всего батча, metadata/version не растут.
 - **69**: `asyncio.gather` из 20 set/get без потерь (один conn + `asyncio.Lock` +
-  `asyncio.to_thread`, `check_same_thread=False`); execute/fetchone/fetchall параметризованы.
-- **70**: `default_db_path(profile)` = `~/.tg_messenger/<profile>.db`; CLAUDE.md/PLAN.md.
+  `asyncio.to_thread`, `check_same_thread=False`); execute/fetchone/fetchall параметризованы;
+  `close()` ждёт in-flight операцию через тот же lock.
+- **70**: `default_db_path(profile)` = `~/.tg_messenger/<safe-profile>.db`; CLAUDE.md/PLAN.md.
 
 ## Циклы 71–76 — event-потоки (#14, сделано)
 
@@ -516,8 +518,10 @@ titles сам). Дисциплина username-резолва: дорогой (~5
   `chat_id`, `max_id`, `outbox`) + `listen_reads()`. Тесты: inbox vs outbox.
 - **74**: шина `_bus_reactions` + `_on_reaction` через `events.Raw(UpdateMessageReactions)`
   (реальный тип апдейта для user-аккаунтов; `dialog_id` через `telethon.utils.get_peer_id`,
-  `message_id=msg_id`, `emoticon` из первого `ReactionEmoji`, иначе `None`; `actor_id=None`
-  best-effort) + `listen_reactions()`. Неизвестная структура → `logger.warning` + пропуск.
+  `message_id=msg_id`, `emoticon` из первой `recent_reactions[].reaction` если это
+  стандартная `ReactionEmoji`, иначе `None`; aggregate `results` не используется как
+  источник изменившейся реакции; `actor_id=None` best-effort) + `listen_reactions()`.
+  Неизвестная структура → `logger.warning` + пропуск.
 - **75**: `IncomingEvent.album_id = message.grouped_id` в `_on_new_message`; `send_reaction`
   (`SendReactionRequest`+`ReactionEmoji` через `run_with_flood_wait_retry`). Тесты: album_id
   прокинут; запрос записан; non-transient flood → `HandledFloodWaitError`.

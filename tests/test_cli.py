@@ -791,22 +791,79 @@ def test_login_export_session_prints_string_and_warning(monkeypatch):
 
 
 def test_login_import_session_saves_valid_string(monkeypatch):
-    stub = ExportStubClient()
-    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
     valid = _valid_session_for_import()
     result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
     assert result.exit_code == 0, result.output
-    assert stub.imported == [valid]
+    assert saved == [("default", valid)]
+
+
+def test_login_import_session_reads_piped_stdin_without_prompt(monkeypatch):
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    def prompt_must_not_run(*args, **kwargs):
+        raise AssertionError("piped import must read stdin directly")
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
+    monkeypatch.setattr(cli_main.click, "prompt", prompt_must_not_run)
+    valid = _valid_session_for_import()
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
+    assert result.exit_code == 0, result.output
+    assert saved == [("default", valid)]
 
 
 def test_login_import_session_rejects_garbage(monkeypatch):
-    stub = ExportStubClient()
-    # garbage must be rejected before it ever reaches the client
-    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    # garbage must be rejected before it ever reaches the store
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
     result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input="not-a-session\n")
     assert result.exit_code != 0
     assert "invalid StringSession" in result.output
-    assert stub.imported == []
+    assert saved == []
+
+
+def test_login_import_session_rejects_empty_input(monkeypatch):
+    saved = []
+
+    class Store:
+        def save(self, session, raw):
+            saved.append((session, raw))
+
+    monkeypatch.setattr(cli_main, "_session_store", lambda: Store())
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=" \n")
+    assert result.exit_code != 0
+    assert "invalid StringSession" in result.output
+    assert saved == []
+
+
+def test_login_import_session_replaces_unreadable_existing_file(monkeypatch, session_dir):
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(session_dir)
+    store.session_dir.mkdir(parents=True, exist_ok=True)
+    store.path_for("default").write_text("not-a-valid-session", encoding="utf-8")
+    monkeypatch.setattr(cli_main, "_session_store", lambda: store)
+
+    valid = _valid_session_for_import()
+    result = CliRunner().invoke(cli_main.cli, ["login", "--import-session"], input=valid + "\n")
+
+    assert result.exit_code == 0, result.output
+    assert store.load("default") == valid
 
 
 def test_export_session_not_in_log(monkeypatch, tmp_path):
@@ -857,6 +914,56 @@ def test_global_profile_sets_session_name(profile_spy):
     assert profile_spy.get("session_name") == "work"
 
 
+def test_make_client_uses_tg_session_dir(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    monkeypatch.setattr(cli_main, "StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    cli_main.make_client(session_name="work")
+
+    assert captured["session_name"] == "work"
+    assert captured["session_dir"] == str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("args", "input_text"),
+    [
+        (["listen"], None),
+        (["watch"], None),
+        (["chat", "7"], ""),
+        (["agent"], None),
+    ],
+)
+def test_global_profile_reaches_direct_client_commands(
+    profile_spy, monkeypatch, args, input_text
+):
+    class FakeAgentRunner:
+        async def run(self):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        cli_main,
+        "make_agent_runner",
+        lambda client, *, notify_errors=False: FakeAgentRunner(),
+    )
+
+    result = CliRunner().invoke(
+        cli_main.cli,
+        ["--profile", "work", *args],
+        input=input_text,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert profile_spy.get("session_name") == "work"
+
+
 def test_profiles_command_lists_saved(monkeypatch, tmp_path):
     from tg_messenger.core.auth import SessionStore
 
@@ -871,6 +978,15 @@ def test_profiles_command_lists_saved(monkeypatch, tmp_path):
     assert "bob" in result.output
 
 
+def test_profiles_command_empty_hint_uses_global_profile_position(monkeypatch, tmp_path):
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli_main.cli, ["profiles"])
+
+    assert result.exit_code == 0, result.output
+    assert "tg-messenger --profile NAME login" in result.output
+
+
 def test_multiple_profiles_non_interactive_errors(monkeypatch, tmp_path):
     from tg_messenger.core.auth import SessionStore
 
@@ -882,6 +998,27 @@ def test_multiple_profiles_non_interactive_errors(monkeypatch, tmp_path):
     result = CliRunner().invoke(cli_main.cli, ["dialogs"])
     assert result.exit_code != 0
     assert "--profile" in result.output
+
+
+def test_explicit_default_session_skips_profile_picker(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    captured = {}
+
+    def fake_make_client(**kw):
+        captured.update(kw)
+        return StubClient()
+
+    store = SessionStore(tmp_path)
+    store.save("alice", _valid_session_for_import())
+    store.save("bob", _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    monkeypatch.setattr(cli_main, "make_client", fake_make_client)
+
+    result = CliRunner().invoke(cli_main.cli, ["dialogs", "--session", "default"])
+
+    assert result.exit_code == 0, result.output
+    assert captured.get("session_name") == "default"
 
 
 def test_profile_menu_picks_second(monkeypatch, tmp_path):

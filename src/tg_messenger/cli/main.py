@@ -13,10 +13,11 @@ import sys
 from pathlib import Path
 
 import click
+from click.core import ParameterSource
 from telethon.errors import UnauthorizedError
 
 from tg_messenger.agent.config import langsmith_tracing_enabled
-from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT, SessionStore
+from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT, SessionStore, validate_session_string
 from tg_messenger.core.client import StandaloneTelegramClient
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.logsetup import log_file_path, setup_logging
@@ -48,11 +49,24 @@ def _load_dotenv(path: Path | str = ".env") -> None:
         os.environ.setdefault(key, value)
 
 
+def _session_encryption_key() -> str | None:
+    return os.environ.get("SESSION_ENCRYPTION_KEY") or None
+
+
+def _session_store() -> SessionStore:
+    """SessionStore over the configured session dir (env override for tests/ops)."""
+    return SessionStore(
+        os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
+        encryption_key=_session_encryption_key(),
+    )
+
+
 def make_client(**kwargs) -> StandaloneTelegramClient:
     api_id = int(os.environ.get("TG_API_ID", "0"))
     api_hash = os.environ.get("TG_API_HASH", "")
     # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
-    kwargs.setdefault("encryption_key", os.environ.get("SESSION_ENCRYPTION_KEY") or None)
+    kwargs.setdefault("encryption_key", _session_encryption_key())
+    kwargs.setdefault("session_dir", os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
     return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
 
 
@@ -144,11 +158,6 @@ async def _with_client(session, fn):
         await client.disconnect()
 
 
-def _session_store() -> SessionStore:
-    """SessionStore over the configured session dir (env override for tests/ops)."""
-    return SessionStore(os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
-
-
 def _is_interactive() -> bool:
     """True when a human can answer a prompt (stdin is a tty)."""
     return sys.stdin.isatty()
@@ -202,6 +211,11 @@ def _effective_session(ctx: click.Context | None, session: str) -> str:
     profile = ctx.obj.get("profile") if ctx is not None and ctx.obj else None
     if profile:
         return profile
+    if (
+        ctx is not None
+        and ctx.get_parameter_source("session") == ParameterSource.COMMANDLINE
+    ):
+        return session
     return _resolve_profile(session)
 
 
@@ -226,15 +240,18 @@ def _export_session(session: str) -> None:
 
 def _import_session(session: str) -> None:
     """Read a StringSession from stdin (no echo), validate it, and save it under ``session``."""
-    from tg_messenger.core.auth import validate_session_string
-
-    raw = click.prompt("Paste StringSession", hide_input=True).strip()
+    if sys.stdin.isatty():
+        raw = click.prompt("Paste StringSession", hide_input=True).strip()
+    else:
+        raw = click.get_text_stream("stdin").read().strip()
+    if not raw:
+        raise click.ClickException("invalid StringSession")
     try:
         # validate before touching the client so garbage is rejected up front
         validate_session_string(raw)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
-    make_client(session_name=session).import_session_string(raw)
+    _session_store().save(session, raw)
     click.echo(f"Session '{session}' imported and saved.")
 
 
@@ -330,7 +347,7 @@ def profiles() -> None:
     """List saved account profiles (sessions on disk)."""
     names = _session_store().list_profiles()
     if not names:
-        click.echo("No profiles yet — run: tg-messenger login --profile NAME")
+        click.echo("No profiles yet — run: tg-messenger --profile NAME login")
         return
     for name in names:
         click.echo(name)
@@ -493,8 +510,10 @@ def mark_read(dialog_id: int, session: str) -> None:
 
 @cli.command()
 @click.option("--session", default="default")
-def listen(session: str) -> None:
+@click.pass_context
+def listen(ctx: click.Context, session: str) -> None:
     """Print incoming messages live."""
+    session = _effective_session(ctx, session)
 
     async def _do():
         client = make_client(session_name=session)
@@ -515,9 +534,12 @@ def listen(session: str) -> None:
 
 @cli.command()
 @click.option("--session", default="default")
-def watch(session: str) -> None:
+@click.pass_context
+def watch(ctx: click.Context, session: str) -> None:
     """Back up your deleted messages (e.g. removed by group moderator bots) to Saved Messages."""
     from tg_messenger.core.watch import DeletionWatcher
+
+    session = _effective_session(ctx, session)
 
     async def _do():
         client = make_client(session_name=session)
@@ -538,8 +560,10 @@ def watch(session: str) -> None:
 @cli.command()
 @click.argument("dialog_id", type=int)
 @click.option("--session", default="default")
-def chat(dialog_id: int, session: str) -> None:
+@click.pass_context
+def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
     """Interactive REPL: see incoming and send replies."""
+    session = _effective_session(ctx, session)
 
     async def _do():
         client = make_client(session_name=session)
@@ -582,8 +606,10 @@ def chat(dialog_id: int, session: str) -> None:
 @click.option("--session", default="default")
 @click.option("--notify-errors", is_flag=True,
               help="Reply with a short notice when processing a message fails.")
-def agent(session: str, notify_errors: bool) -> None:
+@click.pass_context
+def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
     """AI assistant: auto-reply to incoming DMs, route tasks to a deep agent."""
+    session = _effective_session(ctx, session)
     # langchain/langgraph трассируются в LangSmith сами по LANGSMITH_* env —
     # здесь только fail-fast (включено без ключа) и видимый статус
     try:
