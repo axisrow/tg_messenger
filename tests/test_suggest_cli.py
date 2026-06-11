@@ -10,6 +10,7 @@ import pytest
 from click.testing import CliRunner
 
 from tg_messenger.cli import main as cli_main
+from tg_messenger.core.models import Dialog
 
 
 class StubClient:
@@ -26,6 +27,12 @@ class StubClient:
 
     async def is_authorized(self):
         return self.authorized
+
+    async def dialogs(self, dm_only=True):
+        dms = [Dialog(id=42, title="Ann", kind="dm")]
+        if dm_only:
+            return dms
+        return dms + [Dialog(id=-100200, title="Devs", kind="group")]
 
     async def send_text(self, peer, text, reply_to=None):
         self.sent.append({"peer": peer, "text": text})
@@ -102,6 +109,23 @@ def test_suggest_learn_builds_and_saves(suggest_cli):
     assert result.exit_code == 0, result.output
     assert suggester.learned == [42]
     assert suggester.suggested == []  # --learn не зовёт suggest
+
+
+def test_suggest_rejects_group_dialog_before_llm(suggest_cli):
+    r, client, suggester, _ = suggest_cli
+    result = r.invoke(cli_main.cli, ["suggest", "--", "-100200"])
+    assert result.exit_code != 0
+    assert "DM dialogs only" in result.output
+    assert suggester.suggested == []
+    assert client.sent == []
+
+
+def test_suggest_learn_rejects_group_dialog_before_history(suggest_cli):
+    r, _, suggester, _ = suggest_cli
+    result = r.invoke(cli_main.cli, ["suggest", "--learn", "--", "-100200"])
+    assert result.exit_code != 0
+    assert "DM dialogs only" in result.output
+    assert suggester.learned == []
 
 
 def test_suggest_uses_requested_session_storage(suggest_cli):
