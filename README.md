@@ -27,7 +27,7 @@ The base install is **core + CLI**. The Web and TUI front-ends are optional extr
 pip install tg-messenger          # core + CLI
 pip install 'tg-messenger[web]'   # + FastAPI web UI  (tg-messenger serve)
 pip install 'tg-messenger[tui]'   # + Textual TUI     (tg-messenger tui)
-pip install 'tg-messenger[all]'   # web + tui + agent
+pip install 'tg-messenger[all]'   # web + tui + crypto + agent + interop
 ```
 
 ## Use as a library
@@ -43,7 +43,7 @@ async def main():
     client = StandaloneTelegramClient(
         api_id=12345,
         api_hash="...",
-        session_string="...",   # or session_name=... for on-disk StringSession
+        external_session="...",   # or session_name=... for on-disk StringSession
     )
     await client.connect()
     for dialog in await client.dialogs():

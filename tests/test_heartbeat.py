@@ -265,6 +265,20 @@ async def test_template_chosen_via_rng(tmp_path):
         await storage.close()
 
 
+async def test_template_rng_upper_bound_covers_last(tmp_path):
+    # int(uniform(0, len-1)) почти никогда не выбирал бы последний шаблон —
+    # верхняя граница len с min-клампом возвращает ему равную долю
+    svc, client, storage, t = _mk_service(tmp_path, rng=lambda a, b: b - 1e-9)
+    await storage.connect()
+    try:
+        await add_plan(storage, HeartbeatPlan(
+            peer=PEER, templates=["a", "b", "c"], interval_hours=24.0))
+        await svc.process_plans(now=t["now"])
+        assert client.sent == [(PEER, "c")]
+    finally:
+        await storage.close()
+
+
 async def test_text_provider_overrides_template(tmp_path):
     async def provider(peer):
         return f"hi #{peer}"

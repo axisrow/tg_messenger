@@ -302,7 +302,11 @@ class HeartbeatService:
                     "heartbeat text_provider failed for peer %s — falling back to a template",
                     plan.peer, exc_info=True,
                 )
-        idx = int(self._rng(0, len(plan.templates) - 1)) if len(plan.templates) > 1 else 0
+        # upper bound = len, int() truncates to 0..len-1 uniformly; min() guards
+        # the rng returning the bound itself (uniform(0, n-1) + int() would give
+        # the last template a ~zero share)
+        count = len(plan.templates)
+        idx = min(int(self._rng(0, count)), count - 1) if count > 1 else 0
         return plan.templates[idx]
 
     async def _record_ping(self, plan: HeartbeatPlan, *, now: float, text: str) -> None:
