@@ -15,9 +15,10 @@ from __future__ import annotations
 import subprocess
 import sys
 
-# modules that belong to the optional [web]/[tui] extras — importing core or the
-# CLI must never pull them in
-_UI_MODULES = ["fastapi", "uvicorn", "textual", "jinja2"]
+# modules that belong to the optional [web]/[tui]/[interop] extras — importing core
+# or the CLI must never pull them in. httpx lives ONLY in interop/ (#20), so it must
+# not leak into a plain `import tg_messenger` / `import tg_messenger.cli.main`.
+_UI_MODULES = ["fastapi", "uvicorn", "textual", "jinja2", "httpx"]
 
 
 def _import_loads_no_ui(import_stmt: str) -> str:

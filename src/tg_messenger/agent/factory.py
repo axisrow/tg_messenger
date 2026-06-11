@@ -160,7 +160,12 @@ def build_orchestrator(client, cfg: AgentConfig) -> Orchestrator:
     vision_model = init_chat_model(cfg.vision_model) if cfg.vision_model else model
     task_agent = create_deep_agent(
         model=model,
-        tools=[*make_telegram_tools(client), build_search_fn(cfg.search_provider)],
+        tools=[
+            *make_telegram_tools(
+                client, factory_url=cfg.factory_url, factory_password=cfg.factory_password
+            ),
+            build_search_fn(cfg.search_provider),
+        ],
         system_prompt=TASK_SYSTEM_PROMPT,
     )
     return Orchestrator(
