@@ -42,8 +42,6 @@ def build_classify_prompt(intents: Sequence[IntentSpec] = ()) -> str:
     return "\n".join(lines)
 
 
-CLASSIFY_SYSTEM_PROMPT = build_classify_prompt()
-
 CHAT_SYSTEM_PROMPT = (
     "You are a friendly Telegram assistant. Reply briefly and naturally,"
     " in the language of the user's message."
@@ -82,21 +80,23 @@ def make_classifier(model, intents: Sequence[IntentSpec] = ()) -> Callable[[str]
     return classify
 
 
-def make_chat_fn(model) -> Callable[[list], Awaitable[str]]:
-    async def chat(messages: list) -> str:
-        response = await model.ainvoke([SystemMessage(content=CHAT_SYSTEM_PROMPT), *messages])
+def _make_prompted_fn(model, system_prompt: str) -> Callable[[list], Awaitable[str]]:
+    """A plain ainvoke under a fixed system prompt — chat and vision differ only here."""
+
+    async def call(messages: list) -> str:
+        response = await model.ainvoke([SystemMessage(content=system_prompt), *messages])
         return str(response.content)
 
-    return chat
+    return call
+
+
+def make_chat_fn(model) -> Callable[[list], Awaitable[str]]:
+    return _make_prompted_fn(model, CHAT_SYSTEM_PROMPT)
 
 
 def make_vision_fn(model) -> Callable[[list], Awaitable[str]]:
     # мультимодальное сообщение собирает orchestrator — здесь только промпт и вызов
-    async def vision(messages: list) -> str:
-        response = await model.ainvoke([SystemMessage(content=VISION_SYSTEM_PROMPT), *messages])
-        return str(response.content)
-
-    return vision
+    return _make_prompted_fn(model, VISION_SYSTEM_PROMPT)
 
 
 SUGGEST_SYSTEM_PROMPT = (

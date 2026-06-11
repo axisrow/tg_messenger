@@ -24,7 +24,6 @@ DEFAULT_SESSION_DIR = Path.home() / ".tg_messenger" / "sessions"
 
 # single source for the "you need to log in" UX hint, shared by all three UIs
 LOGIN_HINT = "Not logged in. Run: tg-messenger login"
-_sanitize = sanitize_profile_name
 
 
 def validate_session_string(session_string: str) -> str:
@@ -36,8 +35,13 @@ def validate_session_string(session_string: str) -> str:
     return session_string
 
 
-# back-compat private alias (used internally below)
-_validate_session_string = validate_session_string
+def session_store_from_env() -> SessionStore:
+    """SessionStore from the environment (``TG_SESSION_DIR`` dir override,
+    ``SESSION_ENCRYPTION_KEY`` at-rest encryption) — one definition for CLI/web."""
+    return SessionStore(
+        os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
+        encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
+    )
 
 
 class SessionStore:
@@ -77,7 +81,7 @@ class SessionStore:
                 f"session {name!r} is encrypted but SESSION_ENCRYPTION_KEY is not set"
             )
         plaintext = decrypt_session(raw, self._encryption_key) if self._encryption_key else raw
-        validated = _validate_session_string(plaintext)
+        validated = validate_session_string(plaintext)
         # lazy migration: a plaintext file read under a key is rewritten encrypted
         if self._encryption_key and not is_encrypted(raw):
             self.save(name, validated)
@@ -100,7 +104,7 @@ class SessionStore:
 
     def from_external(self, session_string: str) -> str:
         """Validate and return the session string verbatim — never written to disk."""
-        return _validate_session_string(session_string)
+        return validate_session_string(session_string)
 
     def list_profiles(self) -> list[str]:
         """Sorted profile names = ``*.session`` files in the session dir (no extension)."""

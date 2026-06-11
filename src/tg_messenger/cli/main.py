@@ -18,10 +18,10 @@ from click.core import ParameterSource
 from telethon.errors import UnauthorizedError
 
 from tg_messenger.agent.config import langsmith_tracing_enabled
-from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT, SessionStore, validate_session_string
+from tg_messenger.core.auth import LOGIN_HINT, session_store_from_env, validate_session_string
 from tg_messenger.core.client import (
     MessageDeleteValidationError,
-    StandaloneTelegramClient,
+    client_from_env,
     is_channel_or_megagroup_id,
 )
 from tg_messenger.core.flood import HandledFloodWaitError
@@ -54,27 +54,14 @@ def _load_dotenv(path: Path | str = ".env") -> None:
         os.environ.setdefault(key, value)
 
 
-def _session_encryption_key() -> str | None:
-    return os.environ.get("SESSION_ENCRYPTION_KEY") or None
-
-
-def _session_store() -> SessionStore:
+def _session_store():
     """SessionStore over the configured session dir (env override for tests/ops)."""
-    return SessionStore(
-        os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
-        encryption_key=_session_encryption_key(),
-    )
+    return session_store_from_env()
 
 
-def make_client(**kwargs) -> StandaloneTelegramClient:
-    api_id = int(os.environ.get("TG_API_ID", "0"))
-    api_hash = os.environ.get("TG_API_HASH", "")
-    # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
-    kwargs.setdefault("encryption_key", _session_encryption_key())
-    kwargs.setdefault("session_dir", os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
-    # global outgoing rate cap (#25): TG_SEND_RATE sends/min, 0/unset = off
-    kwargs.setdefault("send_rate_per_min", float(os.environ.get("TG_SEND_RATE", "0") or 0))
-    return StandaloneTelegramClient(api_id=api_id, api_hash=api_hash, **kwargs)
+def make_client(**kwargs):
+    """Build the client from env (core ``client_from_env``); the seam tests patch."""
+    return client_from_env(**kwargs)
 
 
 def make_factory_client(*, base_url: str, password: str | None = None):
@@ -286,6 +273,43 @@ async def _with_client(session, fn):
         await client.disconnect()
 
 
+async def _with_storage(session, register_fn, fn):
+    """Open the per-profile storage with ``register_fn`` migrations, run ``fn``, close."""
+    storage = make_storage(session)
+    register_fn(storage)
+    await storage.connect()
+    try:
+        return await fn(storage)
+    finally:
+        await storage.close()
+
+
+def _run_interruptible(coro, session: str = "default") -> None:
+    """``_run`` + the long-running commands' Ctrl+C contract (prints "stopped.")."""
+    try:
+        _run(coro, session=session)
+    except KeyboardInterrupt:
+        click.echo("stopped.")
+
+
+@contextlib.asynccontextmanager
+async def _read_receipts_watcher(client, storage):
+    """Суфлёрская фиксация read-receipts (#17, kv) рядом с долгоживущим движком.
+
+    Фоновая задача + cancel в finally, не gather: KeyboardInterrupt из движка
+    не должен бросать вечный watcher недобитым.
+    """
+    from tg_messenger.agent.suggest import watch_read_receipts
+
+    watcher = asyncio.create_task(watch_read_receipts(client, storage))
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+
+
 def _is_interactive() -> bool:
     """True when a human can answer a prompt (stdin is a tty)."""
     return sys.stdin.isatty()
@@ -355,7 +379,7 @@ def _export_session(session: str) -> None:
         await client.connect()
         try:
             if not await client.is_authorized():
-                raise click.ClickException(LOGIN_HINT)
+                raise click.ClickException(_login_hint(session))
             return client.export_session_string()
         finally:
             await client.disconnect()
@@ -738,10 +762,7 @@ def listen(ctx: click.Context, session: str) -> None:
         finally:
             await client.disconnect()
 
-    try:
-        _run(_do(), session=session)
-    except KeyboardInterrupt:
-        click.echo("stopped.")
+    _run_interruptible(_do(), session=session)
 
 
 @cli.command()
@@ -763,10 +784,7 @@ def watch(ctx: click.Context, session: str) -> None:
         finally:
             await client.disconnect()
 
-    try:
-        _run(_do(), session=session)
-    except KeyboardInterrupt:
-        click.echo("stopped.")
+    _run_interruptible(_do(), session=session)
 
 
 @cli.command()
@@ -810,23 +828,12 @@ def moderate(ctx: click.Context, session: str, enforce: bool) -> None:
             await client.disconnect()
             await storage.close()
 
-    try:
-        _run(_do(), session=session)
-    except KeyboardInterrupt:
-        click.echo("stopped.")
+    _run_interruptible(_do(), session=session)
 
 
 @cli.group("moderate-rules")
 def moderate_rules() -> None:
     """Manage moderation rules (list / add / remove)."""
-
-
-def _open_storage(session: str):
-    from tg_messenger.core.moderation import register_moderation_migrations
-
-    storage = make_storage(session)
-    register_moderation_migrations(storage)
-    return storage
 
 
 @moderate_rules.command("list")
@@ -835,19 +842,15 @@ def _open_storage(session: str):
 @click.pass_context
 def moderate_rules_list(ctx: click.Context, session: str, chat_id: int | None) -> None:
     """List stored moderation rules."""
-    from tg_messenger.core.moderation import list_rules
+    from tg_messenger.core.moderation import list_rules, register_moderation_migrations
 
     session = _effective_session(ctx, session)
 
-    async def _do():
-        storage = _open_storage(session)
-        await storage.connect()
-        try:
-            return await list_rules(storage, chat_id=chat_id)
-        finally:
-            await storage.close()
-
-    rules = _run(_do(), session=session)
+    rules = _run(
+        _with_storage(session, register_moderation_migrations,
+                      lambda storage: list_rules(storage, chat_id=chat_id)),
+        session=session,
+    )
     if not rules:
         click.echo("No rules.")
         return
@@ -862,7 +865,7 @@ def moderate_rules_list(ctx: click.Context, session: str, chat_id: int | None) -
 @click.pass_context
 def moderate_rules_add(ctx: click.Context, rule_file: str, session: str) -> None:
     """Add (or replace) a rule from a JSON file (see moderation.json.example)."""
-    from tg_messenger.core.moderation import ModerationRule, add_rule
+    from tg_messenger.core.moderation import ModerationRule, add_rule, register_moderation_migrations
 
     session = _effective_session(ctx, session)
 
@@ -872,15 +875,11 @@ def moderate_rules_add(ctx: click.Context, rule_file: str, session: str) -> None
     except Exception as exc:
         raise click.ClickException(f"invalid rule JSON: {exc}") from exc
 
-    async def _do():
-        storage = _open_storage(session)
-        await storage.connect()
-        try:
-            await add_rule(storage, rule)
-        finally:
-            await storage.close()
-
-    _run(_do(), session=session)
+    _run(
+        _with_storage(session, register_moderation_migrations,
+                      lambda storage: add_rule(storage, rule)),
+        session=session,
+    )
     click.echo(f"rule '{rule.name}' added for chat {rule.chat_id}.")
 
 
@@ -891,19 +890,15 @@ def moderate_rules_add(ctx: click.Context, rule_file: str, session: str) -> None
 @click.pass_context
 def moderate_rules_remove(ctx: click.Context, chat_id: int, name: str, session: str) -> None:
     """Remove a rule by CHAT_ID and NAME."""
-    from tg_messenger.core.moderation import remove_rule
+    from tg_messenger.core.moderation import register_moderation_migrations, remove_rule
 
     session = _effective_session(ctx, session)
 
-    async def _do():
-        storage = _open_storage(session)
-        await storage.connect()
-        try:
-            return await remove_rule(storage, chat_id, name)
-        finally:
-            await storage.close()
-
-    deleted = _run(_do(), session=session)
+    deleted = _run(
+        _with_storage(session, register_moderation_migrations,
+                      lambda storage: remove_rule(storage, chat_id, name)),
+        session=session,
+    )
     if deleted == 0:
         raise click.ClickException(f"rule '{name}' not found in chat {chat_id}.")
     click.echo(f"rule '{name}' removed from chat {chat_id}.")
@@ -948,10 +943,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
         finally:
             await client.disconnect()
 
-    try:
-        _run(_do(), session=session)
-    except KeyboardInterrupt:
-        click.echo("stopped.")
+    _run_interruptible(_do(), session=session)
 
 
 @cli.command()
@@ -983,10 +975,7 @@ def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
         finally:
             await client.disconnect()
 
-    try:
-        _run(_do(), session=session)
-    except KeyboardInterrupt:
-        click.echo("stopped.")
+    _run_interruptible(_do(), session=session)
 
 
 @cli.command()
@@ -1041,10 +1030,7 @@ def worker(ctx: click.Context, session: str, factory_url: str | None, types: str
         finally:
             await client.disconnect()
 
-    try:
-        _run(_do(), session=session)
-    except KeyboardInterrupt:
-        click.echo("stopped.")
+    _run_interruptible(_do(), session=session)
 
 
 @cli.command()
@@ -1118,7 +1104,7 @@ def ghostwrite(ctx: click.Context, session: str, enforce: bool) -> None:
         list_enabled,
         register_ghostwrite_migrations,
     )
-    from tg_messenger.agent.suggest import register_suggest_migrations, watch_read_receipts
+    from tg_messenger.agent.suggest import register_suggest_migrations
     session = _effective_session(ctx, session)
 
     async def _do():
@@ -1144,36 +1130,18 @@ def ghostwrite(ctx: click.Context, session: str, enforce: bool) -> None:
             click.echo(f"Ghostwriting ({mode}) — Ctrl+C to stop...")
             # цикл 98 (#17): рядом с движком пишем read-receipts (last_read
             # per dialog, kv) — сигнал «прочитал и молчит» для #18/#19.
-            # Фоновая задача + cancel в finally, не gather: KeyboardInterrupt
-            # из движка не должен бросать вечный watcher недобитым.
-            watcher = asyncio.create_task(watch_read_receipts(client, storage))
-            try:
+            async with _read_receipts_watcher(client, storage):
                 await engine.run()
-            finally:
-                watcher.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await watcher
         finally:
             await client.disconnect()
             await storage.close()
 
-    try:
-        _run(_do(), session=session)
-    except KeyboardInterrupt:
-        click.echo("stopped.")
+    _run_interruptible(_do(), session=session)
 
 
 @cli.group("ghostwrite-dialogs")
 def ghostwrite_dialogs() -> None:
     """Manage the ghostwrite per-dialog allowlist (enable / disable / list / pause)."""
-
-
-def _open_ghostwrite_storage(session: str):
-    from tg_messenger.agent.ghostwrite import register_ghostwrite_migrations
-
-    storage = make_storage(session)
-    register_ghostwrite_migrations(storage)
-    return storage
 
 
 @ghostwrite_dialogs.command("enable")
@@ -1190,18 +1158,14 @@ def ghostwrite_dialogs_enable(ctx: click.Context, peer: str, session: str) -> No
         dialog_id = int(peer)
     except ValueError as exc:
         raise click.ClickException(f"PEER must be a numeric dialog id, got {peer!r}") from exc
-    from tg_messenger.agent.ghostwrite import enable_dialog
+    from tg_messenger.agent.ghostwrite import enable_dialog, register_ghostwrite_migrations
     session = _effective_session(ctx, session)
 
-    async def _do():
-        storage = _open_ghostwrite_storage(session)
-        await storage.connect()
-        try:
-            await enable_dialog(storage, dialog_id)
-        finally:
-            await storage.close()
-
-    _run(_do(), session=session)
+    _run(
+        _with_storage(session, register_ghostwrite_migrations,
+                      lambda storage: enable_dialog(storage, dialog_id)),
+        session=session,
+    )
     click.echo(f"ghostwrite enabled for dialog {dialog_id}.")
 
 
@@ -1211,18 +1175,14 @@ def ghostwrite_dialogs_enable(ctx: click.Context, peer: str, session: str) -> No
 @click.pass_context
 def ghostwrite_dialogs_disable(ctx: click.Context, dialog_id: int, session: str) -> None:
     """Turn ghostwrite OFF for a dialog."""
-    from tg_messenger.agent.ghostwrite import disable_dialog
+    from tg_messenger.agent.ghostwrite import disable_dialog, register_ghostwrite_migrations
     session = _effective_session(ctx, session)
 
-    async def _do():
-        storage = _open_ghostwrite_storage(session)
-        await storage.connect()
-        try:
-            await disable_dialog(storage, dialog_id)
-        finally:
-            await storage.close()
-
-    _run(_do(), session=session)
+    _run(
+        _with_storage(session, register_ghostwrite_migrations,
+                      lambda storage: disable_dialog(storage, dialog_id)),
+        session=session,
+    )
     click.echo(f"ghostwrite disabled for dialog {dialog_id}.")
 
 
@@ -1231,18 +1191,13 @@ def ghostwrite_dialogs_disable(ctx: click.Context, dialog_id: int, session: str)
 @click.pass_context
 def ghostwrite_dialogs_list(ctx: click.Context, session: str) -> None:
     """List dialogs where ghostwrite is enabled."""
-    from tg_messenger.agent.ghostwrite import list_enabled
+    from tg_messenger.agent.ghostwrite import list_enabled, register_ghostwrite_migrations
     session = _effective_session(ctx, session)
 
-    async def _do():
-        storage = _open_ghostwrite_storage(session)
-        await storage.connect()
-        try:
-            return await list_enabled(storage)
-        finally:
-            await storage.close()
-
-    enabled = _run(_do(), session=session)
+    enabled = _run(
+        _with_storage(session, register_ghostwrite_migrations, list_enabled),
+        session=session,
+    )
     if not enabled:
         click.echo("No dialogs enabled.")
         return
@@ -1255,18 +1210,13 @@ def ghostwrite_dialogs_list(ctx: click.Context, session: str) -> None:
 @click.pass_context
 def ghostwrite_dialogs_pause_all(ctx: click.Context, session: str) -> None:
     """Kill switch: pause every enabled dialog (resume one with 'resume PEER')."""
-    from tg_messenger.agent.ghostwrite import pause_all
+    from tg_messenger.agent.ghostwrite import pause_all, register_ghostwrite_migrations
     session = _effective_session(ctx, session)
 
-    async def _do():
-        storage = _open_ghostwrite_storage(session)
-        await storage.connect()
-        try:
-            await pause_all(storage)
-        finally:
-            await storage.close()
-
-    _run(_do(), session=session)
+    _run(
+        _with_storage(session, register_ghostwrite_migrations, pause_all),
+        session=session,
+    )
     click.echo("ghostwrite paused for all enabled dialogs.")
 
 
@@ -1276,30 +1226,18 @@ def ghostwrite_dialogs_pause_all(ctx: click.Context, session: str) -> None:
 @click.pass_context
 def ghostwrite_dialogs_resume(ctx: click.Context, dialog_id: int, session: str) -> None:
     """Clear a dialog's pause (re-arm it after pause-all or an auto-pause)."""
-    from tg_messenger.agent.ghostwrite import resume_dialog
+    from tg_messenger.agent.ghostwrite import register_ghostwrite_migrations, resume_dialog
     session = _effective_session(ctx, session)
 
-    async def _do():
-        storage = _open_ghostwrite_storage(session)
-        await storage.connect()
-        try:
-            await resume_dialog(storage, dialog_id)
-        finally:
-            await storage.close()
-
-    _run(_do(), session=session)
+    _run(
+        _with_storage(session, register_ghostwrite_migrations,
+                      lambda storage: resume_dialog(storage, dialog_id)),
+        session=session,
+    )
     click.echo(f"ghostwrite resumed for dialog {dialog_id}.")
 
 
 # --- heartbeat (#19): scheduled pings with templates and safeties ---------------
-
-
-def _open_heartbeat_storage(session: str):
-    from tg_messenger.core.heartbeat import register_heartbeat_migrations
-
-    storage = make_storage(session)
-    register_heartbeat_migrations(storage)
-    return storage
 
 
 def _parse_at(at: str):
@@ -1361,7 +1299,7 @@ def heartbeat_plan(ctx: click.Context, peer: int, at: str | None, interval_hours
         return
 
     # recurring: store a plan
-    from tg_messenger.core.heartbeat import HeartbeatPlan, add_plan
+    from tg_messenger.core.heartbeat import HeartbeatPlan, add_plan, register_heartbeat_migrations
 
     plan = HeartbeatPlan(
         peer=peer, templates=list(templates), interval_hours=interval_hours,
@@ -1369,15 +1307,11 @@ def heartbeat_plan(ctx: click.Context, peer: int, at: str | None, interval_hours
         max_per_day=max_per_day,
     )
 
-    async def _do():
-        storage = _open_heartbeat_storage(session)
-        await storage.connect()
-        try:
-            await add_plan(storage, plan)
-        finally:
-            await storage.close()
-
-    _run(_do(), session=session)
+    _run(
+        _with_storage(session, register_heartbeat_migrations,
+                      lambda storage: add_plan(storage, plan)),
+        session=session,
+    )
     click.echo(f"heartbeat plan stored for peer {peer} (every {interval_hours}h).")
 
 
@@ -1386,18 +1320,13 @@ def heartbeat_plan(ctx: click.Context, peer: int, at: str | None, interval_hours
 @click.pass_context
 def heartbeat_list(ctx: click.Context, session: str) -> None:
     """List stored heartbeat plans."""
-    from tg_messenger.core.heartbeat import list_plans
+    from tg_messenger.core.heartbeat import list_plans, register_heartbeat_migrations
     session = _effective_session(ctx, session)
 
-    async def _do():
-        storage = _open_heartbeat_storage(session)
-        await storage.connect()
-        try:
-            return await list_plans(storage)
-        finally:
-            await storage.close()
-
-    plans = _run(_do(), session=session)
+    plans = _run(
+        _with_storage(session, register_heartbeat_migrations, list_plans),
+        session=session,
+    )
     if not plans:
         click.echo("No plans.")
         return
@@ -1412,18 +1341,14 @@ def heartbeat_list(ctx: click.Context, session: str) -> None:
 @click.pass_context
 def heartbeat_remove(ctx: click.Context, peer: int, session: str) -> None:
     """Remove a stored heartbeat plan by PEER."""
-    from tg_messenger.core.heartbeat import remove_plan
+    from tg_messenger.core.heartbeat import register_heartbeat_migrations, remove_plan
     session = _effective_session(ctx, session)
 
-    async def _do():
-        storage = _open_heartbeat_storage(session)
-        await storage.connect()
-        try:
-            await remove_plan(storage, peer)
-        finally:
-            await storage.close()
-
-    _run(_do(), session=session)
+    _run(
+        _with_storage(session, register_heartbeat_migrations,
+                      lambda storage: remove_plan(storage, peer)),
+        session=session,
+    )
     click.echo(f"heartbeat plan removed for peer {peer}.")
 
 
@@ -1432,8 +1357,6 @@ def heartbeat_remove(ctx: click.Context, peer: int, session: str) -> None:
 @click.pass_context
 def heartbeat_run(ctx: click.Context, session: str) -> None:
     """Run the heartbeat scheduler: send stored plans' pings on schedule (Ctrl+C to stop)."""
-    # суфлёрская фиксация read-receipts (#17, kv) — лёгкий модуль без LLM-стека
-    from tg_messenger.agent.suggest import watch_read_receipts
     from tg_messenger.core.heartbeat import HeartbeatService, register_heartbeat_migrations
     session = _effective_session(ctx, session)
 
@@ -1446,23 +1369,14 @@ def heartbeat_run(ctx: click.Context, session: str) -> None:
         try:
             await _ensure_authorized(client, session)
             click.echo("Heartbeat scheduler running — Ctrl+C to stop...")
-            # сигнал «прочитал и молчит»: last_read пишется и здесь (#17/#19);
-            # фоновая задача + cancel в finally — см. комментарий в ghostwrite
-            watcher = asyncio.create_task(watch_read_receipts(client, storage))
-            try:
+            # сигнал «прочитал и молчит»: last_read пишется и здесь (#17/#19)
+            async with _read_receipts_watcher(client, storage):
                 await HeartbeatService(client, storage).run()
-            finally:
-                watcher.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await watcher
         finally:
             await client.disconnect()
             await storage.close()
 
-    try:
-        _run(_do(), session=session)
-    except KeyboardInterrupt:
-        click.echo("stopped.")
+    _run_interruptible(_do(), session=session)
 
 
 @cli.group()
@@ -1498,11 +1412,8 @@ def username_set(name: str, session: str) -> None:
     async def _do(client):
         try:
             available = await client.check_username(name)
-        except ValueError as exc:
-            raise click.ClickException(str(exc)) from exc
-        if not available:
-            raise click.ClickException(f"username '{name}' is not available.")
-        try:
+            if not available:
+                raise click.ClickException(f"username '{name}' is not available.")
             await client.set_username(name)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc

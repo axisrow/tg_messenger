@@ -26,11 +26,10 @@ from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
 from tg_messenger.core.auth import (
-    DEFAULT_SESSION_DIR,
     LoginError,
     LoginSession,
-    SessionStore,
     delivery_hint,
+    session_store_from_env,
 )
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.search import filter_dialogs
@@ -86,16 +85,9 @@ def _wants_html(request: Request) -> bool:
 
 
 def _make_real_client(session_name: str):
-    from tg_messenger.core.client import StandaloneTelegramClient
+    from tg_messenger.core.client import client_from_env
 
-    return StandaloneTelegramClient(
-        api_id=int(os.environ.get("TG_API_ID", "0")),
-        api_hash=os.environ.get("TG_API_HASH", ""),
-        session_name=session_name,
-        session_dir=os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
-        encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
-        send_rate_per_min=float(os.environ.get("TG_SEND_RATE", "0") or 0),
-    )
+    return client_from_env(session_name=session_name)
 
 
 def _dialog_li(d) -> str:
@@ -107,9 +99,9 @@ def _dialog_li(d) -> str:
     )
 
 
-def _session_store() -> SessionStore:
+def _session_store():
     """SessionStore over the configured session dir (env override for tests/ops)."""
-    return SessionStore(os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
+    return session_store_from_env()
 
 
 DEFAULT_MAX_UPLOAD_MB = 50
@@ -151,22 +143,21 @@ def _message_div(m) -> str:
     return f'<div class="msg {cls}" data-id="{m.id}">{body}</div>'
 
 
+def _error_response(text: str, status_code: int) -> HTMLResponse:
+    """The one error-fragment shape every route returns; ``text`` is NOT escaped here."""
+    return HTMLResponse(f'<div class="error">{text}</div>', status_code=status_code)
+
+
 def _same_origin_error(request: Request) -> HTMLResponse | None:
     if request.headers.get(SUGGEST_CSRF_HEADER) != "1":
-        return HTMLResponse(
-            '<div class="error">Suggest requires a same-origin request.</div>',
-            status_code=403,
-        )
+        return _error_response("Suggest requires a same-origin request.", 403)
     origin = request.headers.get("origin")
     if origin is None:
         return None
     host = request.headers.get("host") or request.url.netloc
     expected = f"{request.url.scheme}://{host}"
     if origin != expected:
-        return HTMLResponse(
-            '<div class="error">Suggest requires a same-origin request.</div>',
-            status_code=403,
-        )
+        return _error_response("Suggest requires a same-origin request.", 403)
     return None
 
 
@@ -289,7 +280,6 @@ def build_app(
     app = FastAPI(lifespan=lifespan)
     # per-process random cookie-signing key — restart invalidates every session.
     app.state.cookie_key = secrets.token_bytes(32)
-    app.state.web_pass = web_pass
 
     if web_pass:
         @app.middleware("http")
@@ -301,9 +291,7 @@ def build_app(
             # browsers (HTML) go to the login form; API/SSE callers get a hard 401
             if _wants_html(request):
                 return RedirectResponse("/login", status_code=302)
-            return HTMLResponse(
-                '<div class="error">Authentication required.</div>', status_code=401
-            )
+            return _error_response("Authentication required.", 401)
 
         @app.get("/login", response_class=HTMLResponse)
         async def login_form(request: Request):
@@ -326,9 +314,7 @@ def build_app(
             client_ip = request.client.host if request.client else "?"
             logger.warning("failed web login attempt from %s", client_ip)
             await _login_delay(_WRONG_PASSWORD_DELAY)
-            return HTMLResponse(
-                '<div class="error">Wrong password.</div>', status_code=401
-            )
+            return _error_response("Wrong password.", 401)
 
         @app.get("/logout")
         async def logout(request: Request):
@@ -404,17 +390,14 @@ def build_app(
     @app.exception_handler(HandledFloodWaitError)
     async def flood_wait(request: Request, exc: HandledFloodWaitError):
         logger.warning("%s: flood wait %ss", exc.operation, exc.wait_seconds)
-        return HTMLResponse(f'<div class="error">{exc.user_message}</div>', status_code=503)
+        return _error_response(exc.user_message, 503)
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception):
         logger.error(
             "unhandled error: %s %s", request.method, request.url.path, exc_info=exc
         )
-        return HTMLResponse(
-            '<div class="error">Internal error — see log for details.</div>',
-            status_code=500,
-        )
+        return _error_response("Internal error — see log for details.", 500)
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request):
@@ -457,9 +440,9 @@ def build_app(
     async def send(request: Request, dialog_id: str = Form(""), text: str = Form(""),
                    reply_to: str = Form("")):
         if not dialog_id.strip().lstrip("-").isdigit():
-            return HTMLResponse('<div class="error">Select a dialog first.</div>', status_code=400)
+            return _error_response("Select a dialog first.", 400)
         if not text.strip():
-            return HTMLResponse('<div class="error">Cannot send an empty message.</div>', status_code=400)
+            return _error_response("Cannot send an empty message.", 400)
         reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
         msg = await request.app.state.client.send_text(int(dialog_id), text, reply_to=reply_to_id)
         return HTMLResponse(_message_div(msg))
@@ -488,13 +471,10 @@ def build_app(
             if size > max_bytes:
                 logger.warning("media upload for dialog %s rejected: over %d MB",
                                dialog_id, max_mb)
-                return HTMLResponse(
-                    f'<div class="error">File too large (limit {max_mb} MB).</div>',
-                    status_code=413,
-                )
+                return _error_response(f"File too large (limit {max_mb} MB).", 413)
             if size == 0:
                 logger.warning("media upload for dialog %s rejected: empty file", dialog_id)
-                return HTMLResponse('<div class="error">Empty file.</div>', status_code=400)
+                return _error_response("Empty file.", 400)
             msg = await request.app.state.client.send_media(dialog_id, tmp_path, caption=caption)
         finally:
             os.unlink(tmp_path)
@@ -509,17 +489,12 @@ def build_app(
             return same_origin_error
         suggester = request.app.state.suggester
         if suggester is None:
-            return HTMLResponse(
-                '<div class="error">Suggest is not configured — needs the [agent]'
-                " extra and TG_AGENT_MODEL.</div>",
-                status_code=503,
+            return _error_response(
+                "Suggest is not configured — needs the [agent] extra and TG_AGENT_MODEL.", 503
             )
         dm_ids = {d.id for d in await request.app.state.client.dialogs()}
         if dialog_id not in dm_ids:
-            return HTMLResponse(
-                '<div class="error">Suggest is available for DM dialogs only.</div>',
-                status_code=403,
-            )
+            return _error_response("Suggest is available for DM dialogs only.", 403)
         draft = await suggester.suggest(dialog_id)
         return PlainTextResponse(draft)
 

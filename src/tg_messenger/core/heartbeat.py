@@ -152,20 +152,18 @@ async def add_plan(storage, plan: HeartbeatPlan) -> None:
     )
 
 
-async def list_plans(storage) -> list[HeartbeatPlan]:
-    """All plans, ordered by peer for determinism."""
+async def list_plans(storage, *, enabled_only: bool = False) -> list[HeartbeatPlan]:
+    """Plans ordered by peer for determinism; ``enabled_only`` filters in SQL."""
+    where = " WHERE enabled = 1" if enabled_only else ""
     rows = await storage.fetchall(
-        f"SELECT {_COLUMNS} FROM heartbeat_plans ORDER BY peer"
+        f"SELECT {_COLUMNS} FROM heartbeat_plans{where} ORDER BY peer"
     )
     return [_row_to_plan(row) for row in rows]
 
 
 async def list_enabled_plans(storage) -> list[HeartbeatPlan]:
     """Only enabled plans, ordered by peer."""
-    rows = await storage.fetchall(
-        f"SELECT {_COLUMNS} FROM heartbeat_plans WHERE enabled = 1 ORDER BY peer"
-    )
-    return [_row_to_plan(row) for row in rows]
+    return await list_plans(storage, enabled_only=True)
 
 
 async def remove_plan(storage, peer: int) -> None:

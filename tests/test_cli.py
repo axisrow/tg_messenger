@@ -1445,7 +1445,11 @@ def test_make_client_uses_tg_session_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("TG_API_ID", "123")
     monkeypatch.setenv("TG_API_HASH", "hash")
     monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
-    monkeypatch.setattr(cli_main, "StandaloneTelegramClient", FakeStandaloneTelegramClient)
+    # make_client делегирует в core.client_from_env — сема подменяется там же,
+    # как в зеркальных тестах web/tui (_make_real_client)
+    monkeypatch.setattr(
+        "tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient
+    )
 
     cli_main.make_client(session_name="work")
 

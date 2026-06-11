@@ -178,6 +178,14 @@ DEFAULT_RATE_CACHE_SIZE = 2000
 RATE_WINDOW_SEC = 60.0
 
 
+async def _load_rules_by_chat(storage) -> dict[int, list[ModerationRule]]:
+    """All stored rules grouped by chat — shared by the rights check and the engine."""
+    rules_by_chat: dict[int, list[ModerationRule]] = {}
+    for rule in await list_rules(storage):
+        rules_by_chat.setdefault(rule.chat_id, []).append(rule)
+    return rules_by_chat
+
+
 async def check_admin_rights(client, storage) -> dict[int, bool]:
     """For every chat that has rules, check whether we have the rights they need.
 
@@ -185,9 +193,7 @@ async def check_admin_rights(client, storage) -> dict[int, bool]:
     (``logger.warning``) — the engine simply finds no enabled rules there at
     runtime if the caller disables them; this never raises.
     """
-    rules_by_chat: dict[int, list[ModerationRule]] = {}
-    for rule in await list_rules(storage):
-        rules_by_chat.setdefault(rule.chat_id, []).append(rule)
+    rules_by_chat = await _load_rules_by_chat(storage)
     result: dict[int, bool] = {}
     for chat_id, rules in sorted(rules_by_chat.items()):
         needs_delete = any(rule.enabled and rule.actions.delete for rule in rules)
@@ -250,10 +256,7 @@ class ModerationEngine:
 
     async def load_rules(self) -> None:
         """Load moderation rules into memory for the current engine run."""
-        rules_by_chat: dict[int, list[ModerationRule]] = {}
-        for rule in await list_rules(self._storage):
-            rules_by_chat.setdefault(rule.chat_id, []).append(rule)
-        self._rules_by_chat = rules_by_chat
+        self._rules_by_chat = await _load_rules_by_chat(self._storage)
 
     async def _rules_for_chat(self, chat_id: int) -> list[ModerationRule]:
         if self._rules_by_chat is None:

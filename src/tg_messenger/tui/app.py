@@ -17,12 +17,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 
-from tg_messenger.core.auth import (
-    DEFAULT_SESSION_DIR,
-    LoginError,
-    LoginSession,
-    delivery_hint,
-)
+from tg_messenger.core.auth import LoginError, LoginSession, delivery_hint
 
 logger = logging.getLogger(__name__)
 
@@ -72,16 +67,9 @@ def _strip_first_token(s: str) -> str:
 
 
 def _make_real_client(session_name: str):
-    from tg_messenger.core.client import StandaloneTelegramClient
+    from tg_messenger.core.client import client_from_env
 
-    return StandaloneTelegramClient(
-        api_id=int(os.environ.get("TG_API_ID", "0")),
-        api_hash=os.environ.get("TG_API_HASH", ""),
-        session_name=session_name,
-        session_dir=os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
-        encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
-        send_rate_per_min=float(os.environ.get("TG_SEND_RATE", "0") or 0),
-    )
+    return client_from_env(session_name=session_name)
 
 
 class ProfileItem(ListItem):
