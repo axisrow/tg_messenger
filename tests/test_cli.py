@@ -484,6 +484,55 @@ def test_chat_sends_and_disconnects_on_eof(runner):
     assert stub.connected is False
 
 
+def test_chat_prints_own_message_sent_from_another_device(runner, monkeypatch):
+    """chat shows our OWN message (out) sent elsewhere for the open dialog only."""
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    async def outgoing():
+        # one for the open dialog (id=7) — must print; one for another (id=9) — must not
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield OutgoingEvent(dialog_id=7, message=Message(
+            id=50, dialog_id=7, sender_id=1, out=True, text="с телефона", date=date))
+        yield OutgoingEvent(dialog_id=9, message=Message(
+            id=51, dialog_id=9, sender_id=1, out=True, text="в другой чат", date=date))
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(stub, "listen_outgoing", outgoing)
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="")  # EOF immediately; just watch
+    assert result.exit_code == 0
+    assert "→ с телефона" in result.output
+    assert "в другой чат" not in result.output  # другой диалог
+
+
+def test_chat_does_not_echo_back_our_own_input(runner, monkeypatch):
+    """A line we type isn't printed back when its outgoing echo arrives (dedup by id)."""
+    r, stub = runner
+    stub.listen_interrupt = False
+    sent_gate = asyncio.Event()
+
+    async def send_text(peer, text, reply_to=None, schedule=None):
+        stub.sent.append((peer, text, reply_to, schedule))
+        sent_gate.set()  # the echo may only arrive AFTER we've recorded the id
+        return Message(id=99, dialog_id=peer, sender_id=1, out=True, text=text,
+                       date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    async def outgoing():
+        # echo the same id=99 send_text returns — but only once it has been sent
+        await sent_gate.wait()
+        yield OutgoingEvent(dialog_id=7, message=Message(
+            id=99, dialog_id=7, sender_id=1, out=True, text="hello",
+            date=datetime(2024, 1, 1, tzinfo=timezone.utc)))
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(stub, "listen_outgoing", outgoing)
+    monkeypatch.setattr(stub, "send_text", send_text)
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
+    assert result.exit_code == 0
+    # our own line must NOT be echoed back via the outgoing printer
+    assert "→ hello" not in result.output
+
+
 class FakeInnerLoginClient:
     """Stands in for the raw Telethon client used by LoginFlow."""
 

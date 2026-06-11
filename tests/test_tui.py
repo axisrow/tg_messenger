@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import pytest
 from textual.widgets import Input, ListView, Static, Tabs
 
-from tg_messenger.core.models import Dialog, IncomingEvent, Message
+from tg_messenger.core.models import Dialog, IncomingEvent, Message, OutgoingEvent
 from tg_messenger.tui.app import (
     DialogItem,
     MessageBubble,
@@ -92,6 +92,11 @@ class TuiStubClient:
 
     async def listen_all(self):
         # idle forever; the worker just waits for events
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+    async def listen_outgoing(self):
+        # idle forever; the outgoing worker just waits for events
         await asyncio.Event().wait()
         yield  # pragma: no cover
 
@@ -680,6 +685,67 @@ async def test_tui_group_incoming_appends_bubble_for_open_group_only():
         bubbles = list(app.query(MessageBubble))
         # ЛС-событие не дорисовано (чужой диалог), групповое — да
         assert [str(b.render()) for b in bubbles] == ["из группы"]
+
+
+class OutgoingEventClient(TuiStubClient):
+    """listen_outgoing, который по сигналу отдаёт два своих сообщения с другого устройства."""
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def listen_outgoing(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield OutgoingEvent(dialog_id=7, message=Message(
+            id=30, dialog_id=7, sender_id=1, out=True, text="с телефона", date=date))
+        yield OutgoingEvent(dialog_id=-100200, message=Message(
+            id=31, dialog_id=-100200, sender_id=1, out=True, text="в другой чат", date=date))
+        await asyncio.Event().wait()  # idle forever
+
+
+async def test_tui_outgoing_from_another_device_appends_out_bubble_for_open_dialog_only():
+    stub = OutgoingEventClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7  # открыт диалог 7
+        stub.fire.set()
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+        # своё сообщение в открытый диалог дорисовано (out=True), в чужой — нет
+        assert [str(b.render()) for b in bubbles] == ["с телефона"]
+        assert all("out" in b.classes for b in bubbles)
+
+
+class OutgoingEchoClient(TuiStubClient):
+    """listen_outgoing, отдающий эхо именно того id, что мы только что отправили."""
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def listen_outgoing(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        # id=2 — ровно то, что вернёт send_text стаба (см. TuiStubClient)
+        yield OutgoingEvent(dialog_id=7, message=Message(
+            id=2, dialog_id=7, sender_id=1, out=True, text="привет", date=date))
+        await asyncio.Event().wait()
+
+
+async def test_tui_own_send_is_not_duplicated_by_outgoing_echo():
+    stub = OutgoingEchoClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._send_text(7, "привет")  # оптимистичный пузырёк + запоминание id=2
+        stub.fire.set()  # эхо того же id=2 приходит через listen_outgoing()
+        await pilot.pause()
+        bubbles = [str(b.render()) for b in app.query(MessageBubble)]
+        # ровно один пузырёк, эхо не продублировало
+        assert bubbles == ["привет"]
 
 
 async def test_tui_group_incoming_does_not_trigger_suggester():

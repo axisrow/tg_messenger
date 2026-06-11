@@ -15,6 +15,7 @@ import os
 import secrets
 import tempfile
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from hashlib import sha256
 from html import escape
@@ -161,18 +162,60 @@ def _same_origin_error(request: Request) -> HTMLResponse | None:
     return None
 
 
-async def sse_event_stream(client, dialog_id: int):
-    """Yield SSE frames for incoming messages of one dialog (any kind — groups too)."""
+def _remember_sent(sent_ids: OrderedDict, message_id: int) -> None:
+    """Record a message id sent via this server so its outgoing echo isn't re-streamed."""
+    sent_ids[message_id] = True
+    sent_ids.move_to_end(message_id)
+    while len(sent_ids) > 200:  # bounded, like the core caches
+        sent_ids.popitem(last=False)
+
+
+async def sse_event_stream(client, dialog_id: int, sent_ids: OrderedDict | None = None):
+    """Yield SSE frames for one dialog: incoming messages AND our own (out) messages.
+
+    Merges listen_all() (incoming, groups too) and listen_outgoing() (our messages
+    from any device) into one stream via a shared queue. Outgoing echoes of messages
+    this server already sent (their ids in ``sent_ids``) are skipped — the POST that
+    sent them already returned the bubble.
+    """
+    sent_ids = sent_ids if sent_ids is not None else OrderedDict()
+    # Merge listen_all() (incoming, groups too) and listen_outgoing() (our own
+    # messages from any device) by racing their __anext__ coroutines. The iterators
+    # are created here, before the first await, so an EventBus subscription is live
+    # by the time anything is published — no event slips through the gap.
+    iterators = {
+        False: client.listen_all().__aiter__(),   # out=False
+        True: client.listen_outgoing().__aiter__(),  # out=True
+    }
+    # one pending __anext__ task per still-open stream
+    pending = {
+        asyncio.ensure_future(it.__anext__()): out
+        for out, it in iterators.items()
+    }
     try:
-        async for ev in client.listen_all():
-            if ev.dialog_id != dialog_id:
-                continue
-            payload = json.dumps({"id": ev.message.id, "text": ev.message.text})
-            yield f"data: {payload}\n\n"
-    except Exception:
-        # close the stream; the browser's EventSource will reconnect
-        logger.exception("SSE stream for dialog %s failed", dialog_id)
-        return
+        while pending:
+            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                out = pending.pop(task)
+                try:
+                    ev = task.result()
+                except StopAsyncIteration:
+                    continue  # that stream ended; the other may still run
+                except Exception:
+                    logger.exception("SSE %s stream for dialog %s failed",
+                                     "outgoing" if out else "incoming", dialog_id)
+                    continue
+                # queue the next pull from this stream right away
+                pending[asyncio.ensure_future(iterators[out].__anext__())] = out
+                if ev.dialog_id != dialog_id:
+                    continue
+                if out and ev.message.id in sent_ids:
+                    continue  # our own optimistic bubble already shows it
+                payload = {"id": ev.message.id, "text": ev.message.text, "out": out}
+                yield f"data: {json.dumps(payload)}\n\n"
+    finally:
+        for task in pending:
+            task.cancel()
 
 
 def _tg_login_phone_fragment(*, error: str) -> str:
@@ -249,6 +292,10 @@ def build_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.background_tasks = set()
+        # ids of messages sent via this server's /send & /media — those echo back on
+        # listen_outgoing(); the SSE stream skips them so the optimistic bubble the
+        # POST already returned isn't duplicated. Bounded (OrderedDict-as-set).
+        app.state.sent_ids = OrderedDict()
         app.state.client = client or _make_real_client(session_name)
         # reply suggester (#17) — optional; None disables the /suggest endpoint
         app.state.suggester = suggester
@@ -445,6 +492,7 @@ def build_app(
             return _error_response("Cannot send an empty message.", 400)
         reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
         msg = await request.app.state.client.send_text(int(dialog_id), text, reply_to=reply_to_id)
+        _remember_sent(request.app.state.sent_ids, msg.id)  # suppress its SSE echo
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/media", response_class=HTMLResponse)
@@ -478,6 +526,7 @@ def build_app(
             msg = await request.app.state.client.send_media(dialog_id, tmp_path, caption=caption)
         finally:
             os.unlink(tmp_path)
+        _remember_sent(request.app.state.sent_ids, msg.id)  # suppress its SSE echo
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/suggest", response_class=PlainTextResponse)
@@ -501,7 +550,7 @@ def build_app(
     @app.get("/stream/{dialog_id}")
     async def stream(request: Request, dialog_id: int):
         return StreamingResponse(
-            sse_event_stream(request.app.state.client, dialog_id),
+            sse_event_stream(request.app.state.client, dialog_id, request.app.state.sent_ids),
             media_type="text/event-stream",
         )
 

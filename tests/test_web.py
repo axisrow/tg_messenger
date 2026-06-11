@@ -13,6 +13,7 @@ from tg_messenger.web.app import build_app
 class WebStubClient:
     def __init__(self):
         self.bus = EventBus()
+        self.bus_out = EventBus()  # own messages from another device (listen_outgoing)
         self.sent = []
         self.searched = []
         self.read_acks = []
@@ -63,6 +64,10 @@ class WebStubClient:
 
     async def listen_all(self):
         async for ev in self.bus.subscribe():
+            yield ev
+
+    async def listen_outgoing(self):
+        async for ev in self.bus_out.subscribe():
             yield ev
 
 
@@ -491,7 +496,9 @@ async def test_sse_stream_failure_is_logged_and_closes(caplog):
         raise RuntimeError("stream blew up")
         yield  # pragma: no cover
 
+    # both pumps fail → the merged stream logs each and closes (StopAsyncIteration)
     stub.listen_all = broken_listen
+    stub.listen_outgoing = broken_listen
     gen = sse_event_stream(stub, dialog_id=7)
     with caplog.at_level("ERROR", logger="tg_messenger.web.app"):
         with pytest.raises(StopAsyncIteration):
@@ -510,7 +517,8 @@ async def test_stream_yields_sse_frame():
     stub = WebStubClient()
     gen = sse_event_stream(stub, dialog_id=7)
     task = asyncio.create_task(gen.__anext__())
-    await asyncio.sleep(0)  # let it subscribe
+    while stub.bus.subscriber_count == 0:  # deterministic: wait until subscribed
+        await asyncio.sleep(0)
 
     # a message for a different dialog must be ignored
     other = Message(id=8, dialog_id=1, sender_id=1, out=False, text="nope",
@@ -536,7 +544,8 @@ async def test_stream_yields_group_frame():
     stub = WebStubClient()
     gen = sse_event_stream(stub, dialog_id=-100200)
     task = asyncio.create_task(gen.__anext__())
-    await asyncio.sleep(0)  # let it subscribe
+    while stub.bus.subscriber_count == 0:  # deterministic: wait until subscribed
+        await asyncio.sleep(0)
 
     dm = Message(id=10, dialog_id=7, sender_id=7, out=False, text="не то",
                  date=datetime(2024, 1, 1, tzinfo=timezone.utc))
@@ -549,7 +558,64 @@ async def test_stream_yields_group_frame():
     frame = await asyncio.wait_for(task, timeout=2)
     import json
     payload = json.loads(frame.removeprefix("data: ").strip())
-    assert payload == {"id": 11, "text": "в группе"}  # не DM-событие, а групповое
+    assert payload == {"id": 11, "text": "в группе", "out": False}  # не DM, а групповое
+    await gen.aclose()
+
+
+async def test_stream_yields_outgoing_frame_for_own_message_from_another_device():
+    # своё сообщение, отправленное с телефона, приходит через listen_outgoing с out=True
+    import asyncio
+    import json
+
+    from tg_messenger.core.models import OutgoingEvent
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+    gen = sse_event_stream(stub, dialog_id=7)
+    task = asyncio.create_task(gen.__anext__())
+    while stub.bus_out.subscriber_count == 0:  # deterministic: wait until subscribed
+        await asyncio.sleep(0)
+
+    msg = Message(id=42, dialog_id=7, sender_id=1, out=True, text="с телефона",
+                  date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus_out.publish(OutgoingEvent(dialog_id=7, message=msg))
+
+    frame = await asyncio.wait_for(task, timeout=2)
+    payload = json.loads(frame.removeprefix("data: ").strip())
+    assert payload == {"id": 42, "text": "с телефона", "out": True}
+    await gen.aclose()
+
+
+async def test_stream_skips_outgoing_echo_of_messages_we_sent():
+    # сообщение, отправленное ЭТИМ сервером (id в sent_ids), не дублируется в SSE
+    import asyncio
+    from collections import OrderedDict
+
+    from tg_messenger.core.models import OutgoingEvent
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+    sent_ids = OrderedDict()
+    sent_ids[42] = True  # как будто /send уже вернул пузырёк для этого id
+    gen = sse_event_stream(stub, dialog_id=7, sent_ids=sent_ids)
+    task = asyncio.create_task(gen.__anext__())
+    while stub.bus_out.subscriber_count == 0:  # deterministic: wait until subscribed
+        await asyncio.sleep(0)
+
+    # эхо нашего собственного сообщения (id=42) — должно быть пропущено
+    echo = Message(id=42, dialog_id=7, sender_id=1, out=True, text="эхо",
+                   date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus_out.publish(OutgoingEvent(dialog_id=7, message=echo))
+    # а вот следующее своё сообщение (id=43) — должно прийти
+    fresh = Message(id=43, dialog_id=7, sender_id=1, out=True, text="новое",
+                    date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus_out.publish(OutgoingEvent(dialog_id=7, message=fresh))
+
+    import json
+    frame = await asyncio.wait_for(task, timeout=2)
+    payload = json.loads(frame.removeprefix("data: ").strip())
+    # эхо (id=42) пропущено, пришло следующее своё сообщение (id=43)
+    assert payload == {"id": 43, "text": "новое", "out": True}
     await gen.aclose()
 
 
