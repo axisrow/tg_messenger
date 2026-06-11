@@ -43,13 +43,14 @@ DEFAULT_MAX_PER_HOUR = 6
 DEFAULT_PAUSE_ON_HUMAN_SEC = 86_400  # a human reply pauses the dialog for a day
 RATE_WINDOW_SEC = 3600.0
 DEFAULT_OWN_CACHE_SIZE = 1000
+DEFAULT_MAX_RATE_DIALOGS = 10_000
 
 
 # --- storage (#13): per-dialog allowlist + auto-reply journal --------------------
 
 # Registered via storage.register_migrations BEFORE connect(); engine and CLI share the
-# schema. dialog_id is the PK so enable_dialog is an upsert. paused_until is a Unix-ish
-# float on the same monotonic clock the engine reads (NULL = not paused).
+# schema. dialog_id is the PK so enable_dialog is an upsert. paused_until is a
+# Unix timestamp from time.time() (NULL = not paused).
 GHOSTWRITE_MIGRATIONS = [
     "CREATE TABLE ghostwrite_dialogs ("
     " dialog_id INTEGER PRIMARY KEY,"
@@ -100,10 +101,8 @@ async def list_enabled(storage) -> list[int]:
 async def pause_dialog(storage, dialog_id: int, *, paused_until: float) -> None:
     """Pause an (enabled) dialog until ``paused_until`` on the engine's clock."""
     await storage.execute(
-        "INSERT INTO ghostwrite_dialogs (dialog_id, enabled, paused_until) "
-        "VALUES (?, 1, ?) "
-        "ON CONFLICT(dialog_id) DO UPDATE SET paused_until = excluded.paused_until",
-        (int(dialog_id), float(paused_until)),
+        "UPDATE ghostwrite_dialogs SET paused_until = ? WHERE dialog_id = ?",
+        (float(paused_until), int(dialog_id)),
     )
 
 
@@ -156,10 +155,11 @@ class GhostwriteEngine:
         storage,
         *,
         enforce: bool = False,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.time,
         max_per_hour: int = DEFAULT_MAX_PER_HOUR,
         pause_on_human_sec: int = DEFAULT_PAUSE_ON_HUMAN_SEC,
         own_cache_size: int = DEFAULT_OWN_CACHE_SIZE,
+        max_rate_dialogs: int = DEFAULT_MAX_RATE_DIALOGS,
     ):
         self._client = client
         self._suggester = suggester
@@ -169,6 +169,9 @@ class GhostwriteEngine:
         self._max_per_hour = max_per_hour
         self._pause_on_human_sec = pause_on_human_sec
         self._own_cache_size = own_cache_size
+        self._max_rate_dialogs = max_rate_dialogs
+        self._enabled_dialogs: set[int] | None = None
+        self._sending: dict[int, list[OutgoingEvent]] = {}
         # dialog_id -> sliding window of recent auto-reply times (bounded)
         self._rate: OrderedDict[int, deque[float]] = OrderedDict()
         # (dialog_id, message_id) we sent ourselves — recognise our own outgoing echo.
@@ -179,7 +182,26 @@ class GhostwriteEngine:
     async def run(self) -> None:
         # gather, не TaskGroup: TaskGroup оборачивает KeyboardInterrupt
         # в BaseExceptionGroup и ломает Ctrl+C-обработку в CLI
+        await self._ensure_enabled_dialogs()
         await asyncio.gather(self._consume_incoming(), self._consume_outgoing())
+
+    async def _ensure_enabled_dialogs(self) -> set[int]:
+        if self._enabled_dialogs is None:
+            self._enabled_dialogs = set(await list_enabled(self._storage))
+        return self._enabled_dialogs
+
+    async def _is_enabled_dialog(self, dialog_id: int) -> bool:
+        enabled = await self._ensure_enabled_dialogs()
+        if dialog_id in enabled:
+            return True
+        row = await self._storage.fetchone(
+            "SELECT 1 FROM ghostwrite_dialogs WHERE dialog_id = ? AND enabled = 1",
+            (int(dialog_id),),
+        )
+        if row is None:
+            return False
+        enabled.add(int(dialog_id))
+        return True
 
     async def _consume_incoming(self) -> None:
         async for ev in self._client.listen():
@@ -209,6 +231,8 @@ class GhostwriteEngine:
         now = self._clock()
         if not await is_active(self._storage, dialog_id, now=now):
             return  # not enabled, or paused — the suggester is never even asked
+        # Record the rate slot before the LLM call so maxed dialogs skip generation.
+        # Trade-off: the slot is consumed even if _dispatch later bails post-pause.
         if self._over_rate_limit(dialog_id, now):
             logger.warning(
                 "ghostwrite skip in dialog %s: per-hour limit (%s) reached",
@@ -229,7 +253,7 @@ class GhostwriteEngine:
         """Record an attempt, then report if the trailing hour already hit ``max_per_hour``.
 
         Called BEFORE the suggester so a maxed-out dialog never costs an LLM call. The
-        attempt is recorded regardless — a steady inbound stream stays capped.
+        attempt is recorded only while the dialog is under the limit.
         """
         window = self._rate.get(dialog_id)
         if window is None:
@@ -238,7 +262,7 @@ class GhostwriteEngine:
         self._rate.move_to_end(dialog_id)
         while window and now - window[0] > RATE_WINDOW_SEC:
             window.popleft()
-        while len(self._rate) > self._own_cache_size:
+        while len(self._rate) > self._max_rate_dialogs:
             self._rate.popitem(last=False)
         if len(window) >= self._max_per_hour:
             return True
@@ -247,17 +271,31 @@ class GhostwriteEngine:
 
     async def _dispatch(self, dialog_id: int, message: Message, reply: str) -> None:
         """Send (or, in dry-run, skip) one auto-reply; journal it; never kill the engine."""
+        if not await is_active(self._storage, dialog_id, now=self._clock()):
+            logger.info("ghostwrite skip dialog %s: became inactive while drafting", dialog_id)
+            return
         if not self._enforce:
             logger.info("would auto-reply in dialog %s (message %s): %r",
                         dialog_id, message.id, reply)
             await self._journal(dialog_id, message.id, reply, dry_run=True)
             return
+        sent_id = None
+        pending_events: list[OutgoingEvent] = []
         try:
-            sent = await self._client.send_text(dialog_id, reply)
+            self._sending[int(dialog_id)] = pending_events
+            try:
+                sent = await self._client.send_text(dialog_id, reply)
+                sent_id = getattr(sent, "id", None)
+                self._remember_own(dialog_id, sent_id)
+            finally:
+                self._sending.pop(int(dialog_id), None)
         except Exception:
             logger.exception("ghostwrite failed to send reply in dialog %s", dialog_id)
+            # send_text failed, so no own id is trustworthy; deferred outgoing events
+            # are treated as human intervention, which is conservative and safe.
+            await self._handle_deferred_outgoing(pending_events, own_message_id=sent_id)
             return
-        self._remember_own(dialog_id, getattr(sent, "id", None))
+        await self._handle_deferred_outgoing(pending_events, own_message_id=sent_id)
         await self._journal(dialog_id, message.id, reply, dry_run=False)
 
     def _remember_own(self, dialog_id: int, message_id) -> None:
@@ -279,11 +317,36 @@ class GhostwriteEngine:
         dialog_id = event.dialog_id
         message = event.message
         key = (int(dialog_id), int(message.id))
+        pending_events = self._sending.get(int(dialog_id))
+        if pending_events is not None:
+            pending_events.append(event)
+            return  # decide once send_text returns with the real message id
         if self._own_sent.pop(key, None) is not None:
             return  # our own reply — not a human
-        if dialog_id not in await list_enabled(self._storage):
+        await self._pause_for_human_outgoing(event)
+
+    async def _handle_deferred_outgoing(
+        self, events: list[OutgoingEvent], *, own_message_id
+    ) -> None:
+        for event in events:
+            if own_message_id is not None and int(event.message.id) == int(own_message_id):
+                continue
+            try:
+                await self._pause_for_human_outgoing(event)
+            except Exception:
+                logger.exception(
+                    "ghostwrite failed to handle deferred outgoing message in dialog %s",
+                    getattr(event, "dialog_id", "?"),
+                )
+
+    async def _pause_for_human_outgoing(self, event: OutgoingEvent) -> None:
+        dialog_id = event.dialog_id
+        if not await self._is_enabled_dialog(dialog_id):
             return  # not a ghostwrite dialog — nothing to pause
-        paused_until = self._clock() + self._pause_on_human_sec
+        now = self._clock()
+        if not await is_active(self._storage, dialog_id, now=now):
+            return  # already paused/disabled — do not shorten an existing pause
+        paused_until = now + self._pause_on_human_sec
         await pause_dialog(self._storage, dialog_id, paused_until=paused_until)
         logger.info(
             "ghostwrite paused dialog %s for %ss — a human replied",
