@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 import httpx
@@ -45,8 +46,8 @@ class WebStubClient:
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
-    async def mark_read(self, peer):
-        self.read_acks.append(peer)
+    async def mark_read(self, peer, max_id=None):
+        self.read_acks.append((peer, max_id))
 
     async def send_media(self, peer, file_path, *, caption=None, voice_note=False,
                          video_note=False, force_document=False):
@@ -63,6 +64,28 @@ class WebStubClient:
     async def listen_all(self):
         async for ev in self.bus.subscribe():
             yield ev
+
+
+def test_real_web_client_gets_session_encryption_key(monkeypatch, tmp_path):
+    from tg_messenger.web import app as web_app
+
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("SESSION_ENCRYPTION_KEY", "shared-secret")
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    monkeypatch.setattr("tg_messenger.core.client.StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    web_app._make_real_client("default")
+
+    assert captured["session_name"] == "default"
+    assert captured["session_dir"] == str(tmp_path)
+    assert captured["encryption_key"] == "shared-secret"
 
 
 @pytest_asyncio.fixture
@@ -205,7 +228,50 @@ async def test_opening_messages_marks_read(client_app):
     # цикл 81: открытие диалога помечает его прочитанным (best-effort)
     ac, stub = client_app
     await ac.get("/dialogs/7/messages")
-    assert stub.read_acks == [7]
+    await asyncio.sleep(0)
+    assert stub.read_acks == [(7, 1)]
+
+
+async def test_messages_mark_read_does_not_block_response():
+    stub = WebStubClient()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_mark_read(peer, max_id=None):
+        started.set()
+        await release.wait()
+        stub.read_acks.append((peer, max_id))
+
+    stub.mark_read = slow_mark_read
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await asyncio.wait_for(ac.get("/dialogs/7/messages"), timeout=1)
+            assert r.status_code == 200
+            assert "hi" in r.text
+            await asyncio.wait_for(started.wait(), timeout=1)
+            assert stub.read_acks == []
+            release.set()
+            await asyncio.sleep(0)
+    assert stub.read_acks == [(7, 1)]
+
+
+async def test_messages_empty_history_does_not_mark_read():
+    stub = WebStubClient()
+
+    async def empty_history(peer, limit=50, offset_id=0):
+        return []
+
+    stub.history = empty_history
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/dialogs/7/messages")
+            await asyncio.sleep(0)
+    assert r.status_code == 200
+    assert stub.read_acks == []
 
 
 async def test_messages_mark_read_failure_does_not_break(caplog):
@@ -214,7 +280,7 @@ async def test_messages_mark_read_failure_does_not_break(caplog):
 
     stub = WebStubClient()
 
-    async def boom(peer):
+    async def boom(peer, max_id=None):
         raise RuntimeError("nope")
 
     stub.mark_read = boom
@@ -224,6 +290,7 @@ async def test_messages_mark_read_failure_does_not_break(caplog):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
             with caplog.at_level(logging.WARNING):
                 r = await ac.get("/dialogs/7/messages")
+                await asyncio.sleep(0)
     assert r.status_code == 200
     assert "hi" in r.text
     assert any("mark_read" in rec.message or "nope" in str(rec.message) for rec in caplog.records)
@@ -443,10 +510,14 @@ class StubSuggester:
     def __init__(self, draft="suggested reply"):
         self.draft = draft
         self.calls = []
+        self.closed = 0
 
     async def suggest(self, dialog_id):
         self.calls.append(dialog_id)
         return self.draft
+
+    async def close(self):
+        self.closed += 1
 
 
 @pytest_asyncio.fixture
@@ -468,11 +539,36 @@ async def test_suggest_endpoint_returns_draft(suggest_app):
     assert suggester.calls == [7]
 
 
+async def test_suggest_endpoint_does_not_escape_draft(suggest_app):
+    ac, suggester = suggest_app
+    suggester.draft = "you & me"
+    r = await ac.get("/dialogs/7/suggest")
+    assert r.status_code == 200
+    assert r.text == "you & me"
+
+
+async def test_suggest_endpoint_returns_plain_text_for_markup(suggest_app):
+    ac, suggester = suggest_app
+    suggester.draft = "<script>alert(1)</script>"
+    r = await ac.get("/dialogs/7/suggest")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert r.text == "<script>alert(1)</script>"
+
+
 async def test_suggest_endpoint_negative_id(suggest_app):
     ac, suggester = suggest_app
     r = await ac.get("/dialogs/-100200/suggest")
-    assert r.status_code == 200
-    assert suggester.calls == [-100200]
+    assert r.status_code == 403
+    assert "DM" in r.text
+    assert suggester.calls == []
+
+
+async def test_suggest_endpoint_does_not_send_group_history_to_llm(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.get("/dialogs/-100123/suggest")
+    assert r.status_code == 403
+    assert suggester.calls == []
 
 
 async def test_suggest_endpoint_404_when_no_suggester(client_app):
@@ -487,3 +583,13 @@ async def test_index_has_suggest_button(suggest_app):
     ac, _ = suggest_app
     r = await ac.get("/")
     assert "suggest" in r.text.lower()
+    assert "suggest-error" in r.text
+
+
+async def test_lifespan_closes_suggester():
+    stub = WebStubClient()
+    suggester = StubSuggester()
+    app = build_app(client=stub, suggester=suggester)
+    async with app.router.lifespan_context(app):
+        pass
+    assert suggester.closed == 1

@@ -17,7 +17,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 
-from tg_messenger.core.auth import LOGIN_HINT
+from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,8 @@ def _make_real_client(session_name: str):
         api_id=int(os.environ.get("TG_API_ID", "0")),
         api_hash=os.environ.get("TG_API_HASH", ""),
         session_name=session_name,
+        session_dir=os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
+        encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
     )
 
 
@@ -155,11 +157,12 @@ class DialogListView(ListView):
 
 
 class DialogItem(ListItem):
-    def __init__(self, dialog_id: int, title: str, unread: int = 0):
+    def __init__(self, dialog_id: int, title: str, unread: int = 0, kind: str = "dm"):
         # markup=False: titles/messages are untrusted text, [brackets] must render literally
         badge = f" ({unread})" if unread else ""
         super().__init__(Static(f"{dialog_id} — {title}{badge}", markup=False))
         self.dialog_id = dialog_id
+        self.kind = kind
 
 
 class MessageBubble(Static):
@@ -185,7 +188,8 @@ class MessengerTUI(App):
     """
 
     def __init__(self, *, client=None, session_name: str = "default",
-                 profiles: list[str] | None = None, client_factory=None, suggester=None):
+                 profiles: list[str] | None = None, client_factory=None,
+                 suggester=None):
         super().__init__()
         self._client = client
         self._session_name = session_name
@@ -196,7 +200,6 @@ class MessengerTUI(App):
         self._tab = "dm"
         self._started = False  # gates tab events until _startup finished
         self._all_dialogs: list = []  # full loaded list; search filters it locally
-        # reply suggester (#17) — None disables the feature; pending draft text below
         self._suggester = suggester
         self._pending_suggestion: str | None = None
 
@@ -253,6 +256,12 @@ class MessengerTUI(App):
     async def on_unmount(self) -> None:
         if self._client is not None:
             await self._client.disconnect()
+        close_suggester = getattr(self._suggester, "close", None)
+        if close_suggester is not None:
+            try:
+                await close_suggester()
+            except Exception:
+                logger.warning("suggester close failed", exc_info=True)
 
     async def _load_dialogs(self) -> None:
         if self._tab == "groups":
@@ -274,7 +283,7 @@ class MessengerTUI(App):
         query = self.query_one("#search", Input).value
         await lv.clear()
         for d in filter_dialogs(self._all_dialogs, query):
-            await lv.append(DialogItem(d.id, d.title, d.unread))
+            await lv.append(DialogItem(d.id, d.title, d.unread, d.kind))
 
     async def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         # Tabs fires this once at mount, before the client exists — _started gates it.
@@ -301,15 +310,13 @@ class MessengerTUI(App):
         item = event.item
         if isinstance(item, DialogItem):
             self._current = item.dialog_id
+            self._clear_suggestion()
             # exclusive group: selecting another dialog cancels a still-loading history
             self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
-            # opening a dialog clears its unread counter — best-effort, via a worker
-            # (never await network in a handler; the message pump must stay free)
-            self.run_worker(self._mark_read(item.dialog_id), group="mark_read", exclusive=False)
 
-    async def _mark_read(self, dialog_id: int) -> None:
+    async def _mark_read(self, dialog_id: int, max_id: int) -> None:
         try:
-            await self._client.mark_read(dialog_id)
+            await self._client.mark_read(dialog_id, max_id=max_id)
         except Exception:
             logger.warning("mark_read failed (dialog %s) — continuing", dialog_id, exc_info=True)
 
@@ -326,6 +333,13 @@ class MessengerTUI(App):
             return
         pane.loading = False
         await pane.mount(*(MessageBubble(m.text or "<media>", m.out) for m in messages))
+        if messages:
+            # Acknowledge exactly the loaded snapshot; messages arriving later stay unread.
+            self.run_worker(
+                self._mark_read(dialog_id, max(m.id for m in messages)),
+                group="mark_read",
+                exclusive=False,
+            )
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "composer":
@@ -407,9 +421,14 @@ class MessengerTUI(App):
         """
         if self._suggester is None:
             return
+        if not self._is_dm_dialog(dialog_id):
+            return
         if self.query_one("#composer", Input).value:
             return  # don't suggest over a draft the user is writing
         self.run_worker(self._suggest(dialog_id), group="suggest", exclusive=True)
+
+    def _is_dm_dialog(self, dialog_id: int) -> bool:
+        return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
 
     async def _suggest(self, dialog_id: int) -> None:
         try:
