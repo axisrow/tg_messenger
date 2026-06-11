@@ -14,20 +14,26 @@ from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from telethon import TelegramClient, events
+from telethon import utils as tl_utils
 from telethon.sessions import StringSession
+from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
 from tg_messenger.core.auth import DEFAULT_SESSION_DIR, SessionStore
 from tg_messenger.core.cache import TTLCache
 from tg_messenger.core.events import EventBus
 from tg_messenger.core.flood import run_with_flood_wait_retry
 from tg_messenger.core.models import (
+    ChatActionEvent,
     Dialog,
     DialogKind,
     IncomingEvent,
     MediaRef,
     Message,
+    MessageReadEvent,
     MessagesDeletedEvent,
     OutgoingEvent,
+    ReactionEvent,
     User,
 )
 
@@ -126,6 +132,11 @@ class StandaloneTelegramClient:
         self._bus_all: EventBus[IncomingEvent] = EventBus()
         self._bus_out: EventBus[OutgoingEvent] = EventBus()
         self._bus_deleted: EventBus[MessagesDeletedEvent] = EventBus()
+        # #14 event streams: chat actions / read receipts / reactions — lazy buses,
+        # same fan-out pattern; publishing without subscribers is a no-op.
+        self._bus_chat_actions: EventBus[ChatActionEvent] = EventBus()
+        self._bus_reads: EventBus[MessageReadEvent] = EventBus()
+        self._bus_reactions: EventBus[ReactionEvent] = EventBus()
         self._handler_registered = False
         # one full dialog list (all kinds); dm_only filters from it — see dialogs()
         self._dialogs_cache: TTLCache[str, list[Dialog]] = TTLCache(
@@ -281,6 +292,17 @@ class StandaloneTelegramClient:
         self._invalidate_history(peer)
         return self._to_message(msg, dialog_id=int(peer))
 
+    async def send_reaction(self, peer: int, message_id: int, emoticon: str) -> None:
+        """React to a message with a standard emoji, routed through flood-wait retry."""
+        await run_with_flood_wait_retry(
+            lambda: self._client(
+                SendReactionRequest(
+                    peer=peer, msg_id=int(message_id), reaction=[ReactionEmoji(emoticon=emoticon)]
+                )
+            ),
+            operation="send_reaction",
+        )
+
     def typing(self, peer: int):
         """Async context manager: show the 'typing…' chat action while the body runs.
 
@@ -320,6 +342,12 @@ class StandaloneTelegramClient:
         # publishing into a bus without subscribers is a no-op, so eager is free
         self._client.add_event_handler(self._on_outgoing_message, events.NewMessage(outgoing=True))
         self._client.add_event_handler(self._on_deleted, events.MessageDeleted())
+        # #14: chat actions (joins/leaves/title/pin/photo), read receipts, reactions
+        self._client.add_event_handler(self._on_chat_action, events.ChatAction())
+        self._client.add_event_handler(self._on_message_read, events.MessageRead())
+        self._client.add_event_handler(self._on_message_read, events.MessageRead(inbox=True))
+        # reactions arrive as a raw update (no high-level event for user accounts)
+        self._client.add_event_handler(self._on_reaction, events.Raw(UpdateMessageReactions))
         self._handler_registered = True
 
     async def _on_new_message(self, event) -> None:
@@ -328,7 +356,12 @@ class StandaloneTelegramClient:
             # invalidate BEFORE mapping: a broken event still drops stale history
             self._invalidate_history(dialog_id)
             message = self._to_message(event.message, dialog_id=dialog_id)
-            incoming = IncomingEvent(dialog_id=dialog_id, message=message)
+            album_id = getattr(event.message, "grouped_id", None)
+            incoming = IncomingEvent(
+                dialog_id=dialog_id,
+                message=message,
+                album_id=int(album_id) if album_id is not None else None,
+            )
             self._bus_all.publish(incoming)  # every chat — the UIs' groups tab
             if getattr(event, "is_private", True):
                 # listen() stays private-only (DMs + bots) — the agent relies on it
@@ -364,6 +397,92 @@ class StandaloneTelegramClient:
         except Exception:
             logger.exception("failed to handle deleted-messages event")
 
+    @staticmethod
+    def _to_user(raw) -> User | None:
+        """Best-effort map a Telethon user entity → User (None if absent)."""
+        if raw is None:
+            return None
+        return User(
+            id=getattr(raw, "id", 0) or 0,
+            first_name=getattr(raw, "first_name", None),
+            last_name=getattr(raw, "last_name", None),
+            username=getattr(raw, "username", None),
+        )
+
+    @staticmethod
+    def _chat_action_kind(event) -> str:
+        if getattr(event, "user_joined", False) or getattr(event, "user_added", False):
+            return "join"
+        if getattr(event, "user_kicked", False):
+            return "kick"
+        if getattr(event, "user_left", False):
+            return "leave"
+        if getattr(event, "new_title", None):
+            return "title"
+        if getattr(event, "new_pin", False):
+            return "pin"
+        if getattr(event, "new_photo", False):
+            return "photo"
+        return "other"
+
+    async def _on_chat_action(self, event) -> None:
+        try:
+            dialog_id = int(getattr(event, "chat_id", 0) or 0)
+            kind = self._chat_action_kind(event)
+            user = self._to_user(getattr(event, "user", None))
+            # actor = whoever added/kicked them (None for self-actions)
+            actor = self._to_user(
+                getattr(event, "added_by", None) or getattr(event, "kicked_by", None)
+            )
+            raw_text = getattr(getattr(event, "action_message", None), "message", None) \
+                or getattr(event, "new_title", None)
+            self._bus_chat_actions.publish(
+                ChatActionEvent(
+                    dialog_id=dialog_id, kind=kind, user=user, actor=actor, raw_text=raw_text
+                )
+            )
+        except Exception:
+            logger.exception("failed to handle chat-action event")
+
+    async def _on_message_read(self, event) -> None:
+        try:
+            dialog_id = int(getattr(event, "chat_id", 0) or 0)
+            self._bus_reads.publish(
+                MessageReadEvent(
+                    dialog_id=dialog_id,
+                    max_id=int(getattr(event, "max_id", 0) or 0),
+                    outbox=bool(getattr(event, "outbox", False)),
+                )
+            )
+        except Exception:
+            logger.exception("failed to handle message-read event")
+
+    async def _on_reaction(self, update) -> None:
+        try:
+            peer = getattr(update, "peer", None)
+            dialog_id = int(tl_utils.get_peer_id(peer)) if peer is not None else 0
+            emoticon = self._recent_emoticon(getattr(update, "reactions", None))
+            self._bus_reactions.publish(
+                ReactionEvent(
+                    dialog_id=dialog_id,
+                    message_id=int(getattr(update, "msg_id", 0) or 0),
+                    emoticon=emoticon,
+                    actor_id=None,  # raw update carries no reliable single actor — best-effort None
+                )
+            )
+        except Exception:
+            # unknown update shape: log and skip, never break the stream
+            logger.warning("failed to handle reaction update — skipping", exc_info=True)
+
+    @staticmethod
+    def _recent_emoticon(reactions) -> str | None:
+        """Pull the changed standard-emoji reaction's emoticon; custom/premium → None."""
+        recent = getattr(reactions, "recent_reactions", None) or []
+        if not recent:
+            return None
+        reaction = getattr(recent[0], "reaction", None)
+        return getattr(reaction, "emoticon", None)  # ReactionCustomEmoji has no .emoticon
+
     async def listen(self) -> AsyncIterator[IncomingEvent]:
         """Incoming from private chats only (DMs + bots)."""
         async for ev in self._bus.subscribe():
@@ -380,6 +499,21 @@ class StandaloneTelegramClient:
 
     async def listen_deleted(self) -> AsyncIterator[MessagesDeletedEvent]:
         async for ev in self._bus_deleted.subscribe():
+            yield ev
+
+    async def listen_chat_actions(self) -> AsyncIterator[ChatActionEvent]:
+        """Participant/structure changes (joins, leaves, kicks, title/pin/photo)."""
+        async for ev in self._bus_chat_actions.subscribe():
+            yield ev
+
+    async def listen_reads(self) -> AsyncIterator[MessageReadEvent]:
+        """Read receipts; ``outbox=True`` means the other party read OUR messages."""
+        async for ev in self._bus_reads.subscribe():
+            yield ev
+
+    async def listen_reactions(self) -> AsyncIterator[ReactionEvent]:
+        """Reactions added to messages (custom/premium reactions map to emoticon=None)."""
+        async for ev in self._bus_reactions.subscribe():
             yield ev
 
     # --- mapping ---

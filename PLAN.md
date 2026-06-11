@@ -500,6 +500,37 @@ titles сам). Дисциплина username-резолва: дорогой (~5
   `close()` ждёт in-flight операцию через тот же lock.
 - **70**: `default_db_path(profile)` = `~/.tg_messenger/<safe-profile>.db`; CLAUDE.md/PLAN.md.
 
+## Циклы 71–76 — event-потоки (#14, сделано)
+
+Расширение событийного слоя `core/`: chat-actions, read-receipts, реакции, album_id.
+Новые модели в `models.py`, новые ленивые шины/стримы в `client.py` (один паттерн с
+`listen_deleted`), фейки в `conftest` диспатчат новые типы событий по атрибутам-маркерам.
+`tests/test_models.py` + `tests/test_client.py`:
+- **71**: модели `ChatActionEvent` (`dialog_id`, `kind: join|leave|kick|title|pin|photo|other`,
+  `user`/`actor`/`raw_text`), `MessageReadEvent` (`dialog_id`/`max_id`/`outbox`),
+  `ReactionEvent` (`dialog_id`/`message_id`/`emoticon`/`actor_id`); `IncomingEvent.album_id`.
+- **72**: шина `_bus_chat_actions` + `_on_chat_action` (маппит `events.ChatAction`: флаги
+  `user_joined`/`user_added`→`join`, `user_kicked`→`kick`, `user_left`→`leave`,
+  `new_title`/`new_pin`/`new_photo`, иначе `other`; `user` и `added_by`/`kicked_by`
+  best-effort) + `listen_chat_actions()`; регистрация eager в `connect()`. Битое событие →
+  `logger.exception`, поток жив; publish без подписчиков = no-op.
+- **73**: шина `_bus_reads` + `_on_message_read` (`events.MessageRead`: `dialog_id` из
+  `chat_id`, `max_id`, `outbox`) + `listen_reads()`. Тесты: inbox vs outbox.
+- **74**: шина `_bus_reactions` + `_on_reaction` через `events.Raw(UpdateMessageReactions)`
+  (реальный тип апдейта для user-аккаунтов; `dialog_id` через `telethon.utils.get_peer_id`,
+  `message_id=msg_id`, `emoticon` из первой `recent_reactions[].reaction` если это
+  стандартная `ReactionEmoji`, иначе `None`; aggregate `results` не используется как
+  источник изменившейся реакции; `actor_id=None` best-effort) + `listen_reactions()`.
+  Неизвестная структура → `logger.warning` + пропуск.
+- **75**: `IncomingEvent.album_id = message.grouped_id` в `_on_new_message`; `send_reaction`
+  (`SendReactionRequest`+`ReactionEmoji` через `run_with_flood_wait_retry`). Тесты: album_id
+  прокинут; запрос записан; non-transient flood → `HandledFloodWaitError`.
+- **76**: CLAUDE.md (семь стримов, album_id, send_reaction) + PLAN.md этот блок.
+
+v1-компромиссы (в рамках плана): альбомы только маркируются `album_id` — агрегатора нет,
+потребитель группирует сам; кастомные/премиум-реакции → `emoticon=None`; `actor_id` реакции —
+best-effort `None` (raw-апдейт не несёт надёжного единственного автора).
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.

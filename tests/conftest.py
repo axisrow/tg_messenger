@@ -12,14 +12,32 @@ def _builder_matches(builder, event) -> bool:
     """Mimic Telethon dispatch: route a pushed event only to matching builders.
 
     Just enough for our handlers: MessageDeleted events are recognised by the
-    ``deleted_ids`` attribute; NewMessage(incoming=)/(outgoing=) — by message.out.
+    ``deleted_ids`` attribute; NewMessage(incoming=)/(outgoing=) — by message.out;
+    ChatAction by the ``_is_chat_action`` marker; MessageRead by ``_is_message_read``;
+    Raw (reactions) by the ``_raw_update`` marker.
     """
     if builder is None:
         return True
+    if isinstance(builder, _tg_events.Raw):
+        # events.Raw(UpdateMessageReactions) — route fake raw updates here
+        return getattr(event, "_raw_update", False)
     if isinstance(builder, _tg_events.MessageDeleted):
         return hasattr(event, "deleted_ids")
+    if isinstance(builder, _tg_events.ChatAction):
+        return getattr(event, "_is_chat_action", False)
+    if isinstance(builder, _tg_events.MessageRead):
+        return (
+            getattr(event, "_is_message_read", False)
+            and bool(getattr(builder, "inbox", False)) != bool(getattr(event, "outbox", False))
+        )
     if isinstance(builder, _tg_events.NewMessage):
         if hasattr(event, "deleted_ids"):
+            return False
+        if (
+            getattr(event, "_is_chat_action", False)
+            or getattr(event, "_is_message_read", False)
+            or getattr(event, "_raw_update", False)
+        ):
             return False
         out = bool(getattr(getattr(event, "message", None), "out", False))
         if builder.outgoing and not builder.incoming:
@@ -67,9 +85,10 @@ class FakeDocument:
 class FakeMessage:
     def __init__(
         self, id, sender_id, text=None, out=False, date=None, media=None, peer_id=None,
-        photo=None, document=None, voice=None, file=None,
+        photo=None, document=None, voice=None, file=None, grouped_id=None,
     ):
         self.id = id
+        self.grouped_id = grouped_id
         self.sender_id = sender_id
         self.message = text
         self.text = text
@@ -103,6 +122,43 @@ class FakeDialog:
         self.message = message
 
 
+class FakeChatActionEvent:
+    """Stand-in for telethon events.ChatAction.Event — only the attrs our handler reads.
+
+    Mirrors the real flag set: user_joined/user_added/user_left/user_kicked/new_title/
+    new_pin/new_photo, plus user/added_by/kicked_by and action_message (for raw_text).
+    """
+
+    def __init__(
+        self, chat_id, *, user_joined=False, user_added=False, user_left=False,
+        user_kicked=False, new_title=None, new_pin=False, new_photo=False,
+        user=None, added_by=None, kicked_by=None, action_message=None,
+    ):
+        self._is_chat_action = True
+        self.chat_id = chat_id
+        self.user_joined = user_joined
+        self.user_added = user_added
+        self.user_left = user_left
+        self.user_kicked = user_kicked
+        self.new_title = new_title
+        self.new_pin = new_pin
+        self.new_photo = new_photo
+        self.user = user
+        self.added_by = added_by
+        self.kicked_by = kicked_by
+        self.action_message = action_message
+
+
+class FakeMessageReadEvent:
+    """Stand-in for telethon events.MessageRead.Event — chat_id/max_id/outbox."""
+
+    def __init__(self, chat_id, max_id, outbox=False):
+        self._is_message_read = True
+        self.chat_id = chat_id
+        self.max_id = max_id
+        self.outbox = outbox
+
+
 def make_sent_code(kind: str = "App", phone_code_hash: str = "hash123",
                    next_kind: str | None = None):
     """Fake auth.SentCode: type/next_type class names mimic telethon's (SentCodeTypeApp...)."""
@@ -130,6 +186,7 @@ class FakeTelethonClient:
         self.actions_log: list[tuple] = []
         self._handlers: list = []
         self.code_requests: list[str] = []
+        self.requests: list = []  # every raw RPC call (reactions, resend, ...)
         self.resend_requests: list = []
         self.signed_in_with: list = []
         # network-call counters: the TTL-cache tests assert how often we hit the wire
@@ -155,7 +212,9 @@ class FakeTelethonClient:
         return make_sent_code("App", "hash123")
 
     async def __call__(self, request):
-        # raw RPC path; LoginFlow uses it for auth.ResendCodeRequest
+        # raw RPC path; LoginFlow uses it for auth.ResendCodeRequest, and the
+        # client uses it for SendReactionRequest etc. — record every raw call.
+        self.requests.append(request)
         self.resend_requests.append(request)
         return make_sent_code("Sms", "hash456")
 
