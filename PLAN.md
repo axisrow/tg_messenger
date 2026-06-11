@@ -491,12 +491,14 @@ titles сам). Дисциплина username-резолва: дорогой (~5
 переезжает (in-memory из #8). `tests/test_storage.py`:
 - **67**: connect/close создаёт файл; kv-roundtrip (str/dict/list); get отсутствующего→None;
   context manager закрывает и данные персистятся.
-- **68**: миграции через `PRAGMA user_version` (растёт по числу зарегистрированных);
-  повторный connect не перенакатывает; две пачки от разных потребителей по порядку;
-  ошибка в миграции → rollback всего батча, version не растёт.
+- **68**: миграции трекаются по стабильному id SQL-миграции в `_tg_messenger_migrations`
+  (`PRAGMA user_version` только зеркалит число применённых); повторный connect не
+  перенакатывает; две пачки от разных потребителей не зависят от порядка регистрации;
+  ошибка в миграции → rollback всего батча, metadata/version не растут.
 - **69**: `asyncio.gather` из 20 set/get без потерь (один conn + `asyncio.Lock` +
-  `asyncio.to_thread`, `check_same_thread=False`); execute/fetchone/fetchall параметризованы.
-- **70**: `default_db_path(profile)` = `~/.tg_messenger/<profile>.db`; CLAUDE.md/PLAN.md.
+  `asyncio.to_thread`, `check_same_thread=False`); execute/fetchone/fetchall параметризованы;
+  `close()` ждёт in-flight операцию через тот же lock.
+- **70**: `default_db_path(profile)` = `~/.tg_messenger/<safe-profile>.db`; CLAUDE.md/PLAN.md.
 
 ## Циклы 71–76 — event-потоки (#14, сделано)
 

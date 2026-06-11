@@ -16,7 +16,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 
-from tg_messenger.core.auth import LOGIN_HINT
+from tg_messenger.core.auth import DEFAULT_SESSION_DIR, LOGIN_HINT
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,8 @@ def _make_real_client(session_name: str):
         api_id=int(os.environ.get("TG_API_ID", "0")),
         api_hash=os.environ.get("TG_API_HASH", ""),
         session_name=session_name,
+        session_dir=os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
+        encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
     )
 
 

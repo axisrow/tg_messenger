@@ -89,8 +89,8 @@ Each saved login is a *profile* (a session file under `~/.tg_messenger/sessions/
 Log in to as many as you like and pick one per run with the global `--profile` flag:
 
 ```bash
-tg-messenger login --profile work --phone +1...   # create/replace the "work" profile
-tg-messenger login --profile personal --phone +1...
+tg-messenger --profile work login --phone +1...   # create/replace the "work" profile
+tg-messenger --profile personal login --phone +1...
 tg-messenger profiles                             # list saved profiles
 tg-messenger --profile work dialogs               # any command targets a profile
 tg-messenger --profile personal serve             # CLI / TUI / web all accept --profile
