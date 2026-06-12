@@ -7,6 +7,7 @@ from textual.widgets import Input, ListView, Static, Tabs
 
 from tg_messenger.core.models import Dialog, IncomingEvent, Message, OutgoingEvent, ReactionEvent
 from tg_messenger.tui.app import (
+    ORIGINAL_SENTINEL,
     DialogItem,
     MessageBubble,
     MessengerTUI,
@@ -1120,6 +1121,94 @@ async def test_tui_switching_dialogs_clears_pending_suggestion():
 
         assert app._pending_suggestion is None
         assert str(app.query_one("#suggestion", Static).render()) == ""
+
+
+async def test_tui_outbound_clears_composer_while_worker_runs():
+    class BlockingOutbound:
+        def __init__(self):
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def applies(self, dialog_id, text):
+            self.entered.set()
+            await self.release.wait()
+            return None
+
+    outbound = BlockingOutbound()
+    app = MessengerTUI(client=TuiStubClient(), outbound=outbound)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        composer.value = "hello"
+        await app.on_input_submitted(Input.Submitted(composer, "hello"))
+        await asyncio.wait_for(outbound.entered.wait(), timeout=5)
+        assert composer.value == ""
+        outbound.release.set()
+        await pilot.pause()
+
+
+async def test_tui_outbound_cancel_restores_original_draft(monkeypatch):
+    class VariantOutbound:
+        async def applies(self, dialog_id, text):
+            return "es"
+
+        async def variants(self, dialog_id, text, target_lang):
+            return ["hola"]
+
+    app = MessengerTUI(client=TuiStubClient(), outbound=VariantOutbound())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        async def cancel(_screen):
+            return None
+
+        monkeypatch.setattr(app, "push_screen_wait", cancel)
+        composer = app.query_one("#composer", Input)
+        composer.value = ""
+        await app._outbound_flow(7, "hello")
+        assert composer.value == "hello"
+
+
+async def test_tui_outbound_error_restores_original_for_bypass():
+    class FailingOutbound:
+        async def applies(self, dialog_id, text):
+            return "es"
+
+        async def variants(self, dialog_id, text, target_lang):
+            raise RuntimeError("llm down")
+
+    app = MessengerTUI(client=TuiStubClient(), outbound=FailingOutbound())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+        composer.value = ""
+        await app._outbound_flow(7, "hello")
+        assert composer.value == "hello"
+        assert app._outbound_bypass == _OutboundPending(7, "hello")
+
+
+async def test_tui_outbound_original_choice_restores_original_for_bypass(monkeypatch):
+    class VariantOutbound:
+        async def applies(self, dialog_id, text):
+            return "es"
+
+        async def variants(self, dialog_id, text, target_lang):
+            return ["hola"]
+
+    app = MessengerTUI(client=TuiStubClient(), outbound=VariantOutbound())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        async def pick_original(_screen):
+            return ORIGINAL_SENTINEL
+
+        monkeypatch.setattr(app, "push_screen_wait", pick_original)
+        composer = app.query_one("#composer", Input)
+        composer.value = ""
+        await app._outbound_flow(7, "hello")
+        assert composer.value == "hello"
+        assert app._outbound_bypass == _OutboundPending(7, "hello")
 
 
 async def test_tui_switching_dialogs_clears_pending_outbound_variant():

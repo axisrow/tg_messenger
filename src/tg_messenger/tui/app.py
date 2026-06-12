@@ -718,6 +718,7 @@ class MessengerTUI(App):
             self.run_worker(self._send_text(self._current, text), exclusive=False)
             return
         if self._outbound is not None:
+            event.input.value = ""
             self.run_worker(
                 self._outbound_flow(self._current, text),
                 group="outbound",
@@ -777,14 +778,20 @@ class MessengerTUI(App):
         except Exception:
             logger.exception("outbound translation failed (dialog %s)", dialog_id)
             self._outbound_bypass = _OutboundPending(dialog_id, text)
+            if not composer.value:
+                composer.value = text
             self.notify("Перевод не удался — Enter отправит оригинал", severity="warning")
             return
         picked = await self.push_screen_wait(VariantPickScreen(variants, text))
         if picked is None:
+            if not composer.value:
+                composer.value = text
             composer.focus()
             return
         if picked == ORIGINAL_SENTINEL:
             self._outbound_bypass = _OutboundPending(dialog_id, text)
+            if not composer.value:
+                composer.value = text
             self.notify("Enter отправит оригинал")
             composer.focus()
             return

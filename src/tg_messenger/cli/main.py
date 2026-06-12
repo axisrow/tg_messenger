@@ -1108,6 +1108,8 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             outbound = make_optional_outbound(store, storage)
             await store.connect()
             store_task = asyncio.create_task(store.run())
+            from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
+            from tg_messenger.agent.translate import get_user_lang
 
             # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();
             # skip them so our own input isn't printed back. Bounded (deque).
@@ -1156,6 +1158,38 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 continue
                             await client.send_reaction(dialog_id, int(parts[1]), parts[2])
                             continue
+                        if line.split(maxsplit=1)[0] == "/lang":
+                            parts = line.split(maxsplit=1)
+                            if len(parts) != 2 or not parts[1].strip():
+                                click.echo("usage: /lang CODE|auto|on|off", err=True)
+                                continue
+                            if outbound is None:
+                                click.echo("outbound translation is not configured.", err=True)
+                                continue
+                            value = parts[1].strip().lower()
+                            try:
+                                if value == "auto":
+                                    await set_dialog_lang(outbound.storage, dialog_id, None)
+                                elif value == "on":
+                                    await set_outbound_enabled(outbound.storage, dialog_id, True)
+                                elif value == "off":
+                                    await set_outbound_enabled(outbound.storage, dialog_id, False)
+                                else:
+                                    await set_dialog_lang(
+                                        outbound.storage,
+                                        dialog_id,
+                                        value,
+                                        source="manual",
+                                    )
+                            except ValueError as exc:
+                                click.echo(str(exc), err=True)
+                                continue
+                            except Exception as exc:
+                                logger.exception("dialog language command failed")
+                                click.echo(f"language setting failed: {exc}", err=True)
+                                continue
+                            click.echo("language setting saved.")
+                            continue
                         if outbound is not None:
                             target_lang = await outbound.applies(dialog_id, line)
                             if target_lang is not None:
@@ -1190,8 +1224,6 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                     continue
                                 msg = await client.send_text(dialog_id, picked)
                                 sent_ids.append((dialog_id, msg.id))
-                                from tg_messenger.agent.translate import get_user_lang
-
                                 source_lang = await get_user_lang(storage) or ""
                                 if source_lang:
                                     try:

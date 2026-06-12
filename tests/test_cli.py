@@ -578,6 +578,55 @@ def test_chat_outbound_variant_sends_pick(runner, monkeypatch):
     assert "↳ привет" in result.output
 
 
+def test_chat_lang_command_is_handled_before_outbound(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    class FakeStorage:
+        def __init__(self):
+            self.values = []
+            self.executed = []
+
+        async def get_value(self, key):
+            return None
+
+        async def set_value(self, key, value):
+            self.values.append((key, value))
+
+        async def execute(self, sql, params=()):
+            self.executed.append((sql, params))
+
+    class FakeStore(DummyMessageStore):
+        def __init__(self, client):
+            super().__init__(client)
+            self.storage = FakeStorage()
+
+    class FakeOutbound:
+        def __init__(self, storage):
+            self.storage = storage
+            self.applies_calls = []
+
+        async def applies(self, dialog_id, text):
+            self.applies_calls.append((dialog_id, text))
+            return "en"
+
+        async def variants(self, dialog_id, text, target_lang):
+            return ["translated"]
+
+    store = FakeStore(stub)
+    outbound = FakeOutbound(store.storage)
+    monkeypatch.setattr(cli_main, "make_message_store", lambda client, **kw: (store, store.storage))
+    monkeypatch.setattr(cli_main, "make_optional_outbound", lambda s, storage: outbound)
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="/lang en\n")
+    assert result.exit_code == 0, result.output
+    assert stub.sent == []
+    assert outbound.applies_calls == []
+    assert store.storage.values == [
+        ("dialog_lang_7", {"lang": "en", "source": "manual"}),
+    ]
+    assert "language setting saved" in result.output
+
+
 def test_dialog_lang_show_set_and_off(monkeypatch, tmp_path):
     from tg_messenger.core.storage import Storage
 
