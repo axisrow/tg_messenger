@@ -225,6 +225,9 @@
       outboundNonce.value = state.outboundNonce || '';
       composer.dataset.outboundReady = state.outboundReady ? '1' : '';
     }
+    function markSubmittingDialog(id) {
+      composer.dataset.submittingDialogId = id;
+    }
     function saveComposeState() {
       if (!activeDialogId) return;
       const state = stateFor(activeDialogId);
@@ -301,12 +304,18 @@
     });
     composer.addEventListener('htmx:afterRequest', (evt) => {
       if (evt.detail.xhr && evt.detail.xhr.status >= 400) return;
-      const dialogId = activeDialogId;
-      if (dialogId) {
-        clearComposeState(stateFor(dialogId));
+      const submittedDialogId = composer.dataset.submittingDialogId || activeDialogId;
+      delete composer.dataset.submittingDialogId;
+      if (submittedDialogId) {
+        clearComposeState(stateFor(submittedDialogId));
       }
-      composer.reset();
-      dialogInput.value = dialogId;
+      if (submittedDialogId === activeDialogId) {
+        composer.reset();
+        dialogInput.value = activeDialogId;
+      } else if (activeDialogId) {
+        applyComposeState(stateFor(activeDialogId));
+        dialogInput.value = activeDialogId;
+      }
       const clientInput = document.getElementById('web_client_id');
       clientInput.value = webClientId;
       clientInput.defaultValue = webClientId;
@@ -322,6 +331,7 @@
         state.outboundReady = false;
         composer.dataset.outboundReady = '';
         hideVariants();
+        markSubmittingDialog(id);
         return;
       }
       evt.preventDefault();
@@ -347,11 +357,15 @@
         const data = await resp.json();
         if (data.status === 'disabled' || data.status === 'not_applicable') {
           clearOutboundState(state);
+          markSubmittingDialog(id);
           evt.detail.issueRequest(true);
           return;
         }
         if (data.status === 'error' || !data.applies) {
-          showSendOriginal(id, draft, data.error, () => evt.detail.issueRequest(true));
+          showSendOriginal(id, draft, data.error, () => {
+            markSubmittingDialog(id);
+            evt.detail.issueRequest(true);
+          });
           return;
         }
         variantPanel.textContent = '';
@@ -386,11 +400,15 @@
           state.outboundReady = true;
           applyComposeState(state);
           hideVariants();
+          markSubmittingDialog(id);
           evt.detail.issueRequest(true);
         });
         variantPanel.appendChild(original);
       } catch (err) {
-        showSendOriginal(id, draft, 'Translation failed.', () => evt.detail.issueRequest(true));
+        showSendOriginal(id, draft, 'Translation failed.', () => {
+          markSubmittingDialog(id);
+          evt.detail.issueRequest(true);
+        });
       } finally {
         clearTimeout(outboundTimer);
         outboundController = null;

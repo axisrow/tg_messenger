@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 
 from tg_messenger.core.message_store import MessageStore, register_message_store_migrations
@@ -41,10 +43,35 @@ class StoreClient:
         yield
 
 
+class InterruptingStoreClient(StoreClient):
+    async def listen_all(self):
+        if False:
+            yield None
+        raise KeyboardInterrupt
+
+    async def listen_outgoing(self):
+        await asyncio.Event().wait()
+        yield
+
+    async def listen_deleted(self):
+        await asyncio.Event().wait()
+        yield
+
+
 async def _storage(tmp_path):
     storage = Storage(tmp_path / "messages.db")
     register_message_store_migrations(storage)
     return storage
+
+
+async def test_message_store_run_handles_keyboard_interrupt(tmp_path, caplog):
+    store = MessageStore(client=InterruptingStoreClient(), storage=await _storage(tmp_path))
+    try:
+        with caplog.at_level(logging.INFO, logger="tg_messenger.core.message_store"):
+            await store.run()
+    finally:
+        await store.close()
+    assert any("message store interrupted" in rec.message for rec in caplog.records)
 
 
 async def test_message_store_first_load_then_cooldown_serves_db(tmp_path):

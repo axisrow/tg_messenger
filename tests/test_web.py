@@ -1300,9 +1300,19 @@ async def test_index_clears_outbound_ready_state_on_variant_edit(client_app):
 async def test_index_blocks_outbound_errors_until_explicit_send_original(client_app):
     ac, _ = client_app
     r = await ac.get("/")
-    assert "showSendOriginal(id, draft, data.error, () => evt.detail.issueRequest(true));" in r.text
-    assert "showSendOriginal(id, draft, 'Translation failed.', () => evt.detail.issueRequest(true));" in r.text
+    assert "showSendOriginal(id, draft, data.error, () => {" in r.text
+    assert "showSendOriginal(id, draft, 'Translation failed.', () => {" in r.text
+    assert "markSubmittingDialog(id);" in r.text
     assert "Translation timed out — sending the original." not in r.text
+
+
+async def test_index_after_request_clears_submitted_dialog_not_active_dialog(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "composer.dataset.submittingDialogId = id;" in r.text
+    assert "const submittedDialogId = composer.dataset.submittingDialogId || activeDialogId;" in r.text
+    assert "clearComposeState(stateFor(submittedDialogId));" in r.text
+    assert "if (submittedDialogId === activeDialogId)" in r.text
 
 
 async def test_suggest_endpoint_does_not_escape_draft(suggest_app):

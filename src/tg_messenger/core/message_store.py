@@ -131,13 +131,35 @@ class MessageStore:
             )
 
     async def run(self) -> None:
-        """Drain existing live streams; gather keeps Ctrl+C behavior simple."""
+        """Drain existing live streams; stop cleanly when a stream is interrupted."""
         await self.connect()
-        await asyncio.gather(
-            self._consume_incoming(),
-            self._consume_outgoing(),
-            self._consume_deleted(),
-        )
+        tasks = {
+            asyncio.create_task(self._consume_until_done(self._consume_incoming)): "incoming",
+            asyncio.create_task(self._consume_until_done(self._consume_outgoing)): "outgoing",
+            asyncio.create_task(self._consume_until_done(self._consume_deleted)): "deleted",
+        }
+        try:
+            while tasks:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    interrupted = task.result()
+                    if interrupted:
+                        for pending_task in pending:
+                            pending_task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        return
+                tasks = {task: tasks[task] for task in pending}
+        finally:
+            for task in tasks:
+                task.cancel()
+
+    async def _consume_until_done(self, consume_fn) -> bool:
+        try:
+            await consume_fn()
+            return False
+        except KeyboardInterrupt:
+            logger.info("message store interrupted")
+            return True
 
     async def record_outgoing(
         self,
