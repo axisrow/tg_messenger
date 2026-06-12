@@ -71,7 +71,8 @@ async def test_dialog_lang_and_enabled_kv(tmp_path):
         (["привіт", "як справи"], None),
         (["안녕하세요"], "ko"),
         (["こんにちは"], "ja"),
-        (["你好"], "zh"),
+        (["你好"], None),
+        (["東京大学"], None),
         (["hello world"], None),
         (["123 😀"], None),
     ],
@@ -100,6 +101,28 @@ async def test_dialog_lang_uses_detector_for_cyrillic_before_caching(tmp_path):
     finally:
         await storage.close()
     assert calls == [["привіт", "як справи"]]
+
+
+async def test_dialog_lang_uses_detector_for_han_before_caching(tmp_path):
+    storage = await _storage(tmp_path)
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return "ja"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "東京大学")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        assert await outbound.dialog_lang(7) == "ja"
+        assert await outbound.dialog_lang(7) == "ja"
+    finally:
+        await storage.close()
+    assert calls == [["東京大学"]]
 
 
 async def test_dialog_lang_uses_llm_for_latin_and_caches(tmp_path):
@@ -209,6 +232,29 @@ async def test_applies_cyrillic_user_to_non_cyrillic_dialog_uses_exact_detection
     finally:
         await storage.close()
     assert calls == [["привіт"]]
+
+
+async def test_applies_han_user_to_non_han_dialog_uses_exact_detection(tmp_path):
+    storage = await _storage(tmp_path)
+    await set_user_lang(storage, "ja")
+    await set_dialog_lang(storage, 7, "en", source="manual")
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return "ja"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        assert await outbound.applies(7, "東京大学") == "en"
+    finally:
+        await storage.close()
+    assert calls == [["東京大学"]]
 
 
 async def test_variants_passes_profile_and_context(tmp_path):

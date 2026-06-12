@@ -25,6 +25,7 @@ OUTBOUND_ENABLED_KEY = "outbound_enabled_{dialog_id}"
 LANG_CODE_RE = re.compile(r"^[a-z]{2,3}$")
 NON_LATIN_SCRIPT_LANGS = {"ar", "el", "he", "ja", "ko", "ru", "th", "zh"}
 CYRILLIC_SCRIPT_LANGS = {"be", "bg", "kk", "ky", "mk", "mn", "ru", "sr", "tg", "uk", "uz"}
+HAN_SCRIPT_LANGS = {"ja", "ko", "lzh", "yue", "zh"}
 
 
 class DialogLang(BaseModel):
@@ -82,9 +83,9 @@ async def set_outbound_enabled(storage, dialog_id: int, enabled: bool) -> None:
 
 def detect_script_lang(texts: Sequence[str]) -> str | None:
     lang = _dominant_script_lang(texts)
-    # Latin and Cyrillic are scripts shared by many languages. They need the
-    # injected exact detector before we persist a dialog language.
-    return None if lang in {None, "latin", "ru"} else lang
+    # Latin, Cyrillic and Han ideographs are shared by many languages. They
+    # need the injected exact detector before we persist a dialog language.
+    return None if lang in {None, "latin", "ru", "han"} else lang
 
 
 def _dominant_script_lang(texts: Sequence[str]) -> str | None:
@@ -127,7 +128,7 @@ def _char_lang(ch: str) -> str | None:
     if 0x3040 <= cp <= 0x30FF:
         return "ja"
     if 0x4E00 <= cp <= 0x9FFF:
-        return "zh"
+        return "han"
     if 0x0E00 <= cp <= 0x0E7F:
         return "th"
     if 0x0590 <= cp <= 0x05FF:
@@ -204,6 +205,15 @@ class OutboundTranslator:
                 return None
             if script_lang == "ru":
                 if user_lang not in CYRILLIC_SCRIPT_LANGS:
+                    return None
+                draft_lang = await self._detect_draft_lang(draft_text)
+                if draft_lang == dialog_lang:
+                    return None
+                if draft_lang is not None and draft_lang != user_lang:
+                    return None
+                return dialog_lang
+            if script_lang == "han":
+                if user_lang not in HAN_SCRIPT_LANGS:
                     return None
                 draft_lang = await self._detect_draft_lang(draft_text)
                 if draft_lang == dialog_lang:
