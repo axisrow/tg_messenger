@@ -672,6 +672,37 @@ async def test_stream_does_not_skip_same_message_id_from_other_dialog():
     await gen.aclose()
 
 
+async def test_stream_does_not_skip_message_sent_by_other_web_client():
+    import json
+
+    from tg_messenger.core.models import OutgoingEvent
+    from tg_messenger.web.app import _sent_bucket, sse_event_stream
+
+    stub = WebStubClient()
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/send", data={"dialog_id": "7", "text": "from a", "web_client_id": "a"})
+
+        assert r.status_code == 200
+        assert stub.sent == [(7, "from a", None)]
+
+        gen = sse_event_stream(stub, dialog_id=7, sent_ids=_sent_bucket(app.state.sent_ids_by_client, "b"))
+        task = asyncio.create_task(gen.__anext__())
+        while stub.bus_out.subscriber_count == 0:
+            await asyncio.sleep(0)
+
+        msg = Message(id=2, dialog_id=7, sender_id=1, out=True, text="from a",
+                      date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        stub.bus_out.publish(OutgoingEvent(dialog_id=7, message=msg))
+
+        frame = await asyncio.wait_for(task, timeout=2)
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        assert payload == {"id": 2, "text": "from a", "out": True}
+        await gen.aclose()
+
+
 # --- цикл 97: суфлёр в web (черновик ответа по кнопке Suggest) ---
 
 

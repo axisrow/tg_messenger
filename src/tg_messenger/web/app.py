@@ -162,6 +162,19 @@ def _same_origin_error(request: Request) -> HTMLResponse | None:
     return None
 
 
+def _sent_bucket(sent_ids_by_client: OrderedDict, client_id: str) -> OrderedDict:
+    """Return the bounded sent-message set for one browser client."""
+    client_id = client_id[:80]
+    bucket = sent_ids_by_client.get(client_id)
+    if bucket is None:
+        bucket = OrderedDict()
+        sent_ids_by_client[client_id] = bucket
+    sent_ids_by_client.move_to_end(client_id)
+    while len(sent_ids_by_client) > 100:
+        sent_ids_by_client.popitem(last=False)
+    return bucket
+
+
 def _remember_sent(sent_ids: OrderedDict, dialog_id: int, message_id: int) -> None:
     """Record a sent message key so its outgoing echo isn't re-streamed."""
     key = (dialog_id, message_id)
@@ -293,10 +306,10 @@ def build_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.background_tasks = set()
-        # ids of messages sent via this server's /send & /media — those echo back on
-        # listen_outgoing(); the SSE stream skips them so the optimistic bubble the
-        # POST already returned isn't duplicated. Bounded (OrderedDict-as-set).
-        app.state.sent_ids = OrderedDict()
+        # Per-browser ids of messages sent via this server's /send & /media.
+        # They echo back on listen_outgoing(); only the same browser client skips
+        # them because its POST already returned the optimistic bubble.
+        app.state.sent_ids_by_client = OrderedDict()
         app.state.client = client or _make_real_client(session_name)
         # reply suggester (#17) — optional; None disables the /suggest endpoint
         app.state.suggester = suggester
@@ -486,14 +499,15 @@ def build_app(
 
     @app.post("/send", response_class=HTMLResponse)
     async def send(request: Request, dialog_id: str = Form(""), text: str = Form(""),
-                   reply_to: str = Form("")):
+                   reply_to: str = Form(""), web_client_id: str = Form("")):
         if not dialog_id.strip().lstrip("-").isdigit():
             return _error_response("Select a dialog first.", 400)
         if not text.strip():
             return _error_response("Cannot send an empty message.", 400)
         reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
         msg = await request.app.state.client.send_text(int(dialog_id), text, reply_to=reply_to_id)
-        _remember_sent(request.app.state.sent_ids, int(dialog_id), msg.id)  # suppress its SSE echo
+        sent_ids = _sent_bucket(request.app.state.sent_ids_by_client, web_client_id)
+        _remember_sent(sent_ids, int(dialog_id), msg.id)  # suppress only this client's SSE echo
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/media", response_class=HTMLResponse)
@@ -502,6 +516,7 @@ def build_app(
         dialog_id: int,
         file: UploadFile = File(...),
         caption: str | None = Form(None),
+        web_client_id: str = Form(""),
     ):
         max_mb = _max_upload_mb()
         max_bytes = max_mb * 1024 * 1024
@@ -527,7 +542,8 @@ def build_app(
             msg = await request.app.state.client.send_media(dialog_id, tmp_path, caption=caption)
         finally:
             os.unlink(tmp_path)
-        _remember_sent(request.app.state.sent_ids, dialog_id, msg.id)  # suppress its SSE echo
+        sent_ids = _sent_bucket(request.app.state.sent_ids_by_client, web_client_id)
+        _remember_sent(sent_ids, dialog_id, msg.id)  # suppress only this client's SSE echo
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/suggest", response_class=PlainTextResponse)
@@ -549,9 +565,13 @@ def build_app(
         return PlainTextResponse(draft)
 
     @app.get("/stream/{dialog_id}")
-    async def stream(request: Request, dialog_id: int):
+    async def stream(request: Request, dialog_id: int, client_id: str = ""):
         return StreamingResponse(
-            sse_event_stream(request.app.state.client, dialog_id, request.app.state.sent_ids),
+            sse_event_stream(
+                request.app.state.client,
+                dialog_id,
+                _sent_bucket(request.app.state.sent_ids_by_client, client_id),
+            ),
             media_type="text/event-stream",
         )
 
