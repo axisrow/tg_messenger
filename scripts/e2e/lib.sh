@@ -342,6 +342,21 @@ e2e_start_background() {
   E2E_BG_NAMES+=("$name")
 }
 
+e2e_start_tg_background() {
+  local name="$1"
+  local output_file="$2"
+  shift 2
+  "$E2E_TG_BIN" --profile "$E2E_PROFILE" "$@" >"$output_file" 2>&1 &
+  E2E_LAST_BG_PID=$!
+  E2E_BG_PIDS+=("$E2E_LAST_BG_PID")
+  E2E_BG_NAMES+=("$name")
+}
+
+e2e_is_process_running() {
+  local pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1
+}
+
 e2e_stop_background_pid() {
   local pid="$1"
   if [ -z "$pid" ]; then

@@ -83,12 +83,10 @@ export E2E_SERVE_PORT=18090
 export E2E_ALLOW_LLM=1
 export E2E_SUGGEST_DM="$E2E_SAVED_ID"
 export E2E_SUGGEST_LEARN=1
-export E2E_SUGGEST_SEND=1
 ```
 
 `E2E_ALLOW_LLM=1` is required because `suggest` and `ghostwrite` may send
-dialog context to the configured LLM provider. `suggest --send` is automated
-only when `E2E_SUGGEST_DM` equals `E2E_SAVED_ID`.
+dialog context to the configured LLM provider.
 
 ## Safety Tiers
 
@@ -141,7 +139,7 @@ Covered scenarios:
 - `chat` REPL `/react` best-effort in Saved Messages
 - `suggest` dry-run, gated by `TG_AGENT_MODEL`, `E2E_ALLOW_LLM=1`, and `E2E_SUGGEST_DM`
 - optional `suggest --learn`
-- optional `suggest --send`, only to Saved Messages
+- `suggest --send` parity stub: skipped until the CLI exposes the sent message id for safe cleanup
 - timed dry-run startup for `moderate`, gated by `E2E_RUN_SERVICES=1`
 - timed dry-run startup for `ghostwrite`, gated by `E2E_RUN_SERVICES=1` and LLM opt-in
 - timed `heartbeat run` startup only when `heartbeat list` has no stored plans

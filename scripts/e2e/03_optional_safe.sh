@@ -46,10 +46,22 @@ step_serve_http() {
   local status
 
   e2e_require_services_enabled || return 77
-  e2e_start_background serve "$log" tg serve --host 127.0.0.1 --port "$port"
+  e2e_start_tg_background serve "$log" serve --host 127.0.0.1 --port "$port"
   pid="$E2E_LAST_BG_PID"
+  if ! e2e_wait_for_file_pattern "$log" "Serving on http://127.0.0.1:$port" 10; then
+    e2e_stop_background_pid "$pid"
+    echo "serve did not reach startup line" >&2
+    cat "$log"
+    return 1
+  fi
   e2e_wait_for_http "http://127.0.0.1:$port/login" 30
   status=$?
+  if ! e2e_is_process_running "$pid"; then
+    e2e_stop_background_pid "$pid"
+    echo "serve process exited; HTTP response may have come from a stale process" >&2
+    cat "$log"
+    return 1
+  fi
   e2e_stop_background_pid "$pid"
   if [ "$status" -eq 77 ]; then
     return 77
@@ -131,11 +143,6 @@ step_suggest_learn() {
 }
 
 step_suggest_send_saved() {
-  local before_history
-  local before_id
-  local after_history
-  local sent_id
-
   e2e_require_llm_allowed || return 77
   if [ "${E2E_SUGGEST_SEND:-0}" != "1" ]; then
     e2e_skip_step "set E2E_SUGGEST_SEND=1 to run suggest --send"
@@ -146,19 +153,8 @@ step_suggest_send_saved() {
     e2e_skip_step "suggest --send is only automated when E2E_SUGGEST_DM equals E2E_SAVED_ID"
     return 77
   fi
-
-  before_history="$(e2e_recent_history "$SAVED_PEER" 1)" || return 1
-  before_id="$(e2e_extract_first_message_id "$before_history")"
-  tg suggest "$SAVED_PEER" --send >/dev/null || return 1
-  e2e_mutation_pause
-  after_history="$(e2e_recent_history "$SAVED_PEER" 3)" || return 1
-  sent_id="$(e2e_extract_first_message_id "$after_history")"
-  if [ -z "$sent_id" ] || [ "$sent_id" = "$before_id" ]; then
-    echo "could not identify suggest --send message id" >&2
-    echo "$after_history"
-    return 1
-  fi
-  e2e_register_message "$SAVED_PEER" "$sent_id" ""
+  e2e_skip_step "suggest --send is deferred until the CLI exposes the sent message id for safe cleanup"
+  return 77
 }
 
 step_moderate_dry_run() {
@@ -166,7 +162,7 @@ step_moderate_dry_run() {
   local pid
 
   e2e_require_services_enabled || return 77
-  e2e_start_background moderate "$log" tg moderate
+  e2e_start_tg_background moderate "$log" moderate
   pid="$E2E_LAST_BG_PID"
   if ! e2e_wait_for_file_pattern "$log" "Moderating (dry-run)" 20; then
     e2e_stop_background_pid "$pid"
@@ -183,7 +179,7 @@ step_ghostwrite_dry_run() {
 
   e2e_require_services_enabled || return 77
   e2e_require_llm_allowed || return 77
-  e2e_start_background ghostwrite "$log" tg ghostwrite
+  e2e_start_tg_background ghostwrite "$log" ghostwrite
   pid="$E2E_LAST_BG_PID"
   if ! e2e_wait_for_file_pattern "$log" "Ghostwriting (dry-run)" 20; then
     e2e_stop_background_pid "$pid"
@@ -205,7 +201,7 @@ step_heartbeat_run_startup() {
     e2e_skip_step "heartbeat run skipped because stored plans exist"
     return 77
   fi
-  e2e_start_background heartbeat-run "$log" tg heartbeat run
+  e2e_start_tg_background heartbeat-run "$log" heartbeat run
   pid="$E2E_LAST_BG_PID"
   if ! e2e_wait_for_file_pattern "$log" "Heartbeat scheduler running" 20; then
     e2e_stop_background_pid "$pid"

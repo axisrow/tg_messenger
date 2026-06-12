@@ -46,7 +46,7 @@ step_guided_listen() {
   fi
   guided_confirm "Start tg listen and trigger an incoming DM/bot reply within ${E2E_GUIDED_SECONDS}s?" ||
     return $?
-  e2e_start_background listen "$log" tg listen
+  e2e_start_tg_background listen "$log" listen
   pid="$E2E_LAST_BG_PID"
   sleep "$E2E_GUIDED_SECONDS"
   e2e_stop_background_pid "$pid"
@@ -67,7 +67,7 @@ step_guided_watch() {
   fi
   guided_confirm "Start tg watch and perform a throwaway group deletion scenario within ${E2E_GUIDED_SECONDS}s?" ||
     return $?
-  e2e_start_background watch "$log" tg watch
+  e2e_start_tg_background watch "$log" watch
   pid="$E2E_LAST_BG_PID"
   sleep "$E2E_GUIDED_SECONDS"
   e2e_stop_background_pid "$pid"

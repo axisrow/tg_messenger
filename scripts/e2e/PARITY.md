@@ -48,7 +48,7 @@ destructive or externally visible real-state changes outside Saved Messages.
 | `username set`, `username clear` | parity stub only | Public account identity mutation. |
 | `suggest` dry-run | safe optional | `03_optional_safe.sh`, gated by `TG_AGENT_MODEL`, `E2E_ALLOW_LLM=1`, and `E2E_SUGGEST_DM`. |
 | `suggest --learn` | safe optional | `03_optional_safe.sh`, additionally gated by `E2E_SUGGEST_LEARN=1`. |
-| `suggest --send` | safe optional | `03_optional_safe.sh`, additionally gated by `E2E_SUGGEST_SEND=1` and Saved Messages target only. |
+| `suggest --send` | safe optional follow-up | `03_optional_safe.sh` skips it until the CLI exposes the sent message id for safe cleanup. |
 | `agent` | safe optional follow-up | Needs agent env and bounded dry-run harness. |
 | `worker` | safe optional follow-up | Needs controlled factory URL fixture. |
 | `serve` | safe optional | `03_optional_safe.sh`, localhost `/login` HTTP assertion gated by `E2E_RUN_SERVICES=1`. |
