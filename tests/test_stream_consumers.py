@@ -19,11 +19,7 @@ from pathlib import Path
 _SRC = Path(__file__).resolve().parent.parent / "src" / "tg_messenger"
 _CLIENT = _SRC / "core" / "client.py"
 
-# Streams deliberately not yet consumed by any UI/service, each with a reason.
-# An entry here is a documented gap, not a silent omission — remove it the moment
-# a consumer lands. listen_reactions: the core publishes reaction changes but no
-# UI renders them yet — tracked in issue #56.
-_DEFERRED = {"listen_reactions"}
+_DEFERRED = set()
 
 
 def _core_stream_names() -> set[str]:
@@ -83,3 +79,33 @@ def test_live_uis_consume_outgoing():
         if "listen_outgoing(" not in path.read_text(encoding="utf-8")
     ]
     assert not missing, f"these live UIs never consume listen_outgoing(): {missing}"
+
+
+def test_live_uis_consume_reactions():
+    """TUI, web and the CLI `chat` REPL must all show reaction changes live."""
+    must_consume_reactions = {
+        "TUI": _SRC / "tui" / "app.py",
+        "web": _SRC / "web" / "app.py",
+        "CLI chat": _SRC / "cli" / "main.py",
+    }
+    missing = [
+        label
+        for label, path in must_consume_reactions.items()
+        if "listen_reactions(" not in path.read_text(encoding="utf-8")
+    ]
+    assert not missing, f"these live UIs never consume listen_reactions(): {missing}"
+
+
+def test_live_uis_can_send_reactions():
+    """TUI, web and CLI must expose the core send_reaction action."""
+    must_send_reactions = {
+        "TUI": _SRC / "tui" / "app.py",
+        "web": _SRC / "web" / "app.py",
+        "CLI": _SRC / "cli" / "main.py",
+    }
+    missing = [
+        label
+        for label, path in must_send_reactions.items()
+        if ".send_reaction(" not in path.read_text(encoding="utf-8")
+    ]
+    assert not missing, f"these UIs never call send_reaction(): {missing}"

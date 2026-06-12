@@ -32,6 +32,10 @@ from tg_messenger.core.models import message_line
 logger = logging.getLogger(__name__)
 
 
+def _reaction_emoticon(emoticon: str | None) -> str:
+    return emoticon if emoticon is not None else "<custom>"
+
+
 def _parse_dotenv(path: Path | str = ".env") -> dict[str, str]:
     """Parse KEY=VALUE pairs from a .env file (quotes stripped); missing file -> {}."""
     path = Path(path)
@@ -672,6 +676,21 @@ def send(dialog_id: int, text: str | None, file_path: str | None, caption: str |
     click.echo("sent.")
 
 
+@cli.command()
+@click.argument("dialog_id", type=int)
+@click.argument("message_id", type=int)
+@click.argument("emoticon")
+@click.option("--session", default="default")
+def react(dialog_id: int, message_id: int, emoticon: str, session: str) -> None:
+    """React to a message with a standard emoji."""
+
+    async def _do(client):
+        await client.send_reaction(dialog_id, message_id, emoticon)
+
+    _run(_with_client(session, _do), session=session)
+    click.echo("reacted.")
+
+
 def _parse_ids(raw: str) -> list[int]:
     """Parse a comma-separated message-id list; a bad token is a ClickException."""
     try:
@@ -934,7 +953,18 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     if ev.dialog_id == dialog_id and (ev.dialog_id, ev.message.id) not in sent_ids:
                         click.echo(f"\n→ {ev.message.text or '<media>'}")
 
-            tasks = [asyncio.create_task(printer()), asyncio.create_task(printer_outgoing())]
+            async def printer_reactions():
+                async for ev in client.listen_reactions():
+                    if ev.dialog_id == dialog_id:
+                        click.echo(
+                            f"\n* reaction [{ev.message_id}]: {_reaction_emoticon(ev.emoticon)}"
+                        )
+
+            tasks = [
+                asyncio.create_task(printer()),
+                asyncio.create_task(printer_outgoing()),
+                asyncio.create_task(printer_reactions()),
+            ]
             try:
                 while True:
                     try:
@@ -942,6 +972,13 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     except EOFError:
                         break
                     if line.strip():
+                        if line.startswith("/react "):
+                            parts = line.split(maxsplit=2)
+                            if len(parts) != 3 or not parts[1].isdigit():
+                                click.echo("usage: /react MESSAGE_ID EMOTICON", err=True)
+                                continue
+                            await client.send_reaction(dialog_id, int(parts[1]), parts[2])
+                            continue
                         msg = await client.send_text(dialog_id, line)
                         sent_ids.append((dialog_id, msg.id))  # suppress this line's outgoing echo
             finally:

@@ -141,7 +141,17 @@ def _profile_li(name: str, *, active: bool) -> str:
 def _message_div(m) -> str:
     cls = "out" if m.out else "in"
     body = escape(m.text) if m.text else "&lt;media&gt;"
+    body = f"[{m.id}] {body}"
     return f'<div class="msg {cls}" data-id="{m.id}">{body}</div>'
+
+
+def _reaction_emoticon(emoticon: str | None) -> str:
+    return emoticon if emoticon is not None else "<custom>"
+
+
+def _reaction_div(message_id: int, emoticon: str | None) -> str:
+    body = f"reacted [{message_id}]: {escape(_reaction_emoticon(emoticon))}"
+    return f'<div class="msg reaction">{body}</div>'
 
 
 def _error_response(text: str, status_code: int) -> HTMLResponse:
@@ -193,36 +203,44 @@ async def sse_event_stream(client, dialog_id: int, sent_ids: OrderedDict | None 
     sent them already returned the bubble.
     """
     sent_ids = sent_ids if sent_ids is not None else OrderedDict()
-    # Merge listen_all() (incoming, groups too) and listen_outgoing() (our own
-    # messages from any device) by racing their __anext__ coroutines. The iterators
-    # are created here, before the first await, so an EventBus subscription is live
-    # by the time anything is published — no event slips through the gap.
+    # Merge incoming, outgoing and reaction streams by racing their __anext__
+    # coroutines. The iterators are created here, before the first await, so an
+    # EventBus subscription is live by the time anything is published.
     iterators = {
-        False: client.listen_all().__aiter__(),   # out=False
-        True: client.listen_outgoing().__aiter__(),  # out=True
+        "incoming": client.listen_all().__aiter__(),
+        "outgoing": client.listen_outgoing().__aiter__(),
+        "reaction": client.listen_reactions().__aiter__(),
     }
     # one pending __anext__ task per still-open stream
     pending = {
-        asyncio.create_task(it.__anext__()): out
-        for out, it in iterators.items()
+        asyncio.create_task(it.__anext__()): kind
+        for kind, it in iterators.items()
     }
     try:
         while pending:
             done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                out = pending.pop(task)
+                kind = pending.pop(task)
                 try:
                     ev = task.result()
                 except StopAsyncIteration:
                     continue  # that stream ended; the other may still run
                 except Exception:
-                    logger.exception("SSE %s stream for dialog %s failed",
-                                     "outgoing" if out else "incoming", dialog_id)
+                    logger.exception("SSE %s stream for dialog %s failed", kind, dialog_id)
                     return  # close the SSE stream; browser EventSource will reconnect
                 # queue the next pull from this stream right away
-                pending[asyncio.create_task(iterators[out].__anext__())] = out
+                pending[asyncio.create_task(iterators[kind].__anext__())] = kind
                 if ev.dialog_id != dialog_id:
                     continue
+                if kind == "reaction":
+                    payload = {
+                        "type": "reaction",
+                        "message_id": ev.message_id,
+                        "emoticon": ev.emoticon,
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    continue
+                out = kind == "outgoing"
                 if out and (ev.dialog_id, ev.message.id) in sent_ids:
                     continue  # our own optimistic bubble already shows it
                 payload = {"id": ev.message.id, "text": ev.message.text, "out": out}
@@ -509,6 +527,21 @@ def build_app(
         sent_ids = _sent_bucket(request.app.state.sent_ids_by_client, web_client_id)
         _remember_sent(sent_ids, int(dialog_id), msg.id)  # suppress only this client's SSE echo
         return HTMLResponse(_message_div(msg))
+
+    @app.post("/dialogs/{dialog_id}/reaction", response_class=HTMLResponse)
+    async def reaction(
+        request: Request,
+        dialog_id: int,
+        message_id: str = Form(""),
+        emoticon: str = Form(""),
+    ):
+        if not message_id.strip().isdigit():
+            return _error_response("Message id must be a positive integer.", 400)
+        emoticon = emoticon.strip()
+        if not emoticon:
+            return _error_response("Reaction cannot be empty.", 400)
+        await request.app.state.client.send_reaction(dialog_id, int(message_id), emoticon)
+        return HTMLResponse(_reaction_div(int(message_id), emoticon))
 
     @app.post("/dialogs/{dialog_id}/media", response_class=HTMLResponse)
     async def upload_media(

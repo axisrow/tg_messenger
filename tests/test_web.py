@@ -6,7 +6,7 @@ import pytest_asyncio
 from telethon.sessions import StringSession
 
 from tg_messenger.core.events import EventBus
-from tg_messenger.core.models import Dialog, IncomingEvent, Message
+from tg_messenger.core.models import Dialog, IncomingEvent, Message, ReactionEvent
 from tg_messenger.web.app import build_app
 
 
@@ -14,7 +14,9 @@ class WebStubClient:
     def __init__(self):
         self.bus = EventBus()
         self.bus_out = EventBus()  # own messages from another device (listen_outgoing)
+        self.bus_reactions = EventBus()
         self.sent = []
+        self.reactions = []
         self.searched = []
         self.read_acks = []
 
@@ -57,6 +59,9 @@ class WebStubClient:
         return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption or "<media>",
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
+    async def send_reaction(self, peer, message_id, emoticon):
+        self.reactions.append((peer, message_id, emoticon))
+
     async def search_messages(self, peer, query, limit=20):
         self.searched.append((peer, query))
         return [Message(id=5, dialog_id=peer, sender_id=peer, out=False, text="found-it",
@@ -68,6 +73,10 @@ class WebStubClient:
 
     async def listen_outgoing(self):
         async for ev in self.bus_out.subscribe():
+            yield ev
+
+    async def listen_reactions(self):
+        async for ev in self.bus_reactions.subscribe():
             yield ev
 
 
@@ -240,6 +249,13 @@ async def test_messages_fragment(client_app):
     assert "hi" in r.text
 
 
+async def test_messages_fragment_shows_visible_message_id(client_app):
+    ac, _ = client_app
+    r = await ac.get("/dialogs/7/messages")
+    assert r.status_code == 200
+    assert "[1]" in r.text
+
+
 async def test_send_returns_fragment(client_app):
     ac, stub = client_app
     r = await ac.post("/send", data={"dialog_id": "7", "text": "hello"})
@@ -346,6 +362,28 @@ async def test_send_without_dialog_returns_400(client_app):
     r = await ac.post("/send", data={"dialog_id": "", "text": "hi"})
     assert r.status_code == 400
     assert stub.sent == []
+
+
+async def test_reaction_endpoint_calls_client(client_app):
+    ac, stub = client_app
+    r = await ac.post("/dialogs/7/reaction", data={"message_id": "10", "emoticon": "👍"})
+    assert r.status_code == 200, r.text
+    assert stub.reactions == [(7, 10, "👍")]
+    assert "reacted" in r.text.lower()
+
+
+async def test_reaction_endpoint_rejects_bad_message_id(client_app):
+    ac, stub = client_app
+    r = await ac.post("/dialogs/7/reaction", data={"message_id": "bad", "emoticon": "👍"})
+    assert r.status_code == 400
+    assert stub.reactions == []
+
+
+async def test_reaction_endpoint_rejects_empty_emoticon(client_app):
+    ac, stub = client_app
+    r = await ac.post("/dialogs/7/reaction", data={"message_id": "10", "emoticon": "   "})
+    assert r.status_code == 400
+    assert stub.reactions == []
 
 
 async def test_media_upload_calls_send_media(client_app):
@@ -620,6 +658,27 @@ async def test_stream_yields_outgoing_frame_for_own_message_from_another_device(
     await gen.aclose()
 
 
+async def test_stream_yields_reaction_frame():
+    import asyncio
+    import json
+
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+    gen = sse_event_stream(stub, dialog_id=7)
+    task = asyncio.create_task(gen.__anext__())
+    while stub.bus_reactions.subscriber_count == 0:
+        await asyncio.sleep(0)
+
+    stub.bus_reactions.publish(ReactionEvent(dialog_id=9, message_id=50, emoticon="❤️"))
+    stub.bus_reactions.publish(ReactionEvent(dialog_id=7, message_id=51, emoticon=None))
+
+    frame = await asyncio.wait_for(task, timeout=2)
+    payload = json.loads(frame.removeprefix("data: ").strip())
+    assert payload == {"type": "reaction", "message_id": 51, "emoticon": None}
+    await gen.aclose()
+
+
 async def test_stream_skips_outgoing_echo_of_messages_we_sent():
     # сообщение, отправленное ЭТИМ сервером (id в sent_ids), не дублируется в SSE
     import asyncio
@@ -819,6 +878,14 @@ async def test_index_has_suggest_button(suggest_app):
     assert "suggest" in r.text.lower()
     assert "suggest-error" in r.text
     assert "X-TG-Messenger-CSRF" in r.text
+
+
+async def test_index_has_reaction_controls(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert 'id="reaction-form"' in r.text
+    assert 'name="message_id"' in r.text
+    assert 'name="emoticon"' in r.text
 
 
 # --- циклы 131-132: web-мастер логина Telegram (/tg-login) ---

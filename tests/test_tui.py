@@ -4,13 +4,14 @@ from datetime import datetime, timezone
 import pytest
 from textual.widgets import Input, ListView, Static, Tabs
 
-from tg_messenger.core.models import Dialog, IncomingEvent, Message, OutgoingEvent
+from tg_messenger.core.models import Dialog, IncomingEvent, Message, OutgoingEvent, ReactionEvent
 from tg_messenger.tui.app import (
     DialogItem,
     MessageBubble,
     MessengerTUI,
     ProfileItem,
     parse_media_command,
+    parse_reaction_command,
 )
 
 
@@ -35,6 +36,21 @@ def test_parse_media_empty_after_at_is_none():
     assert parse_media_command("@   ") is None
 
 
+def test_parse_reaction_command():
+    assert parse_reaction_command("/react 10 👍") == (10, "👍")
+
+
+def test_parse_reaction_command_non_command_is_none():
+    assert parse_reaction_command("hello") is None
+
+
+def test_parse_reaction_command_rejects_bad_shape():
+    with pytest.raises(ValueError):
+        parse_reaction_command("/react bad 👍")
+    with pytest.raises(ValueError):
+        parse_reaction_command("/react 10")
+
+
 class TuiStubClient:
     def __init__(self):
         self.sent = []
@@ -43,6 +59,7 @@ class TuiStubClient:
         self.authorized = True
         self.dialogs_calls = 0
         self.save_session_calls = 0
+        self.reactions = []
 
     async def connect(self):
         self.connected = True
@@ -87,6 +104,9 @@ class TuiStubClient:
         return Message(id=4, dialog_id=peer, sender_id=1, out=True, text=caption or "<media>",
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
+    async def send_reaction(self, peer, message_id, emoticon):
+        self.reactions.append((peer, message_id, emoticon))
+
     async def mark_read(self, peer, max_id=None):
         self.read_acks.append((peer, max_id))
 
@@ -97,6 +117,10 @@ class TuiStubClient:
 
     async def listen_outgoing(self):
         # idle forever; the outgoing worker just waits for events
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+    async def listen_reactions(self):
         await asyncio.Event().wait()
         yield  # pragma: no cover
 
@@ -199,6 +223,16 @@ async def test_tui_selecting_dialog_marks_read():
         await pilot.pause()
         await pilot.pause()
     assert stub.read_acks == [(7, 1)]
+
+
+async def test_tui_history_shows_visible_message_id():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app._show_history(7)
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+        assert any(str(b.render()).startswith("[1] ") for b in bubbles)
 
 
 async def test_tui_survives_markup_hostile_text():
@@ -391,6 +425,35 @@ async def test_tui_send_failure_notifies_instead_of_crashing(caplog):
             assert composer.value == "hi"  # draft is given back, not lost
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert errors and errors[0].exc_info is not None
+
+
+async def test_tui_react_command_calls_client():
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "/react 1 👍"))
+        await pilot.pause()
+    assert stub.reactions == [(7, 1, "👍")]
+    assert stub.sent == []
+
+
+async def test_tui_bad_react_command_notifies_and_does_not_send_text():
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    notifications = []
+    app.notify = lambda message, **kw: notifications.append((message, kw))  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "/react bad 👍"))
+        await pilot.pause()
+    assert stub.reactions == []
+    assert stub.sent == []
+    assert notifications
 
 
 async def test_tui_listener_failure_logged_app_stays_alive(caplog):
@@ -684,7 +747,7 @@ async def test_tui_group_incoming_appends_bubble_for_open_group_only():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
         # ЛС-событие не дорисовано (чужой диалог), групповое — да
-        assert [str(b.render()) for b in bubbles] == ["из группы"]
+        assert [str(b.render()) for b in bubbles] == ["[21] из группы"]
 
 
 class OutgoingEventClient(TuiStubClient):
@@ -714,7 +777,7 @@ async def test_tui_outgoing_from_another_device_appends_out_bubble_for_open_dial
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
         # своё сообщение в открытый диалог дорисовано (out=True), в чужой — нет
-        assert [str(b.render()) for b in bubbles] == ["с телефона"]
+        assert [str(b.render()) for b in bubbles] == ["[30] с телефона"]
         assert all("out" in b.classes for b in bubbles)
 
 
@@ -745,7 +808,7 @@ async def test_tui_own_send_is_not_duplicated_by_outgoing_echo():
         await pilot.pause()
         bubbles = [str(b.render()) for b in app.query(MessageBubble)]
         # ровно один пузырёк, эхо не продублировало
-        assert bubbles == ["привет"]
+        assert bubbles == ["[2] привет"]
 
 
 class OutgoingSameIdOtherDialogClient(TuiStubClient):
@@ -771,7 +834,31 @@ async def test_tui_outgoing_does_not_skip_same_message_id_from_other_dialog():
         stub.fire.set()  # dialog 7 also has id=2; it must still render
         await pilot.pause()
         bubbles = [str(b.render()) for b in app.query(MessageBubble)]
-        assert bubbles == ["same id"]
+        assert bubbles == ["[2] same id"]
+
+
+class ReactionEventClient(TuiStubClient):
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def listen_reactions(self):
+        await self.fire.wait()
+        yield ReactionEvent(dialog_id=9, message_id=10, emoticon="❤️")
+        yield ReactionEvent(dialog_id=7, message_id=11, emoticon=None)
+        await asyncio.Event().wait()
+
+
+async def test_tui_reaction_event_appends_bubble_for_open_dialog_only():
+    stub = ReactionEventClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        stub.fire.set()
+        await pilot.pause()
+        bubbles = [str(b.render()) for b in app.query(MessageBubble)]
+        assert bubbles == ["reaction [11]: <custom>"]
 
 
 async def test_tui_group_incoming_does_not_trigger_suggester():

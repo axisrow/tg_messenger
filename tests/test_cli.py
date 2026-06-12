@@ -16,6 +16,7 @@ from tg_messenger.core.models import (
     Message,
     MessagesDeletedEvent,
     OutgoingEvent,
+    ReactionEvent,
     User,
 )
 
@@ -27,6 +28,7 @@ class StubClient:
         self.edited = []
         self.deleted_calls = []
         self.read_acks = []
+        self.reactions = []
         self.downloaded = []
         self.searched = []
         self.history_items = None
@@ -124,6 +126,9 @@ class StubClient:
         return Message(id=3, dialog_id=peer, sender_id=1, out=True, text=caption,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
+    async def send_reaction(self, peer, message_id, emoticon):
+        self.reactions.append((peer, message_id, emoticon))
+
     async def get_me(self):
         return User(id=1, first_name="Me")
 
@@ -153,6 +158,10 @@ class StubClient:
                             text="удалят меня", date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
         )
         await asyncio.Event().wait()
+
+    async def listen_reactions(self):
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
 
     admin = True  # default: we can moderate every chat
 
@@ -324,6 +333,14 @@ def test_send_file_conflicting_flags_error(runner, tmp_path):
     assert stub.sent == []
 
 
+def test_react_command_calls_client(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["react", "7", "10", "👍"])
+    assert result.exit_code == 0, result.output
+    assert stub.reactions == [(7, 10, "👍")]
+    assert "reacted." in result.output
+
+
 # --- цикл 80: reply/forward/edit/delete/read команды ---
 
 
@@ -484,6 +501,15 @@ def test_chat_sends_and_disconnects_on_eof(runner):
     assert stub.connected is False
 
 
+def test_chat_react_command_does_not_send_text(runner):
+    r, stub = runner
+    stub.listen_interrupt = False
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="/react 10 👍\n")
+    assert result.exit_code == 0, result.output
+    assert stub.reactions == [(7, 10, "👍")]
+    assert stub.sent == []
+
+
 def test_chat_prints_own_message_sent_from_another_device(runner, monkeypatch):
     """chat shows our OWN message (out) sent elsewhere for the open dialog only."""
     r, stub = runner
@@ -503,6 +529,24 @@ def test_chat_prints_own_message_sent_from_another_device(runner, monkeypatch):
     assert result.exit_code == 0
     assert "→ с телефона" in result.output
     assert "в другой чат" not in result.output  # другой диалог
+
+
+def test_chat_prints_reactions_for_open_dialog(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    async def reactions():
+        yield ReactionEvent(dialog_id=7, message_id=10, emoticon="👍")
+        yield ReactionEvent(dialog_id=9, message_id=11, emoticon="❤️")
+        yield ReactionEvent(dialog_id=7, message_id=12, emoticon=None)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(stub, "listen_reactions", reactions)
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="")
+    assert result.exit_code == 0, result.output
+    assert "* reaction [10]: 👍" in result.output
+    assert "* reaction [12]: <custom>" in result.output
+    assert "❤️" not in result.output
 
 
 def test_chat_does_not_echo_back_our_own_input(runner, monkeypatch):
