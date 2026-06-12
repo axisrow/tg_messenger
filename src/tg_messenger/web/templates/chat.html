@@ -19,8 +19,12 @@
     .msg { max-width: 60%; margin: 4px 0; padding: 8px 12px; border-radius: 12px; }
     .msg.in { background: #eee; }
     .msg.out { background: #cfe9ff; margin-left: auto; }
+    .msg.reaction { background: #fff7d6; color: #6b5700; font-size: 13px; }
     #composer { display: flex; border-top: 1px solid #ccc; padding: 8px; }
     #composer input { flex: 1; padding: 8px; }
+    #reaction-form { display: flex; gap: 6px; border-top: 1px solid #eee; padding: 8px; }
+    #reaction-form input[name="message_id"] { width: 90px; }
+    #reaction-form input[name="emoticon"] { width: 70px; }
     #suggest-error { color: #b00020; padding: 0 8px; align-self: center; font-size: 12px; }
   </style>
 </head>
@@ -54,6 +58,11 @@
       </label>
       <span id="suggest-error" role="status"></span>
     </form>
+    <form id="reaction-form">
+      <input type="text" name="message_id" placeholder="Message id" inputmode="numeric" autocomplete="off">
+      <input type="text" name="emoticon" placeholder="👍" autocomplete="off">
+      <button type="submit">React</button>
+    </form>
   </main>
   <script>
     const webClientId = (() => {
@@ -62,7 +71,9 @@
         id = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
         sessionStorage.setItem('tgMessengerClientId', id);
       }
-      document.getElementById('web_client_id').value = id;
+      const clientInput = document.getElementById('web_client_id');
+      clientInput.value = id;
+      clientInput.defaultValue = id;
       return id;
     })();
     // Highlight the active dialog-list tab and remember it for the search box.
@@ -86,9 +97,15 @@
       es.onmessage = (ev) => {
         const data = JSON.parse(ev.data);
         const div = document.createElement('div');
+        if (data.type === 'reaction') {
+          div.className = 'msg reaction';
+          div.textContent = 'reaction [' + data.message_id + ']: ' + (data.emoticon || '<custom>');
+          document.getElementById('messages').appendChild(div);
+          return;
+        }
         // our own messages (sent from another device) render on the right
         div.className = data.out ? 'msg out' : 'msg in';
-        div.textContent = data.text || '<media>';
+        div.textContent = '[' + data.id + '] ' + (data.text || '<media>');
         document.getElementById('messages').appendChild(div);
       };
     });
@@ -110,6 +127,25 @@
         alert(html.replace(/<[^>]+>/g, '').trim() || 'Upload failed');
       }
       e.target.value = '';
+    });
+    // React by message id. Message ids are rendered in each bubble as [id].
+    document.getElementById('reaction-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const id = document.getElementById('dialog_id').value;
+      if (!id) return;
+      const fd = new FormData(e.target);
+      fd.append('web_client_id', webClientId);
+      const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/reaction', {
+        method: 'POST',
+        body: fd
+      });
+      const html = await resp.text();
+      if (resp.ok) {
+        document.getElementById('messages').insertAdjacentHTML('beforeend', html);
+        e.target.reset();
+      } else {
+        alert(html.replace(/<[^>]+>/g, '').trim() || 'Reaction failed');
+      }
     });
     // Suggest: fetch a draft for the open dialog and drop it into the composer.
     document.getElementById('suggest-btn').addEventListener('click', async () => {

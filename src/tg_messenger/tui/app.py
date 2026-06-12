@@ -55,6 +55,21 @@ def parse_media_command(text: str) -> tuple[str, str | None] | None:
     return path, caption
 
 
+def parse_reaction_command(text: str) -> tuple[int, str] | None:
+    """Parse ``/react MESSAGE_ID EMOTICON`` from the composer."""
+    parts = text.split(maxsplit=2)
+    if not parts or parts[0] != "/react":
+        return None
+    if len(parts) != 3:
+        raise ValueError("usage: /react MESSAGE_ID EMOTICON")
+    if not parts[1].isdigit():
+        raise ValueError("message id must be a positive integer")
+    emoticon = parts[2].strip()
+    if not emoticon:
+        raise ValueError("reaction cannot be empty")
+    return int(parts[1]), emoticon
+
+
 def _strip_first_token(s: str) -> str:
     """Return ``s`` with its first shlex token (quoted or not) removed."""
     lexer = shlex.shlex(s, posix=True)
@@ -71,6 +86,18 @@ def _make_real_client(session_name: str):
     from tg_messenger.core.client import client_from_env
 
     return client_from_env(session_name=session_name)
+
+
+def _message_label(message) -> str:
+    return f"[{message.id}] {message.text or '<media>'}"
+
+
+def _reaction_emoticon(emoticon: str | None) -> str:
+    return emoticon if emoticon is not None else "<custom>"
+
+
+def _reaction_label(event) -> str:
+    return f"reaction [{event.message_id}]: {_reaction_emoticon(event.emoticon)}"
 
 
 class ProfileItem(ListItem):
@@ -284,6 +311,9 @@ class MessengerTUI(App):
         # listen_outgoing(); skip them so our optimistic bubble isn't duplicated.
         # Bounded (OrderedDict-as-set, watch.py pattern): a long session can't grow it.
         self._sent_ids: OrderedDict[tuple[int, int], bool] = OrderedDict()
+        # (dialog_id, message_id, emoticon) keys we reacted with from this composer.
+        # Telegram echoes the update via listen_reactions(); skip the local echo only.
+        self._sent_reactions: OrderedDict[tuple[int, int, str | None], bool] = OrderedDict()
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -348,6 +378,7 @@ class MessengerTUI(App):
         self._started = True
         self.run_worker(self._drain_incoming(), exclusive=False)
         self.run_worker(self._drain_outgoing(), exclusive=False)
+        self.run_worker(self._drain_reactions(), exclusive=False)
 
     async def on_unmount(self) -> None:
         if self._client is not None:
@@ -428,7 +459,7 @@ class MessengerTUI(App):
             self.notify(f"History failed: {exc}", severity="error")
             return
         pane.loading = False
-        await pane.mount(*(MessageBubble(m.text or "<media>", m.out) for m in messages))
+        await pane.mount(*(MessageBubble(_message_label(m), m.out) for m in messages))
         if messages:
             # Acknowledge exactly the loaded snapshot; messages arriving later stay unread.
             self.run_worker(
@@ -456,6 +487,19 @@ class MessengerTUI(App):
         if self._current is None or not event.value.strip():
             return
         text = event.value
+        try:
+            reaction = parse_reaction_command(text)
+        except ValueError as exc:
+            logger.warning("bad reaction command in dialog %s: %s", self._current, exc)
+            self.notify(str(exc), severity="error")
+            return
+        if reaction is not None:
+            message_id, emoticon = reaction
+            event.input.value = ""
+            self.run_worker(
+                self._send_reaction(self._current, message_id, emoticon), exclusive=False
+            )
+            return
         parsed = parse_media_command(text)
         if parsed is not None:
             path, caption = parsed
@@ -480,6 +524,14 @@ class MessengerTUI(App):
         while len(self._sent_ids) > 200:  # bounded, like watch.py's caches
             self._sent_ids.popitem(last=False)
 
+    def _remember_sent_reaction(self, dialog_id: int, message_id: int, emoticon: str | None) -> None:
+        """Record a reaction we sent so its listen_reactions() echo isn't drawn twice."""
+        key = (dialog_id, message_id, emoticon)
+        self._sent_reactions[key] = True
+        self._sent_reactions.move_to_end(key)
+        while len(self._sent_reactions) > 200:  # bounded, like watch.py's caches
+            self._sent_reactions.popitem(last=False)
+
     async def _send_text(self, peer: int, text: str) -> None:
         try:
             msg = await self._client.send_text(peer, text)
@@ -493,7 +545,7 @@ class MessengerTUI(App):
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            await pane.mount(MessageBubble(text, out=True))
+            await pane.mount(MessageBubble(_message_label(msg), out=True))
 
     async def _send_media(self, peer: int, path: str, caption: str | None) -> None:
         try:
@@ -505,15 +557,26 @@ class MessengerTUI(App):
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            label = caption or f"📎 {os.path.basename(path)}"
-            await pane.mount(MessageBubble(label, out=True))
+            await pane.mount(MessageBubble(_message_label(msg), out=True))
+
+    async def _send_reaction(self, peer: int, message_id: int, emoticon: str) -> None:
+        try:
+            await self._client.send_reaction(peer, message_id, emoticon)
+        except Exception as exc:
+            logger.exception("send reaction failed (dialog %s, message %s)", peer, message_id)
+            self.notify(f"Reaction failed: {exc}", severity="error")
+            return
+        self._remember_sent_reaction(peer, message_id, emoticon)
+        if peer == self._current:
+            pane = self.query_one("#messages", Vertical)
+            await pane.mount(MessageBubble(f"reaction [{message_id}]: {emoticon}", out=True))
 
     async def _drain_incoming(self) -> None:
         try:
             async for ev in self._client.listen_all():  # groups too, not just DMs
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    await pane.mount(MessageBubble(ev.message.text or "<media>", out=False))
+                    await pane.mount(MessageBubble(_message_label(ev.message), out=False))
                     self._maybe_suggest(ev.dialog_id)
         except Exception:
             logger.exception("incoming listener failed")
@@ -532,10 +595,24 @@ class MessengerTUI(App):
                     continue  # our own optimistic bubble already shows it
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    await pane.mount(MessageBubble(ev.message.text or "<media>", out=True))
+                    await pane.mount(MessageBubble(_message_label(ev.message), out=True))
         except Exception:
             logger.exception("outgoing listener failed")
             self.notify("Outgoing listener failed — see log.", severity="error")
+
+    async def _drain_reactions(self) -> None:
+        try:
+            async for ev in self._client.listen_reactions():
+                key = (ev.dialog_id, ev.message_id, ev.emoticon)
+                if key in self._sent_reactions:
+                    self._sent_reactions.pop(key, None)
+                    continue  # our own optimistic bubble already shows it
+                if ev.dialog_id == self._current:
+                    pane = self.query_one("#messages", Vertical)
+                    await pane.mount(MessageBubble(_reaction_label(ev), out=False))
+        except Exception:
+            logger.exception("reaction listener failed")
+            self.notify("Reaction listener failed — see log.", severity="error")
 
     def _maybe_suggest(self, dialog_id: int) -> None:
         """Kick off a reply suggestion for an incoming message in the open dialog.
