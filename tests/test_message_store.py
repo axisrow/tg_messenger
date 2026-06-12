@@ -108,6 +108,21 @@ async def test_message_store_window_excludes_live_ingest_above_unsynced_gap(tmp_
         await store.close()
 
 
+async def test_message_store_prunes_cached_window_when_no_newer_messages(tmp_path):
+    t = {"now": 0.0}
+    client = StoreClient()
+    store = MessageStore(client=client, storage=await _storage(tmp_path), clock=lambda: t["now"])
+    try:
+        assert [m.id for m in await store.history(7, limit=3)] == [1, 2, 3]
+        t["now"] = 16.0
+        client.messages = [_msg(3), _msg(1)]
+        assert [m.id for m in await store.history(7, limit=3)] == [1, 3]
+    finally:
+        await store.close()
+
+    assert client.calls == [(7, 0, 3), (7, 3, 3), (7, 0, 3)]
+
+
 async def test_message_store_deletion_without_chat_id_skips_channels(tmp_path):
     storage = await _storage(tmp_path)
     store = MessageStore(client=StoreClient(), storage=storage, sync_ttl=0)

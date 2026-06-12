@@ -188,29 +188,45 @@ class MessageStore:
         high_id = int(row[1]) if row is not None else 0
         fetched = await self._client.history_since(peer, min_id=high_id, limit=limit)
         if fetched:
-            for message in fetched:
-                await self._upsert_message(message)
-            ids = [int(m.id) for m in fetched]
             if row is None or len(fetched) >= limit:
-                low, high = (0 if len(fetched) < limit else min(ids)), max(ids)
+                await self._replace_window(peer, fetched, limit)
             else:
+                for message in fetched:
+                    await self._upsert_message(message)
+                ids = [int(m.id) for m in fetched]
                 low, high = int(row[0]), max(high_id, max(ids))
-            await self._set_sync_row(peer, low, high)
+                await self._set_sync_row(peer, low, high)
         elif row is None:
-            await self._set_sync_row(peer, 0, 0)
+            await self._replace_window(peer, fetched, limit)
+        else:
+            await self._sync_full_window(peer, limit)
+            return
         self._last_sync[peer] = self._clock()
 
     async def _sync_full_window(self, peer: int, limit: int) -> None:
         fetched = await self._client.history_since(peer, min_id=0, limit=limit)
+        await self._replace_window(peer, fetched, limit)
+        self._last_sync[peer] = self._clock()
+
+    async def _replace_window(self, peer: int, fetched: list[Message], limit: int) -> tuple[int, int]:
         if not fetched:
+            await self._storage.execute("DELETE FROM messages WHERE dialog_id = ?", (int(peer),))
             await self._set_sync_row(peer, 0, 0)
-            self._last_sync[peer] = self._clock()
-            return
+            return 0, 0
         for message in fetched:
             await self._upsert_message(message)
         ids = [int(m.id) for m in fetched]
-        await self._set_sync_row(peer, 0 if len(fetched) < limit else min(ids), max(ids))
-        self._last_sync[peer] = self._clock()
+        low, high = (0 if len(fetched) < limit else min(ids)), max(ids)
+        await self._prune_window(peer, low, high, ids)
+        await self._set_sync_row(peer, low, high)
+        return low, high
+
+    async def _prune_window(self, peer: int, low_id: int, high_id: int, ids: list[int]) -> None:
+        placeholders = ",".join("?" for _ in ids)
+        await self._storage.execute(
+            f"DELETE FROM messages WHERE dialog_id = ? AND id >= ? AND id <= ? AND id NOT IN ({placeholders})",
+            (int(peer), int(low_id), int(high_id), *ids),
+        )
 
     async def _window_count(self, peer: int, low_id: int, high_id: int) -> int:
         row = await self._storage.fetchone(
