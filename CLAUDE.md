@@ -31,6 +31,7 @@ tg-messenger -v <cmd>        # DEBUG logging; file log: ~/.tg_messenger/logs/tg_
 tg-messenger serve           # web (FastAPI/uvicorn), default port 8090 (env TG_WEB_PORT; --port overrides)
 tg-messenger tui             # Textual TUI
 tg-messenger agent           # AI auto-reply: needs the [agent] extra + TG_AGENT_* env (see .env.example)
+scripts/e2e/run_safe.sh      # manual real-CLI Telegram smoke checks; NEVER pytest/CI
 ```
 
 CI (`.github/workflows/ci.yml`): every PR and push to main runs `ruff check .` + `pytest -q` on python 3.11/3.12, plus a second job with the `[agent]` extra so the agent tests run un-skipped.
@@ -45,6 +46,7 @@ pytest is configured for `asyncio_mode = auto` (no `@pytest.mark.asyncio` needed
 - Every network call goes through `run_with_flood_wait_retry`; never `get_entity('@username')` in loops (~50 resolves in a row → flood).
 - UIs render Pydantic models from core — never raw Telethon objects.
 - Tests: fakes from conftest only — no network, no real LLM, no real `sleep` (inject `clock`/`rng`); `filterwarnings=error`.
+- Manual real-API smoke checks live in `scripts/e2e/` as human-run shell scripts over the installed CLI; never wire them into `pytest` or CI. Safe mutations are confined to Saved Messages / Избранное and clean up their own artifacts. Dangerous/account-visible checks are documented only as parity stubs in `scripts/e2e/03_dangerous_parity.sh`.
 - **Every PR must contain a closing keyword (`Closes #N`)** for its issue; one issue = one closing PR.
 - Secrets, session strings, phone numbers and login codes never reach logs or the repository.
 
