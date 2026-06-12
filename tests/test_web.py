@@ -97,6 +97,35 @@ class WebTranslatorStub:
         return message
 
 
+class WebSourceStorage:
+    async def get_value(self, key):
+        if key == "user_lang":
+            return "ru"
+        return None
+
+
+class WebSourceStore:
+    def __init__(self):
+        self.storage = WebSourceStorage()
+        self.recorded = []
+
+    async def connect(self):
+        pass
+
+    async def close(self):
+        pass
+
+    async def run(self):
+        await asyncio.Event().wait()
+
+    async def history(self, peer, limit=50):
+        return [Message(id=1, dialog_id=peer, sender_id=peer, out=False, text="hi",
+                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))]
+
+    async def record_outgoing(self, dialog_id, message, *, source_text, source_lang):
+        self.recorded.append((dialog_id, message.text, source_text, source_lang))
+
+
 def test_real_web_client_gets_session_encryption_key(monkeypatch, tmp_path):
     from tg_messenger.web import app as web_app
 
@@ -930,6 +959,40 @@ async def test_suggest_endpoint_returns_draft(suggest_app):
     assert r.status_code == 200
     assert "suggested reply" in r.text
     assert suggester.calls == [7]
+
+
+async def test_outbound_endpoint_returns_variants():
+    class StubOutbound:
+        async def applies(self, dialog_id, text):
+            return "en"
+
+        async def variants(self, dialog_id, text, target_lang):
+            return ["hi", "hello"]
+
+    stub = WebStubClient()
+    app = build_app(client=stub, outbound=StubOutbound())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/dialogs/7/outbound", data={"text": "привет"}, headers=SUGGEST_HEADERS)
+    assert r.status_code == 200
+    assert r.json() == {"applies": True, "target_lang": "en", "variants": ["hi", "hello"]}
+
+
+async def test_send_with_source_text_records_and_renders_original():
+    stub = WebStubClient()
+    store = WebSourceStore()
+    app = build_app(client=stub, store=store)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/send",
+                data={"dialog_id": "7", "text": "hello", "source_text": "привет"},
+            )
+    assert r.status_code == 200
+    assert store.recorded == [(7, "hello", "привет", "ru")]
+    assert "↳ привет" in r.text
 
 
 async def test_suggest_endpoint_does_not_escape_draft(suggest_app):

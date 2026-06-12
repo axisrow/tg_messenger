@@ -18,8 +18,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from tg_messenger.agent.config import AgentConfig, IntentSpec
 from tg_messenger.agent.orchestrator import Orchestrator
+from tg_messenger.agent.outbound import OutboundTranslator
 from tg_messenger.agent.search import build_search_fn
-from tg_messenger.agent.suggest import StyleProfile, Suggester
+from tg_messenger.agent.suggest import ContextMessage, StyleProfile, Suggester
 from tg_messenger.agent.tools import make_telegram_tools
 from tg_messenger.agent.translate import Translator
 
@@ -68,6 +69,17 @@ TRANSLATE_SYSTEM_PROMPT = (
     "Translate Telegram messages into the target language. Return ONLY JSON: "
     "[{\"id\": number, \"translation\": string|null}]. Use null when a message is "
     "already in the target language or should not be translated."
+)
+
+OUTBOUND_VARIANTS_SYSTEM_PROMPT = (
+    "Translate the user's draft into the target language. Produce up to 3 alternative "
+    "translations in the user's own voice, using their style profile and recent context. "
+    "Output ONLY a JSON array of strings."
+)
+
+DETECT_LANG_SYSTEM_PROMPT = (
+    "Detect the dominant language of these Telegram messages. Answer with ONLY the ISO 639-1 "
+    "or ISO 639-2 lowercase language code, no punctuation."
 )
 
 
@@ -192,6 +204,83 @@ def make_translate_fn(model) -> Callable:
         return result
 
     return translate
+
+
+def _style_lines(profile: StyleProfile | None) -> list[str]:
+    if profile is None:
+        return ["No stored style profile."]
+    lines = [
+        f"average reply length: {profile.avg_length:.0f} chars",
+        f"emoji per reply: {profile.emoji_freq:.2f}",
+    ]
+    if profile.greetings:
+        lines.append("greetings: " + ", ".join(profile.greetings))
+    if profile.signatures:
+        lines.append("sign-offs: " + ", ".join(profile.signatures))
+    if profile.examples:
+        lines.append("example replies:")
+        lines.extend(f"- {ex}" for ex in profile.examples)
+    return lines
+
+
+def make_outbound_variants_fn(model) -> Callable:
+    async def variants(
+        draft: str,
+        target_lang: str,
+        profile: StyleProfile | None,
+        context: Sequence[ContextMessage],
+    ) -> list[str]:
+        payload = {
+            "target_lang": target_lang,
+            "draft": draft,
+            "style_profile": _style_lines(profile),
+            "context": [{"out": msg.out, "text": msg.text} for msg in context],
+        }
+        response = await model.ainvoke(
+            [
+                SystemMessage(content=OUTBOUND_VARIANTS_SYSTEM_PROMPT),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+            ]
+        )
+        raw = _strip_json_fence(str(response.content))
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.warning("outbound variants returned non-json content: %r", response.content)
+            raise ValueError("outbound variants returned non-json content") from exc
+        if not isinstance(parsed, list):
+            logger.warning("outbound variants returned non-list content: %r", response.content)
+            raise ValueError("outbound variants returned non-list content")
+        return [item for item in parsed if isinstance(item, str)]
+
+    return variants
+
+
+def make_detect_lang_fn(model) -> Callable:
+    async def detect(texts: Sequence[str]) -> str | None:
+        response = await model.ainvoke(
+            [
+                SystemMessage(content=DETECT_LANG_SYSTEM_PROMPT),
+                HumanMessage(content="\n".join(texts[:10])),
+            ]
+        )
+        code = str(response.content).strip().lower().strip(".!\"'")
+        if re.fullmatch(r"[a-z]{2,3}", code):
+            return code
+        logger.warning("language detector returned invalid code %r", response.content)
+        return None
+
+    return detect
+
+
+def build_outbound(store, storage, model_name: str) -> OutboundTranslator:
+    model = init_chat_model(model_name)
+    return OutboundTranslator(
+        store=store,
+        storage=storage,
+        variants_fn=make_outbound_variants_fn(model),
+        detect_lang_fn=make_detect_lang_fn(model),
+    )
 
 
 def build_translator(storage, model_name: str) -> Translator:

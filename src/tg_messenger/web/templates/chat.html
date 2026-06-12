@@ -27,6 +27,8 @@
     #reaction-form input[name="message_id"] { width: 90px; }
     #reaction-form input[name="emoticon"] { width: 70px; }
     #suggest-error { color: #b00020; padding: 0 8px; align-self: center; font-size: 12px; }
+    #variant-panel { border-top: 1px solid #ddd; padding: 8px; display: none; }
+    .variant-card { display: block; width: 100%; text-align: left; margin: 4px 0; padding: 8px; }
   </style>
 </head>
 <body>
@@ -49,10 +51,12 @@
   <main id="chat">
     <div id="messages"></div>
     <div id="lang-settings" hx-get="/settings/lang" hx-trigger="load" hx-swap="innerHTML"></div>
+    <div id="variant-panel" role="status"></div>
     <form id="composer" hx-post="/send" hx-target="#messages" hx-swap="beforeend"
           hx-on::after-request="this.reset()">
       <input type="hidden" name="dialog_id" id="dialog_id" value="">
       <input type="hidden" name="web_client_id" id="web_client_id" value="">
+      <input type="hidden" name="source_text" id="source_text" value="">
       <input type="text" name="text" id="composer-text" placeholder="Message…" autocomplete="off" required>
       <button type="button" id="suggest-btn" title="Suggest a reply">💡 Suggest</button>
       <label id="attach-btn" title="Attach a file">📎
@@ -184,6 +188,84 @@
         error.textContent = 'Suggest failed.';
       } finally {
         btn.disabled = false;
+      }
+    });
+    const composer = document.getElementById('composer');
+    const composerText = document.getElementById('composer-text');
+    const sourceText = document.getElementById('source_text');
+    const variantPanel = document.getElementById('variant-panel');
+    function hideVariants() {
+      variantPanel.style.display = 'none';
+      variantPanel.textContent = '';
+    }
+    composerText.addEventListener('input', () => {
+      if (!composerText.value) {
+        sourceText.value = '';
+        composer.dataset.outboundReady = '';
+        hideVariants();
+      }
+    });
+    composer.addEventListener('htmx:confirm', async (evt) => {
+      if (composer.dataset.outboundReady === '1') {
+        composer.dataset.outboundReady = '';
+        hideVariants();
+        return;
+      }
+      const id = document.getElementById('dialog_id').value;
+      const draft = composerText.value;
+      if (!id || !draft.trim()) return;
+      evt.preventDefault();
+      const fd = new FormData();
+      fd.append('text', draft);
+      const sendBtn = composer.querySelector('button[type="submit"]');
+      if (sendBtn) sendBtn.disabled = true;
+      try {
+        const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/outbound', {
+          method: 'POST',
+          headers: { 'X-TG-Messenger-CSRF': '1' },
+          body: fd
+        });
+        const data = await resp.json();
+        if (!data.applies) {
+          if (data.error) {
+            document.getElementById('suggest-error').textContent = data.error;
+          }
+          evt.detail.issueRequest(true);
+          return;
+        }
+        variantPanel.textContent = '';
+        variantPanel.style.display = 'block';
+        const title = document.createElement('div');
+        title.textContent = 'Translate to ' + data.target_lang;
+        variantPanel.appendChild(title);
+        data.variants.forEach((variant) => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'variant-card';
+          btn.textContent = variant;
+          btn.addEventListener('click', () => {
+            composerText.value = variant;
+            sourceText.value = draft;
+            composer.dataset.outboundReady = '1';
+            hideVariants();
+            composerText.focus();
+          });
+          variantPanel.appendChild(btn);
+        });
+        const original = document.createElement('button');
+        original.type = 'button';
+        original.className = 'variant-card';
+        original.textContent = 'Send original';
+        original.addEventListener('click', () => {
+          composer.dataset.outboundReady = '1';
+          hideVariants();
+          evt.detail.issueRequest(true);
+        });
+        variantPanel.appendChild(original);
+      } catch (err) {
+        evt.detail.issueRequest(true);
+      } finally {
+        if (sendBtn) sendBtn.disabled = false;
       }
     });
   </script>

@@ -240,6 +240,30 @@ def make_optional_translator(storage):
         return None
 
 
+def make_optional_outbound(store, storage):
+    """Best-effort outbound translator, sharing the message-store Storage."""
+    if os.environ.get("TG_OUTBOUND", "on").strip().lower() in {"0", "false", "off", "no"}:
+        logger.info("outbound translator disabled: TG_OUTBOUND=off")
+        return None
+    try:
+        from tg_messenger.agent.factory import build_outbound
+        from tg_messenger.agent.suggest import register_suggest_migrations
+        from tg_messenger.agent.translate import translate_model_from_env
+    except ImportError as exc:
+        logger.warning("outbound translator disabled: %s", exc)
+        return None
+    model_name = translate_model_from_env()
+    if not model_name:
+        logger.warning("outbound translator disabled: TG_TRANSLATE_MODEL/TG_AGENT_MODEL is unset")
+        return None
+    try:
+        register_suggest_migrations(storage)
+        return build_outbound(store, storage, model_name)
+    except Exception as exc:
+        logger.warning("outbound translator disabled: %s", exc)
+        return None
+
+
 def _print_message_with_translation(message) -> None:
     click.echo(message_line(message))
     if getattr(message, "translated_text", None):
@@ -724,6 +748,59 @@ def lang(ctx: click.Context, code: str | None, clear: bool, session: str) -> Non
     _run(_with_storage(session, lambda storage: None, _do), session=session)
 
 
+@cli.command("dialog-lang")
+@click.argument("dialog_id", type=int)
+@click.argument("code", required=False)
+@click.option("--auto", "auto", is_flag=True, help="Clear manual language override.")
+@click.option("--on", "turn_on", is_flag=True, help="Enable outbound translation for this dialog.")
+@click.option("--off", "turn_off", is_flag=True, help="Disable outbound translation for this dialog.")
+@click.option("--session", default="default")
+@click.pass_context
+def dialog_lang(
+    ctx: click.Context,
+    dialog_id: int,
+    code: str | None,
+    auto: bool,
+    turn_on: bool,
+    turn_off: bool,
+    session: str,
+) -> None:
+    """Show or override a dialog language and outbound translation flag."""
+    from tg_messenger.agent.outbound import (
+        get_dialog_lang,
+        is_outbound_enabled,
+        set_dialog_lang,
+        set_outbound_enabled,
+    )
+
+    if sum([code is not None, auto]) > 1:
+        raise click.ClickException("CODE and --auto are mutually exclusive")
+    if turn_on and turn_off:
+        raise click.ClickException("--on and --off are mutually exclusive")
+    session = _effective_session(ctx, session)
+
+    async def _do(storage):
+        if code is not None:
+            await set_dialog_lang(storage, dialog_id, code, source="manual")
+        if auto:
+            await set_dialog_lang(storage, dialog_id, None)
+        if turn_on:
+            await set_outbound_enabled(storage, dialog_id, True)
+        if turn_off:
+            await set_outbound_enabled(storage, dialog_id, False)
+        lang_info = await get_dialog_lang(storage, dialog_id)
+        enabled = await is_outbound_enabled(storage, dialog_id)
+        if lang_info is None:
+            click.echo(f"{dialog_id}\tlang=unset\toutbound={'on' if enabled else 'off'}")
+        else:
+            click.echo(
+                f"{dialog_id}\tlang={lang_info.lang}\tsource={lang_info.source}"
+                f"\toutbound={'on' if enabled else 'off'}"
+            )
+
+    _run(_with_storage(session, lambda storage: None, _do), session=session)
+
+
 @cli.command()
 @click.argument("dialog_id", type=int)
 @click.argument("text", required=False)
@@ -1028,6 +1105,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             await _ensure_authorized(client, session)
             store, storage = make_message_store(client, session=session)
             translator = make_optional_translator(storage)
+            outbound = make_optional_outbound(store, storage)
             await store.connect()
             store_task = asyncio.create_task(store.run())
 
@@ -1078,6 +1156,55 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 continue
                             await client.send_reaction(dialog_id, int(parts[1]), parts[2])
                             continue
+                        if outbound is not None:
+                            target_lang = await outbound.applies(dialog_id, line)
+                            if target_lang is not None:
+                                try:
+                                    variants = await outbound.variants(dialog_id, line, target_lang)
+                                except Exception:
+                                    logger.exception("outbound variants failed (dialog %s)", dialog_id)
+                                    confirm = await asyncio.to_thread(
+                                        input, "перевод не удался, отправить оригинал? [y/N] "
+                                    )
+                                    if confirm.strip().lower() not in {"y", "yes", "д", "да"}:
+                                        continue
+                                    msg = await client.send_text(dialog_id, line)
+                                    sent_ids.append((dialog_id, msg.id))
+                                    continue
+                                for idx, variant in enumerate(variants, start=1):
+                                    click.echo(f"[{idx}] {variant}")
+                                original_idx = len(variants) + 1
+                                click.echo(f"[{original_idx}] original: {line}")
+                                click.echo("[0] cancel")
+                                choice = await asyncio.to_thread(input, "вариант> ")
+                                if not choice.strip() or choice.strip() == "0":
+                                    continue
+                                if choice.strip() == str(original_idx):
+                                    msg = await client.send_text(dialog_id, line)
+                                    sent_ids.append((dialog_id, msg.id))
+                                    continue
+                                try:
+                                    picked = variants[int(choice.strip()) - 1]
+                                except (ValueError, IndexError):
+                                    click.echo("cancelled.", err=True)
+                                    continue
+                                msg = await client.send_text(dialog_id, picked)
+                                sent_ids.append((dialog_id, msg.id))
+                                from tg_messenger.agent.translate import get_user_lang
+
+                                source_lang = await get_user_lang(storage) or ""
+                                if source_lang:
+                                    try:
+                                        await store.record_outgoing(
+                                            dialog_id,
+                                            msg,
+                                            source_text=line,
+                                            source_lang=source_lang,
+                                        )
+                                    except Exception:
+                                        logger.exception("failed to record outbound source text")
+                                click.echo(f"  ↳ {line}")
+                                continue
                         msg = await client.send_text(dialog_id, line)
                         sent_ids.append((dialog_id, msg.id))  # suppress this line's outgoing echo
             finally:
@@ -1633,6 +1760,7 @@ def serve(ctx: click.Context, host: str, port: int, session: str, insecure: bool
     suggester = make_optional_suggester(client, session=session)
     store, storage = make_message_store(client, session=session)
     translator = make_optional_translator(storage)
+    outbound = make_optional_outbound(store, storage)
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
     click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
     uvicorn.run(
@@ -1643,6 +1771,7 @@ def serve(ctx: click.Context, host: str, port: int, session: str, insecure: bool
             web_pass=web_pass,
             store=store,
             translator=translator,
+            outbound=outbound,
         ),
         host=host,
         port=port,
@@ -1667,12 +1796,14 @@ def tui(ctx: click.Context, session: str) -> None:
     suggester = make_optional_suggester(client, session=session)
     store, storage = make_message_store(client, session=session)
     translator = make_optional_translator(storage)
+    outbound = make_optional_outbound(store, storage)
     MessengerTUI(
         client=client,
         session_name=session,
         suggester=suggester,
         store=store,
         translator=translator,
+        outbound=outbound,
     ).run()
 
 

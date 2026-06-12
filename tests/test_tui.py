@@ -11,6 +11,7 @@ from tg_messenger.tui.app import (
     MessageBubble,
     MessengerTUI,
     ProfileItem,
+    parse_lang_command,
     parse_media_command,
     parse_reaction_command,
 )
@@ -22,6 +23,15 @@ def test_parse_media_simple():
 
 def test_parse_media_quoted_path_with_caption():
     assert parse_media_command('@"с пробелом.png" подпись') == ("с пробелом.png", "подпись")
+
+
+def test_parse_lang_command():
+    assert parse_lang_command("/lang en") == ("set", "en")
+    assert parse_lang_command("/lang auto") == ("auto", None)
+    assert parse_lang_command("/lang off") == ("off", None)
+    assert parse_lang_command("hello") is None
+    with pytest.raises(ValueError):
+        parse_lang_command("/lang")
 
 
 def test_parse_media_path_and_caption():

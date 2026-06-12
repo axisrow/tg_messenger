@@ -877,6 +877,23 @@ acquire() — ОДИН раз до retry-контура (ретрай после
 - **141**: `.env.example`, CLAUDE.md and tests for store sync, translation cache, factory
   parsing and old UI seams.
 
+## Циклы 142–147 — outbound translation picker (#64, сделано)
+
+Исходящий перевод поверх #62: пользователь пишет на своём языке, выбирает один из вариантов,
+наружу уходит только перевод, оригинал сохраняется локально второй строкой.
+- **142**: `agent/outbound.py` — kv helpers (`dialog_lang_<id>`, `outbound_enabled_<id>`),
+  `detect_script_lang`, `OutboundTranslator.applies()` fail-open and not DM-gated.
+- **143**: factory seams — `make_outbound_variants_fn`, `make_detect_lang_fn`, `build_outbound`;
+  model env reuses `TG_TRANSLATE_MODEL` → `TG_AGENT_MODEL`.
+- **144**: CLI — `make_optional_outbound`, `dialog-lang`, `chat` numbered picker (CLI deviation:
+  choice sends immediately; invalid/0 cancels; failure asks whether to send original).
+- **145**: web — `/dialogs/{id}/outbound`, `/dialogs/{id}/lang`, `/send source_text`, composer
+  variant panel; card click fills composer and send is a second action.
+- **146**: TUI — `/lang CODE|auto|on|off`, modal variant picker, held original state,
+  `record_outgoing` on picked send.
+- **147**: tests for kv/detection/applies/variants, factory parsing, CLI numbered send,
+  web routes/source rendering, TUI parser; `.env.example`/CLAUDE.md/PLAN.md.
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.

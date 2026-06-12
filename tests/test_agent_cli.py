@@ -184,6 +184,25 @@ async def test_make_translate_fn_garbage_returns_empty(caplog):
     assert any("translator returned non-json" in rec.message for rec in caplog.records)
 
 
+async def test_make_outbound_variants_fn_parses_array():
+    variants_fn = factory.make_outbound_variants_fn(FakeModel(reply='```json\n["hi", "hello"]\n```'))
+    result = await variants_fn("привет", "en", None, [])
+    assert result == ["hi", "hello"]
+
+
+async def test_make_outbound_variants_fn_garbage_raises(caplog):
+    variants_fn = factory.make_outbound_variants_fn(FakeModel(reply="nope"))
+    with caplog.at_level(logging.WARNING, logger="tg_messenger.agent.factory"):
+        with pytest.raises(ValueError):
+            await variants_fn("привет", "en", None, [])
+    assert any("outbound variants returned non-json" in rec.message for rec in caplog.records)
+
+
+async def test_make_detect_lang_fn_validates_code():
+    assert await factory.make_detect_lang_fn(FakeModel(reply="EN."))(["hello"]) == "en"
+    assert await factory.make_detect_lang_fn(FakeModel(reply="English"))(["hello"]) is None
+
+
 # --- Цикл 25: классификатор по списку интентов + видимость конфига в CLI ---
 
 RECIPE = IntentSpec(name="recipe", description="просит рецепт блюда", pipeline="chat",

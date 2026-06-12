@@ -22,7 +22,13 @@ from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
@@ -361,7 +367,7 @@ def _schedule_mark_read(app: FastAPI, client, dialog_id: int, max_id: int) -> No
 
 def build_app(
     *, client=None, session_name: str = "default", suggester=None, web_pass: str | None = None,
-    login_session=None, store=None, translator=None,
+    login_session=None, store=None, translator=None, outbound=None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -376,6 +382,7 @@ def build_app(
         app.state.suggester = suggester
         app.state.store = store
         app.state.translator = translator
+        app.state.outbound = outbound
         await app.state.client.connect()
         app.state.store_task = None
         if app.state.store is not None:
@@ -578,13 +585,29 @@ def build_app(
 
     @app.post("/send", response_class=HTMLResponse)
     async def send(request: Request, dialog_id: str = Form(""), text: str = Form(""),
-                   reply_to: str = Form(""), web_client_id: str = Form("")):
+                   reply_to: str = Form(""), web_client_id: str = Form(""),
+                   source_text: str = Form("")):
         if not dialog_id.strip().lstrip("-").isdigit():
             return _error_response("Select a dialog first.", 400)
         if not text.strip():
             return _error_response("Cannot send an empty message.", 400)
         reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
         msg = await request.app.state.client.send_text(int(dialog_id), text, reply_to=reply_to_id)
+        if source_text.strip() and request.app.state.store is not None:
+            from tg_messenger.agent.translate import get_user_lang
+
+            try:
+                source_lang = await get_user_lang(request.app.state.store.storage)
+                if source_lang:
+                    await request.app.state.store.record_outgoing(
+                        int(dialog_id),
+                        msg,
+                        source_text=source_text,
+                        source_lang=source_lang,
+                    )
+                    msg = msg.model_copy(update={"translated_text": source_text})
+            except Exception:
+                logger.exception("failed to record outbound source text after send")
         sent_ids = _sent_bucket(request.app.state.sent_ids_by_client, web_client_id)
         _remember_sent(sent_ids, int(dialog_id), msg.id)  # suppress only this client's SSE echo
         return HTMLResponse(_message_div(msg))
@@ -661,6 +684,45 @@ def build_app(
             return _error_response("Suggest is available for DM dialogs only.", 403)
         draft = await suggester.suggest(dialog_id)
         return PlainTextResponse(draft)
+
+    @app.post("/dialogs/{dialog_id}/outbound")
+    async def outbound_variants(request: Request, dialog_id: int, text: str = Form("")):
+        same_origin_error = _same_origin_error(request)
+        if same_origin_error is not None:
+            return same_origin_error
+        outbound = request.app.state.outbound
+        if outbound is None:
+            return JSONResponse({"applies": False})
+        target_lang = await outbound.applies(dialog_id, text)
+        if target_lang is None:
+            return JSONResponse({"applies": False})
+        try:
+            variants = await outbound.variants(dialog_id, text, target_lang)
+        except Exception:
+            logger.exception("outbound variants failed for dialog %s", dialog_id)
+            return JSONResponse(
+                {"applies": False, "error": "Translation failed — sending the original."}
+            )
+        return JSONResponse({"applies": True, "target_lang": target_lang, "variants": variants})
+
+    @app.post("/dialogs/{dialog_id}/lang", response_class=HTMLResponse)
+    async def outbound_lang(
+        request: Request,
+        dialog_id: int,
+        code: str = Form(""),
+        enabled: str = Form("on"),
+    ):
+        same_origin_error = _same_origin_error(request)
+        if same_origin_error is not None:
+            return same_origin_error
+        outbound = request.app.state.outbound
+        if outbound is None:
+            return _error_response("Outbound translation is not configured.", 503)
+        from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
+
+        await set_dialog_lang(outbound.storage, dialog_id, code.strip() or None, source="manual")
+        await set_outbound_enabled(outbound.storage, dialog_id, enabled != "off")
+        return HTMLResponse('<div id="outbound-lang-status">saved</div>')
 
     @app.get("/settings/lang", response_class=HTMLResponse)
     async def lang_settings(request: Request):
