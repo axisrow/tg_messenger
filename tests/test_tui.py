@@ -11,6 +11,7 @@ from tg_messenger.tui.app import (
     MessageBubble,
     MessengerTUI,
     ProfileItem,
+    _OutboundPending,
     parse_lang_command,
     parse_media_command,
     parse_reaction_command,
@@ -1128,7 +1129,7 @@ async def test_tui_switching_dialogs_clears_pending_outbound_variant():
         await pilot.pause()
         composer = app.query_one("#composer", Input)
         composer.value = "hola"
-        app._held_source = "hello"
+        app._held_source = _OutboundPending(7, "hola", source_text="hello")
 
         lv = app.query_one("#dialogs", ListView)
         lv.index = 1
@@ -1151,7 +1152,7 @@ async def test_tui_switching_dialogs_clears_pending_outbound_original_bypass():
         await pilot.pause()
         composer = app.query_one("#composer", Input)
         composer.value = "hello"
-        app._outbound_bypass = "hello"
+        app._outbound_bypass = _OutboundPending(7, "hello")
 
         lv = app.query_one("#dialogs", ListView)
         lv.index = 1

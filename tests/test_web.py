@@ -1175,6 +1175,15 @@ async def test_index_uses_abort_controller_for_outbound(client_app):
     assert "outboundController.abort()" in r.text
 
 
+async def test_index_clears_outbound_ready_state_on_dialog_switch(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "function clearOutboundComposer()" in r.text
+    assert "if (previousId && id !== previousId) clearOutboundComposer();" in r.text
+    assert "composer.dataset.outboundReady = '';" in r.text
+    assert "if (hadOutboundState) composerText.value = '';" in r.text
+
+
 async def test_suggest_endpoint_does_not_escape_draft(suggest_app):
     ac, suggester = suggest_app
     suggester.draft = "you & me"

@@ -96,8 +96,10 @@
       const li = e.target.closest('#dialogs li');
       if (!li) return;
       const id = li.textContent.trim().split(' ')[0];
-      document.getElementById('dialog_id').value = id;
-      document.getElementById('outbound_nonce').value = '';
+      const dialogInput = document.getElementById('dialog_id');
+      const previousId = dialogInput.value;
+      dialogInput.value = id;
+      if (previousId && id !== previousId) clearOutboundComposer();
       if (es) es.close();
       es = new EventSource('/stream/' + encodeURIComponent(id) +
                            '?client_id=' + encodeURIComponent(webClientId));
@@ -199,6 +201,16 @@
     function hideVariants() {
       variantPanel.style.display = 'none';
       variantPanel.textContent = '';
+    }
+    function clearOutboundComposer() {
+      const hadOutboundState = composer.dataset.outboundReady === '1' ||
+                               outboundNonce.value ||
+                               variantPanel.style.display === 'block';
+      if (outboundController) outboundController.abort();
+      outboundNonce.value = '';
+      composer.dataset.outboundReady = '';
+      hideVariants();
+      if (hadOutboundState) composerText.value = '';
     }
     composerText.addEventListener('input', () => {
       if (!composerText.value) {
