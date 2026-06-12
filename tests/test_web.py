@@ -145,6 +145,12 @@ async def test_index_uses_per_tab_web_client_id(client_app):
     assert "localStorage.getItem('tgMessengerClientId')" not in r.text
 
 
+async def test_index_preserves_web_client_id_after_composer_reset(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "clientInput.defaultValue = id" in r.text
+
+
 async def test_dialogs_fragment(client_app):
     ac, _ = client_app
     r = await ac.get("/dialogs")

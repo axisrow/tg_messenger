@@ -71,7 +71,9 @@
         id = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
         sessionStorage.setItem('tgMessengerClientId', id);
       }
-      document.getElementById('web_client_id').value = id;
+      const clientInput = document.getElementById('web_client_id');
+      clientInput.value = id;
+      clientInput.defaultValue = id;
       return id;
     })();
     // Highlight the active dialog-list tab and remember it for the search box.

@@ -57,10 +57,10 @@ def parse_media_command(text: str) -> tuple[str, str | None] | None:
 
 def parse_reaction_command(text: str) -> tuple[int, str] | None:
     """Parse ``/react MESSAGE_ID EMOTICON`` from the composer."""
-    if not text.startswith("/react"):
-        return None
     parts = text.split(maxsplit=2)
-    if len(parts) != 3 or parts[0] != "/react":
+    if not parts or parts[0] != "/react":
+        return None
+    if len(parts) != 3:
         raise ValueError("usage: /react MESSAGE_ID EMOTICON")
     if not parts[1].isdigit():
         raise ValueError("message id must be a positive integer")
@@ -557,7 +557,7 @@ class MessengerTUI(App):
             return
         if peer == self._current:
             pane = self.query_one("#messages", Vertical)
-            await pane.mount(MessageBubble(f"reaction [{message_id}]: {emoticon}", out=False))
+            await pane.mount(MessageBubble(f"reaction [{message_id}]: {emoticon}", out=True))
 
     async def _drain_incoming(self) -> None:
         try:

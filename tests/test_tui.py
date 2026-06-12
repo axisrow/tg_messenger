@@ -42,6 +42,7 @@ def test_parse_reaction_command():
 
 def test_parse_reaction_command_non_command_is_none():
     assert parse_reaction_command("hello") is None
+    assert parse_reaction_command("/reactivity is important") is None
 
 
 def test_parse_reaction_command_rejects_bad_shape():
@@ -436,8 +437,11 @@ async def test_tui_react_command_calls_client():
         composer = app.query_one("#composer", Input)
         await app.on_input_submitted(Input.Submitted(composer, "/react 1 👍"))
         await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
     assert stub.reactions == [(7, 1, "👍")]
     assert stub.sent == []
+    assert [str(b.render()) for b in bubbles] == ["reaction [1]: 👍"]
+    assert all("out" in b.classes for b in bubbles)
 
 
 async def test_tui_bad_react_command_notifies_and_does_not_send_text():
