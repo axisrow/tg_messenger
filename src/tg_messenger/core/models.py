@@ -49,6 +49,7 @@ class Message(BaseModel):
     media: MediaRef | None = None
     reply_to_id: int | None = None  # id of the message this one replies to, if any
     is_forward: bool = False  # True if this message was forwarded from elsewhere
+    translated_text: str | None = None
 
 
 class IncomingEvent(BaseModel):

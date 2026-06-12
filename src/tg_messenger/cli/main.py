@@ -212,6 +212,52 @@ def make_optional_suggester(client, *, session: str = "default"):
         return None
 
 
+def make_message_store(client, *, session: str = "default"):
+    """Build the persistent message store and its shared Storage."""
+    from tg_messenger.core.message_store import MessageStore, register_message_store_migrations
+
+    storage = make_storage(session)
+    register_message_store_migrations(storage)
+    return MessageStore(client=client, storage=storage), storage
+
+
+def make_optional_translator(storage):
+    """Best-effort cached translator over the shared message-store Storage."""
+    try:
+        from tg_messenger.agent.factory import build_translator
+        from tg_messenger.agent.translate import translate_model_from_env
+    except ImportError as exc:
+        logger.warning("message translator disabled: %s", exc)
+        return None
+    model_name = translate_model_from_env()
+    if not model_name:
+        logger.info("message translator disabled: TG_TRANSLATE_MODEL/TG_AGENT_MODEL is unset")
+        return None
+    try:
+        return build_translator(storage, model_name)
+    except Exception as exc:
+        logger.warning("message translator disabled: %s", exc)
+        return None
+
+
+def _print_message_with_translation(message) -> None:
+    click.echo(message_line(message))
+    if getattr(message, "translated_text", None):
+        click.echo(f"  ↳ {message.translated_text}")
+
+
+async def _maybe_translate_history(translator, dialog_id: int, messages):
+    if translator is None:
+        return list(messages)
+    return await translator.translate_history(dialog_id, messages)
+
+
+async def _maybe_translate_message(translator, message):
+    if translator is None:
+        return message
+    return await translator.translate_message(message)
+
+
 _CODE_DELIVERY_HINTS = {
     "app": "Code sent to your Telegram app — check devices where you are already logged in.",
     "sms": "Code sent via SMS.",
@@ -623,18 +669,59 @@ def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> 
     """Print the message history of a dialog (and optionally download media)."""
 
     async def _do(client):
+        store, storage = make_message_store(client, session=session)
+        translator = make_optional_translator(storage)
         if download_dir:
             os.makedirs(download_dir, exist_ok=True)
-        messages = await client.history(dialog_id, limit=limit)
-        for m in messages:
-            click.echo(message_line(m))
-            if download_dir and m.media is not None and m.media.downloadable:
-                dest = os.path.join(download_dir, f"{dialog_id}_{m.id}")
-                saved = await client.download_message_media(dialog_id, m.id, dest)
-                if saved:
-                    click.echo(f"  saved: {saved}")
+        try:
+            messages = await store.history(dialog_id, limit=limit)
+            messages = await _maybe_translate_history(translator, dialog_id, messages)
+            for m in messages:
+                _print_message_with_translation(m)
+                if download_dir and m.media is not None and m.media.downloadable:
+                    dest = os.path.join(download_dir, f"{dialog_id}_{m.id}")
+                    saved = await client.download_message_media(dialog_id, m.id, dest)
+                    if saved:
+                        click.echo(f"  saved: {saved}")
+        finally:
+            await store.close()
 
     _run(_with_client(session, _do), session=session)
+
+
+@cli.command()
+@click.argument("code", required=False)
+@click.option("--clear", "clear", is_flag=True, help="Clear the stored language override.")
+@click.option("--session", default="default")
+@click.pass_context
+def lang(ctx: click.Context, code: str | None, clear: bool, session: str) -> None:
+    """Show or set the user's target language for cached message translation."""
+    from tg_messenger.agent.translate import USER_LANG_KEY, get_user_lang, set_user_lang
+
+    if clear and code is not None:
+        raise click.ClickException("CODE and --clear are mutually exclusive")
+    session = _effective_session(ctx, session)
+
+    async def _do(storage):
+        if clear:
+            await set_user_lang(storage, None)
+            click.echo("language override cleared.")
+            return
+        if code is not None:
+            await set_user_lang(storage, code)
+            click.echo(f"language set to {code.strip().lower()}.")
+            return
+        stored = await storage.get_value(USER_LANG_KEY)
+        effective = await get_user_lang(storage)
+        if stored:
+            source = "kv"
+        elif os.environ.get("TG_USER_LANG"):
+            source = "env"
+        else:
+            source = "unset"
+        click.echo(f"{effective or 'unset'}\t{source}")
+
+    _run(_with_storage(session, lambda storage: None, _do), session=session)
 
 
 @cli.command()
@@ -935,8 +1022,14 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
     async def _do():
         client = make_client(session_name=session)
         await client.connect()
+        store = None
+        store_task = None
         try:
             await _ensure_authorized(client, session)
+            store, storage = make_message_store(client, session=session)
+            translator = make_optional_translator(storage)
+            await store.connect()
+            store_task = asyncio.create_task(store.run())
 
             # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();
             # skip them so our own input isn't printed back. Bounded (deque).
@@ -945,13 +1038,19 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             async def printer():
                 async for ev in client.listen():
                     if ev.dialog_id == dialog_id:
-                        click.echo(f"\n← {ev.message.text or '<media>'}")
+                        msg = await _maybe_translate_message(translator, ev.message)
+                        click.echo(f"\n← {msg.text or '<media>'}")
+                        if msg.translated_text:
+                            click.echo(f"  ↳ {msg.translated_text}")
 
             async def printer_outgoing():
                 # our own messages sent from another device (phone/web/CLI elsewhere)
                 async for ev in client.listen_outgoing():
                     if ev.dialog_id == dialog_id and (ev.dialog_id, ev.message.id) not in sent_ids:
-                        click.echo(f"\n→ {ev.message.text or '<media>'}")
+                        msg = await _maybe_translate_message(translator, ev.message)
+                        click.echo(f"\n→ {msg.text or '<media>'}")
+                        if msg.translated_text:
+                            click.echo(f"  ↳ {msg.translated_text}")
 
             async def printer_reactions():
                 async for ev in client.listen_reactions():
@@ -990,7 +1089,15 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     if isinstance(r, Exception):
                         logger.error("chat listener failed", exc_info=r)
                         click.echo(f"listener failed: {r}", err=True)
+                if store_task is not None:
+                    store_task.cancel()
+                    store_results = await asyncio.gather(store_task, return_exceptions=True)
+                    for r in store_results:
+                        if isinstance(r, Exception):
+                            logger.error("chat message-store task failed", exc_info=r)
         finally:
+            if store is not None:
+                await store.close()
             await client.disconnect()
 
     _run_interruptible(_do(), session=session)
@@ -1524,10 +1631,19 @@ def serve(ctx: click.Context, host: str, port: int, session: str, insecure: bool
     session = _effective_session(ctx, session)
     client = make_client(session_name=session)
     suggester = make_optional_suggester(client, session=session)
+    store, storage = make_message_store(client, session=session)
+    translator = make_optional_translator(storage)
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
     click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
     uvicorn.run(
-        build_app(client=client, session_name=session, suggester=suggester, web_pass=web_pass),
+        build_app(
+            client=client,
+            session_name=session,
+            suggester=suggester,
+            web_pass=web_pass,
+            store=store,
+            translator=translator,
+        ),
         host=host,
         port=port,
         log_config=None,
@@ -1549,7 +1665,15 @@ def tui(ctx: click.Context, session: str) -> None:
     session = _effective_session(ctx, session)
     client = make_client(session_name=session)
     suggester = make_optional_suggester(client, session=session)
-    MessengerTUI(client=client, session_name=session, suggester=suggester).run()
+    store, storage = make_message_store(client, session=session)
+    translator = make_optional_translator(storage)
+    MessengerTUI(
+        client=client,
+        session_name=session,
+        suggester=suggester,
+        store=store,
+        translator=translator,
+    ).run()
 
 
 if __name__ == "__main__":

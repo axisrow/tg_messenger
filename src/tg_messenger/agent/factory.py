@@ -7,7 +7,9 @@ and tests stub these module-level names directly.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from collections.abc import Awaitable, Callable, Sequence
 
 from deepagents import create_deep_agent
@@ -19,6 +21,7 @@ from tg_messenger.agent.orchestrator import Orchestrator
 from tg_messenger.agent.search import build_search_fn
 from tg_messenger.agent.suggest import StyleProfile, Suggester
 from tg_messenger.agent.tools import make_telegram_tools
+from tg_messenger.agent.translate import Translator
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +63,18 @@ VISION_SYSTEM_PROMPT = (
     " briefly and naturally, in the language of the user's message (or the"
     " dialog language if there is no caption)."
 )
+
+TRANSLATE_SYSTEM_PROMPT = (
+    "Translate Telegram messages into the target language. Return ONLY JSON: "
+    "[{\"id\": number, \"translation\": string|null}]. Use null when a message is "
+    "already in the target language or should not be translated."
+)
+
+
+def _strip_json_fence(text: str) -> str:
+    raw = text.strip()
+    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else raw
 
 
 def make_classifier(model, intents: Sequence[IntentSpec] = ()) -> Callable[[str], Awaitable[str]]:
@@ -141,6 +156,47 @@ def make_suggest_fn(model) -> Callable:
         return str(response.content).strip()
 
     return suggest
+
+
+def make_translate_fn(model) -> Callable:
+    """Batch translator over a plain ainvoke; injected into ``Translator``."""
+
+    async def translate(messages, target_lang: str) -> dict[int, str | None]:
+        payload = {
+            "target_lang": target_lang,
+            "messages": [{"id": int(mid), "text": text} for mid, text in messages],
+        }
+        response = await model.ainvoke(
+            [
+                SystemMessage(content=TRANSLATE_SYSTEM_PROMPT),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+            ]
+        )
+        raw = _strip_json_fence(str(response.content))
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("translator returned non-json content: %r", response.content)
+            return {}
+        if not isinstance(parsed, list):
+            logger.warning("translator returned non-list content: %r", response.content)
+            return {}
+        result: dict[int, str | None] = {}
+        for item in parsed:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            translation = item.get("translation")
+            if translation is not None and not isinstance(translation, str):
+                continue
+            result[int(item["id"])] = translation
+        return result
+
+    return translate
+
+
+def build_translator(storage, model_name: str) -> Translator:
+    model = init_chat_model(model_name)
+    return Translator(storage=storage, translate_fn=make_translate_fn(model))
 
 
 def build_suggester(client, cfg: AgentConfig, storage=None) -> Suggester:

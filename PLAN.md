@@ -858,6 +858,25 @@ acquire() — ОДИН раз до retry-контура (ретрай после
 ИНВАРИАНТ: весь флоу через ОДИН клиент (`phone_code_hash` привязан к сессии — нельзя
 разносить шаги); телефон/код не в логи.
 
+## Циклы 136–141 — SQLite message cache + inbound translation (#62, сделано)
+
+`core/message_store.py` — сервис над client, а не зависимость внутри `client.py`.
+- **136**: `client.history_since(peer, min_id, limit)` — uncached, flood-retry, chronological;
+  fake Telethon учитывает `min_id`.
+- **137**: `messages` + `message_sync` migrations; `MessageStore.history()` syncs via
+  `min_id=high_id`, serves only the contiguous `[low_id, high_id]` window and resets it on
+  possible gaps; live ingest never advances watermarks; deletions respect channel id space.
+- **138**: `Message.translated_text` + `agent/translate.py`: `TG_USER_LANG`/kv override,
+  script heuristic, cached no-op verdicts, batched injected `translate_fn`, failures logged
+  and unraised.
+- **139**: `agent/factory.py`: `make_translate_fn`/`build_translator`; LLM stack remains only
+  in factory, JSON/fenced/null parsing is contained there.
+- **140**: CLI/web/TUI wiring: store-backed history when wired, fallback to client when not;
+  translations render as `↳`/`.translation`, live web SSE emits translation frames, TUI uses
+  workers so LLM/network does not block handlers.
+- **141**: `.env.example`, CLAUDE.md and tests for store sync, translation cache, factory
+  parsing and old UI seams.
+
 ## Финальная верификация (после зелёных циклов)
 
 - **Вся сюита**: `pytest -q` зелёная, `ruff check src/ tests/` чистый, варнингов нет.

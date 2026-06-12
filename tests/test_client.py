@@ -148,6 +148,18 @@ async def test_history_maps_messages(fake_client):
     assert msgs[1].out is True
 
 
+async def test_history_since_is_uncached_and_passes_min_id(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.history_since(7, min_id=1, limit=10)
+    second = await client.history_since(7, min_id=1, limit=10)
+    assert [m.id for m in first] == [2]
+    assert [m.id for m in second] == [2]
+    assert fake_client.last_min_id == 1
+    assert fake_client.iter_messages_calls == 2
+
+
 # --- цикл 64: серверный поиск сообщений в диалоге ---
 
 async def test_search_messages_passes_query_and_maps(fake_client):

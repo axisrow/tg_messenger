@@ -142,7 +142,10 @@ def _message_div(m) -> str:
     cls = "out" if m.out else "in"
     body = escape(m.text) if m.text else "&lt;media&gt;"
     body = f"[{m.id}] {body}"
-    return f'<div class="msg {cls}" data-id="{m.id}">{body}</div>'
+    translation = ""
+    if getattr(m, "translated_text", None):
+        translation = f'<div class="translation">↳ {escape(m.translated_text)}</div>'
+    return f'<div class="msg {cls}" data-id="{m.id}">{body}{translation}</div>'
 
 
 def _reaction_emoticon(emoticon: str | None) -> str:
@@ -213,6 +216,7 @@ async def sse_event_stream(
     dialog_id: int,
     sent_ids: OrderedDict | None = None,
     sent_reactions: OrderedDict | None = None,
+    translator=None,
 ):
     """Yield SSE frames for one dialog: incoming messages AND our own (out) messages.
 
@@ -270,6 +274,19 @@ async def sse_event_stream(
                     continue  # our own optimistic bubble already shows it
                 payload = {"id": ev.message.id, "text": ev.message.text, "out": out}
                 yield f"data: {json.dumps(payload)}\n\n"
+                if translator is not None:
+                    try:
+                        translated = await translator.translate_message(ev.message)
+                    except Exception:
+                        logger.exception("SSE translation failed for dialog %s", dialog_id)
+                        continue
+                    if translated.translated_text:
+                        payload = {
+                            "type": "translation",
+                            "message_id": translated.id,
+                            "text": translated.translated_text,
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
     finally:
         for task in pending:
             task.cancel()
@@ -344,7 +361,7 @@ def _schedule_mark_read(app: FastAPI, client, dialog_id: int, max_id: int) -> No
 
 def build_app(
     *, client=None, session_name: str = "default", suggester=None, web_pass: str | None = None,
-    login_session=None,
+    login_session=None, store=None, translator=None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -357,7 +374,13 @@ def build_app(
         app.state.client = client or _make_real_client(session_name)
         # reply suggester (#17) — optional; None disables the /suggest endpoint
         app.state.suggester = suggester
+        app.state.store = store
+        app.state.translator = translator
         await app.state.client.connect()
+        app.state.store_task = None
+        if app.state.store is not None:
+            await app.state.store.connect()
+            app.state.store_task = asyncio.create_task(app.state.store.run())
         # one login wizard state machine per process, bound to the lifespan client
         # (phone_code_hash binds to that single connection — see core.LoginSession).
         # A test seam may inject a fake; otherwise build over the inner Telethon client.
@@ -374,7 +397,15 @@ def build_app(
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            if app.state.store_task is not None:
+                app.state.store_task.cancel()
+                results = await asyncio.gather(app.state.store_task, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.warning("message store task failed", exc_info=result)
             await app.state.client.disconnect()
+            if app.state.store is not None:
+                await app.state.store.close()
             close_suggester = getattr(app.state.suggester, "close", None)
             if close_suggester is not None:
                 try:
@@ -535,7 +566,11 @@ def build_app(
     @app.get("/dialogs/{dialog_id}/messages", response_class=HTMLResponse)
     async def messages(request: Request, dialog_id: int):
         client = request.app.state.client
-        items = await client.history(dialog_id, limit=50)
+        store = request.app.state.store
+        translator = request.app.state.translator
+        items = await (store.history(dialog_id, limit=50) if store is not None else client.history(dialog_id, limit=50))
+        if translator is not None:
+            items = await translator.translate_history(dialog_id, items)
         # opening a dialog clears its unread counter, but it must never block rendering history
         if items:
             _schedule_mark_read(request.app, client, dialog_id, max(m.id for m in items))
@@ -627,6 +662,32 @@ def build_app(
         draft = await suggester.suggest(dialog_id)
         return PlainTextResponse(draft)
 
+    @app.get("/settings/lang", response_class=HTMLResponse)
+    async def lang_settings(request: Request):
+        translator = request.app.state.translator
+        if translator is None:
+            return _error_response("Translation is not configured.", 503)
+        lang = await translator.target_lang()
+        return HTMLResponse(
+            '<form hx-post="/settings/lang" hx-swap="outerHTML" '
+            'hx-headers=\'{"x-tg-messenger-csrf": "1"}\'>'
+            f'<input name="code" value="{escape(lang or "")}" placeholder="Language">'
+            '<button type="submit">Save</button>'
+            "</form>"
+        )
+
+    @app.post("/settings/lang", response_class=HTMLResponse)
+    async def lang_settings_update(request: Request, code: str = Form("")):
+        same_origin_error = _same_origin_error(request)
+        if same_origin_error is not None:
+            return same_origin_error
+        translator = request.app.state.translator
+        if translator is None:
+            return _error_response("Translation is not configured.", 503)
+        value = code.strip().lower() or None
+        await translator.set_target_lang(value)
+        return HTMLResponse(f'<div id="lang-status">Language: {escape(value or "unset")}</div>')
+
     @app.get("/stream/{dialog_id}")
     async def stream(request: Request, dialog_id: int, client_id: str = ""):
         return StreamingResponse(
@@ -635,6 +696,7 @@ def build_app(
                 dialog_id,
                 sent_ids=_sent_bucket(request.app.state.sent_ids_by_client, client_id),
                 sent_reactions=_sent_bucket(request.app.state.sent_reactions_by_client, client_id),
+                translator=request.app.state.translator,
             ),
             media_type="text/event-stream",
         )
