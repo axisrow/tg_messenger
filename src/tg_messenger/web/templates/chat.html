@@ -134,6 +134,7 @@
       const id = document.getElementById('dialog_id').value;
       if (!id) return;
       const fd = new FormData(e.target);
+      fd.append('web_client_id', webClientId);
       const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/reaction', {
         method: 'POST',
         body: fd

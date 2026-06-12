@@ -151,6 +151,12 @@ async def test_index_preserves_web_client_id_after_composer_reset(client_app):
     assert "clientInput.defaultValue = id" in r.text
 
 
+async def test_index_sends_web_client_id_with_reactions(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "fd.append('web_client_id', webClientId)" in r.text
+
+
 async def test_dialogs_fragment(client_app):
     ac, _ = client_app
     r = await ac.get("/dialogs")
@@ -772,6 +778,76 @@ async def test_stream_does_not_skip_message_sent_by_other_web_client():
         frame = await asyncio.wait_for(task, timeout=2)
         payload = json.loads(frame.removeprefix("data: ").strip())
         assert payload == {"id": 2, "text": "from a", "out": True}
+        await gen.aclose()
+
+
+async def test_stream_skips_reaction_echo_sent_by_same_web_client():
+    import json
+
+    from tg_messenger.web.app import _sent_bucket, sse_event_stream
+
+    stub = WebStubClient()
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/reaction",
+                data={"message_id": "51", "emoticon": "👍", "web_client_id": "a"},
+            )
+
+        assert r.status_code == 200
+        assert stub.reactions == [(7, 51, "👍")]
+
+        gen = sse_event_stream(
+            stub,
+            dialog_id=7,
+            sent_reactions=_sent_bucket(app.state.sent_reactions_by_client, "a"),
+        )
+        task = asyncio.create_task(gen.__anext__())
+        while stub.bus_reactions.subscriber_count == 0:
+            await asyncio.sleep(0)
+
+        stub.bus_reactions.publish(ReactionEvent(dialog_id=7, message_id=51, emoticon="👍"))
+        stub.bus_reactions.publish(ReactionEvent(dialog_id=7, message_id=52, emoticon="❤️"))
+
+        frame = await asyncio.wait_for(task, timeout=2)
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        assert payload == {"type": "reaction", "message_id": 52, "emoticon": "❤️"}
+        await gen.aclose()
+
+
+async def test_stream_does_not_skip_reaction_sent_by_other_web_client():
+    import json
+
+    from tg_messenger.web.app import _sent_bucket, sse_event_stream
+
+    stub = WebStubClient()
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/reaction",
+                data={"message_id": "51", "emoticon": "👍", "web_client_id": "a"},
+            )
+
+        assert r.status_code == 200
+
+        gen = sse_event_stream(
+            stub,
+            dialog_id=7,
+            sent_reactions=_sent_bucket(app.state.sent_reactions_by_client, "b"),
+        )
+        task = asyncio.create_task(gen.__anext__())
+        while stub.bus_reactions.subscriber_count == 0:
+            await asyncio.sleep(0)
+
+        stub.bus_reactions.publish(ReactionEvent(dialog_id=7, message_id=51, emoticon="👍"))
+
+        frame = await asyncio.wait_for(task, timeout=2)
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        assert payload == {"type": "reaction", "message_id": 51, "emoticon": "👍"}
         await gen.aclose()
 
 

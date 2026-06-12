@@ -311,6 +311,9 @@ class MessengerTUI(App):
         # listen_outgoing(); skip them so our optimistic bubble isn't duplicated.
         # Bounded (OrderedDict-as-set, watch.py pattern): a long session can't grow it.
         self._sent_ids: OrderedDict[tuple[int, int], bool] = OrderedDict()
+        # (dialog_id, message_id, emoticon) keys we reacted with from this composer.
+        # Telegram echoes the update via listen_reactions(); skip the local echo only.
+        self._sent_reactions: OrderedDict[tuple[int, int, str | None], bool] = OrderedDict()
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -521,6 +524,14 @@ class MessengerTUI(App):
         while len(self._sent_ids) > 200:  # bounded, like watch.py's caches
             self._sent_ids.popitem(last=False)
 
+    def _remember_sent_reaction(self, dialog_id: int, message_id: int, emoticon: str | None) -> None:
+        """Record a reaction we sent so its listen_reactions() echo isn't drawn twice."""
+        key = (dialog_id, message_id, emoticon)
+        self._sent_reactions[key] = True
+        self._sent_reactions.move_to_end(key)
+        while len(self._sent_reactions) > 200:  # bounded, like watch.py's caches
+            self._sent_reactions.popitem(last=False)
+
     async def _send_text(self, peer: int, text: str) -> None:
         try:
             msg = await self._client.send_text(peer, text)
@@ -555,6 +566,7 @@ class MessengerTUI(App):
             logger.exception("send reaction failed (dialog %s, message %s)", peer, message_id)
             self.notify(f"Reaction failed: {exc}", severity="error")
             return
+        self._remember_sent_reaction(peer, message_id, emoticon)
         if peer == self._current:
             pane = self.query_one("#messages", Vertical)
             await pane.mount(MessageBubble(f"reaction [{message_id}]: {emoticon}", out=True))
@@ -591,6 +603,10 @@ class MessengerTUI(App):
     async def _drain_reactions(self) -> None:
         try:
             async for ev in self._client.listen_reactions():
+                key = (ev.dialog_id, ev.message_id, ev.emoticon)
+                if key in self._sent_reactions:
+                    self._sent_reactions.pop(key, None)
+                    continue  # our own optimistic bubble already shows it
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
                     await pane.mount(MessageBubble(_reaction_label(ev), out=False))

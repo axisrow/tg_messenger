@@ -865,6 +865,31 @@ async def test_tui_reaction_event_appends_bubble_for_open_dialog_only():
         assert bubbles == ["reaction [11]: <custom>"]
 
 
+class SentReactionEchoClient(TuiStubClient):
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def listen_reactions(self):
+        await self.fire.wait()
+        yield ReactionEvent(dialog_id=7, message_id=1, emoticon="👍")
+        await asyncio.Event().wait()
+
+
+async def test_tui_sent_reaction_echo_is_not_duplicated():
+    stub = SentReactionEchoClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._send_reaction(7, 1, "👍")
+        stub.fire.set()
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+    assert [str(b.render()) for b in bubbles] == ["reaction [1]: 👍"]
+    assert all("out" in b.classes for b in bubbles)
+
+
 async def test_tui_group_incoming_does_not_trigger_suggester():
     class RecordingSuggester:
         def __init__(self):
