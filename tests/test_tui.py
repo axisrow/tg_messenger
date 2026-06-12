@@ -1505,6 +1505,28 @@ async def test_tui_outbound_error_original_confirm_is_scoped_to_dialog():
     assert stub.sent == [(7, "привет", None)]
 
 
+async def test_tui_outbound_cancel_restores_current_dialog_draft():
+    stub = TwoDmClient()
+    outbound = RecordingOutbound(variants=["hello"])
+    app = MessengerTUI(client=stub, outbound=outbound)
+
+    async def cancel_variant_picker(screen):
+        return None
+
+    app.push_screen_wait = cancel_variant_picker  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        await _select_dialog(pilot, app, 7)
+        composer.value = "привет"
+        await app.on_input_submitted(Input.Submitted(composer, "привет"))
+        await _pause_until(pilot, lambda: outbound.variants_calls)
+
+        assert composer.value == "привет"
+        assert stub.sent == []
+
+
 async def test_tui_outbound_clears_composer_and_repeated_enter_does_not_restart_worker():
     stub = TwoDmClient()
     outbound = BlockingOutbound()

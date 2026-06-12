@@ -879,6 +879,7 @@ class MessengerTUI(App):
         picked = await self.push_screen_wait(VariantPickScreen(variants, text))
         if picked is None:
             if dialog_id == self._current:
+                composer.value = text
                 composer.focus()
             return
         if picked == ORIGINAL_SENTINEL:
