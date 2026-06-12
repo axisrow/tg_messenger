@@ -275,6 +275,7 @@ step_delete_for_me_saved() {
     echo "failed to send or recover delete-for-me message id" >&2
     return 1
   fi
+  e2e_register_message "$SAVED_PEER" "$FOR_ME_DELETE_ID" "$marker"
   history="$(e2e_recent_history "$SAVED_PEER" 20)" || return 1
   if ! printf '%s\n' "$history" | grep -F -- "$marker" >/dev/null; then
     echo "delete-for-me marker was not visible before deletion: $marker" >&2
@@ -282,6 +283,7 @@ step_delete_for_me_saved() {
     return 1
   fi
   tg delete "$SAVED_PEER" "$FOR_ME_DELETE_ID" --for-me >/dev/null || return 1
+  e2e_unregister_message "$SAVED_PEER" "$FOR_ME_DELETE_ID"
   e2e_mutation_pause
   after_history="$(e2e_recent_history "$SAVED_PEER" 20)" || return 1
   if printf '%s\n' "$after_history" | grep -F -- "$marker" >/dev/null; then

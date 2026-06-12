@@ -185,6 +185,22 @@ e2e_register_message() {
   fi
 }
 
+e2e_unregister_message() {
+  local peer="$1"
+  local id="$2"
+  local i
+  if [ "${#E2E_CREATED_IDS[@]}" -eq 0 ]; then
+    return 0
+  fi
+  for i in "${!E2E_CREATED_IDS[@]}"; do
+    if [ "${E2E_CREATED_PEERS[$i]}" = "$peer" ] && [ "${E2E_CREATED_IDS[$i]}" = "$id" ]; then
+      E2E_CREATED_IDS[$i]=""
+      E2E_CREATED_MARKERS[$i]=""
+      return 0
+    fi
+  done
+}
+
 e2e_delete_registered_messages() {
   local ok=0
   local i
