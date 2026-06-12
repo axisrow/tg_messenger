@@ -218,6 +218,7 @@ def _patch_message_store(monkeypatch):
 
     monkeypatch.setattr(cli_main, "make_message_store", fake_make_message_store)
     monkeypatch.setattr(cli_main, "make_optional_translator", lambda storage: None)
+    monkeypatch.setattr(cli_main, "make_optional_outbound", lambda store, storage: None)
     return stores
 
 
@@ -541,6 +542,123 @@ def test_chat_react_command_does_not_send_text(runner):
     assert result.exit_code == 0, result.output
     assert stub.reactions == [(7, 10, "👍")]
     assert stub.sent == []
+
+
+def test_chat_outbound_variant_sends_pick(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    class FakeStorage:
+        async def get_value(self, key):
+            return "ru" if key == "user_lang" else None
+
+    class FakeStore(DummyMessageStore):
+        def __init__(self, client):
+            super().__init__(client)
+            self.storage = FakeStorage()
+            self.recorded = []
+
+        async def record_outgoing(self, dialog_id, message, *, source_text, source_lang):
+            self.recorded.append((dialog_id, message.text, source_text, source_lang))
+
+    class FakeOutbound:
+        async def applies(self, dialog_id, text):
+            return "en"
+
+        async def variants(self, dialog_id, text, target_lang):
+            return ["hi", "hello", "hey"]
+
+    store = FakeStore(stub)
+    monkeypatch.setattr(cli_main, "make_message_store", lambda client, **kw: (store, store.storage))
+    monkeypatch.setattr(cli_main, "make_optional_outbound", lambda s, storage: FakeOutbound())
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n2\n")
+    assert result.exit_code == 0, result.output
+    assert (7, "hello", None, None) in stub.sent
+    assert store.recorded == [(7, "hello", "привет", "ru")]
+    assert "↳ привет" in result.output
+
+
+def test_chat_lang_command_is_handled_before_outbound(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    class FakeStorage:
+        def __init__(self):
+            self.values = []
+            self.executed = []
+
+        async def get_value(self, key):
+            return None
+
+        async def set_value(self, key, value):
+            self.values.append((key, value))
+
+        async def execute(self, sql, params=()):
+            self.executed.append((sql, params))
+
+    class FakeStore(DummyMessageStore):
+        def __init__(self, client):
+            super().__init__(client)
+            self.storage = FakeStorage()
+
+    class FakeOutbound:
+        def __init__(self, storage):
+            self.storage = storage
+            self.applies_calls = []
+
+        async def applies(self, dialog_id, text):
+            self.applies_calls.append((dialog_id, text))
+            return "en"
+
+        async def variants(self, dialog_id, text, target_lang):
+            return ["translated"]
+
+    store = FakeStore(stub)
+    outbound = FakeOutbound(store.storage)
+    monkeypatch.setattr(cli_main, "make_message_store", lambda client, **kw: (store, store.storage))
+    monkeypatch.setattr(cli_main, "make_optional_outbound", lambda s, storage: outbound)
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="/lang en\n")
+    assert result.exit_code == 0, result.output
+    assert stub.sent == []
+    assert outbound.applies_calls == []
+    assert store.storage.values == [
+        ("dialog_lang_7", {"lang": "en", "source": "manual"}),
+    ]
+    assert "language setting saved" in result.output
+
+
+def test_chat_outbound_timeout_sends_original(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    class FakeOutbound:
+        async def applies(self, dialog_id, text):
+            raise TimeoutError
+
+    monkeypatch.setattr(cli_main, "make_optional_outbound", lambda s, storage: FakeOutbound())
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n")
+    assert result.exit_code == 0, result.output
+    assert (7, "привет", None, None) in stub.sent
+    assert "translation timed out" in result.output
+
+
+def test_dialog_lang_show_set_and_off(monkeypatch, tmp_path):
+    from tg_messenger.core.storage import Storage
+
+    def fake_make_storage(profile="default"):
+        return Storage(tmp_path / f"{profile}.db")
+
+    monkeypatch.setattr(cli_main, "make_storage", fake_make_storage)
+    runner = CliRunner()
+    set_result = runner.invoke(cli_main.cli, ["dialog-lang", "7", "en", "--off"])
+    show_result = runner.invoke(cli_main.cli, ["dialog-lang", "7"])
+    auto_result = runner.invoke(cli_main.cli, ["dialog-lang", "7", "--auto", "--on"])
+    assert set_result.exit_code == 0, set_result.output
+    assert "lang=en" in set_result.output and "outbound=off" in set_result.output
+    assert show_result.exit_code == 0, show_result.output
+    assert "source=manual" in show_result.output
+    assert auto_result.exit_code == 0, auto_result.output
+    assert "lang=unset" in auto_result.output and "outbound=on" in auto_result.output
 
 
 def test_chat_prints_own_message_sent_from_another_device(runner, monkeypatch):
@@ -1850,13 +1968,14 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
     class FakeTUI:
         def __init__(
             self, *, client=None, session_name="default", suggester=None,
-            store=None, translator=None,
+            store=None, translator=None, outbound=None,
         ):
             captured["client"] = client
             captured["session_name"] = session_name
             captured["suggester"] = suggester
             captured["store"] = store
             captured["translator"] = translator
+            captured["outbound"] = outbound
 
         def run(self):
             pass

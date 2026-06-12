@@ -97,6 +97,35 @@ class WebTranslatorStub:
         return message
 
 
+class WebSourceStorage:
+    async def get_value(self, key):
+        if key == "user_lang":
+            return "ru"
+        return None
+
+
+class WebSourceStore:
+    def __init__(self):
+        self.storage = WebSourceStorage()
+        self.recorded = []
+
+    async def connect(self):
+        pass
+
+    async def close(self):
+        pass
+
+    async def run(self):
+        await asyncio.Event().wait()
+
+    async def history(self, peer, limit=50):
+        return [Message(id=1, dialog_id=peer, sender_id=peer, out=False, text="hi",
+                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))]
+
+    async def record_outgoing(self, dialog_id, message, *, source_text, source_lang):
+        self.recorded.append((dialog_id, message.text, source_text, source_lang))
+
+
 def test_real_web_client_gets_session_encryption_key(monkeypatch, tmp_path):
     from tg_messenger.web import app as web_app
 
@@ -930,6 +959,238 @@ async def test_suggest_endpoint_returns_draft(suggest_app):
     assert r.status_code == 200
     assert "suggested reply" in r.text
     assert suggester.calls == [7]
+
+
+async def test_outbound_endpoint_returns_variants():
+    stub = WebStubClient()
+    app = build_app(client=stub, outbound=WebOutboundStub())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/outbound",
+                data={"text": "привет", "web_client_id": "browser-a"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["applies"] is True
+    assert data["target_lang"] == "en"
+    assert data["variants"] == ["hi", "hello"]
+    assert data["nonce"]
+
+
+class WebOutboundStub:
+    async def applies(self, dialog_id, text):
+        return "en"
+
+    async def variants(self, dialog_id, text, target_lang):
+        return ["hi", "hello"]
+
+
+class WebLangStorage:
+    async def get_value(self, key):
+        return None
+
+    async def set_value(self, key, value):
+        pass
+
+    async def execute(self, sql, params=()):
+        pass
+
+
+class WebOutboundWithStorage(WebOutboundStub):
+    storage = WebLangStorage()
+
+
+async def test_send_without_nonce_ignores_untrusted_source_text():
+    stub = WebStubClient()
+    store = WebSourceStore()
+    app = build_app(client=stub, store=store)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/send",
+                data={"dialog_id": "7", "text": "hello", "source_text": "привет"},
+            )
+    assert r.status_code == 200
+    assert store.recorded == []
+    assert "↳ привет" not in r.text
+
+
+async def test_send_with_valid_outbound_nonce_records_source_once():
+    stub = WebStubClient()
+    store = WebSourceStore()
+    app = build_app(client=stub, store=store, outbound=WebOutboundStub())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            outbound = await ac.post(
+                "/dialogs/7/outbound",
+                data={"text": "привет", "web_client_id": "browser-a"},
+                headers=SUGGEST_HEADERS,
+            )
+            nonce = outbound.json()["nonce"]
+            sent = await ac.post(
+                "/send",
+                data={
+                    "dialog_id": "7",
+                    "text": "hi",
+                    "web_client_id": "browser-a",
+                    "outbound_nonce": nonce,
+                },
+            )
+            reused = await ac.post(
+                "/send",
+                data={
+                    "dialog_id": "7",
+                    "text": "hello",
+                    "web_client_id": "browser-a",
+                    "outbound_nonce": nonce,
+                },
+            )
+    assert sent.status_code == 200
+    assert reused.status_code == 200
+    assert store.recorded == [(7, "hi", "привет", "ru")]
+    assert "↳ привет" in sent.text
+    assert "↳ привет" not in reused.text
+
+
+async def test_send_with_wrong_dialog_outbound_nonce_does_not_record():
+    stub = WebStubClient()
+    store = WebSourceStore()
+    app = build_app(client=stub, store=store, outbound=WebOutboundStub())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            outbound = await ac.post(
+                "/dialogs/7/outbound",
+                data={"text": "привет", "web_client_id": "browser-a"},
+                headers=SUGGEST_HEADERS,
+            )
+            r = await ac.post(
+                "/send",
+                data={
+                    "dialog_id": "8",
+                    "text": "hi",
+                    "web_client_id": "browser-a",
+                    "outbound_nonce": outbound.json()["nonce"],
+                },
+            )
+    assert r.status_code == 200
+    assert store.recorded == []
+
+
+async def test_send_with_expired_outbound_nonce_does_not_record(monkeypatch):
+    from tg_messenger.web import app as web_app
+
+    monkeypatch.setattr(web_app, "OUTBOUND_NONCE_TTL_SECONDS", -1)
+    stub = WebStubClient()
+    store = WebSourceStore()
+    app = build_app(client=stub, store=store, outbound=WebOutboundStub())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            outbound = await ac.post(
+                "/dialogs/7/outbound",
+                data={"text": "привет", "web_client_id": "browser-a"},
+                headers=SUGGEST_HEADERS,
+            )
+            r = await ac.post(
+                "/send",
+                data={
+                    "dialog_id": "7",
+                    "text": "hi",
+                    "web_client_id": "browser-a",
+                    "outbound_nonce": outbound.json()["nonce"],
+                },
+            )
+    assert r.status_code == 200
+    assert store.recorded == []
+
+
+async def test_outbound_lang_invalid_code_returns_400():
+    stub = WebStubClient()
+    app = build_app(client=stub, outbound=WebOutboundWithStorage())
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/lang",
+                data={"code": "english"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 400
+    assert "invalid language code" in r.text
+
+
+async def test_outbound_endpoint_csrf_failure_returns_json():
+    stub = WebStubClient()
+    app = build_app(client=stub, outbound=WebOutboundStub())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/dialogs/7/outbound", data={"text": "привет"})
+    assert r.status_code == 403
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.json()["applies"] is False
+    assert r.json()["error"]
+
+
+async def test_outbound_endpoint_timeout_returns_json(monkeypatch):
+    from tg_messenger.web import app as web_app
+
+    monkeypatch.setattr(web_app, "OUTBOUND_TIMEOUT_SECONDS", 0, raising=False)
+
+    class HangingOutbound:
+        async def applies(self, dialog_id, text):
+            return "en"
+
+        async def variants(self, dialog_id, text, target_lang):
+            await asyncio.Event().wait()
+
+    stub = WebStubClient()
+    app = build_app(client=stub, outbound=HangingOutbound())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await asyncio.wait_for(
+                ac.post(
+                    "/dialogs/7/outbound",
+                    data={"text": "привет"},
+                    headers=SUGGEST_HEADERS,
+                ),
+                timeout=1,
+            )
+    assert r.status_code == 200
+    assert r.json()["applies"] is False
+    assert r.json()["error"]
+
+
+async def test_index_uses_abort_controller_for_outbound(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "AbortController" in r.text
+    assert "outboundController.abort()" in r.text
+
+
+async def test_index_clears_outbound_ready_state_on_dialog_switch(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "function clearOutboundComposer()" in r.text
+    assert "if (previousId && id !== previousId) clearOutboundComposer();" in r.text
+    assert "composer.dataset.outboundReady = '';" in r.text
+    assert "if (hadOutboundState) composerText.value = '';" in r.text
+
+
+async def test_index_clears_outbound_ready_state_on_variant_edit(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "function hasOutboundComposerState()" in r.text
+    assert "function clearOutboundSelection()" in r.text
+    assert "if (hasOutboundComposerState()) clearOutboundSelection();" in r.text
+    assert "if (!composerText.value)" not in r.text
 
 
 async def test_suggest_endpoint_does_not_escape_draft(suggest_app):

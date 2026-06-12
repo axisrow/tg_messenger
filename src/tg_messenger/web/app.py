@@ -22,7 +22,13 @@ from html import escape
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
@@ -39,6 +45,9 @@ logger = logging.getLogger(__name__)
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 SUGGEST_CSRF_HEADER = "x-tg-messenger-csrf"
+OUTBOUND_NONCE_TTL_SECONDS = 5 * 60
+OUTBOUND_NONCE_MAX = 200
+OUTBOUND_TIMEOUT_SECONDS = 20
 
 # --- web authorization (#24) -------------------------------------------------
 COOKIE_NAME = "tg_session"
@@ -175,9 +184,28 @@ def _same_origin_error(request: Request) -> HTMLResponse | None:
     return None
 
 
+def _same_origin_json_error(request: Request) -> JSONResponse | None:
+    if request.headers.get(SUGGEST_CSRF_HEADER) != "1":
+        return JSONResponse(
+            {"applies": False, "error": "Outbound requires a same-origin request."},
+            status_code=403,
+        )
+    origin = request.headers.get("origin")
+    if origin is None:
+        return None
+    host = request.headers.get("host") or request.url.netloc
+    expected = f"{request.url.scheme}://{host}"
+    if origin != expected:
+        return JSONResponse(
+            {"applies": False, "error": "Outbound requires a same-origin request."},
+            status_code=403,
+        )
+    return None
+
+
 def _sent_bucket(sent_ids_by_client: OrderedDict, client_id: str) -> OrderedDict:
     """Return the bounded sent-message set for one browser client."""
-    client_id = client_id[:80]
+    client_id = _bounded_client_id(client_id)
     bucket = sent_ids_by_client.get(client_id)
     if bucket is None:
         bucket = OrderedDict()
@@ -186,6 +214,71 @@ def _sent_bucket(sent_ids_by_client: OrderedDict, client_id: str) -> OrderedDict
     while len(sent_ids_by_client) > 100:
         sent_ids_by_client.popitem(last=False)
     return bucket
+
+
+def _bounded_client_id(client_id: str) -> str:
+    return client_id[:80]
+
+
+def _prune_outbound_nonces(nonces: OrderedDict, *, now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    expired = [
+        nonce for nonce, payload in nonces.items()
+        if payload["expires_at"] <= now
+    ]
+    for nonce in expired:
+        nonces.pop(nonce, None)
+    while len(nonces) > OUTBOUND_NONCE_MAX:
+        nonces.popitem(last=False)
+
+
+def _remember_outbound_nonce(
+    nonces: OrderedDict,
+    *,
+    dialog_id: int,
+    web_client_id: str,
+    source_text: str,
+    variants: list[str],
+) -> str:
+    now = time.monotonic()
+    _prune_outbound_nonces(nonces, now=now)
+    nonce = secrets.token_urlsafe(24)
+    nonces[nonce] = {
+        "dialog_id": dialog_id,
+        "web_client_id": _bounded_client_id(web_client_id),
+        "source_text": source_text,
+        "variants": tuple(variants),
+        "expires_at": now + OUTBOUND_NONCE_TTL_SECONDS,
+    }
+    nonces.move_to_end(nonce)
+    _prune_outbound_nonces(nonces, now=now)
+    return nonce
+
+
+def _consume_outbound_nonce(
+    nonces: OrderedDict,
+    *,
+    nonce: str,
+    dialog_id: int,
+    web_client_id: str,
+    text: str,
+) -> str | None:
+    if not nonce.strip():
+        return None
+    _prune_outbound_nonces(nonces)
+    payload = nonces.pop(nonce, None)
+    if payload is None:
+        return None
+    if payload["dialog_id"] != dialog_id:
+        logger.warning("rejecting outbound nonce for wrong dialog %s", dialog_id)
+        return None
+    if payload["web_client_id"] != _bounded_client_id(web_client_id):
+        logger.warning("rejecting outbound nonce for wrong web client")
+        return None
+    if text not in payload["variants"]:
+        logger.warning("rejecting outbound nonce for non-variant send in dialog %s", dialog_id)
+        return None
+    return payload["source_text"]
 
 
 def _remember_sent(sent_ids: OrderedDict, dialog_id: int, message_id: int) -> None:
@@ -361,7 +454,7 @@ def _schedule_mark_read(app: FastAPI, client, dialog_id: int, max_id: int) -> No
 
 def build_app(
     *, client=None, session_name: str = "default", suggester=None, web_pass: str | None = None,
-    login_session=None, store=None, translator=None,
+    login_session=None, store=None, translator=None, outbound=None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -371,11 +464,13 @@ def build_app(
         # them because its POST already returned the optimistic bubble.
         app.state.sent_ids_by_client = OrderedDict()
         app.state.sent_reactions_by_client = OrderedDict()
+        app.state.outbound_nonces = OrderedDict()
         app.state.client = client or _make_real_client(session_name)
         # reply suggester (#17) — optional; None disables the /suggest endpoint
         app.state.suggester = suggester
         app.state.store = store
         app.state.translator = translator
+        app.state.outbound = outbound
         await app.state.client.connect()
         app.state.store_task = None
         if app.state.store is not None:
@@ -578,15 +673,39 @@ def build_app(
 
     @app.post("/send", response_class=HTMLResponse)
     async def send(request: Request, dialog_id: str = Form(""), text: str = Form(""),
-                   reply_to: str = Form(""), web_client_id: str = Form("")):
+                   reply_to: str = Form(""), web_client_id: str = Form(""),
+                   source_text: str = Form(""), outbound_nonce: str = Form("")):
         if not dialog_id.strip().lstrip("-").isdigit():
             return _error_response("Select a dialog first.", 400)
         if not text.strip():
             return _error_response("Cannot send an empty message.", 400)
+        dialog_id_int = int(dialog_id)
         reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
-        msg = await request.app.state.client.send_text(int(dialog_id), text, reply_to=reply_to_id)
+        msg = await request.app.state.client.send_text(dialog_id_int, text, reply_to=reply_to_id)
+        source_text = _consume_outbound_nonce(
+            request.app.state.outbound_nonces,
+            nonce=outbound_nonce,
+            dialog_id=dialog_id_int,
+            web_client_id=web_client_id,
+            text=text,
+        )
+        if source_text and request.app.state.store is not None:
+            from tg_messenger.agent.translate import get_user_lang
+
+            try:
+                source_lang = await get_user_lang(request.app.state.store.storage)
+                if source_lang:
+                    await request.app.state.store.record_outgoing(
+                        dialog_id_int,
+                        msg,
+                        source_text=source_text,
+                        source_lang=source_lang,
+                    )
+                    msg = msg.model_copy(update={"translated_text": source_text})
+            except Exception:
+                logger.exception("failed to record outbound source text after send")
         sent_ids = _sent_bucket(request.app.state.sent_ids_by_client, web_client_id)
-        _remember_sent(sent_ids, int(dialog_id), msg.id)  # suppress only this client's SSE echo
+        _remember_sent(sent_ids, dialog_id_int, msg.id)  # suppress only this client's SSE echo
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/reaction", response_class=HTMLResponse)
@@ -662,6 +781,70 @@ def build_app(
         draft = await suggester.suggest(dialog_id)
         return PlainTextResponse(draft)
 
+    @app.post("/dialogs/{dialog_id}/outbound")
+    async def outbound_variants(
+        request: Request,
+        dialog_id: int,
+        text: str = Form(""),
+        web_client_id: str = Form(""),
+    ):
+        same_origin_error = _same_origin_json_error(request)
+        if same_origin_error is not None:
+            return same_origin_error
+        outbound = request.app.state.outbound
+        if outbound is None:
+            return JSONResponse({"applies": False})
+        try:
+            target_lang, variants = await asyncio.wait_for(
+                _build_outbound_variants(outbound, dialog_id, text),
+                timeout=OUTBOUND_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning("outbound variants timed out for dialog %s", dialog_id)
+            return JSONResponse(
+                {"applies": False, "error": "Translation timed out — sending the original."}
+            )
+        except Exception:
+            logger.exception("outbound variants failed for dialog %s", dialog_id)
+            return JSONResponse(
+                {"applies": False, "error": "Translation failed — sending the original."}
+            )
+        if target_lang is None:
+            return JSONResponse({"applies": False})
+        nonce = _remember_outbound_nonce(
+            request.app.state.outbound_nonces,
+            dialog_id=dialog_id,
+            web_client_id=web_client_id,
+            source_text=text,
+            variants=variants,
+        )
+        return JSONResponse(
+            {"applies": True, "target_lang": target_lang, "variants": variants, "nonce": nonce}
+        )
+
+    @app.post("/dialogs/{dialog_id}/lang", response_class=HTMLResponse)
+    async def outbound_lang(
+        request: Request,
+        dialog_id: int,
+        code: str = Form(""),
+        enabled: str = Form("on"),
+    ):
+        same_origin_error = _same_origin_error(request)
+        if same_origin_error is not None:
+            return same_origin_error
+        outbound = request.app.state.outbound
+        if outbound is None:
+            return _error_response("Outbound translation is not configured.", 503)
+        from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
+
+        try:
+            await set_dialog_lang(outbound.storage, dialog_id, code.strip() or None, source="manual")
+        except ValueError as exc:
+            logger.warning("invalid outbound language code for dialog %s: %s", dialog_id, exc)
+            return _error_response(escape(str(exc)), 400)
+        await set_outbound_enabled(outbound.storage, dialog_id, enabled != "off")
+        return HTMLResponse('<div id="outbound-lang-status">saved</div>')
+
     @app.get("/settings/lang", response_class=HTMLResponse)
     async def lang_settings(request: Request):
         translator = request.app.state.translator
@@ -702,3 +885,11 @@ def build_app(
         )
 
     return app
+
+
+async def _build_outbound_variants(outbound, dialog_id: int, text: str) -> tuple[str | None, list[str]]:
+    target_lang = await outbound.applies(dialog_id, text)
+    if target_lang is None:
+        return None, []
+    variants = await outbound.variants(dialog_id, text, target_lang)
+    return target_lang, variants
