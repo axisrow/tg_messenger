@@ -51,24 +51,23 @@ scripts/e2e/run_safe.sh
 `run_safe.sh` executes:
 
 - `01_readonly.sh`
-- `02_mutations_saved.sh`
+- `02_saved_messages.sh`
 
-It never calls `03_manual.sh`.
+It never calls `03_dangerous_parity.sh`.
 
 Useful optional variables:
 
 ```bash
 export E2E_DIALOG_QUERY="$E2E_SAVED_ID"
-export E2E_SEARCH_QUERY="some text expected in Saved Messages"
+export E2E_SEARCH_QUERY="тест"
 export E2E_USERNAME_BASE=e2esmoke
 export E2E_REACTION_EMOTICON="👍"
 export E2E_MUTATION_SLEEP=2
 export E2E_VERBOSE=1
 ```
 
-`E2E_REACT_PEER` can point reaction checks at a throwaway group or peer when
-Saved Messages rejects reactions. Setting it means the mutation script will
-send and delete a temporary marker in that explicit peer.
+`E2E_SEARCH_QUERY` defaults to `тест`. Reactions run against Saved Messages and
+are skipped when Telegram rejects them for account-policy reasons.
 
 ## Safety Tiers
 
@@ -84,9 +83,9 @@ Read-only checks. Safe to run periodically.
 - low-limit `username suggest`
 - local list commands for heartbeat, moderation rules, ghostwrite dialogs
 
-### Tier 2: `02_mutations_saved.sh`
+### Tier 2: `02_saved_messages.sh`
 
-Reversible mutations, confined to Saved Messages by default.
+Safe reversible mutations, confined to Saved Messages.
 
 The script creates unique `e2e-...` markers, recovers message ids from
 `tg-messenger read` output, and deletes its created messages. Cleanup also runs
@@ -99,39 +98,36 @@ Covered scenarios:
 - edit
 - best-effort reaction
 - forward Saved Messages to Saved Messages
-- send generated file with caption
+- forward a comma-separated id list
+- send generated file with explicit `--caption`
 - send generated file as a document
+- delete a created Saved Messages message with `--for-me`
 - mark-read
 - reaction event round-trip through `chat`
 - local SQLite CRUD for `moderate-rules`, `heartbeat`, and `ghostwrite-dialogs`
 
-### Tier 3: `03_manual.sh`
+### Dangerous parity: `03_dangerous_parity.sh`
 
-Dangerous/account-visible checks. This script is never run by `run_safe.sh`.
+Dangerous scenarios are documented for parity only and intentionally not
+automated. This script is never run by `run_safe.sh`, and it does not call
+`tg-messenger`.
 
-It requires:
-
-```bash
-export E2E_I_UNDERSTAND=1
-scripts/e2e/03_manual.sh
-```
-
-It also asks interactive `y/N` before every step. Targets have no defaults; set
-only the variables for the checks you intend to run:
+Run it to print the parity stub:
 
 ```bash
-export E2E_REAL_PEER=<explicit peer id>
-export E2E_USERNAME_TEST_NAME=<temporary_public_username>
-export E2E_HEARTBEAT_PEER=<explicit peer id>
-export E2E_HEARTBEAT_AT=23:59
-export E2E_FACTORY_URL=http://127.0.0.1:8000
-export E2E_RUN_SERVE=1
-export E2E_RUN_TUI=1
+scripts/e2e/03_dangerous_parity.sh
 ```
 
-Manual tier scenarios include real-dialog send/delete, username set/clear,
-server-side scheduled sends, enforcing/long-running services, `serve`, `tui`,
-`logout`, and profile removal.
+Dangerous means destructive or externally visible real-state operations outside
+Saved Messages, such as:
+
+- deleting real messages outside Saved Messages
+- `logout` or profile/session destruction
+- public `username set` / `username clear`
+- server-side scheduled sends to a real peer
+- destructive group/account operations
+
+See `PARITY.md` for the full CLI coverage map.
 
 ## Notes
 

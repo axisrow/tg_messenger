@@ -38,11 +38,8 @@ step_dialogs_find() {
 }
 step_read_saved() { tg read "$E2E_SAVED_ID" --limit 5 >/dev/null; }
 step_search_saved() {
-  if [ -z "${E2E_SEARCH_QUERY:-}" ]; then
-    e2e_skip_step "E2E_SEARCH_QUERY is not set"
-    return 77
-  fi
-  tg search "$E2E_SAVED_ID" "$E2E_SEARCH_QUERY" --limit 5 >/dev/null
+  local query="${E2E_SEARCH_QUERY:-тест}"
+  tg search "$E2E_SAVED_ID" "$query" --limit 5 >/dev/null
 }
 step_read_download() {
   tg read "$E2E_SAVED_ID" --limit 5 --download "$TMP_DOWNLOAD_DIR" >/dev/null

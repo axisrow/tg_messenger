@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tier 2: reversible mutations. Telegram writes target Saved Messages by
-# default; any non-Saved reaction peer must be explicitly configured.
+# Tier 2: safe reversible mutations confined to Saved Messages.
 
 set -uo pipefail
 
@@ -18,8 +17,14 @@ BASE_ID=""
 REPLY_ID=""
 FORWARD_SOURCE_ID=""
 FORWARD_COPY_ID=""
+FORWARD_LIST_SOURCE_ID=""
+FORWARD_LIST_REPLY_ID=""
+FORWARD_LIST_COPY_ID_1=""
+FORWARD_LIST_COPY_ID_2=""
 FILE_ID=""
 AS_FILE_ID=""
+CAPTION_FILE_ID=""
+FOR_ME_DELETE_ID=""
 EDIT_MARKER=""
 DELETE_CREATED_OK=0
 SAVED_MARKERS=()
@@ -106,24 +111,8 @@ step_edit_base() {
 }
 
 step_react_best_effort() {
-  local peer="${E2E_REACT_PEER:-$SAVED_PEER}"
+  local peer="$SAVED_PEER"
   local target_id="$BASE_ID"
-  local marker
-  local history
-
-  if [ "$peer" != "$SAVED_PEER" ]; then
-    marker="$(e2e_marker react-peer)"
-    tg send "$peer" "$marker" >/dev/null || return 1
-    e2e_mutation_pause
-    history="$(e2e_recent_history "$peer" 20)" || return 1
-    target_id="$(e2e_extract_message_id "$history" "$marker")"
-    if [ -z "$target_id" ]; then
-      echo "reaction peer marker was not found: $marker" >&2
-      echo "$history"
-      return 1
-    fi
-    e2e_register_message "$peer" "$target_id" "$marker"
-  fi
 
   if [ -z "$target_id" ]; then
     echo "reaction target id is missing" >&2
@@ -161,6 +150,47 @@ step_forward_saved_to_saved() {
   echo "forward copy id: $FORWARD_COPY_ID"
 }
 
+step_forward_saved_list_to_saved() {
+  local marker
+  local reply_marker
+  local history
+  marker="$(e2e_marker forward-list-source)"
+  if ! FORWARD_LIST_SOURCE_ID="$(send_marker_to_peer "$SAVED_PEER" "$marker" 20)" ||
+    [ -z "$FORWARD_LIST_SOURCE_ID" ]; then
+    echo "failed to send or recover forward list source id" >&2
+    return 1
+  fi
+  e2e_register_message "$SAVED_PEER" "$FORWARD_LIST_SOURCE_ID" "$marker"
+  remember_saved_marker "$marker"
+
+  reply_marker="$(e2e_marker forward-list-reply)"
+  tg send "$SAVED_PEER" "$reply_marker" --reply-to "$FORWARD_LIST_SOURCE_ID" >/dev/null || return 1
+  e2e_mutation_pause
+  history="$(e2e_recent_history "$SAVED_PEER" 30)" || return 1
+  FORWARD_LIST_REPLY_ID="$(e2e_extract_message_id "$history" "$reply_marker")"
+  if [ -z "$FORWARD_LIST_REPLY_ID" ]; then
+    echo "forward list reply source was not found: $reply_marker" >&2
+    echo "$history"
+    return 1
+  fi
+  e2e_register_message "$SAVED_PEER" "$FORWARD_LIST_REPLY_ID" "$reply_marker"
+  remember_saved_marker "$reply_marker"
+
+  tg forward "$SAVED_PEER" "$FORWARD_LIST_SOURCE_ID,$FORWARD_LIST_REPLY_ID" "$SAVED_PEER" >/dev/null ||
+    return 1
+  e2e_mutation_pause
+  history="$(e2e_recent_history "$SAVED_PEER" 50)" || return 1
+  FORWARD_LIST_COPY_ID_1="$(e2e_extract_message_id_except "$history" "$marker" "$FORWARD_LIST_SOURCE_ID")"
+  FORWARD_LIST_COPY_ID_2="$(e2e_extract_message_id_except "$history" "$reply_marker" "$FORWARD_LIST_REPLY_ID")"
+  if [ -z "$FORWARD_LIST_COPY_ID_1" ] || [ -z "$FORWARD_LIST_COPY_ID_2" ]; then
+    echo "forwarded list copies were not found" >&2
+    echo "$history"
+    return 1
+  fi
+  e2e_register_message "$SAVED_PEER" "$FORWARD_LIST_COPY_ID_1" "$marker"
+  e2e_register_message "$SAVED_PEER" "$FORWARD_LIST_COPY_ID_2" "$reply_marker"
+}
+
 step_send_file_with_caption() {
   local file="$TMP_DIR/e2e-file.txt"
   local marker
@@ -177,6 +207,25 @@ step_send_file_with_caption() {
     return 1
   fi
   e2e_register_message "$SAVED_PEER" "$FILE_ID" "$marker"
+  remember_saved_marker "$marker"
+}
+
+step_send_file_with_caption_option() {
+  local file="$TMP_DIR/e2e-caption-option.txt"
+  local marker
+  local history
+  marker="$(e2e_marker caption-option)"
+  printf 'temporary e2e caption-option file: %s\n' "$marker" >"$file"
+  tg send "$SAVED_PEER" --file "$file" --caption "$marker" >/dev/null || return 1
+  e2e_mutation_pause
+  history="$(e2e_recent_history "$SAVED_PEER" 30)" || return 1
+  CAPTION_FILE_ID="$(e2e_extract_message_id "$history" "$marker")"
+  if [ -z "$CAPTION_FILE_ID" ]; then
+    echo "explicit --caption marker was not found: $marker" >&2
+    echo "$history"
+    return 1
+  fi
+  e2e_register_message "$SAVED_PEER" "$CAPTION_FILE_ID" "$marker"
   remember_saved_marker "$marker"
 }
 
@@ -199,12 +248,37 @@ step_send_file_as_file() {
   remember_saved_marker "$marker"
 }
 
+step_delete_for_me_saved() {
+  local marker
+  local history
+  local after_history
+  marker="$(e2e_marker delete-for-me)"
+  if ! FOR_ME_DELETE_ID="$(send_marker_to_peer "$SAVED_PEER" "$marker" 20)" || [ -z "$FOR_ME_DELETE_ID" ]; then
+    echo "failed to send or recover delete-for-me message id" >&2
+    return 1
+  fi
+  history="$(e2e_recent_history "$SAVED_PEER" 20)" || return 1
+  if ! printf '%s\n' "$history" | grep -F -- "$marker" >/dev/null; then
+    echo "delete-for-me marker was not visible before deletion: $marker" >&2
+    echo "$history"
+    return 1
+  fi
+  tg delete "$SAVED_PEER" "$FOR_ME_DELETE_ID" --for-me >/dev/null || return 1
+  e2e_mutation_pause
+  after_history="$(e2e_recent_history "$SAVED_PEER" 20)" || return 1
+  if printf '%s\n' "$after_history" | grep -F -- "$marker" >/dev/null; then
+    echo "delete-for-me marker still visible: $marker" >&2
+    echo "$after_history"
+    return 1
+  fi
+}
+
 step_mark_read_saved() {
   tg mark-read "$SAVED_PEER" >/dev/null
 }
 
 step_reaction_roundtrip() {
-  local peer="${E2E_REACT_PEER:-$SAVED_PEER}"
+  local peer="$SAVED_PEER"
   local marker
   local target_id
   local history
@@ -223,9 +297,7 @@ step_reaction_roundtrip() {
     return 1
   fi
   e2e_register_message "$peer" "$target_id" "$marker"
-  if [ "$peer" = "$SAVED_PEER" ]; then
-    remember_saved_marker "$marker"
-  fi
+  remember_saved_marker "$marker"
 
   mkfifo "$stdin_fifo" || return 1
   tail -f /dev/null >"$stdin_fifo" &
@@ -332,8 +404,11 @@ e2e_step "send reply in Saved Messages" step_reply_to_base
 e2e_step "edit Saved Messages test message" step_edit_base
 e2e_step "react best-effort" step_react_best_effort
 e2e_step "forward Saved Messages message to Saved Messages" step_forward_saved_to_saved
+e2e_step "forward Saved Messages id list to Saved Messages" step_forward_saved_list_to_saved
 e2e_step "send generated file with caption" step_send_file_with_caption
+e2e_step "send generated file with explicit --caption" step_send_file_with_caption_option
 e2e_step "send generated file as document" step_send_file_as_file
+e2e_step "delete Saved Messages message --for-me" step_delete_for_me_saved
 e2e_step "mark Saved Messages read" step_mark_read_saved
 e2e_step "reaction listen round-trip through chat" step_reaction_roundtrip
 e2e_step "moderate-rules add/list/remove local CRUD" step_sqlite_moderate_rules
