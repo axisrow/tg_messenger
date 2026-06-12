@@ -63,7 +63,7 @@ async def test_message_store_first_load_then_cooldown_serves_db(tmp_path):
     assert [m.id for m in first] == [1, 2, 3]
     assert [m.id for m in second] == [1, 2, 3]
     assert [m.id for m in third] == [1, 2, 3, 4]
-    assert client.calls == [(7, 0, 50), (7, 3, 50)]
+    assert client.calls == [(7, 0, 50), (7, 3, 50), (7, 0, 50)]
 
 
 async def test_message_store_resets_window_on_possible_gap(tmp_path):
@@ -117,6 +117,21 @@ async def test_message_store_prunes_cached_window_when_no_newer_messages(tmp_pat
         t["now"] = 16.0
         client.messages = [_msg(3), _msg(1)]
         assert [m.id for m in await store.history(7, limit=3)] == [1, 3]
+    finally:
+        await store.close()
+
+    assert client.calls == [(7, 0, 3), (7, 3, 3), (7, 0, 3)]
+
+
+async def test_message_store_prunes_cached_window_when_newer_messages_arrive(tmp_path):
+    t = {"now": 0.0}
+    client = StoreClient()
+    store = MessageStore(client=client, storage=await _storage(tmp_path), clock=lambda: t["now"])
+    try:
+        assert [m.id for m in await store.history(7, limit=3)] == [1, 2, 3]
+        t["now"] = 16.0
+        client.messages = [_msg(4), _msg(3), _msg(1)]
+        assert [m.id for m in await store.history(7, limit=3)] == [1, 3, 4]
     finally:
         await store.close()
 

@@ -116,7 +116,13 @@ class Translator:
 
     async def _prepare_message(self, message: Message, target: str) -> tuple[Message, bool]:
         try:
-            cached = await get_message_translation(self._storage, message.dialog_id, message.id, target)
+            cached = await get_message_translation(
+                self._storage,
+                message.dialog_id,
+                message.id,
+                target,
+                source_text=message.text,
+            )
             if cached is not None:
                 return message.model_copy(update={"translated_text": cached["text"]}), False
             if not needs_translation(message.text, target):

@@ -191,11 +191,8 @@ class MessageStore:
             if row is None or len(fetched) >= limit:
                 await self._replace_window(peer, fetched, limit)
             else:
-                for message in fetched:
-                    await self._upsert_message(message)
-                ids = [int(m.id) for m in fetched]
-                low, high = int(row[0]), max(high_id, max(ids))
-                await self._set_sync_row(peer, low, high)
+                await self._sync_full_window(peer, limit)
+                return
         elif row is None:
             await self._replace_window(peer, fetched, limit)
         else:
@@ -276,8 +273,14 @@ class MessageStore:
         text = translated_text if translated_text is not None else message.translated_text
         lang = translated_lang
         update_translation = (
-            "translated_text = COALESCE(messages.translated_text, excluded.translated_text), "
-            "translated_lang = COALESCE(messages.translated_lang, excluded.translated_lang)"
+            "translated_text = CASE "
+            "WHEN messages.text IS excluded.text "
+            "THEN COALESCE(messages.translated_text, excluded.translated_text) "
+            "ELSE excluded.translated_text END, "
+            "translated_lang = CASE "
+            "WHEN messages.text IS excluded.text "
+            "THEN COALESCE(messages.translated_lang, excluded.translated_lang) "
+            "ELSE excluded.translated_lang END"
             if preserve_translation
             else "translated_text = excluded.translated_text, translated_lang = excluded.translated_lang"
         )
@@ -330,7 +333,9 @@ async def upsert_message_for_translation(storage, message: Message) -> None:
         "ON CONFLICT(dialog_id, id) DO UPDATE SET "
         "sender_id = excluded.sender_id, out = excluded.out, date = excluded.date, "
         "text = excluded.text, media = excluded.media, reply_to_id = excluded.reply_to_id, "
-        "is_forward = excluded.is_forward",
+        "is_forward = excluded.is_forward, "
+        "translated_text = CASE WHEN messages.text IS excluded.text THEN messages.translated_text ELSE NULL END, "
+        "translated_lang = CASE WHEN messages.text IS excluded.text THEN messages.translated_lang ELSE NULL END",
         (
             int(message.dialog_id),
             int(message.id),
@@ -360,11 +365,18 @@ async def set_message_translation(
     )
 
 
-async def get_message_translation(storage, dialog_id: int, message_id: int, lang: str):
+async def get_message_translation(
+    storage,
+    dialog_id: int,
+    message_id: int,
+    lang: str,
+    *,
+    source_text: str | None = None,
+):
     row = await storage.fetchone(
-        "SELECT translated_text, translated_lang FROM messages WHERE dialog_id = ? AND id = ?",
+        "SELECT text, translated_text, translated_lang FROM messages WHERE dialog_id = ? AND id = ?",
         (int(dialog_id), int(message_id)),
     )
-    if row is None or row[1] != lang:
+    if row is None or row[2] != lang or (source_text is not None and row[0] != source_text):
         return None
-    return {"text": row[0], "lang": row[1]}
+    return {"text": row[1], "lang": row[2]}

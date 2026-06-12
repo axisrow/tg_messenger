@@ -164,6 +164,30 @@ async def test_translator_skips_outgoing_messages(tmp_path):
     assert calls == []
 
 
+async def test_translator_retranslates_when_source_text_changes(tmp_path):
+    storage = Storage(tmp_path / "t.db")
+    register_message_store_migrations(storage)
+    calls = []
+
+    async def translate_fn(batch, lang):
+        calls.append((list(batch), lang))
+        return {mid: f"ru:{text}" for mid, text in batch}
+
+    store = MessageStore(client=object(), storage=storage)
+    translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "ru"})
+    try:
+        await store.connect()
+        first = await translator.translate_history(7, [_msg(1, "hello")])
+        await store.ingest(_msg(1, "updated"))
+        second = await translator.translate_history(7, [_msg(1, "updated")])
+    finally:
+        await store.close()
+
+    assert first[0].translated_text == "ru:hello"
+    assert second[0].translated_text == "ru:updated"
+    assert calls == [([(1, "hello")], "ru"), ([(1, "updated")], "ru")]
+
+
 async def test_translator_failure_is_logged_and_unraised(tmp_path, caplog):
     storage = Storage(tmp_path / "t.db")
     register_message_store_migrations(storage)
