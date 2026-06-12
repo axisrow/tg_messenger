@@ -30,6 +30,7 @@ from tg_messenger.core.logsetup import log_file_path, setup_logging
 from tg_messenger.core.models import message_line
 
 logger = logging.getLogger(__name__)
+CHAT_OUTBOUND_TIMEOUT_SECONDS = 20
 
 
 def _reaction_emoticon(emoticon: str | None) -> str:
@@ -1191,10 +1192,31 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                             click.echo("language setting saved.")
                             continue
                         if outbound is not None:
-                            target_lang = await outbound.applies(dialog_id, line)
+                            try:
+                                target_lang = await asyncio.wait_for(
+                                    outbound.applies(dialog_id, line),
+                                    timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS,
+                                )
+                            except TimeoutError:
+                                logger.warning(
+                                    "outbound applicability timed out (dialog %s)", dialog_id
+                                )
+                                click.echo("translation timed out — sending original.", err=True)
+                                msg = await client.send_text(dialog_id, line)
+                                sent_ids.append((dialog_id, msg.id))
+                                continue
                             if target_lang is not None:
                                 try:
-                                    variants = await outbound.variants(dialog_id, line, target_lang)
+                                    variants = await asyncio.wait_for(
+                                        outbound.variants(dialog_id, line, target_lang),
+                                        timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS,
+                                    )
+                                except TimeoutError:
+                                    logger.warning("outbound variants timed out (dialog %s)", dialog_id)
+                                    click.echo("translation timed out — sending original.", err=True)
+                                    msg = await client.send_text(dialog_id, line)
+                                    sent_ids.append((dialog_id, msg.id))
+                                    continue
                                 except Exception:
                                     logger.exception("outbound variants failed (dialog %s)", dialog_id)
                                     confirm = await asyncio.to_thread(

@@ -67,7 +67,8 @@ async def test_dialog_lang_and_enabled_kv(tmp_path):
 @pytest.mark.parametrize(
     ("texts", "expected"),
     [
-        (["привет", "как дела"], "ru"),
+        (["привет", "как дела"], None),
+        (["привіт", "як справи"], None),
         (["안녕하세요"], "ko"),
         (["こんにちは"], "ja"),
         (["你好"], "zh"),
@@ -77,6 +78,28 @@ async def test_dialog_lang_and_enabled_kv(tmp_path):
 )
 def test_detect_script_lang(texts, expected):
     assert detect_script_lang(texts) == expected
+
+
+async def test_dialog_lang_uses_detector_for_cyrillic_before_caching(tmp_path):
+    storage = await _storage(tmp_path)
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return "uk"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "привіт"), _msg(2, "як справи")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        assert await outbound.dialog_lang(7) == "uk"
+        assert await outbound.dialog_lang(7) == "uk"
+    finally:
+        await storage.close()
+    assert calls == [["привіт", "як справи"]]
 
 
 async def test_dialog_lang_uses_llm_for_latin_and_caches(tmp_path):
@@ -163,6 +186,29 @@ async def test_applies_suppresses_latin_draft_when_detector_matches_dialog(tmp_p
     finally:
         await storage.close()
     assert calls == [["hola"]]
+
+
+async def test_applies_cyrillic_user_to_non_cyrillic_dialog_uses_exact_detection(tmp_path):
+    storage = await _storage(tmp_path)
+    await set_user_lang(storage, "uk")
+    await set_dialog_lang(storage, 7, "en", source="manual")
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return "uk"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        assert await outbound.applies(7, "привіт") == "en"
+    finally:
+        await storage.close()
+    assert calls == [["привіт"]]
 
 
 async def test_variants_passes_profile_and_context(tmp_path):

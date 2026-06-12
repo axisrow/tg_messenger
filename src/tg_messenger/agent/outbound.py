@@ -24,6 +24,7 @@ DIALOG_LANG_KEY = "dialog_lang_{dialog_id}"
 OUTBOUND_ENABLED_KEY = "outbound_enabled_{dialog_id}"
 LANG_CODE_RE = re.compile(r"^[a-z]{2,3}$")
 NON_LATIN_SCRIPT_LANGS = {"ar", "el", "he", "ja", "ko", "ru", "th", "zh"}
+CYRILLIC_SCRIPT_LANGS = {"be", "bg", "kk", "ky", "mk", "mn", "ru", "sr", "tg", "uk", "uz"}
 
 
 class DialogLang(BaseModel):
@@ -81,7 +82,9 @@ async def set_outbound_enabled(storage, dialog_id: int, enabled: bool) -> None:
 
 def detect_script_lang(texts: Sequence[str]) -> str | None:
     lang = _dominant_script_lang(texts)
-    return None if lang == "latin" else lang
+    # Latin and Cyrillic are scripts shared by many languages. They need the
+    # injected exact detector before we persist a dialog language.
+    return None if lang in {None, "latin", "ru"} else lang
 
 
 def _dominant_script_lang(texts: Sequence[str]) -> str | None:
@@ -199,6 +202,15 @@ class OutboundTranslator:
             script_lang = _dominant_script_lang([draft_text])
             if script_lang is None:
                 return None
+            if script_lang == "ru":
+                if user_lang not in CYRILLIC_SCRIPT_LANGS:
+                    return None
+                draft_lang = await self._detect_draft_lang(draft_text)
+                if draft_lang == dialog_lang:
+                    return None
+                if draft_lang is not None and draft_lang != user_lang:
+                    return None
+                return dialog_lang
             if script_lang != "latin":
                 if script_lang != user_lang:
                     return None

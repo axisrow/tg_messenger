@@ -627,6 +627,21 @@ def test_chat_lang_command_is_handled_before_outbound(runner, monkeypatch):
     assert "language setting saved" in result.output
 
 
+def test_chat_outbound_timeout_sends_original(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    class FakeOutbound:
+        async def applies(self, dialog_id, text):
+            raise TimeoutError
+
+    monkeypatch.setattr(cli_main, "make_optional_outbound", lambda s, storage: FakeOutbound())
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n")
+    assert result.exit_code == 0, result.output
+    assert (7, "привет", None, None) in stub.sent
+    assert "translation timed out" in result.output
+
+
 def test_dialog_lang_show_set_and_off(monkeypatch, tmp_path):
     from tg_messenger.core.storage import Storage
 
