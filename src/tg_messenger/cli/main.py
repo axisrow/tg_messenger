@@ -919,9 +919,9 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
         try:
             await _ensure_authorized(client, session)
 
-            # ids we sent from this REPL — the same ids echo on listen_outgoing();
+            # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();
             # skip them so our own input isn't printed back. Bounded (deque).
-            sent_ids: deque[int] = deque(maxlen=200)
+            sent_ids: deque[tuple[int, int]] = deque(maxlen=200)
 
             async def printer():
                 async for ev in client.listen():
@@ -931,7 +931,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             async def printer_outgoing():
                 # our own messages sent from another device (phone/web/CLI elsewhere)
                 async for ev in client.listen_outgoing():
-                    if ev.dialog_id == dialog_id and ev.message.id not in sent_ids:
+                    if ev.dialog_id == dialog_id and (ev.dialog_id, ev.message.id) not in sent_ids:
                         click.echo(f"\n→ {ev.message.text or '<media>'}")
 
             tasks = [asyncio.create_task(printer()), asyncio.create_task(printer_outgoing())]
@@ -943,7 +943,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                         break
                     if line.strip():
                         msg = await client.send_text(dialog_id, line)
-                        sent_ids.append(msg.id)  # suppress this line's outgoing echo
+                        sent_ids.append((dialog_id, msg.id))  # suppress this line's outgoing echo
             finally:
                 for t in tasks:
                     t.cancel()

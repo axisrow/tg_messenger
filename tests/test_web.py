@@ -596,7 +596,7 @@ async def test_stream_skips_outgoing_echo_of_messages_we_sent():
 
     stub = WebStubClient()
     sent_ids = OrderedDict()
-    sent_ids[42] = True  # как будто /send уже вернул пузырёк для этого id
+    sent_ids[(7, 42)] = True  # как будто /send уже вернул пузырёк для этого сообщения
     gen = sse_event_stream(stub, dialog_id=7, sent_ids=sent_ids)
     task = asyncio.create_task(gen.__anext__())
     while stub.bus_out.subscriber_count == 0:  # deterministic: wait until subscribed
@@ -616,6 +616,32 @@ async def test_stream_skips_outgoing_echo_of_messages_we_sent():
     payload = json.loads(frame.removeprefix("data: ").strip())
     # эхо (id=42) пропущено, пришло следующее своё сообщение (id=43)
     assert payload == {"id": 43, "text": "новое", "out": True}
+    await gen.aclose()
+
+
+async def test_stream_does_not_skip_same_message_id_from_other_dialog():
+    import asyncio
+    import json
+    from collections import OrderedDict
+
+    from tg_messenger.core.models import OutgoingEvent
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+    sent_ids = OrderedDict()
+    sent_ids[(9, 42)] = True  # same Telegram message id, but a different dialog
+    gen = sse_event_stream(stub, dialog_id=7, sent_ids=sent_ids)
+    task = asyncio.create_task(gen.__anext__())
+    while stub.bus_out.subscriber_count == 0:
+        await asyncio.sleep(0)
+
+    msg = Message(id=42, dialog_id=7, sender_id=1, out=True, text="same id",
+                  date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus_out.publish(OutgoingEvent(dialog_id=7, message=msg))
+
+    frame = await asyncio.wait_for(task, timeout=2)
+    payload = json.loads(frame.removeprefix("data: ").strip())
+    assert payload == {"id": 42, "text": "same id", "out": True}
     await gen.aclose()
 
 

@@ -162,10 +162,11 @@ def _same_origin_error(request: Request) -> HTMLResponse | None:
     return None
 
 
-def _remember_sent(sent_ids: OrderedDict, message_id: int) -> None:
-    """Record a message id sent via this server so its outgoing echo isn't re-streamed."""
-    sent_ids[message_id] = True
-    sent_ids.move_to_end(message_id)
+def _remember_sent(sent_ids: OrderedDict, dialog_id: int, message_id: int) -> None:
+    """Record a sent message key so its outgoing echo isn't re-streamed."""
+    key = (dialog_id, message_id)
+    sent_ids[key] = True
+    sent_ids.move_to_end(key)
     while len(sent_ids) > 200:  # bounded, like the core caches
         sent_ids.popitem(last=False)
 
@@ -209,7 +210,7 @@ async def sse_event_stream(client, dialog_id: int, sent_ids: OrderedDict | None 
                 pending[asyncio.ensure_future(iterators[out].__anext__())] = out
                 if ev.dialog_id != dialog_id:
                     continue
-                if out and ev.message.id in sent_ids:
+                if out and (ev.dialog_id, ev.message.id) in sent_ids:
                     continue  # our own optimistic bubble already shows it
                 payload = {"id": ev.message.id, "text": ev.message.text, "out": out}
                 yield f"data: {json.dumps(payload)}\n\n"
@@ -492,7 +493,7 @@ def build_app(
             return _error_response("Cannot send an empty message.", 400)
         reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
         msg = await request.app.state.client.send_text(int(dialog_id), text, reply_to=reply_to_id)
-        _remember_sent(request.app.state.sent_ids, msg.id)  # suppress its SSE echo
+        _remember_sent(request.app.state.sent_ids, int(dialog_id), msg.id)  # suppress its SSE echo
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/media", response_class=HTMLResponse)
@@ -526,7 +527,7 @@ def build_app(
             msg = await request.app.state.client.send_media(dialog_id, tmp_path, caption=caption)
         finally:
             os.unlink(tmp_path)
-        _remember_sent(request.app.state.sent_ids, msg.id)  # suppress its SSE echo
+        _remember_sent(request.app.state.sent_ids, dialog_id, msg.id)  # suppress its SSE echo
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/suggest", response_class=PlainTextResponse)

@@ -748,6 +748,32 @@ async def test_tui_own_send_is_not_duplicated_by_outgoing_echo():
         assert bubbles == ["привет"]
 
 
+class OutgoingSameIdOtherDialogClient(TuiStubClient):
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def listen_outgoing(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield OutgoingEvent(dialog_id=7, message=Message(
+            id=2, dialog_id=7, sender_id=1, out=True, text="same id", date=date))
+        await asyncio.Event().wait()
+
+
+async def test_tui_outgoing_does_not_skip_same_message_id_from_other_dialog():
+    stub = OutgoingSameIdOtherDialogClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._send_text(9, "other")  # remembers (dialog=9, id=2), no bubble in dialog 7
+        stub.fire.set()  # dialog 7 also has id=2; it must still render
+        await pilot.pause()
+        bubbles = [str(b.render()) for b in app.query(MessageBubble)]
+        assert bubbles == ["same id"]
+
+
 async def test_tui_group_incoming_does_not_trigger_suggester():
     class RecordingSuggester:
         def __init__(self):

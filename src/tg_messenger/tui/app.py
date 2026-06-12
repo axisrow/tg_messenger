@@ -280,10 +280,10 @@ class MessengerTUI(App):
         self._all_dialogs: list = []  # full loaded list; search filters it locally
         self._suggester = suggester
         self._pending_suggestion: str | None = None
-        # ids of messages we sent from this composer — the same ids echo back on
+        # (dialog_id, message_id) keys we sent from this composer — the same messages echo back on
         # listen_outgoing(); skip them so our optimistic bubble isn't duplicated.
         # Bounded (OrderedDict-as-set, watch.py pattern): a long session can't grow it.
-        self._sent_ids: OrderedDict[int, bool] = OrderedDict()
+        self._sent_ids: OrderedDict[tuple[int, int], bool] = OrderedDict()
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -472,10 +472,11 @@ class MessengerTUI(App):
         event.input.value = ""  # clear optimistically; restored on failure
         self.run_worker(self._send_text(self._current, text), exclusive=False)
 
-    def _remember_sent(self, message_id: int) -> None:
+    def _remember_sent(self, dialog_id: int, message_id: int) -> None:
         """Record a message we sent so its listen_outgoing() echo isn't drawn twice."""
-        self._sent_ids[message_id] = True
-        self._sent_ids.move_to_end(message_id)
+        key = (dialog_id, message_id)
+        self._sent_ids[key] = True
+        self._sent_ids.move_to_end(key)
         while len(self._sent_ids) > 200:  # bounded, like watch.py's caches
             self._sent_ids.popitem(last=False)
 
@@ -489,7 +490,7 @@ class MessengerTUI(App):
             if not composer.value:  # don't clobber a draft typed meanwhile
                 composer.value = text
             return
-        self._remember_sent(msg.id)  # suppress the echo from listen_outgoing()
+        self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
             await pane.mount(MessageBubble(text, out=True))
@@ -501,7 +502,7 @@ class MessengerTUI(App):
             logger.exception("send media failed (dialog %s, %s)", peer, path)
             self.notify(f"Send failed: {exc}", severity="error")
             return
-        self._remember_sent(msg.id)  # suppress the echo from listen_outgoing()
+        self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
             label = caption or f"📎 {os.path.basename(path)}"
@@ -527,7 +528,7 @@ class MessengerTUI(App):
         """
         try:
             async for ev in self._client.listen_outgoing():  # own messages, any device
-                if ev.message.id in self._sent_ids:
+                if (ev.dialog_id, ev.message.id) in self._sent_ids:
                     continue  # our own optimistic bubble already shows it
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
