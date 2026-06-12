@@ -326,8 +326,21 @@ class MessengerTUI(App):
 
     def _scroll_messages_to_end(self, pane=None) -> None:
         pane = pane or self.query_one("#messages", Vertical)
-        pane.scroll_end(animate=False)
-        self.call_after_refresh(pane.scroll_end, animate=False)
+        remaining_attempts = 4
+
+        def scroll_once() -> None:
+            nonlocal remaining_attempts
+            pane.scroll_end(animate=False, force=True)
+            if pane.max_scroll_y:
+                pane.scroll_to(y=pane.max_scroll_y, animate=False, force=True)
+            remaining_attempts -= 1
+            if remaining_attempts > 0 and (
+                pane.max_scroll_y == 0 or pane.scroll_y < pane.max_scroll_y
+            ):
+                self.call_later(scroll_once)
+
+        scroll_once()
+        self.call_later(scroll_once)
 
     def compose(self) -> ComposeResult:
         with Horizontal():

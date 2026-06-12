@@ -251,8 +251,11 @@ async def test_tui_history_scrolls_to_newest_message():
     async with app.run_test(size=(80, 20)) as pilot:
         await pilot.pause()
         await app._show_history(7)
-        await pilot.pause()
         pane = app.query_one("#messages")
+        for _ in range(6):
+            await pilot.pause()
+            if pane.max_scroll_y > 0 and pane.scroll_y == pane.max_scroll_y:
+                break
         assert pane.max_scroll_y > 0
         assert pane.scroll_y == pane.max_scroll_y
 
