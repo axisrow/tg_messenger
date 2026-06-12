@@ -77,7 +77,6 @@ Optional media, service and LLM checks are opt-in:
 
 ```bash
 export E2E_VOICE_FILE=/path/to/voice.ogg
-export E2E_VIDEO_NOTE_FILE=/path/to/round-video.mp4
 export E2E_RUN_SERVICES=1
 export E2E_SERVE_PORT=18090
 export E2E_ALLOW_LLM=1
@@ -121,7 +120,7 @@ Covered scenarios:
 - send generated file with explicit `--caption`
 - send generated file as a document
 - optional `send --voice` from `E2E_VOICE_FILE`
-- optional `send --video-note` from `E2E_VIDEO_NOTE_FILE`
+- `send --video-note` parity stub: skipped until the CLI exposes the sent message id for safe cleanup
 - delete a created Saved Messages message with `--for-me`
 - mark-read
 - reaction event round-trip through `chat`
@@ -134,7 +133,7 @@ missing prerequisites report `SKIP` rather than guessing.
 
 Covered scenarios:
 
-- `serve` on localhost with an HTTP assertion, gated by `E2E_RUN_SERVICES=1`
+- `serve` on localhost with a root-route HTTP assertion, gated by `E2E_RUN_SERVICES=1`
 - `chat` REPL send to Saved Messages
 - `chat` REPL `/react` best-effort in Saved Messages
 - `suggest` dry-run, gated by `TG_AGENT_MODEL`, `E2E_ALLOW_LLM=1`, and `E2E_SUGGEST_DM`

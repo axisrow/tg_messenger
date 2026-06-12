@@ -54,7 +54,7 @@ step_serve_http() {
     cat "$log"
     return 1
   fi
-  e2e_wait_for_http "http://127.0.0.1:$port/login" 30
+  e2e_wait_for_http "http://127.0.0.1:$port/" 30
   status=$?
   if ! e2e_is_process_running "$pid"; then
     e2e_stop_background_pid "$pid"
@@ -67,7 +67,7 @@ step_serve_http() {
     return 77
   fi
   if [ "$status" -ne 0 ]; then
-    echo "serve did not return HTTP 200/401 from /login" >&2
+    echo "serve did not return HTTP 200/401 from /" >&2
     cat "$log"
     return 1
   fi
@@ -212,7 +212,7 @@ step_heartbeat_run_startup() {
   e2e_stop_background_pid "$pid"
 }
 
-e2e_step "serve localhost /login HTTP assertion" step_serve_http
+e2e_step "serve localhost root HTTP assertion" step_serve_http
 e2e_step "chat REPL sends a Saved Messages line" step_chat_repl_send
 e2e_step "chat REPL /react best-effort" step_chat_repl_react
 e2e_step "suggest dry-run" step_suggest_dry_run

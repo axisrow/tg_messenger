@@ -21,7 +21,7 @@ destructive or externally visible real-state changes outside Saved Messages.
 | `send --file --caption` | safe automated | `02_saved_messages.sh` with explicit `--caption`. |
 | `send --file --as-file` | safe automated | `02_saved_messages.sh`. |
 | `send --voice` | safe optional | `02_saved_messages.sh`, gated by `E2E_VOICE_FILE`. |
-| `send --video-note` | safe optional | `02_saved_messages.sh`, gated by `E2E_VIDEO_NOTE_FILE`. |
+| `send --video-note` | safe optional follow-up | `02_saved_messages.sh` skips it until the CLI exposes the sent message id for safe cleanup. |
 | `edit` | safe automated | `02_saved_messages.sh` in Saved Messages. |
 | `react` | safe optional | `02_saved_messages.sh`, best-effort because Telegram may reject Saved Messages reactions. |
 | `forward` single id | safe automated | `02_saved_messages.sh`. |
@@ -51,7 +51,7 @@ destructive or externally visible real-state changes outside Saved Messages.
 | `suggest --send` | safe optional follow-up | `03_optional_safe.sh` skips it until the CLI exposes the sent message id for safe cleanup. |
 | `agent` | safe optional follow-up | Needs agent env and bounded dry-run harness. |
 | `worker` | safe optional follow-up | Needs controlled factory URL fixture. |
-| `serve` | safe optional | `03_optional_safe.sh`, localhost `/login` HTTP assertion gated by `E2E_RUN_SERVICES=1`. |
+| `serve` | safe optional | `03_optional_safe.sh`, localhost `/` HTTP assertion gated by `E2E_RUN_SERVICES=1`. |
 | `tui` | safe optional follow-up | Interactive smoke only. |
 
 ## Dangerous Stub

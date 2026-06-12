@@ -29,7 +29,6 @@ E2E_CREATED_PEERS=()
 E2E_CREATED_IDS=()
 E2E_CREATED_MARKERS=()
 E2E_BG_PIDS=()
-E2E_BG_NAMES=()
 E2E_LAST_BG_PID=""
 
 e2e_init() {
@@ -177,18 +176,6 @@ e2e_extract_message_id_except() {
   '
 }
 
-e2e_extract_first_message_id() {
-  local text="$1"
-  printf '%s\n' "$text" | awk '
-    {
-      if (match($0, /\[[0-9]+\]/)) {
-        print substr($0, RSTART + 1, RLENGTH - 2)
-        exit
-      }
-    }
-  '
-}
-
 e2e_send_marker_to_peer() {
   local peer="$1"
   local marker="$2"
@@ -290,7 +277,7 @@ e2e_skip_step() {
 e2e_require_env() {
   local name="$1"
   local value
-  eval "value=\${$name:-}"
+  value="${!name:-}"
   if [ -z "$value" ]; then
     e2e_skip_step "$name is not set"
     return 77
@@ -300,7 +287,7 @@ e2e_require_env() {
 e2e_have_setting() {
   local name="$1"
   local value
-  eval "value=\${$name:-}"
+  value="${!name:-}"
   [ -n "$value" ] || e2e_have_dotenv_key "$name"
 }
 
@@ -315,7 +302,7 @@ e2e_require_setting() {
 e2e_require_file_env() {
   local name="$1"
   local value
-  eval "value=\${$name:-}"
+  value="${!name:-}"
   if [ -z "$value" ]; then
     e2e_skip_step "$name is not set"
     return 77
@@ -332,16 +319,6 @@ e2e_require_interactive() {
   fi
 }
 
-e2e_start_background() {
-  local name="$1"
-  local output_file="$2"
-  shift 2
-  "$@" >"$output_file" 2>&1 &
-  E2E_LAST_BG_PID=$!
-  E2E_BG_PIDS+=("$E2E_LAST_BG_PID")
-  E2E_BG_NAMES+=("$name")
-}
-
 e2e_start_tg_background() {
   local name="$1"
   local output_file="$2"
@@ -349,7 +326,6 @@ e2e_start_tg_background() {
   "$E2E_TG_BIN" --profile "$E2E_PROFILE" "$@" >"$output_file" 2>&1 &
   E2E_LAST_BG_PID=$!
   E2E_BG_PIDS+=("$E2E_LAST_BG_PID")
-  E2E_BG_NAMES+=("$name")
 }
 
 e2e_is_process_running() {

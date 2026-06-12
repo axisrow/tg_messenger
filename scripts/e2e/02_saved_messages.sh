@@ -25,7 +25,6 @@ FILE_ID=""
 AS_FILE_ID=""
 CAPTION_FILE_ID=""
 VOICE_ID=""
-VIDEO_NOTE_ID=""
 FOR_ME_DELETE_ID=""
 EDIT_MARKER=""
 DELETE_CREATED_OK=0
@@ -288,22 +287,9 @@ step_send_voice_file() {
 }
 
 step_send_video_note_file() {
-  local marker
-  local history
   e2e_require_file_env E2E_VIDEO_NOTE_FILE || return 77
-  marker="$(e2e_marker video-note)"
-  tg send "$SAVED_PEER" --file "$E2E_VIDEO_NOTE_FILE" --video-note --caption "$marker" >/dev/null ||
-    return 1
-  e2e_mutation_pause
-  history="$(e2e_recent_history "$SAVED_PEER" 30)" || return 1
-  VIDEO_NOTE_ID="$(e2e_extract_message_id "$history" "$marker")"
-  if [ -z "$VIDEO_NOTE_ID" ]; then
-    echo "video-note marker was not found: $marker" >&2
-    echo "$history"
-    return 1
-  fi
-  e2e_register_message "$SAVED_PEER" "$VIDEO_NOTE_ID" "$marker"
-  remember_saved_marker "$marker"
+  e2e_skip_step "send --video-note is deferred until the CLI exposes the sent message id for safe cleanup"
+  return 77
 }
 
 step_delete_for_me_saved() {
