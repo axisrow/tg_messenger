@@ -57,10 +57,10 @@
   </main>
   <script>
     const webClientId = (() => {
-      let id = localStorage.getItem('tgMessengerClientId');
+      let id = sessionStorage.getItem('tgMessengerClientId');
       if (!id) {
         id = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
-        localStorage.setItem('tgMessengerClientId', id);
+        sessionStorage.setItem('tgMessengerClientId', id);
       }
       document.getElementById('web_client_id').value = id;
       return id;

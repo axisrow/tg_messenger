@@ -129,6 +129,13 @@ async def test_index_serves_html(client_app):
     assert "text/html" in r.headers["content-type"]
 
 
+async def test_index_uses_per_tab_web_client_id(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "sessionStorage.getItem('tgMessengerClientId')" in r.text
+    assert "localStorage.getItem('tgMessengerClientId')" not in r.text
+
+
 async def test_dialogs_fragment(client_app):
     ac, _ = client_app
     r = await ac.get("/dialogs")
