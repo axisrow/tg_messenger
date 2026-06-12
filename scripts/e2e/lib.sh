@@ -28,6 +28,8 @@ E2E_RUN_ID="${E2E_RUN_ID:-$(date +%Y%m%d%H%M%S)-$$}"
 E2E_CREATED_PEERS=()
 E2E_CREATED_IDS=()
 E2E_CREATED_MARKERS=()
+E2E_BG_PIDS=()
+E2E_LAST_BG_PID=""
 
 e2e_init() {
   cd "$E2E_PROJECT_ROOT" || exit 2
@@ -174,6 +176,25 @@ e2e_extract_message_id_except() {
   '
 }
 
+e2e_send_marker_to_peer() {
+  local peer="$1"
+  local marker="$2"
+  local limit="${3:-15}"
+  local history
+  local id
+
+  tg send "$peer" "$marker" >/dev/null || return 1
+  e2e_mutation_pause
+  history="$(e2e_recent_history "$peer" "$limit")" || return 1
+  id="$(e2e_extract_message_id "$history" "$marker")"
+  if [ -z "$id" ]; then
+    echo "sent marker was not found in recent history: $marker" >&2
+    echo "$history"
+    return 1
+  fi
+  printf '%s\n' "$id"
+}
+
 e2e_register_message() {
   local peer="$1"
   local id="$2"
@@ -251,4 +272,120 @@ e2e_recent_history() {
 e2e_skip_step() {
   echo "$*"
   return 77
+}
+
+e2e_require_env() {
+  local name="$1"
+  local value
+  value="${!name:-}"
+  if [ -z "$value" ]; then
+    e2e_skip_step "$name is not set"
+    return 77
+  fi
+}
+
+e2e_have_setting() {
+  local name="$1"
+  local value
+  value="${!name:-}"
+  [ -n "$value" ] || e2e_have_dotenv_key "$name"
+}
+
+e2e_require_setting() {
+  local name="$1"
+  if ! e2e_have_setting "$name"; then
+    e2e_skip_step "$name is not set in env or .env"
+    return 77
+  fi
+}
+
+e2e_require_file_env() {
+  local name="$1"
+  local value
+  value="${!name:-}"
+  if [ -z "$value" ]; then
+    e2e_skip_step "$name is not set"
+    return 77
+  fi
+  if [ ! -f "$value" ]; then
+    e2e_skip_step "$name does not point to a file: $value"
+    return 77
+  fi
+}
+
+e2e_require_interactive() {
+  if [ ! -t 0 ]; then
+    e2e_die "guided E2E requires an interactive terminal"
+  fi
+}
+
+e2e_start_tg_background() {
+  local name="$1"
+  local output_file="$2"
+  shift 2
+  "$E2E_TG_BIN" --profile "$E2E_PROFILE" "$@" >"$output_file" 2>&1 &
+  E2E_LAST_BG_PID=$!
+  E2E_BG_PIDS+=("$E2E_LAST_BG_PID")
+}
+
+e2e_is_process_running() {
+  local pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+e2e_stop_background_pid() {
+  local pid="$1"
+  if [ -z "$pid" ]; then
+    return 0
+  fi
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    kill "$pid" >/dev/null 2>&1 || true
+  fi
+  wait "$pid" >/dev/null 2>&1 || true
+}
+
+e2e_stop_registered_backgrounds() {
+  local i
+  if [ "${#E2E_BG_PIDS[@]}" -eq 0 ]; then
+    return 0
+  fi
+  for i in "${!E2E_BG_PIDS[@]}"; do
+    e2e_stop_background_pid "${E2E_BG_PIDS[$i]}"
+    E2E_BG_PIDS[$i]=""
+  done
+}
+
+e2e_wait_for_file_pattern() {
+  local file="$1"
+  local pattern="$2"
+  local seconds="${3:-20}"
+  local i=0
+  while [ "$i" -lt "$seconds" ]; do
+    if [ -f "$file" ] && grep -F "$pattern" "$file" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+e2e_wait_for_http() {
+  local url="$1"
+  local seconds="${2:-20}"
+  local i=0
+  local status
+  if ! command -v curl >/dev/null 2>&1; then
+    e2e_skip_step "curl is required for HTTP assertion"
+    return 77
+  fi
+  while [ "$i" -lt "$seconds" ]; do
+    status="$(curl -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    if [ "$status" = "200" ] || [ "$status" = "401" ]; then
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
 }

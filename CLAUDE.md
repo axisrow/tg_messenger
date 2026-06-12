@@ -46,7 +46,7 @@ pytest is configured for `asyncio_mode = auto` (no `@pytest.mark.asyncio` needed
 - Every network call goes through `run_with_flood_wait_retry`; never `get_entity('@username')` in loops (~50 resolves in a row → flood).
 - UIs render Pydantic models from core — never raw Telethon objects.
 - Tests: fakes from conftest only — no network, no real LLM, no real `sleep` (inject `clock`/`rng`); `filterwarnings=error`.
-- Manual real-API smoke checks live in `scripts/e2e/` as human-run shell scripts over the installed CLI; never wire them into `pytest` or CI. Safe mutations are confined to Saved Messages / Избранное and clean up their own artifacts. Dangerous/account-visible checks are documented only as parity stubs in `scripts/e2e/03_dangerous_parity.sh`.
+- Manual real-API smoke checks live in `scripts/e2e/` as human-run shell scripts over the installed CLI; never wire them into `pytest` or CI. Safe mutations are confined to Saved Messages / Избранное and clean up their own artifacts. Dangerous/account-visible checks are documented only as parity stubs in `scripts/e2e/99_dangerous_parity.sh`.
 - **Every PR must contain a closing keyword (`Closes #N`)** for its issue; one issue = one closing PR.
 - Secrets, session strings, phone numbers and login codes never reach logs or the repository.
 
