@@ -202,22 +202,24 @@
       variantPanel.style.display = 'none';
       variantPanel.textContent = '';
     }
-    function clearOutboundComposer() {
-      const hadOutboundState = composer.dataset.outboundReady === '1' ||
-                               outboundNonce.value ||
-                               variantPanel.style.display === 'block';
-      if (outboundController) outboundController.abort();
+    function hasOutboundComposerState() {
+      return composer.dataset.outboundReady === '1' ||
+             outboundNonce.value ||
+             variantPanel.style.display === 'block';
+    }
+    function clearOutboundSelection() {
       outboundNonce.value = '';
       composer.dataset.outboundReady = '';
       hideVariants();
+    }
+    function clearOutboundComposer() {
+      const hadOutboundState = hasOutboundComposerState();
+      if (outboundController) outboundController.abort();
+      clearOutboundSelection();
       if (hadOutboundState) composerText.value = '';
     }
     composerText.addEventListener('input', () => {
-      if (!composerText.value) {
-        outboundNonce.value = '';
-        composer.dataset.outboundReady = '';
-        hideVariants();
-      }
+      if (hasOutboundComposerState()) clearOutboundSelection();
     });
     composer.addEventListener('htmx:confirm', async (evt) => {
       if (composer.dataset.outboundReady === '1') {

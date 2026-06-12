@@ -1184,6 +1184,15 @@ async def test_index_clears_outbound_ready_state_on_dialog_switch(client_app):
     assert "if (hadOutboundState) composerText.value = '';" in r.text
 
 
+async def test_index_clears_outbound_ready_state_on_variant_edit(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "function hasOutboundComposerState()" in r.text
+    assert "function clearOutboundSelection()" in r.text
+    assert "if (hasOutboundComposerState()) clearOutboundSelection();" in r.text
+    assert "if (!composerText.value)" not in r.text
+
+
 async def test_suggest_endpoint_does_not_escape_draft(suggest_app):
     ac, suggester = suggest_app
     suggester.draft = "you & me"
