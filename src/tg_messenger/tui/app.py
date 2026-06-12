@@ -270,7 +270,11 @@ class DialogItem(ListItem):
 
 class MessageBubble(Static):
     def __init__(self, text: str, out: bool):
+        self._base_text = text
         super().__init__(text, classes="out" if out else "in", markup=False)
+
+    def show_translation(self, text: str) -> None:
+        self.update(f"{self._base_text}\n↳ {text}")
 
 
 class MessengerTUI(App):
@@ -292,7 +296,7 @@ class MessengerTUI(App):
 
     def __init__(self, *, client=None, session_name: str = "default",
                  profiles: list[str] | None = None, client_factory=None, suggester=None,
-                 login_session=None):
+                 login_session=None, store=None, translator=None):
         super().__init__()
         self._client = client
         self._session_name = session_name
@@ -306,6 +310,9 @@ class MessengerTUI(App):
         self._started = False  # gates tab events until _startup finished
         self._all_dialogs: list = []  # full loaded list; search filters it locally
         self._suggester = suggester
+        self._store = store
+        self._translator = translator
+        self._bubble_index: dict[int, MessageBubble] = {}
         self._pending_suggestion: str | None = None
         # (dialog_id, message_id) keys we sent from this composer — the same messages echo back on
         # listen_outgoing(); skip them so our optimistic bubble isn't duplicated.
@@ -370,6 +377,9 @@ class MessengerTUI(App):
                     except Exception:
                         logger.warning("TUI login succeeded but session save failed", exc_info=True)
             await self._load_dialogs()
+            if self._store is not None:
+                await self._store.connect()
+                self.run_worker(self._run_store(), group="message-store", exclusive=False)
         except Exception as exc:
             logger.exception("TUI startup failed")
             self.exit(return_code=1, message=f"Startup failed: {exc}")
@@ -389,6 +399,14 @@ class MessengerTUI(App):
                 await close_suggester()
             except Exception:
                 logger.warning("suggester close failed", exc_info=True)
+        if self._store is not None:
+            await self._store.close()
+
+    async def _run_store(self) -> None:
+        try:
+            await self._store.run()
+        except Exception:
+            logger.exception("message store task failed")
 
     async def _load_dialogs(self) -> None:
         if self._tab == "groups":
@@ -438,6 +456,7 @@ class MessengerTUI(App):
         if isinstance(item, DialogItem):
             self._current = item.dialog_id
             self._clear_suggestion()
+            self._bubble_index.clear()
             # exclusive group: selecting another dialog cancels a still-loading history
             self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
 
@@ -452,14 +471,31 @@ class MessengerTUI(App):
         await pane.remove_children()
         pane.loading = True
         try:
-            messages = await self._client.history(dialog_id, limit=50)
+            if self._store is not None:
+                messages = await self._store.history(dialog_id, limit=50)
+            else:
+                messages = await self._client.history(dialog_id, limit=50)
         except Exception as exc:
             pane.loading = False
             logger.exception("history load failed (dialog %s)", dialog_id)
             self.notify(f"History failed: {exc}", severity="error")
             return
         pane.loading = False
-        await pane.mount(*(MessageBubble(_message_label(m), m.out) for m in messages))
+        bubbles = []
+        self._bubble_index.clear()
+        for m in messages:
+            bubble = MessageBubble(_message_label(m), m.out)
+            if m.translated_text:
+                bubble.show_translation(m.translated_text)
+            self._bubble_index[m.id] = bubble
+            bubbles.append(bubble)
+        await pane.mount(*bubbles)
+        if self._translator is not None:
+            self.run_worker(
+                self._translate_history_bubbles(dialog_id, messages),
+                group="translate-history",
+                exclusive=True,
+            )
         if messages:
             # Acknowledge exactly the loaded snapshot; messages arriving later stay unread.
             self.run_worker(
@@ -467,6 +503,30 @@ class MessengerTUI(App):
                 group="mark_read",
                 exclusive=False,
             )
+
+    async def _translate_history_bubbles(self, dialog_id: int, messages) -> None:
+        try:
+            translated = await self._translator.translate_history(dialog_id, messages)
+        except Exception:
+            logger.exception("history translation failed (dialog %s)", dialog_id)
+            return
+        if dialog_id != self._current:
+            return
+        for message in translated:
+            if not message.translated_text:
+                continue
+            bubble = self._bubble_index.get(message.id)
+            if bubble is not None:
+                bubble.show_translation(message.translated_text)
+
+    async def _translate_bubble(self, dialog_id: int, message, bubble: MessageBubble) -> None:
+        try:
+            translated = await self._translator.translate_message(message)
+        except Exception:
+            logger.exception("live translation failed (dialog %s)", dialog_id)
+            return
+        if dialog_id == self._current and translated.translated_text:
+            bubble.show_translation(translated.translated_text)
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "composer":
@@ -545,7 +605,9 @@ class MessengerTUI(App):
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            await pane.mount(MessageBubble(_message_label(msg), out=True))
+            bubble = MessageBubble(_message_label(msg), out=True)
+            self._bubble_index[msg.id] = bubble
+            await pane.mount(bubble)
 
     async def _send_media(self, peer: int, path: str, caption: str | None) -> None:
         try:
@@ -557,7 +619,9 @@ class MessengerTUI(App):
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            await pane.mount(MessageBubble(_message_label(msg), out=True))
+            bubble = MessageBubble(_message_label(msg), out=True)
+            self._bubble_index[msg.id] = bubble
+            await pane.mount(bubble)
 
     async def _send_reaction(self, peer: int, message_id: int, emoticon: str) -> None:
         try:
@@ -576,7 +640,17 @@ class MessengerTUI(App):
             async for ev in self._client.listen_all():  # groups too, not just DMs
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    await pane.mount(MessageBubble(_message_label(ev.message), out=False))
+                    bubble = MessageBubble(_message_label(ev.message), out=False)
+                    self._bubble_index[ev.message.id] = bubble
+                    await pane.mount(bubble)
+                    if ev.message.translated_text:
+                        bubble.show_translation(ev.message.translated_text)
+                    elif self._translator is not None:
+                        self.run_worker(
+                            self._translate_bubble(ev.dialog_id, ev.message, bubble),
+                            group="translate-live",
+                            exclusive=False,
+                        )
                     self._maybe_suggest(ev.dialog_id)
         except Exception:
             logger.exception("incoming listener failed")
@@ -595,7 +669,17 @@ class MessengerTUI(App):
                     continue  # our own optimistic bubble already shows it
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    await pane.mount(MessageBubble(_message_label(ev.message), out=True))
+                    bubble = MessageBubble(_message_label(ev.message), out=True)
+                    self._bubble_index[ev.message.id] = bubble
+                    await pane.mount(bubble)
+                    if ev.message.translated_text:
+                        bubble.show_translation(ev.message.translated_text)
+                    elif self._translator is not None:
+                        self.run_worker(
+                            self._translate_bubble(ev.dialog_id, ev.message, bubble),
+                            group="translate-live",
+                            exclusive=False,
+                        )
         except Exception:
             logger.exception("outgoing listener failed")
             self.notify("Outgoing listener failed — see log.", severity="error")

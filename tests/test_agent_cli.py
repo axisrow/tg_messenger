@@ -168,6 +168,22 @@ def test_build_suggester_wires_model(monkeypatch):
     assert isinstance(suggester, Suggester)
 
 
+async def test_make_translate_fn_parses_fenced_json_and_null():
+    model = FakeModel(reply='```json\n[{"id": 1, "translation": "привет"}, {"id": 2, "translation": null}]\n```')
+    translate_fn = factory.make_translate_fn(model)
+    result = await translate_fn([(1, "hello"), (2, "ok")], "ru")
+    assert result == {1: "привет", 2: None}
+    rendered = "\n".join(str(m.content) for m in model.calls[0])
+    assert "target_lang" in rendered
+
+
+async def test_make_translate_fn_garbage_returns_empty(caplog):
+    translate_fn = factory.make_translate_fn(FakeModel(reply="not json"))
+    with caplog.at_level(logging.WARNING, logger="tg_messenger.agent.factory"):
+        assert await translate_fn([(1, "hello")], "ru") == {}
+    assert any("translator returned non-json" in rec.message for rec in caplog.records)
+
+
 # --- Цикл 25: классификатор по списку интентов + видимость конфига в CLI ---
 
 RECIPE = IntentSpec(name="recipe", description="просит рецепт блюда", pipeline="chat",

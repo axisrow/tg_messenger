@@ -226,6 +226,7 @@ class FakeTelethonClient:
         # network-call counters: the TTL-cache tests assert how often we hit the wire
         self.iter_dialogs_calls = 0
         self.iter_messages_calls = 0
+        self.last_min_id = None
 
     # --- connection / auth ---
     async def connect(self):
@@ -296,8 +297,9 @@ class FakeTelethonClient:
 
         return gen()
 
-    def iter_messages(self, peer, limit=50, ids=None, search=None, **k):
+    def iter_messages(self, peer, limit=50, ids=None, search=None, min_id=0, **k):
         self.iter_messages_calls += 1
+        self.last_min_id = min_id
         self.last_search = search  # so search_messages tests can assert it was passed
         items = self.messages.get(int(peer), [])
         if ids is not None:
@@ -306,6 +308,8 @@ class FakeTelethonClient:
         else:
             if search is not None:
                 items = [m for m in items if search.casefold() in (m.text or "").casefold()]
+            if min_id:
+                items = [m for m in items if m.id > int(min_id)]
             items = items[:limit]
 
         async def gen():

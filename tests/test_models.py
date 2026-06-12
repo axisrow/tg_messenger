@@ -59,6 +59,7 @@ def test_message_text_only():
     assert msg.text == "hi"
     assert msg.out is False
     assert msg.media is None
+    assert msg.translated_text is None
 
 
 def test_message_with_media():

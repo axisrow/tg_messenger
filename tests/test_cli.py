@@ -190,10 +190,42 @@ class StubClient:
         raise KeyboardInterrupt  # эмуляция Ctrl+C (паттерн listen_interrupt)
 
 
+class DummyMessageStore:
+    def __init__(self, client):
+        self.client = client
+        self.closed = False
+
+    async def connect(self):
+        pass
+
+    async def close(self):
+        self.closed = True
+
+    async def history(self, peer, limit=50):
+        return await self.client.history(peer, limit=limit)
+
+    async def run(self):
+        await asyncio.Event().wait()
+
+
+def _patch_message_store(monkeypatch):
+    stores = []
+
+    def fake_make_message_store(client, **kw):
+        store = DummyMessageStore(client)
+        stores.append((store, kw))
+        return store, object()
+
+    monkeypatch.setattr(cli_main, "make_message_store", fake_make_message_store)
+    monkeypatch.setattr(cli_main, "make_optional_translator", lambda storage: None)
+    return stores
+
+
 @pytest.fixture
 def runner(monkeypatch):
     stub = StubClient()
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    _patch_message_store(monkeypatch)
     return CliRunner(), stub
 
 
@@ -426,6 +458,7 @@ def serve_spy(monkeypatch):
     suggester = object()
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
     monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c, **kw: suggester)
+    _patch_message_store(monkeypatch)
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls["uvicorn"].append(kw))
     monkeypatch.setattr(
         "tg_messenger.web.app.build_app",
@@ -1763,6 +1796,7 @@ def test_serve_uses_global_profile_as_session(monkeypatch):
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
     monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c, **kw: object())
+    _patch_message_store(monkeypatch)
     monkeypatch.setattr(
         "tg_messenger.web.app.build_app",
         lambda **kw: captured.update(kw) or object(),
@@ -1779,6 +1813,7 @@ def test_serve_wires_suggester(monkeypatch):
     optional_kwargs = {}
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: None)
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    _patch_message_store(monkeypatch)
 
     def fake_make_optional_suggester(c, **kw):
         optional_kwargs.update(kw)
@@ -1804,6 +1839,7 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
     suggester = object()
     optional_kwargs = {}
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    _patch_message_store(monkeypatch)
 
     def fake_make_optional_suggester(c, **kw):
         optional_kwargs.update(kw)
@@ -1812,10 +1848,15 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
     monkeypatch.setattr(cli_main, "make_optional_suggester", fake_make_optional_suggester)
 
     class FakeTUI:
-        def __init__(self, *, client=None, session_name="default", suggester=None):
+        def __init__(
+            self, *, client=None, session_name="default", suggester=None,
+            store=None, translator=None,
+        ):
             captured["client"] = client
             captured["session_name"] = session_name
             captured["suggester"] = suggester
+            captured["store"] = store
+            captured["translator"] = translator
 
         def run(self):
             pass
@@ -1883,6 +1924,7 @@ def serve_capture(monkeypatch):
     calls = {"uvicorn": [], "build_app": [], "optional_suggester": []}
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: calls["uvicorn"].append(kw))
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: client)
+    _patch_message_store(monkeypatch)
     monkeypatch.setattr(
         cli_main,
         "make_optional_suggester",

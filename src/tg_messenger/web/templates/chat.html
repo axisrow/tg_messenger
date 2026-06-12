@@ -20,6 +20,7 @@
     .msg.in { background: #eee; }
     .msg.out { background: #cfe9ff; margin-left: auto; }
     .msg.reaction { background: #fff7d6; color: #6b5700; font-size: 13px; }
+    .translation { margin-top: 4px; color: #555; font-size: 13px; }
     #composer { display: flex; border-top: 1px solid #ccc; padding: 8px; }
     #composer input { flex: 1; padding: 8px; }
     #reaction-form { display: flex; gap: 6px; border-top: 1px solid #eee; padding: 8px; }
@@ -47,6 +48,7 @@
   </aside>
   <main id="chat">
     <div id="messages"></div>
+    <div id="lang-settings" hx-get="/settings/lang" hx-trigger="load" hx-swap="innerHTML"></div>
     <form id="composer" hx-post="/send" hx-target="#messages" hx-swap="beforeend"
           hx-on::after-request="this.reset()">
       <input type="hidden" name="dialog_id" id="dialog_id" value="">
@@ -103,8 +105,19 @@
           document.getElementById('messages').appendChild(div);
           return;
         }
+        if (data.type === 'translation') {
+          const msg = document.querySelector('.msg[data-id="' + CSS.escape(String(data.message_id)) + '"]');
+          if (msg && !msg.querySelector('.translation')) {
+            const line = document.createElement('div');
+            line.className = 'translation';
+            line.textContent = '↳ ' + data.text;
+            msg.appendChild(line);
+          }
+          return;
+        }
         // our own messages (sent from another device) render on the right
         div.className = data.out ? 'msg out' : 'msg in';
+        div.dataset.id = data.id;
         div.textContent = '[' + data.id + '] ' + (data.text || '<media>');
         document.getElementById('messages').appendChild(div);
       };

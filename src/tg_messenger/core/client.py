@@ -289,6 +289,20 @@ class StandaloneTelegramClient:
     async def _collect_history(self, peer, limit, offset_id) -> list:
         return [m async for m in self._client.iter_messages(peer, limit=limit, offset_id=offset_id)]
 
+    async def history_since(self, peer: int, min_id: int = 0, limit: int = 50) -> list[Message]:
+        """Uncached history page newer than ``min_id``, chronological.
+
+        The persistent message store owns its own cooldown/watermarks. It must not
+        build those watermarks from the short-lived UI TTL cache used by ``history``.
+        """
+        raw = await run_with_flood_wait_retry(
+            lambda: self._collect_history_since(peer, min_id, limit), operation="history_since"
+        )
+        return [self._to_message(m, dialog_id=int(peer)) for m in reversed(raw)]
+
+    async def _collect_history_since(self, peer, min_id, limit) -> list:
+        return [m async for m in self._client.iter_messages(peer, limit=limit, min_id=min_id)]
+
     def _invalidate_history(self, peer: int) -> None:
         """Drop every cached history page of ``peer`` (any limit/offset)."""
         p = int(peer)
