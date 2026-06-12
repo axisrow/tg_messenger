@@ -5,9 +5,10 @@ import httpx
 import pytest_asyncio
 from telethon.sessions import StringSession
 
+from tg_messenger.agent.outbound import get_dialog_lang, is_outbound_enabled
 from tg_messenger.core.events import EventBus
 from tg_messenger.core.models import Dialog, IncomingEvent, Message, ReactionEvent
-from tg_messenger.web.app import build_app
+from tg_messenger.web.app import _error_response, build_app
 
 
 class WebStubClient:
@@ -975,6 +976,7 @@ async def test_outbound_endpoint_returns_variants():
     assert r.status_code == 200
     data = r.json()
     assert data["applies"] is True
+    assert data["status"] == "ready"
     assert data["target_lang"] == "en"
     assert data["variants"] == ["hi", "hello"]
     assert data["nonce"]
@@ -988,6 +990,11 @@ class WebOutboundStub:
         return ["hi", "hello"]
 
 
+class WebOutboundNotApplicableStub(WebOutboundStub):
+    async def applies(self, dialog_id, text):
+        return None
+
+
 class WebLangStorage:
     async def get_value(self, key):
         return None
@@ -999,8 +1006,28 @@ class WebLangStorage:
         pass
 
 
+class RecordingLangStorage:
+    def __init__(self):
+        self.values = {}
+
+    async def get_value(self, key):
+        return self.values.get(key)
+
+    async def set_value(self, key, value):
+        self.values[key] = value
+
+    async def execute(self, sql, params=()):
+        if sql.startswith("DELETE FROM kv WHERE key = ?"):
+            self.values.pop(params[0], None)
+
+
 class WebOutboundWithStorage(WebOutboundStub):
     storage = WebLangStorage()
+
+
+class WebOutboundWithRecordingStorage(WebOutboundStub):
+    def __init__(self):
+        self.storage = RecordingLangStorage()
 
 
 async def test_send_without_nonce_ignores_untrusted_source_text():
@@ -1017,6 +1044,36 @@ async def test_send_without_nonce_ignores_untrusted_source_text():
     assert r.status_code == 200
     assert store.recorded == []
     assert "↳ привет" not in r.text
+
+
+async def test_outbound_endpoint_disabled_status_when_unconfigured():
+    stub = WebStubClient()
+    app = build_app(client=stub, outbound=None)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/outbound",
+                data={"text": "привет"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 200
+    assert r.json() == {"applies": False, "status": "disabled"}
+
+
+async def test_outbound_endpoint_not_applicable_status():
+    stub = WebStubClient()
+    app = build_app(client=stub, outbound=WebOutboundNotApplicableStub())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/outbound",
+                data={"text": "hello"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 200
+    assert r.json() == {"applies": False, "status": "not_applicable"}
 
 
 async def test_send_with_valid_outbound_nonce_records_source_once():
@@ -1125,6 +1182,45 @@ async def test_outbound_lang_invalid_code_returns_400():
     assert "invalid language code" in r.text
 
 
+async def test_outbound_lang_saves_code_and_enabled_flag():
+    stub = WebStubClient()
+    outbound = WebOutboundWithRecordingStorage()
+    app = build_app(client=stub, outbound=outbound)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/lang",
+                data={"code": "EN", "enabled": "off"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 200
+    stored = await get_dialog_lang(outbound.storage, 7)
+    assert stored.lang == "en"
+    assert stored.source == "manual"
+    assert await is_outbound_enabled(outbound.storage, 7) is False
+
+
+async def test_outbound_lang_requires_csrf_header():
+    stub = WebStubClient()
+    app = build_app(client=stub, outbound=WebOutboundWithRecordingStorage())
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/dialogs/7/lang", data={"code": "en"})
+    assert r.status_code == 403
+
+
+async def test_outbound_lang_missing_outbound_returns_503():
+    stub = WebStubClient()
+    app = build_app(client=stub, outbound=None)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/dialogs/7/lang", data={"code": "en"}, headers=SUGGEST_HEADERS)
+    assert r.status_code == 503
+
+
 async def test_outbound_endpoint_csrf_failure_returns_json():
     stub = WebStubClient()
     app = build_app(client=stub, outbound=WebOutboundStub())
@@ -1135,6 +1231,7 @@ async def test_outbound_endpoint_csrf_failure_returns_json():
     assert r.status_code == 403
     assert r.headers["content-type"].startswith("application/json")
     assert r.json()["applies"] is False
+    assert r.json()["status"] == "error"
     assert r.json()["error"]
 
 
@@ -1165,7 +1262,14 @@ async def test_outbound_endpoint_timeout_returns_json(monkeypatch):
             )
     assert r.status_code == 200
     assert r.json()["applies"] is False
+    assert r.json()["status"] == "error"
     assert r.json()["error"]
+
+
+def test_error_response_escapes_html():
+    r = _error_response('<script>alert("x")</script>', 400)
+    assert "<script>" not in r.body.decode()
+    assert "&lt;script&gt;" in r.body.decode()
 
 
 async def test_index_uses_abort_controller_for_outbound(client_app):
@@ -1178,19 +1282,27 @@ async def test_index_uses_abort_controller_for_outbound(client_app):
 async def test_index_clears_outbound_ready_state_on_dialog_switch(client_app):
     ac, _ = client_app
     r = await ac.get("/")
-    assert "function clearOutboundComposer()" in r.text
-    assert "if (previousId && id !== previousId) clearOutboundComposer();" in r.text
+    assert "const composeStates = new Map();" in r.text
+    assert "saveComposeState();" in r.text
+    assert "restoreComposeState(id);" in r.text
     assert "composer.dataset.outboundReady = '';" in r.text
-    assert "if (hadOutboundState) composerText.value = '';" in r.text
+    assert "state.dialogId !== activeDialogId" in r.text
 
 
 async def test_index_clears_outbound_ready_state_on_variant_edit(client_app):
     ac, _ = client_app
     r = await ac.get("/")
-    assert "function hasOutboundComposerState()" in r.text
-    assert "function clearOutboundSelection()" in r.text
-    assert "if (hasOutboundComposerState()) clearOutboundSelection();" in r.text
-    assert "if (!composerText.value)" not in r.text
+    assert "function clearOutboundState(state)" in r.text
+    assert "state.outboundNonce = '';" in r.text
+    assert "state.outboundReady && composerText.value !== previousDraft" in r.text
+
+
+async def test_index_blocks_outbound_errors_until_explicit_send_original(client_app):
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "showSendOriginal(id, draft, data.error, () => evt.detail.issueRequest(true));" in r.text
+    assert "showSendOriginal(id, draft, 'Translation failed.', () => evt.detail.issueRequest(true));" in r.text
+    assert "Translation timed out — sending the original." not in r.text
 
 
 async def test_suggest_endpoint_does_not_escape_draft(suggest_app):

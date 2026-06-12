@@ -83,9 +83,11 @@ async def set_outbound_enabled(storage, dialog_id: int, enabled: bool) -> None:
 
 def detect_script_lang(texts: Sequence[str]) -> str | None:
     lang = _dominant_script_lang(texts)
-    # Latin, Cyrillic and Han ideographs are shared by many languages. They
-    # need the injected exact detector before we persist a dialog language.
-    return None if lang in {None, "latin", "ru", "han"} else lang
+    # Latin and Cyrillic are shared by many languages. Pure Han falls back to
+    # zh for callers without an injected exact detector.
+    if lang == "han":
+        return "zh"
+    return None if lang in {None, "latin", "ru"} else lang
 
 
 def _dominant_script_lang(texts: Sequence[str]) -> str | None:
@@ -97,6 +99,8 @@ def _dominant_script_lang(texts: Sequence[str]) -> str | None:
                 counts[lang] = counts.get(lang, 0) + 1
     if not counts:
         return None
+    if counts.get("ja") and counts.get("han"):
+        counts["ja"] += counts.pop("han")
     lang, count = max(counts.items(), key=lambda item: item[1])
     total = sum(counts.values())
     if count / total < 0.70:
@@ -174,7 +178,14 @@ class OutboundTranslator:
         incoming = [(m.text or "").strip() for m in history if not m.out and (m.text or "").strip()]
         if not incoming:
             return None
+        script_lang = _dominant_script_lang(incoming)
         lang = detect_script_lang(incoming)
+        if script_lang == "han" and self._detect_lang_fn is not None:
+            try:
+                lang = await self._detect_lang_fn(incoming[:10])
+            except Exception:
+                logger.exception("dialog language detection failed for %s", dialog_id)
+                return None
         if lang is None and self._detect_lang_fn is not None:
             try:
                 lang = await self._detect_lang_fn(incoming[:10])

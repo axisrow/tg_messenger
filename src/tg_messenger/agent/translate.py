@@ -26,6 +26,7 @@ USER_LANG_KEY = "user_lang"
 DEFAULT_BATCH_SIZE = 20
 
 _LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+LANG_CODE_RE = re.compile(r"^[a-z]{2,3}$")
 
 
 def needs_translation(text: str | None, target_lang: str | None) -> bool:
@@ -58,7 +59,10 @@ async def set_user_lang(storage, code: str | None) -> None:
     if code is None:
         await storage.execute("DELETE FROM kv WHERE key = ?", (USER_LANG_KEY,))
         return
-    await storage.set_value(USER_LANG_KEY, code.strip().lower())
+    lang = code.strip().lower()
+    if not LANG_CODE_RE.fullmatch(lang):
+        raise ValueError(f"invalid language code: {code}")
+    await storage.set_value(USER_LANG_KEY, lang)
 
 
 def translate_model_from_env(env=None) -> str | None:

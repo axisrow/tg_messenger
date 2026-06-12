@@ -48,7 +48,8 @@ logger = logging.getLogger(__name__)
 # floods on rapid repeats (tab switching) — cache them with a short TTL.
 DEFAULT_DIALOGS_TTL_SEC = 30.0
 DEFAULT_HISTORY_TTL_SEC = 15.0
-_DIALOGS_CACHE_KEY = "all"  # one entry: the full mapped list, dm_only filters from it
+_DIALOGS_CACHE_KEY = "all"  # non-archived full mapped list, dm_only filters from it
+_ARCHIVED_DIALOGS_CACHE_KEY = "archived"
 _CHANNEL_ID_THRESHOLD = -1_000_000_000_000
 
 
@@ -166,9 +167,9 @@ class StandaloneTelegramClient:
         self._bus_reads: EventBus[MessageReadEvent] = EventBus()
         self._bus_reactions: EventBus[ReactionEvent] = EventBus()
         self._handler_registered = False
-        # one full dialog list (all kinds); dm_only filters from it — see dialogs()
+        # one non-archived full list + one archived full list; dm_only filters from it — see dialogs()
         self._dialogs_cache: TTLCache[str, list[Dialog]] = TTLCache(
-            dialogs_ttl, maxsize=1, clock=clock
+            dialogs_ttl, maxsize=2, clock=clock
         )
         # keyed by (int(peer), limit, offset_id); invalidated per-peer on writes/events
         self._history_cache: TTLCache[tuple[int, int, int], list[Message]] = TTLCache(
@@ -226,9 +227,18 @@ class StandaloneTelegramClient:
         Concurrent first-loads coalesce (single-flight). The returned list is a
         fresh copy — the cached models are shared (UIs render, never mutate).
         """
-        full = await self._dialogs_cache.get_or_fetch(_DIALOGS_CACHE_KEY, self._fetch_dialogs)
+        full = await self._dialogs_cache.get_or_fetch(
+            _DIALOGS_CACHE_KEY, lambda: self._fetch_dialogs(archived=False)
+        )
         if dm_only:
             return [d for d in full if d.kind == "dm"]
+        return list(full)
+
+    async def archived_dialogs(self) -> list[Dialog]:
+        """Archived dialogs of every kind, served from the dialogs TTL cache."""
+        full = await self._dialogs_cache.get_or_fetch(
+            _ARCHIVED_DIALOGS_CACHE_KEY, lambda: self._fetch_dialogs(archived=True)
+        )
         return list(full)
 
     async def group_dialogs(self) -> list[Dialog]:
@@ -237,34 +247,40 @@ class StandaloneTelegramClient:
         The "Группы" tab in every UI — same cache as ``dialogs()``, filtered the
         opposite way, so the kind filter lives in one place, not in each front-end.
         """
-        full = await self._dialogs_cache.get_or_fetch(_DIALOGS_CACHE_KEY, self._fetch_dialogs)
+        full = await self._dialogs_cache.get_or_fetch(
+            _DIALOGS_CACHE_KEY, lambda: self._fetch_dialogs(archived=False)
+        )
         return [d for d in full if d.kind != "dm"]
 
-    async def _fetch_dialogs(self) -> list[Dialog]:
+    async def _fetch_dialogs(self, *, archived: bool = False) -> list[Dialog]:
         raw = await run_with_flood_wait_retry(
-            lambda: self._collect_dialogs(), operation="dialogs"
+            lambda: self._collect_dialogs(archived=archived),
+            operation="archived_dialogs" if archived else "dialogs",
         )
         result = []
         for d in raw:
             entity = d.entity
             last_msg = getattr(d, "message", None)
+            kind = _dialog_kind(entity)
             result.append(
                 Dialog(
                     # telethon Dialog.id is the marked peer id (negative for groups/
                     # channels) — the same value events carry and history/send accept
                     id=int(getattr(d, "id", entity.id)),
                     title=_entity_title(entity),
-                    kind=_dialog_kind(entity),
+                    kind=kind,
                     username=getattr(entity, "username", None),
                     unread=getattr(d, "unread_count", 0) or 0,
                     last_text=getattr(last_msg, "text", None),
                     last_message_at=getattr(last_msg, "date", None),
+                    is_contact=bool(getattr(entity, "contact", False)) if kind == "dm" else None,
+                    archived=archived or getattr(d, "folder_id", None) == 1,
                 )
             )
         return result
 
-    async def _collect_dialogs(self) -> list:
-        return [d async for d in self._client.iter_dialogs()]
+    async def _collect_dialogs(self, *, archived: bool = False) -> list:
+        return [d async for d in self._client.iter_dialogs(archived=archived)]
 
     async def history(self, peer: int, limit: int = 50, offset_id: int = 0) -> list[Message]:
         """Return messages in chronological order (oldest first), TTL-cached.
@@ -477,6 +493,7 @@ class StandaloneTelegramClient:
             operation="mark_read",
         )
         self._dialogs_cache.invalidate(_DIALOGS_CACHE_KEY)
+        self._dialogs_cache.invalidate(_ARCHIVED_DIALOGS_CACHE_KEY)
 
     async def check_username(self, username: str) -> bool:
         """Whether ``username`` is free for OUR account (True = available).

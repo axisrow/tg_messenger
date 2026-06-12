@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -71,8 +72,9 @@ async def test_dialog_lang_and_enabled_kv(tmp_path):
         (["привіт", "як справи"], None),
         (["안녕하세요"], "ko"),
         (["こんにちは"], "ja"),
-        (["你好"], None),
-        (["東京大学"], None),
+        (["今日は東京"], "ja"),
+        (["你好"], "zh"),
+        (["東京大学"], "zh"),
         (["hello world"], None),
         (["123 😀"], None),
     ],
@@ -145,6 +147,46 @@ async def test_dialog_lang_uses_llm_for_latin_and_caches(tmp_path):
     finally:
         await storage.close()
     assert calls == [["hello", "how are you"]]
+
+
+async def test_dialog_lang_detector_exception_returns_none(tmp_path, caplog):
+    storage = await _storage(tmp_path)
+
+    async def detect(texts):
+        raise RuntimeError("detector down")
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "hello")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        with caplog.at_level(logging.ERROR, logger="tg_messenger.agent.outbound"):
+            assert await outbound.dialog_lang(7) is None
+    finally:
+        await storage.close()
+    assert any("dialog language detection failed" in rec.message for rec in caplog.records)
+
+
+async def test_dialog_lang_invalid_detector_code_warns(tmp_path, caplog):
+    storage = await _storage(tmp_path)
+
+    async def detect(texts):
+        return "english"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "hello")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="tg_messenger.agent.outbound"):
+            assert await outbound.dialog_lang(7) is None
+    finally:
+        await storage.close()
+    assert any("invalid code" in rec.message for rec in caplog.records)
 
 
 async def test_applies_truth_table_and_groups(tmp_path):
@@ -257,6 +299,21 @@ async def test_applies_han_user_to_non_han_dialog_uses_exact_detection(tmp_path)
     assert calls == [["東京大学"]]
 
 
+async def test_applies_storage_error_returns_none(caplog):
+    class BrokenStorage:
+        async def get_value(self, key):
+            raise RuntimeError("storage down")
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([]),
+        storage=BrokenStorage(),
+        variants_fn=None,
+    )
+    with caplog.at_level(logging.ERROR, logger="tg_messenger.agent.outbound"):
+        assert await outbound.applies(7, "hello") is None
+    assert any("outbound translation applicability failed" in rec.message for rec in caplog.records)
+
+
 async def test_variants_passes_profile_and_context(tmp_path):
     storage = await _storage(tmp_path)
     await save_style_profile(storage, 7, StyleProfile(avg_length=4.0, examples=["ok"]))
@@ -281,3 +338,21 @@ async def test_variants_passes_profile_and_context(tmp_path):
     assert target == "en"
     assert profile.examples == ["ok"]
     assert [m.text for m in context] == ["hello", "ок"]
+
+
+async def test_variants_all_empty_raises(tmp_path):
+    storage = await _storage(tmp_path)
+
+    async def variants(draft, target_lang, profile, context):
+        return ["", "   ", None]
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([]),
+        storage=storage,
+        variants_fn=variants,
+    )
+    try:
+        with pytest.raises(ValueError, match="no variants"):
+            await outbound.variants(7, "привет", "en")
+    finally:
+        await storage.close()

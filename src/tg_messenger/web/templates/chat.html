@@ -52,8 +52,7 @@
     <div id="messages"></div>
     <div id="lang-settings" hx-get="/settings/lang" hx-trigger="load" hx-swap="innerHTML"></div>
     <div id="variant-panel" role="status"></div>
-    <form id="composer" hx-post="/send" hx-target="#messages" hx-swap="beforeend"
-          hx-on::after-request="this.reset()">
+    <form id="composer" hx-post="/send" hx-target="#messages" hx-swap="beforeend">
       <input type="hidden" name="dialog_id" id="dialog_id" value="">
       <input type="hidden" name="web_client_id" id="web_client_id" value="">
       <input type="hidden" name="outbound_nonce" id="outbound_nonce" value="">
@@ -96,10 +95,8 @@
       const li = e.target.closest('#dialogs li');
       if (!li) return;
       const id = li.textContent.trim().split(' ')[0];
-      const dialogInput = document.getElementById('dialog_id');
-      const previousId = dialogInput.value;
-      dialogInput.value = id;
-      if (previousId && id !== previousId) clearOutboundComposer();
+      saveComposeState();
+      restoreComposeState(id);
       if (es) es.close();
       es = new EventSource('/stream/' + encodeURIComponent(id) +
                            '?client_id=' + encodeURIComponent(webClientId));
@@ -143,6 +140,8 @@
       if (resp.ok) {
         document.getElementById('messages').insertAdjacentHTML('beforeend', html);
         document.getElementById('composer-text').value = '';
+        const state = currentState();
+        if (state) clearComposeState(state);
       } else {
         alert(html.replace(/<[^>]+>/g, '').trim() || 'Upload failed');
       }
@@ -183,6 +182,8 @@
         const text = await resp.text();
         if (resp.ok) {
           document.getElementById('composer-text').value = text;
+          const state = currentState();
+          if (state) state.draft = text;
         } else {
           const doc = new DOMParser().parseFromString(text, 'text/html');
           error.textContent = (doc.body.textContent || '').trim() || 'Suggest failed.';
@@ -195,42 +196,136 @@
     });
     const composer = document.getElementById('composer');
     const composerText = document.getElementById('composer-text');
+    const dialogInput = document.getElementById('dialog_id');
     const outboundNonce = document.getElementById('outbound_nonce');
     const variantPanel = document.getElementById('variant-panel');
+    const suggestError = document.getElementById('suggest-error');
+    const composeStates = new Map();
+    let activeDialogId = dialogInput.value || '';
     let outboundController = null;
+
+    function blankComposeState(dialogId) {
+      return { dialogId, draft: '', outboundNonce: '', outboundReady: false };
+    }
+    function stateFor(dialogId) {
+      if (!composeStates.has(dialogId)) {
+        composeStates.set(dialogId, blankComposeState(dialogId));
+      }
+      return composeStates.get(dialogId);
+    }
+    function currentState() {
+      return activeDialogId ? stateFor(activeDialogId) : null;
+    }
     function hideVariants() {
       variantPanel.style.display = 'none';
       variantPanel.textContent = '';
     }
-    function hasOutboundComposerState() {
-      return composer.dataset.outboundReady === '1' ||
-             outboundNonce.value ||
-             variantPanel.style.display === 'block';
+    function applyComposeState(state) {
+      composerText.value = state.draft || '';
+      outboundNonce.value = state.outboundNonce || '';
+      composer.dataset.outboundReady = state.outboundReady ? '1' : '';
     }
-    function clearOutboundSelection() {
-      outboundNonce.value = '';
-      composer.dataset.outboundReady = '';
-      hideVariants();
+    function saveComposeState() {
+      if (!activeDialogId) return;
+      const state = stateFor(activeDialogId);
+      state.draft = composerText.value;
+      state.outboundNonce = outboundNonce.value;
+      state.outboundReady = composer.dataset.outboundReady === '1';
     }
-    function clearOutboundComposer() {
-      const hadOutboundState = hasOutboundComposerState();
+    function clearOutboundState(state) {
+      state.outboundNonce = '';
+      state.outboundReady = false;
+      if (state.dialogId === activeDialogId) {
+        outboundNonce.value = '';
+        composer.dataset.outboundReady = '';
+        hideVariants();
+      }
+    }
+    function clearComposeState(state) {
+      state.draft = '';
+      clearOutboundState(state);
+      if (state.dialogId === activeDialogId) {
+        composerText.value = '';
+      }
+    }
+    function restoreComposeState(dialogId) {
+      activeDialogId = dialogId;
+      dialogInput.value = dialogId;
       if (outboundController) outboundController.abort();
-      clearOutboundSelection();
-      if (hadOutboundState) composerText.value = '';
+      const state = stateFor(dialogId);
+      applyComposeState(state);
+      hideVariants();
+      suggestError.textContent = '';
     }
+    function showSendOriginal(dialogId, draft, message, sendOriginal) {
+      const state = stateFor(dialogId);
+      state.draft = draft;
+      state.outboundNonce = '';
+      state.outboundReady = false;
+      if (dialogId === activeDialogId) {
+        composerText.value = draft;
+        outboundNonce.value = '';
+        composer.dataset.outboundReady = '';
+      }
+      variantPanel.textContent = '';
+      variantPanel.style.display = 'block';
+      const line = document.createElement('div');
+      line.textContent = message || 'Translation failed.';
+      variantPanel.appendChild(line);
+      const original = document.createElement('button');
+      original.type = 'button';
+      original.className = 'variant-card';
+      original.textContent = 'Send original';
+      original.addEventListener('click', () => {
+        if (state.dialogId !== activeDialogId) return;
+        state.draft = draft;
+        state.outboundNonce = '';
+        state.outboundReady = true;
+        applyComposeState(state);
+        hideVariants();
+        sendOriginal();
+      });
+      variantPanel.appendChild(original);
+    }
+
     composerText.addEventListener('input', () => {
-      if (hasOutboundComposerState()) clearOutboundSelection();
+      const state = currentState();
+      if (!state) return;
+      const previousDraft = state.draft;
+      state.draft = composerText.value;
+      if (!composerText.value) {
+        clearOutboundState(state);
+      } else if (state.outboundReady && composerText.value !== previousDraft) {
+        clearOutboundState(state);
+      }
+    });
+    composer.addEventListener('htmx:afterRequest', (evt) => {
+      if (evt.detail.xhr && evt.detail.xhr.status >= 400) return;
+      const dialogId = activeDialogId;
+      if (dialogId) {
+        clearComposeState(stateFor(dialogId));
+      }
+      composer.reset();
+      dialogInput.value = dialogId;
+      const clientInput = document.getElementById('web_client_id');
+      clientInput.value = webClientId;
+      clientInput.defaultValue = webClientId;
     });
     composer.addEventListener('htmx:confirm', async (evt) => {
-      if (composer.dataset.outboundReady === '1') {
+      const id = dialogInput.value;
+      if (!id) return;
+      activeDialogId = id;
+      const state = stateFor(id);
+      const draft = composerText.value;
+      if (!draft.trim()) return;
+      if (state.outboundReady && state.dialogId === activeDialogId && state.draft === draft) {
+        state.outboundReady = false;
         composer.dataset.outboundReady = '';
         hideVariants();
         return;
       }
-      const id = document.getElementById('dialog_id').value;
-      const draft = composerText.value;
-      if (!id || !draft.trim()) return;
       evt.preventDefault();
+      state.draft = draft;
       const fd = new FormData();
       fd.append('text', draft);
       fd.append('web_client_id', webClientId);
@@ -246,13 +341,17 @@
           body: fd,
           signal: outboundController.signal
         });
+        if (!resp.ok) {
+          throw new Error('outbound request failed');
+        }
         const data = await resp.json();
-        if (!data.applies) {
-          outboundNonce.value = '';
-          if (data.error) {
-            document.getElementById('suggest-error').textContent = data.error;
-          }
+        if (data.status === 'disabled' || data.status === 'not_applicable') {
+          clearOutboundState(state);
           evt.detail.issueRequest(true);
+          return;
+        }
+        if (data.status === 'error' || !data.applies) {
+          showSendOriginal(id, draft, data.error, () => evt.detail.issueRequest(true));
           return;
         }
         variantPanel.textContent = '';
@@ -266,9 +365,11 @@
           btn.className = 'variant-card';
           btn.textContent = variant;
           btn.addEventListener('click', () => {
-            composerText.value = variant;
-            outboundNonce.value = data.nonce || '';
-            composer.dataset.outboundReady = '1';
+            if (state.dialogId !== activeDialogId) return;
+            state.draft = variant;
+            state.outboundNonce = data.nonce || '';
+            state.outboundReady = true;
+            applyComposeState(state);
             hideVariants();
             composerText.focus();
           });
@@ -279,16 +380,17 @@
         original.className = 'variant-card';
         original.textContent = 'Send original';
         original.addEventListener('click', () => {
-          outboundNonce.value = '';
-          composer.dataset.outboundReady = '1';
+          if (state.dialogId !== activeDialogId) return;
+          state.draft = draft;
+          state.outboundNonce = '';
+          state.outboundReady = true;
+          applyComposeState(state);
           hideVariants();
           evt.detail.issueRequest(true);
         });
         variantPanel.appendChild(original);
       } catch (err) {
-        outboundNonce.value = '';
-        document.getElementById('suggest-error').textContent = 'Translation timed out — sending the original.';
-        evt.detail.issueRequest(true);
+        showSendOriginal(id, draft, 'Translation failed.', () => evt.detail.issueRequest(true));
       } finally {
         clearTimeout(outboundTimer);
         outboundController = null;

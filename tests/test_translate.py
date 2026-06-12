@@ -55,6 +55,19 @@ async def test_user_lang_kv_overrides_env_and_clear(tmp_path):
         await storage.close()
 
 
+async def test_set_user_lang_validates_code(tmp_path):
+    storage = Storage(tmp_path / "t.db")
+    await storage.connect()
+    try:
+        await set_user_lang(storage, "EN")
+        assert await get_user_lang(storage, {}) == "en"
+        with pytest.raises(ValueError, match="invalid language code"):
+            await set_user_lang(storage, "english")
+        assert await get_user_lang(storage, {}) == "en"
+    finally:
+        await storage.close()
+
+
 def test_translate_model_from_env_prefers_translate_model():
     assert translate_model_from_env({"TG_TRANSLATE_MODEL": "openai:x", "TG_AGENT_MODEL": "openai:y"}) == "openai:x"
     assert translate_model_from_env({"TG_AGENT_MODEL": "openai:y"}) == "openai:y"

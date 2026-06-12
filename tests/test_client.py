@@ -86,7 +86,7 @@ async def test_dialogs_dm_only(fake_client):
 
 def _seed_all_kinds(fake_client):
     fake_client.dialogs = [
-        FakeDialog(FakeUser(id=7, first_name="Ann", username="ann"), name="Ann"),
+        FakeDialog(FakeUser(id=7, first_name="Ann", username="ann", contact=True), name="Ann"),
         FakeDialog(FakeUser(id=9, first_name="Helper", bot=True), name="HelperBot"),
         FakeDialog(FakeChat(id=50, title="Devs"), name="Devs"),
         FakeDialog(FakeChannel(id=123, title="News", broadcast=True), name="News"),
@@ -104,6 +104,9 @@ async def test_dialogs_all_returns_every_kind_with_marked_ids(fake_client):
         7: "dm", 9: "bot", -50: "group", -100123: "channel", -100200: "group",
     }
     assert {d.id: d.title for d in dialogs}[-50] == "Devs"
+    assert next(d for d in dialogs if d.id == 7).is_contact is True
+    assert next(d for d in dialogs if d.id == 9).is_contact is None
+    assert all(d.archived is False for d in dialogs)
 
 
 async def test_dialogs_dm_only_excludes_bots_and_groups(fake_client):
@@ -113,6 +116,24 @@ async def test_dialogs_dm_only_excludes_bots_and_groups(fake_client):
     dialogs = await client.dialogs(dm_only=True)
     assert [d.id for d in dialogs] == [7]
     assert dialogs[0].kind == "dm"
+
+
+async def test_archived_dialogs_are_separate_from_normal_dialogs(fake_client):
+    fake_client.dialogs = [
+        FakeDialog(FakeUser(id=7, first_name="Ann", contact=True), name="Ann"),
+        FakeDialog(FakeUser(id=8, first_name="Old", contact=False), name="Old", archived=True),
+        FakeDialog(FakeChannel(id=123, title="Archive News", broadcast=True), name="Archive News", archived=True),
+    ]
+    client = _build(fake_client)
+    await client.connect()
+
+    normal = await client.dialogs(dm_only=False)
+    archived = await client.archived_dialogs()
+
+    assert [d.id for d in normal] == [7]
+    assert [d.id for d in archived] == [8, -100123]
+    assert all(d.archived is True for d in archived)
+    assert archived[0].is_contact is False
 
 
 # --- Цикл 31: классификатор вида диалога ---
@@ -1453,6 +1474,28 @@ async def test_mark_read_invalidates_dialogs_cache(fake_client):
     assert fake_client.iter_dialogs_calls == 2
 
 
+async def test_mark_read_invalidates_archived_dialogs_cache(fake_client):
+    fake_client.dialogs = [
+        FakeDialog(
+            FakeUser(id=8, first_name="Old", contact=False),
+            name="Old",
+            unread_count=3,
+            archived=True,
+        ),
+    ]
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.archived_dialogs()
+    assert first[0].unread == 3
+    assert fake_client.iter_dialogs_calls == 1
+
+    fake_client.dialogs[0].unread_count = 0
+    await client.mark_read(8)
+    second = await client.archived_dialogs()
+    assert second[0].unread == 0
+    assert fake_client.iter_dialogs_calls == 2
+
+
 async def test_mark_read_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
     flood_error = _flood_patch(monkeypatch)
@@ -1485,6 +1528,34 @@ async def test_mark_read_flood_keeps_dialogs_cache(fake_client, monkeypatch):
         await client.mark_read(7)
     second = await client.dialogs()
     assert next(d for d in second if d.id == 7).unread == 2
+    assert fake_client.iter_dialogs_calls == 1
+
+
+async def test_mark_read_flood_keeps_archived_dialogs_cache(fake_client, monkeypatch):
+    from tg_messenger.core.flood import HandledFloodWaitError
+    flood_error = _flood_patch(monkeypatch)
+    fake_client.dialogs = [
+        FakeDialog(
+            FakeUser(id=8, first_name="Old", contact=False),
+            name="Old",
+            unread_count=3,
+            archived=True,
+        ),
+    ]
+    client = _build(fake_client)
+    await client.connect()
+    first = await client.archived_dialogs()
+    assert first[0].unread == 3
+
+    async def boom(peer, max_id=None):
+        raise flood_error(9999)
+
+    fake_client.dialogs[0].unread_count = 0
+    fake_client.send_read_acknowledge = boom
+    with pytest.raises(HandledFloodWaitError):
+        await client.mark_read(8)
+    second = await client.archived_dialogs()
+    assert second[0].unread == 3
     assert fake_client.iter_dialogs_calls == 1
 
 

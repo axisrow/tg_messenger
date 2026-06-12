@@ -37,6 +37,8 @@ def test_dialog_defaults():
     assert dialog.unread == 0
     assert dialog.username is None
     assert dialog.last_message_at is None
+    assert dialog.is_contact is None
+    assert dialog.archived is False
 
 
 def test_dialog_kind_defaults_to_dm():

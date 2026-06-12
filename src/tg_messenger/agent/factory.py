@@ -7,6 +7,7 @@ and tests stub these module-level names directly.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -25,6 +26,7 @@ from tg_messenger.agent.tools import make_telegram_tools
 from tg_messenger.agent.translate import Translator
 
 logger = logging.getLogger(__name__)
+MODEL_CALL_TIMEOUT_SECONDS = 30.0
 
 
 def build_classify_prompt(intents: Sequence[IntentSpec] = ()) -> str:
@@ -236,12 +238,13 @@ def make_outbound_variants_fn(model) -> Callable:
             "style_profile": _style_lines(profile),
             "context": [{"out": msg.out, "text": msg.text} for msg in context],
         }
-        response = await model.ainvoke(
-            [
-                SystemMessage(content=OUTBOUND_VARIANTS_SYSTEM_PROMPT),
-                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
-            ]
-        )
+        async with asyncio.timeout(MODEL_CALL_TIMEOUT_SECONDS):
+            response = await model.ainvoke(
+                [
+                    SystemMessage(content=OUTBOUND_VARIANTS_SYSTEM_PROMPT),
+                    HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+                ]
+            )
         raw = _strip_json_fence(str(response.content))
         try:
             parsed = json.loads(raw)
@@ -258,12 +261,13 @@ def make_outbound_variants_fn(model) -> Callable:
 
 def make_detect_lang_fn(model) -> Callable:
     async def detect(texts: Sequence[str]) -> str | None:
-        response = await model.ainvoke(
-            [
-                SystemMessage(content=DETECT_LANG_SYSTEM_PROMPT),
-                HumanMessage(content="\n".join(texts[:10])),
-            ]
-        )
+        async with asyncio.timeout(MODEL_CALL_TIMEOUT_SECONDS):
+            response = await model.ainvoke(
+                [
+                    SystemMessage(content=DETECT_LANG_SYSTEM_PROMPT),
+                    HumanMessage(content="\n".join(texts[:10])),
+                ]
+            )
         code = str(response.content).strip().lower().strip(".!\"'")
         if re.fullmatch(r"[a-z]{2,3}", code):
             return code

@@ -4,6 +4,7 @@ LLM-стек не вызывается: init_chat_model/create_deep_agent пат
 CLI тестируется через CliRunner со стабами make_client/make_agent_runner.
 """
 
+import asyncio
 import logging
 import sys
 from types import SimpleNamespace
@@ -36,6 +37,11 @@ class FakeModel:
     async def ainvoke(self, messages):
         self.calls.append(list(messages))
         return SimpleNamespace(content=self.reply)
+
+
+class HangingModel:
+    async def ainvoke(self, messages):
+        await asyncio.Event().wait()
 
 
 def test_build_orchestrator_wires_model_and_tools(monkeypatch):
@@ -198,9 +204,23 @@ async def test_make_outbound_variants_fn_garbage_raises(caplog):
     assert any("outbound variants returned non-json" in rec.message for rec in caplog.records)
 
 
+async def test_make_outbound_variants_fn_times_out(monkeypatch):
+    monkeypatch.setattr(factory, "MODEL_CALL_TIMEOUT_SECONDS", 0.01)
+    variants_fn = factory.make_outbound_variants_fn(HangingModel())
+    with pytest.raises(TimeoutError):
+        await variants_fn("привет", "en", None, [])
+
+
 async def test_make_detect_lang_fn_validates_code():
     assert await factory.make_detect_lang_fn(FakeModel(reply="EN."))(["hello"]) == "en"
     assert await factory.make_detect_lang_fn(FakeModel(reply="English"))(["hello"]) is None
+
+
+async def test_make_detect_lang_fn_times_out(monkeypatch):
+    monkeypatch.setattr(factory, "MODEL_CALL_TIMEOUT_SECONDS", 0.01)
+    detect_fn = factory.make_detect_lang_fn(HangingModel())
+    with pytest.raises(TimeoutError):
+        await detect_fn(["hello"])
 
 
 # --- Цикл 25: классификатор по списку интентов + видимость конфига в CLI ---

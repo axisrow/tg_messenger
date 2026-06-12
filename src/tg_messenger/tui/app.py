@@ -1,8 +1,7 @@
-"""Textual TUI: dialog list (left, DM/groups tabs) + message view + composer (right).
+"""Textual TUI: dialog list (left, Telegram-style tabs) + message view + composer.
 
-Reuses the bubble/list pattern. A background worker drains ``client.listen_all()``,
-updates the already-loaded dialog list, and appends incoming bubbles for the
-selected dialog (any kind, groups included).
+Reuses the bubble/list pattern. A background worker drains ``client.listen_all()``
+and appends incoming bubbles for the selected dialog (any kind, groups included).
 """
 
 from __future__ import annotations
@@ -30,11 +29,12 @@ ORIGINAL_SENTINEL = "__tg_messenger_original__"
 OUTBOUND_TIMEOUT_SECONDS = 20
 
 
-@dataclass(frozen=True)
-class _OutboundPending:
-    dialog_id: int
-    composer_text: str
+@dataclass
+class ComposeState:
+    draft: str = ""
     source_text: str | None = None
+    original_confirm_text: str | None = None
+    ignore_next_empty_change: bool = False
 
 
 def parse_media_command(text: str) -> tuple[str, str | None] | None:
@@ -241,7 +241,7 @@ class LoginScreen(ModalScreen[bool]):
 
 
 class SidebarTabs(Tabs):
-    """DM/groups tabs that hand focus down to the sibling dialog list.
+    """Dialog tabs that hand focus down to the sibling dialog list.
 
     Textual's Tabs only binds left/right; Enter or Down here focuses the
     #dialogs list so the user can start scrolling dialogs at once, instead of
@@ -346,6 +346,7 @@ class MessengerTUI(App):
     CSS = """
     #sidebar { width: 32; border-right: solid $primary; }
     #messages { overflow-y: auto; }
+    #messages MessageBubble { width: 100%; text-wrap: wrap; text-overflow: fold; }
     .out { color: $accent; text-align: right; }
     .in { color: $text; }
     #suggestion { dock: bottom; color: $text-muted; height: auto; }
@@ -364,15 +365,14 @@ class MessengerTUI(App):
         # how a client is built once a profile is chosen (injectable for tests)
         self._client_factory = client_factory or _make_real_client
         self._current: int | None = None
-        self._tab = "dm"
+        self._tab = "all"
         self._started = False  # gates tab events until _startup finished
         self._all_dialogs: list = []  # full loaded list; search filters it locally
         self._suggester = suggester
         self._store = store
         self._translator = translator
         self._outbound = outbound
-        self._held_source: _OutboundPending | None = None
-        self._outbound_bypass: _OutboundPending | None = None
+        self._compose_states: dict[int, ComposeState] = {}
         self._bubble_index: dict[int, MessageBubble] = {}
         self._pending_suggestion: str | None = None
         # (dialog_id, message_id) keys we sent from this composer — the same messages echo back on
@@ -401,11 +401,50 @@ class MessengerTUI(App):
         scroll_once()
         self.call_later(scroll_once)
 
+    def _compose_state_for(self, dialog_id: int) -> ComposeState:
+        return self._compose_states.setdefault(int(dialog_id), ComposeState())
+
+    def _save_current_compose_state(self) -> None:
+        if self._current is None:
+            return
+        state = self._compose_state_for(self._current)
+        state.draft = self.query_one("#composer", Input).value
+
+    def _restore_compose_state(self, dialog_id: int) -> None:
+        state = self._compose_state_for(dialog_id)
+        self.query_one("#composer", Input).value = state.draft
+
+    def _clear_pending_outbound(self, dialog_id: int) -> None:
+        state = self._compose_state_for(dialog_id)
+        state.source_text = None
+        state.original_confirm_text = None
+
+    def _clear_compose_state_after_send(self, dialog_id: int, sent_text: str) -> None:
+        state = self._compose_state_for(dialog_id)
+        if state.draft == sent_text:
+            state.draft = ""
+        state.source_text = None
+        state.original_confirm_text = None
+        if dialog_id == self._current:
+            composer = self.query_one("#composer", Input)
+            if composer.value == sent_text:
+                composer.value = ""
+
     def compose(self) -> ComposeResult:
         with Horizontal():
             with Vertical(id="sidebar"):
                 yield Input(placeholder="Поиск…", id="search")
-                yield SidebarTabs(Tab("DM", id="dm"), Tab("Группы", id="groups"), id="tabs")
+                yield SidebarTabs(
+                    Tab("Все", id="all"),
+                    Tab("Контакты", id="contacts"),
+                    Tab("Не контакты", id="non_contacts"),
+                    Tab("Группы/супер", id="groups"),
+                    Tab("Каналы", id="channels"),
+                    Tab("Боты", id="bots"),
+                    Tab("Непрочитанные", id="unread"),
+                    Tab("Архив", id="archive"),
+                    id="tabs",
+                )
                 yield DialogListView(id="dialogs")
             with Vertical():
                 yield Vertical(id="messages")
@@ -488,10 +527,26 @@ class MessengerTUI(App):
             logger.exception("message store task failed")
 
     async def _load_dialogs(self) -> None:
-        if self._tab == "groups":
-            items = await self._client.group_dialogs()
+        if self._tab == "archive":
+            archived_dialogs = getattr(self._client, "archived_dialogs", None)
+            if archived_dialogs is None:
+                items = []
+            else:
+                items = await archived_dialogs()
+        elif self._tab in {"contacts", "non_contacts", "groups", "channels", "bots", "unread"}:
+            all_dialogs = [dialog for dialog in await self._client.dialogs(dm_only=False) if not dialog.archived]
+            if self._tab == "contacts":
+                items = [dialog for dialog in all_dialogs if dialog.kind == "dm" and dialog.is_contact is True]
+            elif self._tab == "non_contacts":
+                items = [dialog for dialog in all_dialogs if dialog.kind == "dm" and dialog.is_contact is False]
+            elif self._tab == "unread":
+                items = [dialog for dialog in all_dialogs if dialog.unread > 0]
+            else:
+                kind_by_tab = {"groups": "group", "channels": "channel", "bots": "bot"}
+                kind = kind_by_tab[self._tab]
+                items = [dialog for dialog in all_dialogs if dialog.kind == kind]
         else:
-            items = await self._client.dialogs()
+            items = [dialog for dialog in await self._client.dialogs(dm_only=False) if not dialog.archived]
         self._all_dialogs = list(items)  # keep the full list for local search
         await self._render_dialogs()
 
@@ -518,22 +573,19 @@ class MessengerTUI(App):
                     lv.index = idx
                     break
 
-    async def _touch_dialog_for_incoming(self, ev) -> None:
-        """Apply one live incoming event to the local dialog snapshot.
-
-        This keeps the sidebar fresh without reloading ``dialogs()`` on every
-        message; the core dialogs cache deliberately survives events to avoid
-        reintroducing the tab-switch/flood-wait incident.
-        """
+    async def _touch_dialog_for_message(self, dialog_id: int, message, *, incoming: bool) -> None:
+        """Apply one live message to the current sidebar snapshot without reloading."""
         for idx, dialog in enumerate(self._all_dialogs):
-            if dialog.id != ev.dialog_id:
+            if dialog.id != dialog_id:
                 continue
-            unread = 0 if ev.dialog_id == self._current else dialog.unread + 1
+            unread = dialog.unread
+            if incoming:
+                unread = 0 if dialog_id == self._current else dialog.unread + 1
             updated = dialog.model_copy(
                 update={
                     "unread": unread,
-                    "last_text": ev.message.text,
-                    "last_message_at": ev.message.date,
+                    "last_text": message.text,
+                    "last_message_at": message.date,
                 }
             )
             self._all_dialogs = [updated, *self._all_dialogs[:idx], *self._all_dialogs[idx + 1:]]
@@ -544,7 +596,7 @@ class MessengerTUI(App):
         # Tabs fires this once at mount, before the client exists — _started gates it.
         # (NOT named _ready: Textual's App already has a _ready coroutine.)
         # Network goes through a worker: awaiting here would stall the message pump.
-        self._tab = event.tab.id or "dm"
+        self._tab = event.tab.id or "all"
         if not self._started:
             return
         self.run_worker(self._reload_dialogs(), group="dialogs", exclusive=True)
@@ -564,8 +616,9 @@ class MessengerTUI(App):
     async def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, DialogItem):
-            self._clear_outbound_pending(clear_composer=True)
+            self._save_current_compose_state()
             self._current = item.dialog_id
+            self._restore_compose_state(item.dialog_id)
             self._clear_suggestion()
             self._bubble_index.clear()
             # exclusive group: selecting another dialog cancels a still-loading history
@@ -601,13 +654,13 @@ class MessengerTUI(App):
             self._bubble_index[m.id] = bubble
             bubbles.append(bubble)
         await pane.mount(*bubbles)
+        self._scroll_messages_to_end(pane)
         if self._translator is not None:
             self.run_worker(
                 self._translate_history_bubbles(dialog_id, messages),
                 group="translate-history",
                 exclusive=True,
             )
-        self._scroll_messages_to_end(pane)
         if messages:
             # Acknowledge exactly the loaded snapshot; messages arriving later stay unread.
             self.run_worker(
@@ -645,8 +698,17 @@ class MessengerTUI(App):
             # the user is typing their own reply — a stale suggestion must go
             if self._pending_suggestion is not None and event.value != self._pending_suggestion:
                 self._clear_suggestion()
+            if self._current is not None:
+                state = self._compose_state_for(self._current)
+                if not event.value and state.ignore_next_empty_change:
+                    state.ignore_next_empty_change = False
+                    return
+                state.draft = event.value
+                if state.original_confirm_text is not None and event.value != state.original_confirm_text:
+                    state.original_confirm_text = None
             if not event.value:
-                self._clear_outbound_pending()
+                if self._current is not None:
+                    self._clear_pending_outbound(self._current)
             return
         # only the search box filters; the composer's own changes are ignored.
         # Filtering is local (over self._all_dialogs) — no network, safe to await here.
@@ -661,29 +723,36 @@ class MessengerTUI(App):
         if self._current is None or not event.value.strip():
             return
         text = event.value
+        dialog_id = self._current
+        state = self._compose_state_for(dialog_id)
+        state.draft = text
         try:
             reaction = parse_reaction_command(text)
         except ValueError as exc:
-            logger.warning("bad reaction command in dialog %s: %s", self._current, exc)
+            logger.warning("bad reaction command in dialog %s: %s", dialog_id, exc)
             self.notify(str(exc), severity="error")
             return
         if reaction is not None:
             message_id, emoticon = reaction
+            state.draft = ""
+            self._clear_pending_outbound(dialog_id)
             event.input.value = ""
             self.run_worker(
-                self._send_reaction(self._current, message_id, emoticon), exclusive=False
+                self._send_reaction(dialog_id, message_id, emoticon), exclusive=False
             )
             return
         try:
             lang_command = parse_lang_command(text)
         except ValueError as exc:
-            logger.warning("bad lang command in dialog %s: %s", self._current, exc)
+            logger.warning("bad lang command in dialog %s: %s", dialog_id, exc)
             self.notify(str(exc), severity="error")
             return
         if lang_command is not None:
+            state.draft = ""
+            self._clear_pending_outbound(dialog_id)
             event.input.value = ""
             self.run_worker(
-                self._apply_lang_command(self._current, lang_command),
+                self._apply_lang_command(dialog_id, lang_command),
                 group="outbound-lang",
                 exclusive=True,
             )
@@ -693,41 +762,43 @@ class MessengerTUI(App):
             path, caption = parsed
             if not os.path.isfile(path):
                 # validate BEFORE the worker/network; surface, don't send
-                logger.warning("media path not found: %s (dialog %s)", path, self._current)
+                logger.warning("media path not found: %s (dialog %s)", path, dialog_id)
                 self.notify(f"File not found: {path}", severity="error")
                 return
+            state.draft = ""
+            self._clear_pending_outbound(dialog_id)
             event.input.value = ""  # clear optimistically; restored on failure
             self.run_worker(
-                self._send_media(self._current, path, caption), exclusive=False
+                self._send_media(dialog_id, path, caption), exclusive=False
             )
             return
-        pending_source, discard = self._validate_outbound_pending(self._held_source, text)
-        if discard:
-            return
-        if pending_source is not None and pending_source.source_text is not None:
-            source = pending_source.source_text
-            self._held_source = None
+        if state.source_text is not None:
+            source = state.source_text
+            state.draft = ""
+            self._clear_pending_outbound(dialog_id)
             event.input.value = ""
-            self.run_worker(self._send_text(self._current, text, source_text=source), exclusive=False)
+            self.run_worker(self._send_text(dialog_id, text, source_text=source), exclusive=False)
             return
-        pending_bypass, discard = self._validate_outbound_pending(self._outbound_bypass, text)
-        if discard:
-            return
-        if pending_bypass is not None:
-            self._outbound_bypass = None
+        if state.original_confirm_text == text:
+            state.draft = ""
+            self._clear_pending_outbound(dialog_id)
             event.input.value = ""
-            self.run_worker(self._send_text(self._current, text), exclusive=False)
+            self.run_worker(self._send_text(dialog_id, text), exclusive=False)
             return
         if self._outbound is not None:
+            state.ignore_next_empty_change = True
             event.input.value = ""
+            state.draft = text
             self.run_worker(
-                self._outbound_flow(self._current, text),
+                self._outbound_flow(dialog_id, text),
                 group="outbound",
                 exclusive=True,
             )
             return
+        state.draft = ""
+        self._clear_pending_outbound(dialog_id)
         event.input.value = ""  # clear optimistically; restored on failure
-        self.run_worker(self._send_text(self._current, text), exclusive=False)
+        self.run_worker(self._send_text(dialog_id, text), exclusive=False)
 
     def _remember_sent(self, dialog_id: int, message_id: int) -> None:
         """Record a message we sent so its listen_outgoing() echo isn't drawn twice."""
@@ -769,13 +840,18 @@ class MessengerTUI(App):
 
     async def _outbound_flow(self, dialog_id: int, text: str) -> None:
         composer = self.query_one("#composer", Input)
+        state = self._compose_state_for(dialog_id)
+        state.draft = text
         try:
             target_lang = await asyncio.wait_for(
                 self._outbound.applies(dialog_id, text),
                 timeout=OUTBOUND_TIMEOUT_SECONDS,
             )
             if target_lang is None:
-                composer.value = ""
+                state.draft = ""
+                self._clear_pending_outbound(dialog_id)
+                if dialog_id == self._current and composer.value == text:
+                    composer.value = ""
                 await self._send_text(dialog_id, text)
                 return
             variants = await asyncio.wait_for(
@@ -784,61 +860,42 @@ class MessengerTUI(App):
             )
         except TimeoutError:
             logger.warning("outbound translation timed out (dialog %s)", dialog_id)
-            self.notify("Перевод не успел — отправляю оригинал", severity="warning")
-            await self._send_text(dialog_id, text)
+            state.draft = text
+            state.source_text = None
+            state.original_confirm_text = text
+            if dialog_id == self._current:
+                composer.value = text
+            self.notify("Перевод не удался — Enter отправит оригинал", severity="warning")
             return
         except Exception:
             logger.exception("outbound translation failed (dialog %s)", dialog_id)
-            self._outbound_bypass = _OutboundPending(dialog_id, text)
-            if not composer.value:
+            state.draft = text
+            state.source_text = None
+            state.original_confirm_text = text
+            if dialog_id == self._current:
                 composer.value = text
             self.notify("Перевод не удался — Enter отправит оригинал", severity="warning")
             return
         picked = await self.push_screen_wait(VariantPickScreen(variants, text))
         if picked is None:
-            if not composer.value:
-                composer.value = text
-            composer.focus()
+            if dialog_id == self._current:
+                composer.focus()
             return
         if picked == ORIGINAL_SENTINEL:
-            self._outbound_bypass = _OutboundPending(dialog_id, text)
-            if not composer.value:
-                composer.value = text
+            state.draft = text
+            state.source_text = None
+            state.original_confirm_text = text
             self.notify("Enter отправит оригинал")
+            if dialog_id == self._current:
+                composer.value = text
+                composer.focus()
+            return
+        state.draft = picked
+        state.source_text = text
+        state.original_confirm_text = None
+        if dialog_id == self._current:
+            composer.value = picked
             composer.focus()
-            return
-        composer.value = picked
-        self._held_source = _OutboundPending(dialog_id, picked, source_text=text)
-        composer.focus()
-
-    def _clear_outbound_pending(self, *, clear_composer: bool = False) -> None:
-        pending = [p for p in (self._held_source, self._outbound_bypass) if p is not None]
-        self._held_source = None
-        self._outbound_bypass = None
-        if not clear_composer or not pending:
-            return
-        composer = self.query_one("#composer", Input)
-        pending_texts = {
-            p.composer_text for p in pending if isinstance(p, _OutboundPending)
-        }
-        if not pending_texts or composer.value in pending_texts:
-            composer.value = ""
-
-    def _validate_outbound_pending(
-        self,
-        pending: _OutboundPending | None,
-        composer_text: str,
-    ) -> tuple[_OutboundPending | None, bool]:
-        if pending is None:
-            return None, False
-        if not isinstance(pending, _OutboundPending) or pending.dialog_id != self._current:
-            logger.warning("discarding stale outbound composer state")
-            self._clear_outbound_pending(clear_composer=True)
-            return None, True
-        if pending.composer_text != composer_text:
-            self._clear_outbound_pending()
-            return None, False
-        return pending, False
 
     async def _send_text(self, peer: int, text: str, source_text: str | None = None) -> None:
         try:
@@ -846,10 +903,14 @@ class MessengerTUI(App):
         except Exception as exc:
             logger.exception("send failed (dialog %s)", peer)
             self.notify(f"Send failed: {exc}", severity="error")
-            composer = self.query_one("#composer", Input)
-            if not composer.value:  # don't clobber a draft typed meanwhile
-                composer.value = text
+            state = self._compose_state_for(peer)
+            state.draft = text
+            if peer == self._current:
+                composer = self.query_one("#composer", Input)
+                if not composer.value:  # don't clobber a draft typed meanwhile
+                    composer.value = text
             return
+        self._clear_compose_state_after_send(peer, text)
         if source_text and self._store is not None:
             from tg_messenger.agent.translate import get_user_lang
 
@@ -863,6 +924,7 @@ class MessengerTUI(App):
             except Exception:
                 logger.exception("failed to record outbound source text")
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
+        await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
             bubble = MessageBubble(_message_label(msg), out=True)
@@ -880,6 +942,7 @@ class MessengerTUI(App):
             self.notify(f"Send failed: {exc}", severity="error")
             return
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
+        await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
             bubble = MessageBubble(_message_label(msg), out=True)
@@ -903,7 +966,7 @@ class MessengerTUI(App):
     async def _drain_incoming(self) -> None:
         try:
             async for ev in self._client.listen_all():  # groups too, not just DMs
-                await self._touch_dialog_for_incoming(ev)
+                await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=True)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
                     bubble = MessageBubble(_message_label(ev.message), out=False)
@@ -939,6 +1002,7 @@ class MessengerTUI(App):
             async for ev in self._client.listen_outgoing():  # own messages, any device
                 if (ev.dialog_id, ev.message.id) in self._sent_ids:
                     continue  # our own optimistic bubble already shows it
+                await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=False)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
                     bubble = MessageBubble(_message_label(ev.message), out=True)

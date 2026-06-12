@@ -167,8 +167,8 @@ def _reaction_div(message_id: int, emoticon: str | None) -> str:
 
 
 def _error_response(text: str, status_code: int) -> HTMLResponse:
-    """The one error-fragment shape every route returns; ``text`` is NOT escaped here."""
-    return HTMLResponse(f'<div class="error">{text}</div>', status_code=status_code)
+    """The one escaped error-fragment shape every route returns."""
+    return HTMLResponse(f'<div class="error">{escape(text)}</div>', status_code=status_code)
 
 
 def _same_origin_error(request: Request) -> HTMLResponse | None:
@@ -187,7 +187,11 @@ def _same_origin_error(request: Request) -> HTMLResponse | None:
 def _same_origin_json_error(request: Request) -> JSONResponse | None:
     if request.headers.get(SUGGEST_CSRF_HEADER) != "1":
         return JSONResponse(
-            {"applies": False, "error": "Outbound requires a same-origin request."},
+            {
+                "applies": False,
+                "status": "error",
+                "error": "Outbound requires a same-origin request.",
+            },
             status_code=403,
         )
     origin = request.headers.get("origin")
@@ -197,7 +201,11 @@ def _same_origin_json_error(request: Request) -> JSONResponse | None:
     expected = f"{request.url.scheme}://{host}"
     if origin != expected:
         return JSONResponse(
-            {"applies": False, "error": "Outbound requires a same-origin request."},
+            {
+                "applies": False,
+                "status": "error",
+                "error": "Outbound requires a same-origin request.",
+            },
             status_code=403,
         )
     return None
@@ -793,7 +801,7 @@ def build_app(
             return same_origin_error
         outbound = request.app.state.outbound
         if outbound is None:
-            return JSONResponse({"applies": False})
+            return JSONResponse({"applies": False, "status": "disabled"})
         try:
             target_lang, variants = await asyncio.wait_for(
                 _build_outbound_variants(outbound, dialog_id, text),
@@ -802,15 +810,23 @@ def build_app(
         except TimeoutError:
             logger.warning("outbound variants timed out for dialog %s", dialog_id)
             return JSONResponse(
-                {"applies": False, "error": "Translation timed out — sending the original."}
+                {
+                    "applies": False,
+                    "status": "error",
+                    "error": "Translation timed out. Use Send original to send without translation.",
+                }
             )
         except Exception:
             logger.exception("outbound variants failed for dialog %s", dialog_id)
             return JSONResponse(
-                {"applies": False, "error": "Translation failed — sending the original."}
+                {
+                    "applies": False,
+                    "status": "error",
+                    "error": "Translation failed. Use Send original to send without translation.",
+                }
             )
         if target_lang is None:
-            return JSONResponse({"applies": False})
+            return JSONResponse({"applies": False, "status": "not_applicable"})
         nonce = _remember_outbound_nonce(
             request.app.state.outbound_nonces,
             dialog_id=dialog_id,
@@ -819,7 +835,13 @@ def build_app(
             variants=variants,
         )
         return JSONResponse(
-            {"applies": True, "target_lang": target_lang, "variants": variants, "nonce": nonce}
+            {
+                "applies": True,
+                "status": "ready",
+                "target_lang": target_lang,
+                "variants": variants,
+                "nonce": nonce,
+            }
         )
 
     @app.post("/dialogs/{dialog_id}/lang", response_class=HTMLResponse)
@@ -841,7 +863,7 @@ def build_app(
             await set_dialog_lang(outbound.storage, dialog_id, code.strip() or None, source="manual")
         except ValueError as exc:
             logger.warning("invalid outbound language code for dialog %s: %s", dialog_id, exc)
-            return _error_response(escape(str(exc)), 400)
+            return _error_response(str(exc), 400)
         await set_outbound_enabled(outbound.storage, dialog_id, enabled != "off")
         return HTMLResponse('<div id="outbound-lang-status">saved</div>')
 

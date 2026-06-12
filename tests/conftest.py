@@ -64,12 +64,13 @@ def patch_flood_error(monkeypatch) -> type[FakeFloodWaitError]:
 
 
 class FakeUser:
-    def __init__(self, id, first_name=None, last_name=None, username=None, bot=False):
+    def __init__(self, id, first_name=None, last_name=None, username=None, bot=False, contact=False):
         self.id = id
         self.first_name = first_name
         self.last_name = last_name
         self.username = username
         self.bot = bot
+        self.contact = contact
 
 
 class FakeChannel:
@@ -138,13 +139,14 @@ def _marked_id(entity) -> int:
 
 
 class FakeDialog:
-    def __init__(self, entity, *, name="", unread_count=0, message=None):
+    def __init__(self, entity, *, name="", unread_count=0, message=None, archived=False):
         self.entity = entity
         self.id = _marked_id(entity)
         self.name = name
         self.title = name
         self.unread_count = unread_count
         self.message = message
+        self.folder_id = 1 if archived else None
 
 
 class FakeChatActionEvent:
@@ -290,10 +292,12 @@ class FakeTelethonClient:
 
     def iter_dialogs(self, *a, **k):
         self.iter_dialogs_calls += 1
+        archived = bool(k.get("archived", False))
 
         async def gen():
             for d in self.dialogs:
-                yield d
+                if bool(getattr(d, "folder_id", None) == 1) == archived:
+                    yield d
 
         return gen()
 
