@@ -19,16 +19,73 @@ python -m venv .venv && ./.venv/bin/pip install -e ".[dev]"
 ./.venv/bin/tg-messenger --help
 ```
 
-The base install is **core + CLI**. The Web and TUI front-ends are optional extras —
-`tg-messenger serve` / `tg-messenger tui` without the extra fail with a hint pointing at it.
-`[dev]` pulls `[web]` + `[tui]` so the full test/lint toolchain and every interface run locally.
+The base install is **core + CLI** — only `telethon + pydantic + click`, so the client
+stays a lightweight import for other projects (the goal behind issue #6). Everything
+heavier is an opt-in extra, pulled in **only when you need that feature**. Forget one and
+the command fails with a copy-paste install hint, never a raw `ModuleNotFoundError`.
 
 ```bash
-pip install tg-messenger          # core + CLI
+pip install tg-messenger          # core + CLI — import StandaloneTelegramClient
 pip install 'tg-messenger[web]'   # + FastAPI web UI  (tg-messenger serve)
 pip install 'tg-messenger[tui]'   # + Textual TUI     (tg-messenger tui)
-pip install 'tg-messenger[all]'   # web + tui + crypto + agent + interop
+pip install 'tg-messenger[all]'   # everything below at once
 ```
+
+| Extra | Pulls in | Needed for |
+|---|---|---|
+| `[web]` | fastapi, uvicorn, jinja2 | `tg-messenger serve` |
+| `[tui]` | textual | `tg-messenger tui` |
+| `[crypto]` | cryptography | at-rest session encryption / SSO with the factory |
+| `[agent]` | langchain, langgraph, deepagents | `tg-messenger agent` (LLM auto-reply) |
+| `[interop]` | httpx | `tg-messenger worker` — task exchange with tg_content_factory |
+
+`[interop]` is just `httpx` on purpose: `core/` never talks HTTP, so the heavy `[agent]`
+LLM stack and the worker's HTTP client are separate installs. `[dev]` pulls
+`[web,tui,crypto]` so the full test/lint toolchain and every interface run locally.
+
+## Running it
+
+**1. Set your Telegram API credentials.** Get an `api_id` / `api_hash` from
+<https://my.telegram.org> and put them in a `.env` in the current directory (auto-loaded;
+real environment variables win) — see `.env.example`:
+
+```bash
+TG_API_ID=12345678
+TG_API_HASH=abcdef1234567890abcdef1234567890
+```
+
+Without these the CLI exits with an error — they are required for every command that
+touches Telegram.
+
+**2. Log in** (phone → code → optional 2FA password). The code arrives in your Telegram
+app, not by SMS:
+
+```bash
+tg-messenger login --phone +1234567890
+```
+
+The session is saved under `~/.tg_messenger/sessions/`, so you only log in once. (You can
+also log in interactively from the Web or TUI — see below.)
+
+**3. Start an interface** — same core, pick whichever you like:
+
+```bash
+tg-messenger chat            # interactive terminal REPL — see incoming, send replies
+tg-messenger tui             # full-screen Textual UI         (needs [tui])
+tg-messenger serve           # web UI on http://127.0.0.1:8090 (needs [web])
+```
+
+Or run one-off commands without a UI:
+
+```bash
+tg-messenger dialogs              # list your DMs (--groups for groups/channels)
+tg-messenger read 7               # print history of dialog 7
+tg-messenger send 7 "hello"       # send a message
+tg-messenger --help               # every command
+```
+
+Add `-v` for DEBUG logging, `--profile NAME` to target a specific account (see
+[Multiple accounts](#multiple-accounts-profiles)).
 
 ## Use as a library
 

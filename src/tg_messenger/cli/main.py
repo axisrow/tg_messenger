@@ -11,6 +11,7 @@ import contextlib
 import logging
 import os
 import sys
+from collections import deque
 from pathlib import Path
 
 import click
@@ -918,12 +919,22 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
         try:
             await _ensure_authorized(client, session)
 
+            # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();
+            # skip them so our own input isn't printed back. Bounded (deque).
+            sent_ids: deque[tuple[int, int]] = deque(maxlen=200)
+
             async def printer():
                 async for ev in client.listen():
                     if ev.dialog_id == dialog_id:
                         click.echo(f"\n← {ev.message.text or '<media>'}")
 
-            task = asyncio.create_task(printer())
+            async def printer_outgoing():
+                # our own messages sent from another device (phone/web/CLI elsewhere)
+                async for ev in client.listen_outgoing():
+                    if ev.dialog_id == dialog_id and (ev.dialog_id, ev.message.id) not in sent_ids:
+                        click.echo(f"\n→ {ev.message.text or '<media>'}")
+
+            tasks = [asyncio.create_task(printer()), asyncio.create_task(printer_outgoing())]
             try:
                 while True:
                     try:
@@ -931,10 +942,12 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     except EOFError:
                         break
                     if line.strip():
-                        await client.send_text(dialog_id, line)
+                        msg = await client.send_text(dialog_id, line)
+                        sent_ids.append((dialog_id, msg.id))  # suppress this line's outgoing echo
             finally:
-                task.cancel()
-                results = await asyncio.gather(task, return_exceptions=True)
+                for t in tasks:
+                    t.cancel()
+                results = await asyncio.gather(*tasks, return_exceptions=True)
                 for r in results:
                     # CancelledError is BaseException — a real failure only
                     if isinstance(r, Exception):

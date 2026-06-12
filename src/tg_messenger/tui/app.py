@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import shlex
+from collections import OrderedDict
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -279,6 +280,10 @@ class MessengerTUI(App):
         self._all_dialogs: list = []  # full loaded list; search filters it locally
         self._suggester = suggester
         self._pending_suggestion: str | None = None
+        # (dialog_id, message_id) keys we sent from this composer — the same messages echo back on
+        # listen_outgoing(); skip them so our optimistic bubble isn't duplicated.
+        # Bounded (OrderedDict-as-set, watch.py pattern): a long session can't grow it.
+        self._sent_ids: OrderedDict[tuple[int, int], bool] = OrderedDict()
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -342,6 +347,7 @@ class MessengerTUI(App):
         self.query_one("#dialogs", ListView).loading = False
         self._started = True
         self.run_worker(self._drain_incoming(), exclusive=False)
+        self.run_worker(self._drain_outgoing(), exclusive=False)
 
     async def on_unmount(self) -> None:
         if self._client is not None:
@@ -466,9 +472,17 @@ class MessengerTUI(App):
         event.input.value = ""  # clear optimistically; restored on failure
         self.run_worker(self._send_text(self._current, text), exclusive=False)
 
+    def _remember_sent(self, dialog_id: int, message_id: int) -> None:
+        """Record a message we sent so its listen_outgoing() echo isn't drawn twice."""
+        key = (dialog_id, message_id)
+        self._sent_ids[key] = True
+        self._sent_ids.move_to_end(key)
+        while len(self._sent_ids) > 200:  # bounded, like watch.py's caches
+            self._sent_ids.popitem(last=False)
+
     async def _send_text(self, peer: int, text: str) -> None:
         try:
-            await self._client.send_text(peer, text)
+            msg = await self._client.send_text(peer, text)
         except Exception as exc:
             logger.exception("send failed (dialog %s)", peer)
             self.notify(f"Send failed: {exc}", severity="error")
@@ -476,17 +490,19 @@ class MessengerTUI(App):
             if not composer.value:  # don't clobber a draft typed meanwhile
                 composer.value = text
             return
+        self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
             await pane.mount(MessageBubble(text, out=True))
 
     async def _send_media(self, peer: int, path: str, caption: str | None) -> None:
         try:
-            await self._client.send_media(peer, path, caption=caption)
+            msg = await self._client.send_media(peer, path, caption=caption)
         except Exception as exc:
             logger.exception("send media failed (dialog %s, %s)", peer, path)
             self.notify(f"Send failed: {exc}", severity="error")
             return
+        self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
             label = caption or f"📎 {os.path.basename(path)}"
@@ -502,6 +518,24 @@ class MessengerTUI(App):
         except Exception:
             logger.exception("incoming listener failed")
             self.notify("Incoming listener failed — see log.", severity="error")
+
+    async def _drain_outgoing(self) -> None:
+        """Render our OWN messages sent from another device (phone/CLI/web).
+
+        Mirrors _drain_incoming but as out=True and with NO suggestion (those are
+        for incoming only). Echoes of messages we just sent from this composer are
+        in _sent_ids and skipped, so they aren't drawn twice.
+        """
+        try:
+            async for ev in self._client.listen_outgoing():  # own messages, any device
+                if (ev.dialog_id, ev.message.id) in self._sent_ids:
+                    continue  # our own optimistic bubble already shows it
+                if ev.dialog_id == self._current:
+                    pane = self.query_one("#messages", Vertical)
+                    await pane.mount(MessageBubble(ev.message.text or "<media>", out=True))
+        except Exception:
+            logger.exception("outgoing listener failed")
+            self.notify("Outgoing listener failed — see log.", severity="error")
 
     def _maybe_suggest(self, dialog_id: int) -> None:
         """Kick off a reply suggestion for an incoming message in the open dialog.
