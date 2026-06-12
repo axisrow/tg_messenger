@@ -79,6 +79,22 @@ async def test_message_store_resets_window_on_possible_gap(tmp_path):
         await store.close()
 
 
+async def test_message_store_backfills_when_requested_window_grows(tmp_path):
+    t = {"now": 0.0}
+    client = StoreClient()
+    client.messages = [_msg(i) for i in range(200, 0, -1)]  # newest first, like Telethon
+    store = MessageStore(client=client, storage=await _storage(tmp_path), clock=lambda: t["now"])
+    try:
+        first = await store.history(7, limit=50)
+        second = await store.history(7, limit=200)
+    finally:
+        await store.close()
+
+    assert [m.id for m in first] == list(range(151, 201))
+    assert [m.id for m in second] == list(range(1, 201))
+    assert client.calls == [(7, 0, 50), (7, 0, 200)]
+
+
 async def test_message_store_deletion_without_chat_id_skips_channels(tmp_path):
     storage = await _storage(tmp_path)
     store = MessageStore(client=StoreClient(), storage=storage, sync_ttl=0)

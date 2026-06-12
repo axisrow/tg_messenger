@@ -49,15 +49,20 @@ def _target_script(target_lang: str) -> str:
 
 
 def needs_translation(text: str | None, target_lang: str | None) -> bool:
-    """Cheap script heuristic; returns False for empty/media/emoji-only text."""
+    """Whether text should be sent to the translator.
+
+    We only skip empty/media/emoji-only messages here. Same-script text still
+    goes to the translator because script is not language detection: e.g. Spanish
+    or German text should still be translated for an English target. The injected
+    translator may return ``None`` when the message is already in the target
+    language, and that result is cached.
+    """
     if not text or not target_lang:
         return False
     letters = [ch for ch in text if _LETTER_RE.match(ch)]
     if not letters:
         return False
-    target = _target_script(target_lang)
-    target_count = sum(1 for ch in letters if _script(ch) == target)
-    return (target_count / len(letters)) < 0.70
+    return True
 
 
 async def get_user_lang(storage, env=None) -> str | None:

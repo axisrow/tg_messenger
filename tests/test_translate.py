@@ -30,11 +30,12 @@ def _msg(mid: int, text: str) -> Message:
 @pytest.mark.parametrize(
     ("text", "lang", "expected"),
     [
-        ("привет", "ru", False),
+        ("привет", "ru", True),
         ("hello", "ru", True),
         ("你好", "ru", True),
         ("123 😀", "ru", False),
-        ("hello", "en", False),
+        ("hello", "en", True),
+        ("hola", "en", True),
     ],
 )
 def test_needs_translation_script_heuristic(text, lang, expected):
@@ -67,7 +68,7 @@ async def test_translator_batches_and_caches(tmp_path):
 
     async def translate_fn(batch, lang):
         calls.append((list(batch), lang))
-        return {mid: f"ru:{text}" for mid, text in batch}
+        return {mid: (None if text == "привет" else f"ru:{text}") for mid, text in batch}
 
     store = MessageStore(client=object(), storage=storage)
     translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "ru"}, batch_size=2)
@@ -81,7 +82,30 @@ async def test_translator_batches_and_caches(tmp_path):
 
     assert [m.translated_text for m in first] == ["ru:hello", "ru:world", None]
     assert [m.translated_text for m in second] == ["ru:hello", "ru:world", None]
-    assert calls == [([(1, "hello"), (2, "world")], "ru")]
+    assert calls == [([(1, "hello"), (2, "world")], "ru"), ([(3, "привет")], "ru")]
+
+
+async def test_translator_does_not_cache_same_script_text_as_already_translated(tmp_path):
+    storage = Storage(tmp_path / "t.db")
+    register_message_store_migrations(storage)
+    calls = []
+
+    async def translate_fn(batch, lang):
+        calls.append((list(batch), lang))
+        return {mid: "hello" for mid, _ in batch}
+
+    store = MessageStore(client=object(), storage=storage)
+    translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "en"})
+    try:
+        await store.connect()
+        first = await translator.translate_history(7, [_msg(1, "hola")])
+        second = await translator.translate_history(7, [_msg(1, "hola")])
+    finally:
+        await store.close()
+
+    assert first[0].translated_text == "hello"
+    assert second[0].translated_text == "hello"
+    assert calls == [([(1, "hola")], "en")]
 
 
 async def test_translator_failure_is_logged_and_unraised(tmp_path, caplog):

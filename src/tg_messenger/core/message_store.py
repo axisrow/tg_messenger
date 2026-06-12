@@ -89,6 +89,9 @@ class MessageStore:
         lock = self._sync_locks.setdefault(peer, asyncio.Lock())
         async with lock:
             row = await self._sync_row(peer)
+            if row is not None and int(row[0]) > 0 and await self._window_count(peer, int(row[0])) < limit:
+                await self._sync_full_window(peer, limit)
+                row = await self._sync_row(peer)
             last = self._last_sync.get(peer)
             if row is None or last is None or self._clock() - last >= self._sync_ttl:
                 await self._sync_history(peer, limit, row)
@@ -185,13 +188,32 @@ class MessageStore:
                 await self._upsert_message(message)
             ids = [int(m.id) for m in fetched]
             if row is None or len(fetched) >= limit:
-                low, high = min(ids), max(ids)
+                low, high = (0 if len(fetched) < limit else min(ids)), max(ids)
             else:
                 low, high = int(row[0]), max(high_id, max(ids))
             await self._set_sync_row(peer, low, high)
         elif row is None:
             await self._set_sync_row(peer, 0, 0)
         self._last_sync[peer] = self._clock()
+
+    async def _sync_full_window(self, peer: int, limit: int) -> None:
+        fetched = await self._client.history_since(peer, min_id=0, limit=limit)
+        if not fetched:
+            await self._set_sync_row(peer, 0, 0)
+            self._last_sync[peer] = self._clock()
+            return
+        for message in fetched:
+            await self._upsert_message(message)
+        ids = [int(m.id) for m in fetched]
+        await self._set_sync_row(peer, 0 if len(fetched) < limit else min(ids), max(ids))
+        self._last_sync[peer] = self._clock()
+
+    async def _window_count(self, peer: int, low_id: int) -> int:
+        row = await self._storage.fetchone(
+            "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND id >= ?",
+            (int(peer), int(low_id)),
+        )
+        return int(row[0]) if row is not None else 0
 
     async def _sync_row(self, peer: int) -> tuple[int, int] | None:
         row = await self._storage.fetchone(
