@@ -119,6 +119,52 @@ async def test_applies_truth_table_and_groups(tmp_path):
         await storage.close()
 
 
+async def test_applies_latin_user_to_latin_dialog_uses_exact_detection(tmp_path):
+    storage = await _storage(tmp_path)
+    await set_user_lang(storage, "en")
+    await set_dialog_lang(storage, 7, "es", source="manual")
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return "en"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        assert await outbound.applies(7, "hello") == "es"
+    finally:
+        await storage.close()
+    assert calls == [["hello"]]
+
+
+async def test_applies_suppresses_latin_draft_when_detector_matches_dialog(tmp_path):
+    storage = await _storage(tmp_path)
+    await set_user_lang(storage, "en")
+    await set_dialog_lang(storage, 7, "es", source="manual")
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return "es"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        assert await outbound.applies(7, "hola") is None
+    finally:
+        await storage.close()
+    assert calls == [["hola"]]
+
+
 async def test_variants_passes_profile_and_context(tmp_path):
     storage = await _storage(tmp_path)
     await save_style_profile(storage, 7, StyleProfile(avg_length=4.0, examples=["ok"]))

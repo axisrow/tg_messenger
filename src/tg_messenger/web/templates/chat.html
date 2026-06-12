@@ -56,7 +56,7 @@
           hx-on::after-request="this.reset()">
       <input type="hidden" name="dialog_id" id="dialog_id" value="">
       <input type="hidden" name="web_client_id" id="web_client_id" value="">
-      <input type="hidden" name="source_text" id="source_text" value="">
+      <input type="hidden" name="outbound_nonce" id="outbound_nonce" value="">
       <input type="text" name="text" id="composer-text" placeholder="Message…" autocomplete="off" required>
       <button type="button" id="suggest-btn" title="Suggest a reply">💡 Suggest</button>
       <label id="attach-btn" title="Attach a file">📎
@@ -97,6 +97,7 @@
       if (!li) return;
       const id = li.textContent.trim().split(' ')[0];
       document.getElementById('dialog_id').value = id;
+      document.getElementById('outbound_nonce').value = '';
       if (es) es.close();
       es = new EventSource('/stream/' + encodeURIComponent(id) +
                            '?client_id=' + encodeURIComponent(webClientId));
@@ -192,15 +193,16 @@
     });
     const composer = document.getElementById('composer');
     const composerText = document.getElementById('composer-text');
-    const sourceText = document.getElementById('source_text');
+    const outboundNonce = document.getElementById('outbound_nonce');
     const variantPanel = document.getElementById('variant-panel');
+    let outboundController = null;
     function hideVariants() {
       variantPanel.style.display = 'none';
       variantPanel.textContent = '';
     }
     composerText.addEventListener('input', () => {
       if (!composerText.value) {
-        sourceText.value = '';
+        outboundNonce.value = '';
         composer.dataset.outboundReady = '';
         hideVariants();
       }
@@ -217,16 +219,22 @@
       evt.preventDefault();
       const fd = new FormData();
       fd.append('text', draft);
+      fd.append('web_client_id', webClientId);
       const sendBtn = composer.querySelector('button[type="submit"]');
       if (sendBtn) sendBtn.disabled = true;
+      if (outboundController) outboundController.abort();
+      outboundController = new AbortController();
+      const outboundTimer = setTimeout(() => outboundController.abort(), 15000);
       try {
         const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/outbound', {
           method: 'POST',
           headers: { 'X-TG-Messenger-CSRF': '1' },
-          body: fd
+          body: fd,
+          signal: outboundController.signal
         });
         const data = await resp.json();
         if (!data.applies) {
+          outboundNonce.value = '';
           if (data.error) {
             document.getElementById('suggest-error').textContent = data.error;
           }
@@ -245,7 +253,7 @@
           btn.textContent = variant;
           btn.addEventListener('click', () => {
             composerText.value = variant;
-            sourceText.value = draft;
+            outboundNonce.value = data.nonce || '';
             composer.dataset.outboundReady = '1';
             hideVariants();
             composerText.focus();
@@ -257,14 +265,19 @@
         original.className = 'variant-card';
         original.textContent = 'Send original';
         original.addEventListener('click', () => {
+          outboundNonce.value = '';
           composer.dataset.outboundReady = '1';
           hideVariants();
           evt.detail.issueRequest(true);
         });
         variantPanel.appendChild(original);
       } catch (err) {
+        outboundNonce.value = '';
+        document.getElementById('suggest-error').textContent = 'Translation timed out — sending the original.';
         evt.detail.issueRequest(true);
       } finally {
+        clearTimeout(outboundTimer);
+        outboundController = null;
         if (sendBtn) sendBtn.disabled = false;
       }
     });

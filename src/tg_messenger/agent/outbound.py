@@ -106,8 +106,15 @@ def _draft_matches_lang(text: str, lang: str) -> bool:
         return False
     lang = lang.strip().lower()
     if script_lang == "latin":
-        return lang not in NON_LATIN_SCRIPT_LANGS
+        return False
     return script_lang == lang
+
+
+def _clean_lang_code(code: str | None) -> str | None:
+    if code is None:
+        return None
+    lang = code.strip().lower()
+    return lang if LANG_CODE_RE.fullmatch(lang) else None
 
 
 def _char_lang(ch: str) -> str | None:
@@ -183,20 +190,45 @@ class OutboundTranslator:
         try:
             if not await is_outbound_enabled(self._storage, dialog_id):
                 return None
-            user_lang = await get_user_lang(self._storage, self._env)
+            user_lang = _clean_lang_code(await get_user_lang(self._storage, self._env))
             if not user_lang:
                 return None
             dialog_lang = await self.dialog_lang(dialog_id)
             if dialog_lang is None or dialog_lang == user_lang:
                 return None
-            if not _draft_matches_lang(draft_text, user_lang):
+            script_lang = _dominant_script_lang([draft_text])
+            if script_lang is None:
                 return None
-            if _draft_matches_lang(draft_text, dialog_lang):
+            if script_lang != "latin":
+                if script_lang != user_lang:
+                    return None
+                if script_lang == dialog_lang:
+                    return None
+                return dialog_lang
+            if user_lang in NON_LATIN_SCRIPT_LANGS:
+                return None
+            draft_lang = await self._detect_draft_lang(draft_text)
+            if draft_lang == dialog_lang:
+                return None
+            if draft_lang is not None and draft_lang != user_lang:
                 return None
             return dialog_lang
         except Exception:
             logger.exception("outbound translation applicability failed for dialog %s", dialog_id)
             return None
+
+    async def _detect_draft_lang(self, draft_text: str) -> str | None:
+        if self._detect_lang_fn is None:
+            return None
+        try:
+            lang = await self._detect_lang_fn([draft_text])
+        except Exception:
+            logger.exception("draft language detection failed")
+            return None
+        cleaned = _clean_lang_code(lang)
+        if lang is not None and cleaned is None:
+            logger.warning("draft language detection returned invalid code %r", lang)
+        return cleaned
 
     async def variants(self, dialog_id: int, draft_text: str, target_lang: str) -> list[str]:
         history = await self._store.history(dialog_id, self._history_limit)

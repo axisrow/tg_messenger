@@ -1121,6 +1121,52 @@ async def test_tui_switching_dialogs_clears_pending_suggestion():
         assert str(app.query_one("#suggestion", Static).render()) == ""
 
 
+async def test_tui_switching_dialogs_clears_pending_outbound_variant():
+    stub = TwoDmClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+        composer.value = "hola"
+        app._held_source = "hello"
+
+        lv = app.query_one("#dialogs", ListView)
+        lv.index = 1
+        lv.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app._held_source is None
+        assert composer.value == ""
+        await app.on_input_submitted(Input.Submitted(composer, composer.value))
+        await pilot.pause()
+
+    assert stub.sent == []
+
+
+async def test_tui_switching_dialogs_clears_pending_outbound_original_bypass():
+    stub = TwoDmClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+        composer.value = "hello"
+        app._outbound_bypass = "hello"
+
+        lv = app.query_one("#dialogs", ListView)
+        lv.index = 1
+        lv.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app._outbound_bypass is None
+        assert composer.value == ""
+        await app.on_input_submitted(Input.Submitted(composer, composer.value))
+        await pilot.pause()
+
+    assert stub.sent == []
+
+
 # --- UX: Enter / стрелка-вниз с вкладок → фокус на список диалогов ---
 
 

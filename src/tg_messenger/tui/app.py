@@ -12,6 +12,7 @@ import logging
 import os
 import shlex
 from collections import OrderedDict
+from dataclasses import dataclass
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -26,6 +27,13 @@ logger = logging.getLogger(__name__)
 # shown before a draft in the suggestion strip; Tab accepts it into the composer
 SUGGEST_PREFIX = "💡 Tab: "
 ORIGINAL_SENTINEL = "__tg_messenger_original__"
+
+
+@dataclass(frozen=True)
+class _OutboundPending:
+    dialog_id: int
+    composer_text: str
+    source_text: str | None = None
 
 
 def parse_media_command(text: str) -> tuple[str, str | None] | None:
@@ -362,8 +370,8 @@ class MessengerTUI(App):
         self._store = store
         self._translator = translator
         self._outbound = outbound
-        self._held_source: str | None = None
-        self._outbound_bypass: str | None = None
+        self._held_source: _OutboundPending | None = None
+        self._outbound_bypass: _OutboundPending | None = None
         self._bubble_index: dict[int, MessageBubble] = {}
         self._pending_suggestion: str | None = None
         # (dialog_id, message_id) keys we sent from this composer — the same messages echo back on
@@ -555,6 +563,7 @@ class MessengerTUI(App):
     async def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, DialogItem):
+            self._clear_outbound_pending(clear_composer=True)
             self._current = item.dialog_id
             self._clear_suggestion()
             self._bubble_index.clear()
@@ -636,8 +645,7 @@ class MessengerTUI(App):
             if self._pending_suggestion is not None and event.value != self._pending_suggestion:
                 self._clear_suggestion()
             if not event.value:
-                self._held_source = None
-                self._outbound_bypass = None
+                self._clear_outbound_pending()
             return
         # only the search box filters; the composer's own changes are ignored.
         # Filtering is local (over self._all_dialogs) — no network, safe to await here.
@@ -692,13 +700,19 @@ class MessengerTUI(App):
                 self._send_media(self._current, path, caption), exclusive=False
             )
             return
-        if self._held_source is not None:
-            source = self._held_source
+        pending_source, discard = self._validate_outbound_pending(self._held_source, text)
+        if discard:
+            return
+        if pending_source is not None and pending_source.source_text is not None:
+            source = pending_source.source_text
             self._held_source = None
             event.input.value = ""
             self.run_worker(self._send_text(self._current, text, source_text=source), exclusive=False)
             return
-        if self._outbound_bypass == text:
+        pending_bypass, discard = self._validate_outbound_pending(self._outbound_bypass, text)
+        if discard:
+            return
+        if pending_bypass is not None:
             self._outbound_bypass = None
             event.input.value = ""
             self.run_worker(self._send_text(self._current, text), exclusive=False)
@@ -762,7 +776,7 @@ class MessengerTUI(App):
             variants = await self._outbound.variants(dialog_id, text, target_lang)
         except Exception:
             logger.exception("outbound translation failed (dialog %s)", dialog_id)
-            self._outbound_bypass = text
+            self._outbound_bypass = _OutboundPending(dialog_id, text)
             self.notify("Перевод не удался — Enter отправит оригинал", severity="warning")
             return
         picked = await self.push_screen_wait(VariantPickScreen(variants, text))
@@ -770,13 +784,42 @@ class MessengerTUI(App):
             composer.focus()
             return
         if picked == ORIGINAL_SENTINEL:
-            self._outbound_bypass = text
+            self._outbound_bypass = _OutboundPending(dialog_id, text)
             self.notify("Enter отправит оригинал")
             composer.focus()
             return
         composer.value = picked
-        self._held_source = text
+        self._held_source = _OutboundPending(dialog_id, picked, source_text=text)
         composer.focus()
+
+    def _clear_outbound_pending(self, *, clear_composer: bool = False) -> None:
+        pending = [p for p in (self._held_source, self._outbound_bypass) if p is not None]
+        self._held_source = None
+        self._outbound_bypass = None
+        if not clear_composer or not pending:
+            return
+        composer = self.query_one("#composer", Input)
+        pending_texts = {
+            p.composer_text for p in pending if isinstance(p, _OutboundPending)
+        }
+        if not pending_texts or composer.value in pending_texts:
+            composer.value = ""
+
+    def _validate_outbound_pending(
+        self,
+        pending: _OutboundPending | None,
+        composer_text: str,
+    ) -> tuple[_OutboundPending | None, bool]:
+        if pending is None:
+            return None, False
+        if not isinstance(pending, _OutboundPending) or pending.dialog_id != self._current:
+            logger.warning("discarding stale outbound composer state")
+            self._clear_outbound_pending(clear_composer=True)
+            return None, True
+        if pending.composer_text != composer_text:
+            self._clear_outbound_pending()
+            return None, False
+        return pending, False
 
     async def _send_text(self, peer: int, text: str, source_text: str | None = None) -> None:
         try:
