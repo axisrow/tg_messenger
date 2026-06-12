@@ -1,7 +1,8 @@
 """Textual TUI: dialog list (left, DM/groups tabs) + message view + composer (right).
 
-Reuses the bubble/list pattern. A background worker drains ``client.listen_all()``
-and appends incoming bubbles for the selected dialog (any kind, groups included).
+Reuses the bubble/list pattern. A background worker drains ``client.listen_all()``,
+updates the already-loaded dialog list, and appends incoming bubbles for the
+selected dialog (any kind, groups included).
 """
 
 from __future__ import annotations
@@ -288,6 +289,7 @@ class MessengerTUI(App):
 
     CSS = """
     #sidebar { width: 32; border-right: solid $primary; }
+    #messages { overflow-y: auto; }
     .out { color: $accent; text-align: right; }
     .in { color: $text; }
     #suggestion { dock: bottom; color: $text-muted; height: auto; }
@@ -321,6 +323,24 @@ class MessengerTUI(App):
         # (dialog_id, message_id, emoticon) keys we reacted with from this composer.
         # Telegram echoes the update via listen_reactions(); skip the local echo only.
         self._sent_reactions: OrderedDict[tuple[int, int, str | None], bool] = OrderedDict()
+
+    def _scroll_messages_to_end(self, pane=None) -> None:
+        pane = pane or self.query_one("#messages", Vertical)
+        remaining_attempts = 4
+
+        def scroll_once() -> None:
+            nonlocal remaining_attempts
+            pane.scroll_end(animate=False, force=True)
+            if pane.max_scroll_y:
+                pane.scroll_to(y=pane.max_scroll_y, animate=False, force=True)
+            remaining_attempts -= 1
+            if remaining_attempts > 0 and (
+                pane.max_scroll_y == 0 or pane.scroll_y < pane.max_scroll_y
+            ):
+                self.call_later(scroll_once)
+
+        scroll_once()
+        self.call_later(scroll_once)
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -426,9 +446,40 @@ class MessengerTUI(App):
 
         lv = self.query_one("#dialogs", ListView)
         query = self.query_one("#search", Input).value
+        selected_id = None
+        if isinstance(lv.highlighted_child, DialogItem):
+            selected_id = lv.highlighted_child.dialog_id
+        filtered = list(filter_dialogs(self._all_dialogs, query))
         await lv.clear()
-        for d in filter_dialogs(self._all_dialogs, query):
+        for d in filtered:
             await lv.append(DialogItem(d.id, d.title, d.unread, d.kind))
+        if selected_id is not None:
+            for idx, dialog in enumerate(filtered):
+                if dialog.id == selected_id:
+                    lv.index = idx
+                    break
+
+    async def _touch_dialog_for_incoming(self, ev) -> None:
+        """Apply one live incoming event to the local dialog snapshot.
+
+        This keeps the sidebar fresh without reloading ``dialogs()`` on every
+        message; the core dialogs cache deliberately survives events to avoid
+        reintroducing the tab-switch/flood-wait incident.
+        """
+        for idx, dialog in enumerate(self._all_dialogs):
+            if dialog.id != ev.dialog_id:
+                continue
+            unread = 0 if ev.dialog_id == self._current else dialog.unread + 1
+            updated = dialog.model_copy(
+                update={
+                    "unread": unread,
+                    "last_text": ev.message.text,
+                    "last_message_at": ev.message.date,
+                }
+            )
+            self._all_dialogs = [updated, *self._all_dialogs[:idx], *self._all_dialogs[idx + 1:]]
+            await self._render_dialogs()
+            return
 
     async def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         # Tabs fires this once at mount, before the client exists — _started gates it.
@@ -496,6 +547,7 @@ class MessengerTUI(App):
                 group="translate-history",
                 exclusive=True,
             )
+        self._scroll_messages_to_end(pane)
         if messages:
             # Acknowledge exactly the loaded snapshot; messages arriving later stay unread.
             self.run_worker(
@@ -608,6 +660,7 @@ class MessengerTUI(App):
             bubble = MessageBubble(_message_label(msg), out=True)
             self._bubble_index[msg.id] = bubble
             await pane.mount(bubble)
+            self._scroll_messages_to_end(pane)
 
     async def _send_media(self, peer: int, path: str, caption: str | None) -> None:
         try:
@@ -622,6 +675,7 @@ class MessengerTUI(App):
             bubble = MessageBubble(_message_label(msg), out=True)
             self._bubble_index[msg.id] = bubble
             await pane.mount(bubble)
+            self._scroll_messages_to_end(pane)
 
     async def _send_reaction(self, peer: int, message_id: int, emoticon: str) -> None:
         try:
@@ -634,10 +688,12 @@ class MessengerTUI(App):
         if peer == self._current:
             pane = self.query_one("#messages", Vertical)
             await pane.mount(MessageBubble(f"reaction [{message_id}]: {emoticon}", out=True))
+            self._scroll_messages_to_end(pane)
 
     async def _drain_incoming(self) -> None:
         try:
             async for ev in self._client.listen_all():  # groups too, not just DMs
+                await self._touch_dialog_for_incoming(ev)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
                     bubble = MessageBubble(_message_label(ev.message), out=False)
@@ -651,6 +707,12 @@ class MessengerTUI(App):
                             group="translate-live",
                             exclusive=False,
                         )
+                    self._scroll_messages_to_end(pane)
+                    self.run_worker(
+                        self._mark_read(ev.dialog_id, ev.message.id),
+                        group="mark_read",
+                        exclusive=True,
+                    )
                     self._maybe_suggest(ev.dialog_id)
         except Exception:
             logger.exception("incoming listener failed")
@@ -680,6 +742,7 @@ class MessengerTUI(App):
                             group="translate-live",
                             exclusive=False,
                         )
+                    self._scroll_messages_to_end(pane)
         except Exception:
             logger.exception("outgoing listener failed")
             self.notify("Outgoing listener failed — see log.", severity="error")
@@ -694,6 +757,7 @@ class MessengerTUI(App):
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
                     await pane.mount(MessageBubble(_reaction_label(ev), out=False))
+                    self._scroll_messages_to_end(pane)
         except Exception:
             logger.exception("reaction listener failed")
             self.notify("Reaction listener failed — see log.", severity="error")
