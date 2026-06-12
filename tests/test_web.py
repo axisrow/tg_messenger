@@ -507,6 +507,33 @@ async def test_sse_stream_failure_is_logged_and_closes(caplog):
     assert errors and errors[0].exc_info is not None
 
 
+async def test_sse_substream_failure_closes_whole_stream(caplog):
+    import pytest
+
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+    outgoing_subscribed = asyncio.Event()
+
+    async def broken_outgoing():
+        outgoing_subscribed.set()
+        raise RuntimeError("outgoing stream blew up")
+        yield  # pragma: no cover
+
+    stub.listen_outgoing = broken_outgoing
+    gen = sse_event_stream(stub, dialog_id=7)
+
+    with caplog.at_level("ERROR", logger="tg_messenger.web.app"):
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(gen.__anext__(), timeout=2)
+
+    assert outgoing_subscribed.is_set()
+    await asyncio.sleep(0)
+    assert stub.bus.subscriber_count == 0
+    errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
 async def test_stream_yields_sse_frame():
     # Drive the SSE generator directly: subscribing then publishing must
     # produce one data frame for the matching dialog (and skip others).

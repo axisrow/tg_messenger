@@ -190,7 +190,7 @@ async def sse_event_stream(client, dialog_id: int, sent_ids: OrderedDict | None 
     }
     # one pending __anext__ task per still-open stream
     pending = {
-        asyncio.ensure_future(it.__anext__()): out
+        asyncio.create_task(it.__anext__()): out
         for out, it in iterators.items()
     }
     try:
@@ -205,9 +205,9 @@ async def sse_event_stream(client, dialog_id: int, sent_ids: OrderedDict | None 
                 except Exception:
                     logger.exception("SSE %s stream for dialog %s failed",
                                      "outgoing" if out else "incoming", dialog_id)
-                    continue
+                    return  # close the SSE stream; browser EventSource will reconnect
                 # queue the next pull from this stream right away
-                pending[asyncio.ensure_future(iterators[out].__anext__())] = out
+                pending[asyncio.create_task(iterators[out].__anext__())] = out
                 if ev.dialog_id != dialog_id:
                     continue
                 if out and (ev.dialog_id, ev.message.id) in sent_ids:
