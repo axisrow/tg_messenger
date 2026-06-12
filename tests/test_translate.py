@@ -108,6 +108,62 @@ async def test_translator_does_not_cache_same_script_text_as_already_translated(
     assert calls == [([(1, "hola")], "en")]
 
 
+async def test_translator_caches_missing_model_response_ids_as_null(tmp_path):
+    storage = Storage(tmp_path / "t.db")
+    register_message_store_migrations(storage)
+    calls = []
+
+    async def translate_fn(batch, lang):
+        calls.append((list(batch), lang))
+        return {}
+
+    store = MessageStore(client=object(), storage=storage)
+    translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "ru"})
+    try:
+        await store.connect()
+        first = await translator.translate_history(7, [_msg(1, "hello")])
+        second = await translator.translate_history(7, [_msg(1, "hello")])
+    finally:
+        await store.close()
+
+    assert first[0].translated_text is None
+    assert second[0].translated_text is None
+    assert calls == [([(1, "hello")], "ru")]
+
+
+async def test_translator_skips_outgoing_messages(tmp_path):
+    storage = Storage(tmp_path / "t.db")
+    register_message_store_migrations(storage)
+    calls = []
+
+    async def translate_fn(batch, lang):
+        calls.append((list(batch), lang))
+        return {mid: "ru:own" for mid, _ in batch}
+
+    store = MessageStore(client=object(), storage=storage)
+    translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "ru"})
+    try:
+        await store.connect()
+        result = await translator.translate_history(
+            7,
+            [
+                Message(
+                    id=1,
+                    dialog_id=7,
+                    sender_id=1,
+                    out=True,
+                    text="hello",
+                    date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                )
+            ],
+        )
+    finally:
+        await store.close()
+
+    assert result[0].translated_text is None
+    assert calls == []
+
+
 async def test_translator_failure_is_logged_and_unraised(tmp_path, caplog):
     storage = Storage(tmp_path / "t.db")
     register_message_store_migrations(storage)

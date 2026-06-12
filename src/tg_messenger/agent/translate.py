@@ -28,26 +28,6 @@ DEFAULT_BATCH_SIZE = 20
 _LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 
 
-def _script(ch: str) -> str | None:
-    cp = ord(ch)
-    if 0x0400 <= cp <= 0x052F:
-        return "cyrillic"
-    if 0x4E00 <= cp <= 0x9FFF or 0x3040 <= cp <= 0x30FF or 0xAC00 <= cp <= 0xD7AF:
-        return "cjk"
-    if ("A" <= ch <= "Z") or ("a" <= ch <= "z") or (0x00C0 <= cp <= 0x024F):
-        return "latin"
-    return None
-
-
-def _target_script(target_lang: str) -> str:
-    lang = target_lang.lower()
-    if lang in {"ru", "uk", "bg", "sr"}:
-        return "cyrillic"
-    if lang in {"zh", "ja", "ko"}:
-        return "cjk"
-    return "latin"
-
-
 def needs_translation(text: str | None, target_lang: str | None) -> bool:
     """Whether text should be sent to the translator.
 
@@ -113,6 +93,9 @@ class Translator:
         result: list[Message] = []
         pending: list[tuple[Message, str]] = []
         for message in messages:
+            if message.out:
+                result.append(message)
+                continue
             translated, needs_llm = await self._prepare_message(message, target)
             result.append(translated)
             if needs_llm and message.text:
@@ -162,9 +145,7 @@ class Translator:
                 logger.exception("translation batch failed")
                 continue
             for message, _ in chunk:
-                if message.id not in translated:
-                    continue
-                text = translated[message.id]
+                text = translated.get(message.id)
                 try:
                     await upsert_message_for_translation(self._storage, message)
                     await set_message_translation(

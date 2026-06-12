@@ -80,6 +80,23 @@ class WebStubClient:
             yield ev
 
 
+class WebTranslatorStub:
+    def __init__(self):
+        self.lang = "en"
+
+    async def target_lang(self):
+        return self.lang
+
+    async def set_target_lang(self, code):
+        self.lang = code
+
+    async def translate_history(self, dialog_id, messages):
+        return list(messages)
+
+    async def translate_message(self, message):
+        return message
+
+
 def test_real_web_client_gets_session_encryption_key(monkeypatch, tmp_path):
     from tg_messenger.web import app as web_app
 
@@ -880,6 +897,31 @@ async def suggest_app():
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
             yield ac, suggester
+
+
+@pytest_asyncio.fixture
+async def translation_app():
+    stub = WebStubClient()
+    translator = WebTranslatorStub()
+    app = build_app(client=stub, translator=translator)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac, translator
+
+
+async def test_language_settings_form_sends_csrf_header(translation_app):
+    ac, _ = translation_app
+    r = await ac.get("/settings/lang")
+    assert r.status_code == 200
+    assert 'hx-headers=\'{"x-tg-messenger-csrf": "1"}\'' in r.text
+
+
+async def test_language_settings_post_saves_with_csrf_header(translation_app):
+    ac, translator = translation_app
+    r = await ac.post("/settings/lang", data={"code": "ru"}, headers=SUGGEST_HEADERS)
+    assert r.status_code == 200
+    assert translator.lang == "ru"
 
 
 async def test_suggest_endpoint_returns_draft(suggest_app):

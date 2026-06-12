@@ -89,7 +89,11 @@ class MessageStore:
         lock = self._sync_locks.setdefault(peer, asyncio.Lock())
         async with lock:
             row = await self._sync_row(peer)
-            if row is not None and int(row[0]) > 0 and await self._window_count(peer, int(row[0])) < limit:
+            if (
+                row is not None
+                and int(row[0]) > 0
+                and await self._window_count(peer, int(row[0]), int(row[1])) < limit
+            ):
                 await self._sync_full_window(peer, limit)
                 row = await self._sync_row(peer)
             last = self._last_sync.get(peer)
@@ -208,10 +212,10 @@ class MessageStore:
         await self._set_sync_row(peer, 0 if len(fetched) < limit else min(ids), max(ids))
         self._last_sync[peer] = self._clock()
 
-    async def _window_count(self, peer: int, low_id: int) -> int:
+    async def _window_count(self, peer: int, low_id: int, high_id: int) -> int:
         row = await self._storage.fetchone(
-            "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND id >= ?",
-            (int(peer), int(low_id)),
+            "SELECT COUNT(*) FROM messages WHERE dialog_id = ? AND id >= ? AND id <= ?",
+            (int(peer), int(low_id), int(high_id)),
         )
         return int(row[0]) if row is not None else 0
 
@@ -235,12 +239,12 @@ class MessageStore:
         row = await self._sync_row(peer)
         if row is None:
             return []
-        low_id = int(row[0])
+        low_id, high_id = int(row[0]), int(row[1])
         rows = await self._storage.fetchall(
             "SELECT dialog_id, id, sender_id, out, date, text, media, reply_to_id, "
             "is_forward, translated_text "
-            "FROM messages WHERE dialog_id = ? AND id >= ? ORDER BY id DESC LIMIT ?",
-            (int(peer), low_id, int(limit)),
+            "FROM messages WHERE dialog_id = ? AND id >= ? AND id <= ? ORDER BY id DESC LIMIT ?",
+            (int(peer), low_id, high_id, int(limit)),
         )
         return [self._row_to_message(r) for r in reversed(rows)]
 

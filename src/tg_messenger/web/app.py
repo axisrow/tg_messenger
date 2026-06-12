@@ -669,7 +669,8 @@ def build_app(
             return _error_response("Translation is not configured.", 503)
         lang = await translator.target_lang()
         return HTMLResponse(
-            '<form hx-post="/settings/lang" hx-swap="outerHTML">'
+            '<form hx-post="/settings/lang" hx-swap="outerHTML" '
+            'hx-headers=\'{"x-tg-messenger-csrf": "1"}\'>'
             f'<input name="code" value="{escape(lang or "")}" placeholder="Language">'
             '<button type="submit">Save</button>'
             "</form>"
