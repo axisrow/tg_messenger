@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # shown before a draft in the suggestion strip; Tab accepts it into the composer
 SUGGEST_PREFIX = "💡 Tab: "
 ORIGINAL_SENTINEL = "__tg_messenger_original__"
+OUTBOUND_TIMEOUT_SECONDS = 20
 
 
 @dataclass(frozen=True)
@@ -769,12 +770,23 @@ class MessengerTUI(App):
     async def _outbound_flow(self, dialog_id: int, text: str) -> None:
         composer = self.query_one("#composer", Input)
         try:
-            target_lang = await self._outbound.applies(dialog_id, text)
+            target_lang = await asyncio.wait_for(
+                self._outbound.applies(dialog_id, text),
+                timeout=OUTBOUND_TIMEOUT_SECONDS,
+            )
             if target_lang is None:
                 composer.value = ""
                 await self._send_text(dialog_id, text)
                 return
-            variants = await self._outbound.variants(dialog_id, text, target_lang)
+            variants = await asyncio.wait_for(
+                self._outbound.variants(dialog_id, text, target_lang),
+                timeout=OUTBOUND_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning("outbound translation timed out (dialog %s)", dialog_id)
+            self.notify("Перевод не успел — отправляю оригинал", severity="warning")
+            await self._send_text(dialog_id, text)
+            return
         except Exception:
             logger.exception("outbound translation failed (dialog %s)", dialog_id)
             self._outbound_bypass = _OutboundPending(dialog_id, text)

@@ -1188,6 +1188,47 @@ async def test_tui_outbound_error_restores_original_for_bypass():
         assert app._outbound_bypass == _OutboundPending(7, "hello")
 
 
+async def test_tui_outbound_applies_timeout_sends_original():
+    class TimeoutOutbound:
+        async def applies(self, dialog_id, text):
+            raise TimeoutError
+
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub, outbound=TimeoutOutbound())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        composer.value = "hello"
+        await app.on_input_submitted(Input.Submitted(composer, "hello"))
+        await pilot.pause()
+        await pilot.pause()
+
+    assert stub.sent == [(7, "hello", None)]
+
+
+async def test_tui_outbound_variants_timeout_sends_original():
+    class TimeoutOutbound:
+        async def applies(self, dialog_id, text):
+            return "es"
+
+        async def variants(self, dialog_id, text, target_lang):
+            raise TimeoutError
+
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub, outbound=TimeoutOutbound())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        composer.value = "hello"
+        await app.on_input_submitted(Input.Submitted(composer, "hello"))
+        await pilot.pause()
+        await pilot.pause()
+
+    assert stub.sent == [(7, "hello", None)]
+
+
 async def test_tui_outbound_original_choice_restores_original_for_bypass(monkeypatch):
     class VariantOutbound:
         async def applies(self, dialog_id, text):
