@@ -829,6 +829,17 @@ class IncomingDialogListClient(TuiStubClient):
         await asyncio.Event().wait()
 
 
+class IncomingAnnDialogListClient(IncomingDialogListClient):
+    async def listen_all(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield IncomingEvent(
+            dialog_id=7,
+            message=Message(id=23, dialog_id=7, sender_id=7, out=False, text="fresh", date=date),
+        )
+        await asyncio.Event().wait()
+
+
 async def test_tui_incoming_updates_dialog_list_without_network_reload():
     stub = IncomingDialogListClient()
     app = MessengerTUI(client=stub)
@@ -841,6 +852,25 @@ async def test_tui_incoming_updates_dialog_list_without_network_reload():
     assert rendered[0] == "8 — Bob (1)"
     assert rendered[1] == "7 — Ann"
     assert stub.dialogs_calls == calls_before
+
+
+async def test_tui_incoming_sidebar_refresh_preserves_selected_dialog():
+    stub = IncomingAnnDialogListClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.index = 1
+        app._current = 8
+        assert isinstance(lv.highlighted_child, DialogItem)
+        assert lv.highlighted_child.dialog_id == 8
+
+        stub.fire.set()
+        await pilot.pause()
+        await pilot.pause()
+
+        assert isinstance(lv.highlighted_child, DialogItem)
+        assert lv.highlighted_child.dialog_id == 8
 
 
 async def test_tui_open_dialog_live_message_stays_read_and_marks_new_id():
@@ -857,6 +887,29 @@ async def test_tui_open_dialog_live_message_stays_read_and_marks_new_id():
     assert rendered[0] == "8 — Bob"
     assert bubbles == ["[22] fresh"]
     assert stub.read_acks == [(8, 22)]
+
+
+async def test_tui_live_mark_read_worker_replaces_superseded_calls(monkeypatch):
+    stub = IncomingDialogListClient()
+    app = MessengerTUI(client=stub)
+    worker_calls = []
+
+    def capture_worker(coro, *args, **kwargs):
+        worker_calls.append(kwargs)
+        coro.close()
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 8
+        monkeypatch.setattr(app, "run_worker", capture_worker)
+        stub.fire.set()
+        await pilot.pause()
+        await pilot.pause()
+
+    assert any(
+        call.get("group") == "mark_read" and call.get("exclusive") is True
+        for call in worker_calls
+    )
 
 
 class OutgoingEventClient(TuiStubClient):

@@ -433,9 +433,18 @@ class MessengerTUI(App):
 
         lv = self.query_one("#dialogs", ListView)
         query = self.query_one("#search", Input).value
+        selected_id = None
+        if isinstance(lv.highlighted_child, DialogItem):
+            selected_id = lv.highlighted_child.dialog_id
+        filtered = list(filter_dialogs(self._all_dialogs, query))
         await lv.clear()
-        for d in filter_dialogs(self._all_dialogs, query):
+        for d in filtered:
             await lv.append(DialogItem(d.id, d.title, d.unread, d.kind))
+        if selected_id is not None:
+            for idx, dialog in enumerate(filtered):
+                if dialog.id == selected_id:
+                    lv.index = idx
+                    break
 
     async def _touch_dialog_for_incoming(self, ev) -> None:
         """Apply one live incoming event to the local dialog snapshot.
@@ -689,7 +698,7 @@ class MessengerTUI(App):
                     self.run_worker(
                         self._mark_read(ev.dialog_id, ev.message.id),
                         group="mark_read",
-                        exclusive=False,
+                        exclusive=True,
                     )
                     self._maybe_suggest(ev.dialog_id)
         except Exception:
