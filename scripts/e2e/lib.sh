@@ -127,6 +127,13 @@ e2e_require_saved_id() {
   esac
 }
 
+e2e_require_saved_id_confirmed() {
+  e2e_require_saved_id
+  if [ "${E2E_SAVED_ID_CONFIRM:-}" != "$E2E_SAVED_ID" ]; then
+    e2e_die "E2E_SAVED_ID_CONFIRM must equal E2E_SAVED_ID after you verify it is your own Saved Messages/self-dialog id"
+  fi
+}
+
 e2e_marker() {
   local step="$1"
   printf 'e2e-%s-%s' "$E2E_RUN_ID" "$step"
@@ -139,6 +146,7 @@ e2e_mutation_pause() {
 e2e_extract_message_id() {
   local text="$1"
   local marker="$2"
+  # Coupled to `tg-messenger read` lines like: `→ [123] e2e-marker`.
   printf '%s\n' "$text" | awk -v marker="$marker" '
     index($0, marker) > 0 {
       if (match($0, /\[[0-9]+\]/)) {
@@ -227,48 +235,4 @@ e2e_recent_history() {
 e2e_skip_step() {
   echo "$*"
   return 77
-}
-
-e2e_require_danger_guard() {
-  if [ "${E2E_I_UNDERSTAND:-}" != "1" ]; then
-    e2e_die "dangerous manual E2E requires E2E_I_UNDERSTAND=1"
-  fi
-  if [ ! -t 0 ]; then
-    e2e_die "dangerous manual E2E requires an interactive terminal"
-  fi
-}
-
-e2e_confirm() {
-  local prompt="$1"
-  local answer
-  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-    printf '%s [y/N] ' "$prompt" >/dev/tty
-    read -r answer </dev/tty
-  else
-    printf '%s [y/N] ' "$prompt" >&2
-    read -r answer
-  fi
-  case "$answer" in
-    y|Y|yes|YES)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-e2e_run_for_seconds() {
-  local seconds="$1"
-  shift
-  local pid
-  "$@" &
-  pid=$!
-  sleep "$seconds"
-  if kill -0 "$pid" >/dev/null 2>&1; then
-    kill "$pid" >/dev/null 2>&1 || true
-    wait "$pid" >/dev/null 2>&1 || true
-  else
-    wait "$pid"
-  fi
 }

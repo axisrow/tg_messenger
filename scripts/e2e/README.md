@@ -35,12 +35,15 @@ Set the profile and Saved Messages peer:
 ```bash
 export E2E_PROFILE=default
 export E2E_SAVED_ID=<your numeric Telegram user id>
+export E2E_SAVED_ID_CONFIRM="$E2E_SAVED_ID"
 ```
 
 `E2E_SAVED_ID` is your own numeric user id. Telegram uses that id as the
 Saved Messages/self-dialog peer id, and the current CLI accepts numeric peers.
 Look it up once from Telegram/account metadata or from a trusted local session
-tool. A future `tg-messenger whoami` command could remove this manual step.
+tool. A wrong value can target a real DM, so the Saved Messages mutation tier
+requires `E2E_SAVED_ID_CONFIRM` to match after you verify the id. A future
+`tg-messenger whoami` command could remove this manual step.
 
 ## Run Safe Checks
 

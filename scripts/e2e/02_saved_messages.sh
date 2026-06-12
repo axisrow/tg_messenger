@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 e2e_init
 e2e_require_creds
-e2e_require_saved_id
+e2e_require_saved_id_confirmed
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tg-messenger-e2e-mutations.XXXXXX")"
 SAVED_PEER="$E2E_SAVED_ID"
@@ -28,12 +28,30 @@ FOR_ME_DELETE_ID=""
 EDIT_MARKER=""
 DELETE_CREATED_OK=0
 SAVED_MARKERS=()
+REACTION_CHAT_PID=""
+REACTION_TAIL_PID=""
+
+cleanup_reaction_processes() {
+  if [ -n "$REACTION_CHAT_PID" ]; then
+    kill "$REACTION_CHAT_PID" >/dev/null 2>&1 || true
+    wait "$REACTION_CHAT_PID" >/dev/null 2>&1 || true
+    REACTION_CHAT_PID=""
+  fi
+  if [ -n "$REACTION_TAIL_PID" ]; then
+    kill "$REACTION_TAIL_PID" >/dev/null 2>&1 || true
+    wait "$REACTION_TAIL_PID" >/dev/null 2>&1 || true
+    REACTION_TAIL_PID=""
+  fi
+}
 
 cleanup_all() {
+  cleanup_reaction_processes
   e2e_cleanup_created_messages
   rm -rf "$TMP_DIR"
 }
 trap cleanup_all EXIT
+trap 'cleanup_all; exit 130' INT
+trap 'cleanup_all; exit 143' TERM
 
 remember_saved_marker() {
   SAVED_MARKERS+=("$1")
@@ -284,7 +302,6 @@ step_reaction_roundtrip() {
   local history
   local chat_log="$TMP_DIR/chat-reactions.log"
   local stdin_fifo="$TMP_DIR/chat-stdin.fifo"
-  local chat_pid
 
   marker="$(e2e_marker reaction-roundtrip)"
   tg send "$peer" "$marker" >/dev/null || return 1
@@ -301,30 +318,25 @@ step_reaction_roundtrip() {
 
   mkfifo "$stdin_fifo" || return 1
   tail -f /dev/null >"$stdin_fifo" &
-  local tail_pid=$!
+  REACTION_TAIL_PID=$!
   tg chat "$peer" <"$stdin_fifo" >"$chat_log" 2>&1 &
-  chat_pid=$!
+  REACTION_CHAT_PID=$!
   sleep 3
-  if ! kill -0 "$chat_pid" >/dev/null 2>&1; then
-    kill "$tail_pid" >/dev/null 2>&1 || true
-    wait "$tail_pid" >/dev/null 2>&1 || true
+  if ! kill -0 "$REACTION_CHAT_PID" >/dev/null 2>&1; then
+    cleanup_reaction_processes
     echo "chat process exited before reaction was sent" >&2
     cat "$chat_log"
     return 1
   fi
 
   if ! tg react "$peer" "$target_id" "${E2E_REACTION_EMOTICON:-👍}" >/dev/null 2>&1; then
-    kill "$chat_pid" "$tail_pid" >/dev/null 2>&1 || true
-    wait "$chat_pid" >/dev/null 2>&1 || true
-    wait "$tail_pid" >/dev/null 2>&1 || true
+    cleanup_reaction_processes
     e2e_skip_step "Telegram rejected reaction round-trip for peer $peer"
     return 77
   fi
 
   sleep "${E2E_REACTION_WAIT:-8}"
-  kill "$chat_pid" "$tail_pid" >/dev/null 2>&1 || true
-  wait "$chat_pid" >/dev/null 2>&1 || true
-  wait "$tail_pid" >/dev/null 2>&1 || true
+  cleanup_reaction_processes
 
   if ! grep -F '* reaction [' "$chat_log" >/dev/null; then
     echo "chat output did not include a real reaction event" >&2
@@ -357,25 +369,52 @@ step_sqlite_moderate_rules() {
   }
 }
 EOF
-  tg moderate-rules add "$rule_file" >/dev/null &&
-    tg moderate-rules list --chat "$chat_id" | grep -F "$name" >/dev/null &&
-    tg moderate-rules remove -- "$chat_id" "$name" >/dev/null
+  local added=0
+  local result=0
+  if tg moderate-rules add "$rule_file" >/dev/null; then
+    added=1
+  else
+    return 1
+  fi
+  tg moderate-rules list --chat "$chat_id" | grep -F "$name" >/dev/null || result=1
+  if [ "$added" -eq 1 ]; then
+    tg moderate-rules remove -- "$chat_id" "$name" >/dev/null || result=1
+  fi
+  return "$result"
 }
 
 step_sqlite_heartbeat() {
   local peer="999$(date +%s)"
   local marker
+  local added=0
+  local result=0
   marker="$(e2e_marker heartbeat)"
-  tg heartbeat plan "$peer" --interval 999999 --template "$marker" >/dev/null &&
-    tg heartbeat list | grep -F "$marker" >/dev/null &&
-    tg heartbeat remove "$peer" >/dev/null
+  if tg heartbeat plan "$peer" --interval 999999 --template "$marker" >/dev/null; then
+    added=1
+  else
+    return 1
+  fi
+  tg heartbeat list | grep -F "$marker" >/dev/null || result=1
+  if [ "$added" -eq 1 ]; then
+    tg heartbeat remove "$peer" >/dev/null || result=1
+  fi
+  return "$result"
 }
 
 step_sqlite_ghostwrite() {
   local peer="998$(date +%s)"
-  tg ghostwrite-dialogs enable "$peer" >/dev/null &&
-    tg ghostwrite-dialogs list | grep -F "$peer" >/dev/null &&
-    tg ghostwrite-dialogs disable "$peer" >/dev/null
+  local added=0
+  local result=0
+  if tg ghostwrite-dialogs enable "$peer" >/dev/null; then
+    added=1
+  else
+    return 1
+  fi
+  tg ghostwrite-dialogs list | grep -F "$peer" >/dev/null || result=1
+  if [ "$added" -eq 1 ]; then
+    tg ghostwrite-dialogs disable "$peer" >/dev/null || result=1
+  fi
+  return "$result"
 }
 
 step_delete_all_created() {
