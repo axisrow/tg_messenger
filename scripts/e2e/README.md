@@ -55,8 +55,9 @@ scripts/e2e/run_safe.sh
 
 - `01_readonly.sh`
 - `02_saved_messages.sh`
+- `03_optional_safe.sh`
 
-It never calls `03_dangerous_parity.sh`.
+It never calls `04_guided_events.sh` or `99_dangerous_parity.sh`.
 
 Useful optional variables:
 
@@ -71,6 +72,23 @@ export E2E_VERBOSE=1
 
 `E2E_SEARCH_QUERY` defaults to `тест`. Reactions run against Saved Messages and
 are skipped when Telegram rejects them for account-policy reasons.
+
+Optional media, service and LLM checks are opt-in:
+
+```bash
+export E2E_VOICE_FILE=/path/to/voice.ogg
+export E2E_VIDEO_NOTE_FILE=/path/to/round-video.mp4
+export E2E_RUN_SERVICES=1
+export E2E_SERVE_PORT=18090
+export E2E_ALLOW_LLM=1
+export E2E_SUGGEST_DM="$E2E_SAVED_ID"
+export E2E_SUGGEST_LEARN=1
+export E2E_SUGGEST_SEND=1
+```
+
+`E2E_ALLOW_LLM=1` is required because `suggest` and `ghostwrite` may send
+dialog context to the configured LLM provider. `suggest --send` is automated
+only when `E2E_SUGGEST_DM` equals `E2E_SAVED_ID`.
 
 ## Safety Tiers
 
@@ -104,12 +122,47 @@ Covered scenarios:
 - forward a comma-separated id list
 - send generated file with explicit `--caption`
 - send generated file as a document
+- optional `send --voice` from `E2E_VOICE_FILE`
+- optional `send --video-note` from `E2E_VIDEO_NOTE_FILE`
 - delete a created Saved Messages message with `--for-me`
 - mark-read
 - reaction event round-trip through `chat`
 - local SQLite CRUD for `moderate-rules`, `heartbeat`, and `ghostwrite-dialogs`
 
-### Dangerous parity: `03_dangerous_parity.sh`
+### Tier 3: `03_optional_safe.sh`
+
+Safe optional checks. The script is part of `run_safe.sh`, but steps with
+missing prerequisites report `SKIP` rather than guessing.
+
+Covered scenarios:
+
+- `serve` on localhost with an HTTP assertion, gated by `E2E_RUN_SERVICES=1`
+- `chat` REPL send to Saved Messages
+- `chat` REPL `/react` best-effort in Saved Messages
+- `suggest` dry-run, gated by `TG_AGENT_MODEL`, `E2E_ALLOW_LLM=1`, and `E2E_SUGGEST_DM`
+- optional `suggest --learn`
+- optional `suggest --send`, only to Saved Messages
+- timed dry-run startup for `moderate`, gated by `E2E_RUN_SERVICES=1`
+- timed dry-run startup for `ghostwrite`, gated by `E2E_RUN_SERVICES=1` and LLM opt-in
+- timed `heartbeat run` startup only when `heartbeat list` has no stored plans
+
+### Guided events: `04_guided_events.sh`
+
+Guided checks are safe but require a human to create the live event at the right
+time. They are not called by `run_safe.sh`.
+
+```bash
+export E2E_RUN_LISTEN_GUIDED=1
+export E2E_RUN_WATCH_GUIDED=1
+export E2E_GUIDED_SECONDS=60
+scripts/e2e/04_guided_events.sh
+```
+
+- `listen`: start the listener, then trigger an incoming DM or bot reply.
+- `watch`: start the watcher, then perform a throwaway group deletion scenario
+  that produces a Saved Messages backup.
+
+### Dangerous parity: `99_dangerous_parity.sh`
 
 Dangerous scenarios are documented for parity only and intentionally not
 automated. This script is never run by `run_safe.sh`, and it does not call
@@ -118,7 +171,7 @@ automated. This script is never run by `run_safe.sh`, and it does not call
 Run it to print the parity stub:
 
 ```bash
-scripts/e2e/03_dangerous_parity.sh
+scripts/e2e/99_dangerous_parity.sh
 ```
 
 Dangerous means destructive or externally visible real-state operations outside

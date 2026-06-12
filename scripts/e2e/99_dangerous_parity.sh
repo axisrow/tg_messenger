@@ -10,6 +10,8 @@ Dangerous scenarios are documented for parity only and intentionally not automat
 Safe automated analogs live in:
 - scripts/e2e/01_readonly.sh
 - scripts/e2e/02_saved_messages.sh
+- scripts/e2e/03_optional_safe.sh
+- scripts/e2e/04_guided_events.sh
 - scripts/e2e/run_safe.sh
 
 Parity-only dangerous scenarios:
