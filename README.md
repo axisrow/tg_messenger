@@ -294,3 +294,21 @@ a grounded recommendation — memory (factory) plus hands (messenger).
 no source authorization beyond the shared password — whoever can enqueue tasks
 drives your "hands". Trust the factory as you trust yourself; keep the password in
 env only, never in logs or the repo.
+
+## Outgoing rate limit (automated senders)
+
+Several commands send on your behalf in the background — `agent`, `heartbeat run`,
+`worker`, `ghostwrite`, and `moderate` (warn/notice actions). A systematically high
+send rate is the main account-ban risk (worse than any single FloodWait), so a single
+global token-bucket caps **all** of them.
+
+It is **opt-in**: `TG_SEND_RATE` is the per-minute cap, and the default `0` means
+**off** (no ceiling). When it is off, those commands log a WARNING on start so the
+unbounded state is never silent. A conservative starting value is `20`:
+
+```bash
+TG_SEND_RATE=20 tg-messenger agent
+```
+
+When the cap is reached, a send **waits** for the next token (nothing is lost) and
+logs a WARNING — it never errors. Reads (dialogs/history) are not limited.
