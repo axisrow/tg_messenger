@@ -23,6 +23,7 @@ from tg_messenger.agent.config import langsmith_tracing_enabled
 from tg_messenger.core.auth import LOGIN_HINT, session_store_from_env, validate_session_string
 from tg_messenger.core.client import (
     MessageDeleteValidationError,
+    SendForbiddenError,
     client_from_env,
     is_channel_or_megagroup_id,
 )
@@ -390,6 +391,11 @@ def _run(coro, session: str = "default"):
         raise click.ClickException(exc.user_message) from exc
     except MessageDeleteValidationError as exc:
         raise click.ClickException(str(exc)) from exc
+    except SendForbiddenError as exc:
+        logger.warning("send rejected (rights): %s", exc)
+        raise click.ClickException(
+            "This chat is read-only — you don't have permission to post here."
+        ) from exc
     except UnauthorizedError as exc:
         # session missing or revoked mid-command
         raise click.ClickException(_login_hint(session)) from exc
@@ -925,6 +931,10 @@ def send(dialog_id: int, text: str | None, file_path: str | None, caption: str |
         )
 
     async def _do(client):
+        # No pre-flight dialog fetch: a one-shot CLI process has a cold cache, so a
+        # read-only check would cost a full dialog list every time. send_media's own
+        # offline path check runs first; the core SendForbiddenError seam (mapped in
+        # _run) is the authoritative net for a read-only chat.
         if file_path:
             return await client.send_media(
                 dialog_id, file_path, caption=caption or text,
@@ -945,6 +955,9 @@ def react(dialog_id: int, message_id: int, emoticon: str, session: str) -> None:
     """React to a message with a standard emoji."""
 
     async def _do(client):
+        # No pre-flight gate: reactions are a separate capability from posting, and a
+        # one-shot CLI has a cold cache. Telegram rejects (→ SendForbiddenError) if the
+        # channel truly forbids reactions. Proper per-message reaction UI: issue #86.
         await client.send_reaction(dialog_id, message_id, emoticon)
 
     _run(_with_client(session, _do), session=session)
@@ -1209,14 +1222,26 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             from tg_messenger.agent.translate import get_user_lang
 
             telegram_lang_code = None
-            if outbound is not None:
+            # read the dialog once: telegram_lang_code (outbound) AND can_send (read-only gate)
+            try:
+                for dialog in await client.dialogs(dm_only=False):
+                    if dialog.id == dialog_id:
+                        telegram_lang_code = getattr(dialog, "telegram_lang_code", None)
+                        if not getattr(dialog, "can_send", True):
+                            click.echo("Чат только для чтения — отправка отключена.", err=True)
+                        break
+            except Exception:
+                logger.warning("failed to read dialogs for the chat REPL", exc_info=True)
+
+            async def _send_or_warn(coro):
+                """Run a send; on a rights rejection warn and return None so the REPL
+                keeps running instead of the whole session exiting (F3)."""
                 try:
-                    for dialog in await client.dialogs(dm_only=False):
-                        if dialog.id == dialog_id:
-                            telegram_lang_code = getattr(dialog, "telegram_lang_code", None)
-                            break
-                except Exception:
-                    logger.warning("failed to read dialogs for telegram language hint", exc_info=True)
+                    return await coro
+                except SendForbiddenError:
+                    logger.warning("send rejected (rights) in chat REPL (dialog %s)", dialog_id)
+                    click.echo("Сюда писать нельзя — чат только для чтения.", err=True)
+                    return None
 
             # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();
             # skip them so our own input isn't printed back. Bounded (deque).
@@ -1263,7 +1288,9 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                             if len(parts) != 3 or not parts[1].isdigit():
                                 click.echo("usage: /react MESSAGE_ID EMOTICON", err=True)
                                 continue
-                            await client.send_reaction(dialog_id, int(parts[1]), parts[2])
+                            await _send_or_warn(
+                                client.send_reaction(dialog_id, int(parts[1]), parts[2])
+                            )
                             continue
                         if line.split(maxsplit=1)[0] == "/lang":
                             parts = line.split(maxsplit=1)
@@ -1324,8 +1351,9 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                     "outbound applicability timed out (dialog %s)", dialog_id
                                 )
                                 click.echo("translation timed out — sending original.", err=True)
-                                msg = await client.send_text(dialog_id, line)
-                                sent_ids.append((dialog_id, msg.id))
+                                msg = await _send_or_warn(client.send_text(dialog_id, line))
+                                if msg is not None:
+                                    sent_ids.append((dialog_id, msg.id))
                                 continue
                             if target_lang is not None:
                                 try:
@@ -1337,8 +1365,9 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 except TimeoutError:
                                     logger.warning("outbound variants timed out (dialog %s)", dialog_id)
                                     click.echo("translation timed out — sending original.", err=True)
-                                    msg = await client.send_text(dialog_id, line)
-                                    sent_ids.append((dialog_id, msg.id))
+                                    msg = await _send_or_warn(client.send_text(dialog_id, line))
+                                    if msg is not None:
+                                        sent_ids.append((dialog_id, msg.id))
                                     continue
                                 except Exception:
                                     logger.exception("outbound variants failed (dialog %s)", dialog_id)
@@ -1347,8 +1376,9 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                     )
                                     if confirm.strip().lower() not in {"y", "yes", "д", "да"}:
                                         continue
-                                    msg = await client.send_text(dialog_id, line)
-                                    sent_ids.append((dialog_id, msg.id))
+                                    msg = await _send_or_warn(client.send_text(dialog_id, line))
+                                    if msg is not None:
+                                        sent_ids.append((dialog_id, msg.id))
                                     continue
                                 for idx, variant in enumerate(variants, start=1):
                                     click.echo(f"[{idx}] {variant}")
@@ -1359,15 +1389,18 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 if not choice.strip() or choice.strip() == "0":
                                     continue
                                 if choice.strip() == str(original_idx):
-                                    msg = await client.send_text(dialog_id, line)
-                                    sent_ids.append((dialog_id, msg.id))
+                                    msg = await _send_or_warn(client.send_text(dialog_id, line))
+                                    if msg is not None:
+                                        sent_ids.append((dialog_id, msg.id))
                                     continue
                                 try:
                                     picked = variants[int(choice.strip()) - 1]
                                 except (ValueError, IndexError):
                                     click.echo("cancelled.", err=True)
                                     continue
-                                msg = await client.send_text(dialog_id, picked)
+                                msg = await _send_or_warn(client.send_text(dialog_id, picked))
+                                if msg is None:
+                                    continue
                                 sent_ids.append((dialog_id, msg.id))
                                 source_lang = await get_user_lang(storage) or ""
                                 if source_lang:
@@ -1382,8 +1415,9 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                         logger.exception("failed to record outbound source text")
                                 click.echo(f"  ↳ {line}")
                                 continue
-                        msg = await client.send_text(dialog_id, line)
-                        sent_ids.append((dialog_id, msg.id))  # suppress this line's outgoing echo
+                        msg = await _send_or_warn(client.send_text(dialog_id, line))
+                        if msg is not None:
+                            sent_ids.append((dialog_id, msg.id))  # suppress this line's echo
             finally:
                 for t in tasks:
                     t.cancel()

@@ -299,8 +299,8 @@ env only, never in logs or the repo.
 
 Several commands send on your behalf in the background — `agent`, `heartbeat run`,
 `worker`, `ghostwrite`, and `moderate` (warn/notice actions). A systematically high
-send rate is the main account-ban risk (worse than any single FloodWait), so a single
-global token-bucket caps **all** of them.
+send rate is the main account-ban risk (worse than any single FloodWait), so a
+token-bucket caps every outgoing message in the process.
 
 The default cap is **20 messages/minute**. You can override it with `TG_SEND_RATE`;
 setting `TG_SEND_RATE=0` explicitly turns the cap **off** (no ceiling). When it is
@@ -310,6 +310,11 @@ silent:
 ```bash
 TG_SEND_RATE=0 tg-messenger agent
 ```
+
+**Scope: the cap is per-process, not per-account.** Each running command (a separate
+`agent`, `worker`, `serve`, `tui`, …) holds its own bucket, so two senders running at
+once can put up to `2 × TG_SEND_RATE` on the same account. If you run several senders
+in parallel, size `TG_SEND_RATE` with that multiplication in mind (or run one at a time).
 
 When the cap is reached, a send **waits** for the next token (nothing is lost) and
 logs a WARNING — it never errors. Reads (dialogs/history) are not limited.

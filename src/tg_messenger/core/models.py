@@ -40,6 +40,10 @@ class Dialog(BaseModel):
     is_contact: bool | None = None
     archived: bool = False
     telegram_lang_code: str | None = None
+    # whether OUR account may post here — UIs disable the composer when False
+    # (read-only broadcast channel, restricted/left group). Default True = writable,
+    # so DMs and unknown shapes stay writable (backward-compatible).
+    can_send: bool = True
 
 
 class Message(BaseModel):

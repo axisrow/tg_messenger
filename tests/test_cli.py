@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from tests.conftest import make_sent_code
 from tg_messenger.cli import main as cli_main
+from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.models import (
     Dialog,
@@ -36,6 +37,11 @@ class StubClient:
         self.authorized = True
         self.logged_out = False
         self.listen_interrupt = True  # emulate Ctrl+C after the first event
+        self.channel_can_send = True  # flip to False to simulate a read-only channel
+        self.send_text_raises = None  # set to an exception to exercise error mapping
+        self.send_media_raises = None
+        self.send_reaction_raises = None
+        self.dialogs_calls = 0  # count dialog-list fetches (F-cli-preflight regression)
 
     async def is_authorized(self):
         return self.authorized
@@ -67,13 +73,14 @@ class StubClient:
         await asyncio.Event().wait()
 
     async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
         dms = [Dialog(id=7, title="Ann", username="ann", unread=2)]
         if dm_only:
             return dms
         # повторяет контракт core: dm_only=False — все диалоги с kind и marked id
         return dms + [
             Dialog(id=-100200, title="Devs", kind="group"),
-            Dialog(id=-100123, title="News", kind="channel"),
+            Dialog(id=-100123, title="News", kind="channel", can_send=self.channel_can_send),
             Dialog(id=9, title="HelperBot", kind="bot"),
         ]
 
@@ -98,6 +105,8 @@ class StubClient:
         return str(dest)
 
     async def send_text(self, peer, text, reply_to=None, schedule=None):
+        if self.send_text_raises is not None:
+            raise self.send_text_raises
         self.sent.append((peer, text, reply_to, schedule))
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
@@ -120,6 +129,8 @@ class StubClient:
 
     async def send_media(self, peer, file_path, *, caption=None, voice_note=False,
                          video_note=False, force_document=False):
+        if self.send_media_raises is not None:
+            raise self.send_media_raises
         self.sent.append((peer, "file", str(file_path), caption))
         self.media_kwargs = {"voice_note": voice_note, "video_note": video_note,
                              "force_document": force_document}
@@ -127,6 +138,8 @@ class StubClient:
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
     async def send_reaction(self, peer, message_id, emoticon):
+        if self.send_reaction_raises is not None:
+            raise self.send_reaction_raises
         self.reactions.append((peer, message_id, emoticon))
 
     async def get_me(self):
@@ -374,6 +387,58 @@ def test_react_command_calls_client(runner):
     assert "reacted." in result.output
 
 
+# --- read-only chat gating (capability) ---
+
+
+def test_send_to_readonly_channel_refused(runner):
+    # The CLI does no pre-flight dialog fetch (F-cli-preflight); a read-only chat is
+    # refused by the core SendForbiddenError seam at send time, mapped to a clean message.
+    r, stub = runner
+    stub.send_text_raises = SendForbiddenError("ChatWriteForbiddenError")
+    # `--` separates options from a negative DIALOG_ID (a marked channel id)
+    result = r.invoke(cli_main.cli, ["send", "--", "-100123", "hello"])
+    assert result.exit_code != 0
+    assert "read-only" in result.output
+
+
+def test_send_does_not_fetch_dialogs(runner):
+    # F-cli-preflight: a one-shot send must NOT pull the whole dialog list just to
+    # check write permission — the cache is always cold in a one-shot process.
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["send", "7", "hi"])
+    assert result.exit_code == 0, result.output
+    assert stub.sent == [(7, "hi", None, None)]
+    assert stub.dialogs_calls == 0  # no read-side dependency on the send path
+
+
+def test_send_file_missing_path_fails_before_dialogs(runner):
+    # The local path check (ValueError "file not found") must fire first — a typo in
+    # --file no longer burns a network round-trip on a dialog fetch.
+    r, stub = runner
+    stub.send_media_raises = ValueError("file not found: /no/such/file.jpg")
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", "/no/such/file.jpg"])
+    assert result.exit_code != 0
+    assert stub.dialogs_calls == 0
+
+
+def test_send_to_writable_channel_allowed(runner):
+    r, stub = runner
+    stub.channel_can_send = True  # a writable chat sends normally
+    result = r.invoke(cli_main.cli, ["send", "--", "-100123", "hi"])
+    assert result.exit_code == 0, result.output
+    assert stub.sent == [(-100123, "hi", None, None)]
+
+
+def test_send_maps_send_forbidden_error(runner):
+    # TOCTOU net: Telegram rejected at send time → clean message, no raw traceback.
+    r, stub = runner
+    stub.send_text_raises = SendForbiddenError("ChatWriteForbiddenError")
+    result = r.invoke(cli_main.cli, ["send", "7", "hi"])
+    assert result.exit_code != 0
+    assert "read-only" in result.output
+    assert "Traceback" not in result.output  # clean message, no raw traceback
+
+
 # --- цикл 80: reply/forward/edit/delete/read команды ---
 
 
@@ -542,6 +607,27 @@ def test_chat_react_command_does_not_send_text(runner):
     assert result.exit_code == 0, result.output
     assert stub.reactions == [(7, 10, "👍")]
     assert stub.sent == []
+
+
+def test_chat_send_forbidden_warns_and_keeps_session(runner):
+    # F3: a SendForbiddenError on send must NOT crash the REPL — warn and continue.
+    r, stub = runner
+    stub.listen_interrupt = False
+    stub.send_text_raises = SendForbiddenError("ChatWriteForbiddenError")
+    # two lines then EOF: if the first send killed the session, the second wouldn't run
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="first\nsecond\n")
+    assert result.exit_code == 0, result.output
+    assert "read-only" in result.output.lower() or "нельзя" in result.output
+    assert stub.connected is False  # clean shutdown on EOF, not a crash
+
+
+def test_chat_react_forbidden_warns_and_keeps_session(runner):
+    r, stub = runner
+    stub.listen_interrupt = False
+    stub.send_reaction_raises = SendForbiddenError("ChatWriteForbiddenError")
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="/react 10 👍\nplain\n")
+    assert result.exit_code == 0, result.output
+    assert stub.connected is False
 
 
 def test_chat_outbound_variant_sends_pick(runner, monkeypatch):

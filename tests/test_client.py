@@ -7,6 +7,8 @@ from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser
 
 from tests.conftest import (
+    FakeAdminRights,
+    FakeBannedRights,
     FakeChannel,
     FakeChat,
     FakeChatActionEvent,
@@ -17,7 +19,13 @@ from tests.conftest import (
     FakeUser,
 )
 from tg_messenger.core import client as client_module
-from tg_messenger.core.client import MessageDeleteValidationError, StandaloneTelegramClient, _dialog_kind
+from tg_messenger.core.client import (
+    MessageDeleteValidationError,
+    SendForbiddenError,
+    StandaloneTelegramClient,
+    _dialog_kind,
+    _entity_can_send,
+)
 from tg_messenger.core.models import (
     ChatActionEvent,
     Dialog,
@@ -184,6 +192,151 @@ def test_dialog_kind_classifier(entity, kind):
 def test_unknown_entity_is_not_dm():
     # fail-safe прежней _is_dm_entity-семантики: ни title, ни имён → НЕ DM
     assert _dialog_kind(object()) != "dm"
+
+
+@pytest.mark.parametrize(
+    ("entity", "can_send"),
+    [
+        # DM / бот — нет title → всегда writable
+        (FakeUser(id=7, first_name="Ann"), True),
+        (FakeUser(id=9, first_name="Helper", bot=True), True),
+        # read-only broadcast: обычный подписчик (наш кейс из скриншота)
+        (FakeChannel(id=1, title="News", broadcast=True), False),
+        # broadcast-админ с правом постить
+        (FakeChannel(id=2, title="News", broadcast=True,
+                     admin_rights=FakeAdminRights(post_messages=True)), True),
+        # broadcast-админ БЕЗ права постить (только модерация) → read-only
+        (FakeChannel(id=3, title="News", broadcast=True,
+                     admin_rights=FakeAdminRights(post_messages=False)), False),
+        # creator канала
+        (FakeChannel(id=4, title="News", broadcast=True, creator=True), True),
+        # супергруппа: чат-wide ограничение отправки → read-only
+        (FakeChannel(id=5, title="SG", broadcast=False,
+                     default_banned_rights=FakeBannedRights(send_messages=True)), False),
+        # обычная writable супергруппа
+        (FakeChannel(id=6, title="SG", broadcast=False), True),
+        # обычная writable малая группа
+        (FakeChat(id=7, title="Devs"), True),
+        # админ супергруппы пишет вопреки default_banned_rights
+        (FakeChannel(id=8, title="SG", broadcast=False,
+                     admin_rights=FakeAdminRights(),
+                     default_banned_rights=FakeBannedRights(send_messages=True)), True),
+        # персональное ограничение (нас замутили) → read-only
+        (FakeChannel(id=9, title="SG", broadcast=False,
+                     banned_rights=FakeBannedRights(send_messages=True)), False),
+        # вышли из чата → read-only
+        (FakeChannel(id=10, title="SG", broadcast=False, left=True), False),
+        # неизвестная форма entity — fail-safe в writable
+        (object(), True),
+    ],
+)
+def test_entity_can_send(entity, can_send):
+    assert _entity_can_send(entity) is can_send
+
+
+async def test_dialogs_populates_can_send(fake_client):
+    fake_client.dialogs = [
+        FakeDialog(FakeUser(id=7, first_name="Ann"), name="Ann"),
+        FakeDialog(FakeChannel(id=123, title="News", broadcast=True), name="News"),
+        FakeDialog(FakeChat(id=50, title="Devs"), name="Devs"),
+        FakeDialog(FakeChannel(id=200, title="SG", broadcast=False,
+                               default_banned_rights=FakeBannedRights(send_messages=True)),
+                   name="Locked"),
+    ]
+    client = _build(fake_client)
+    await client.connect()
+    dialogs = await client.dialogs(dm_only=False)
+    assert {d.id: d.can_send for d in dialogs} == {
+        7: True,          # DM
+        -100123: False,   # read-only broadcast
+        -50: True,        # writable group
+        -100200: False,   # chat-wide restricted group
+    }
+
+
+_RIGHTS_ERROR_NAMES = [
+    "ChatAdminRequiredError",
+    "ChatWriteForbiddenError",
+    "ChatSendMediaForbiddenError",
+    "UserBannedInChannelError",
+    "ChatGuestSendForbiddenError",
+    "ChatRestrictedError",
+    "ChatSendGifsForbiddenError",
+    "ChatSendStickersForbiddenError",
+    "ChatSendPollForbiddenError",
+    "VoiceMessagesForbiddenError",
+    "ChatForbiddenError",  # "You cannot write in this chat" — read-only after a stale cache
+]
+
+
+def _rights_error(name):
+    from telethon import errors
+
+    return getattr(errors, name)(request=None)
+
+
+@pytest.mark.parametrize("err_name", _RIGHTS_ERROR_NAMES)
+async def test_send_text_classifies_rights_errors(fake_client, err_name):
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.send_message_raises = _rights_error(err_name)
+    with pytest.raises(SendForbiddenError):
+        await client.send_text(-100123, "nope")
+
+
+@pytest.mark.parametrize("err_name", _RIGHTS_ERROR_NAMES)
+async def test_send_media_classifies_rights_errors(fake_client, err_name, tmp_path):
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.send_file_raises = _rights_error(err_name)
+    with pytest.raises(SendForbiddenError):
+        await client.send_media(-100123, str(f))
+
+
+@pytest.mark.parametrize("err_name", _RIGHTS_ERROR_NAMES)
+async def test_send_reaction_classifies_rights_errors(fake_client, err_name):
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.call_raises = _rights_error(err_name)
+    with pytest.raises(SendForbiddenError):
+        await client.send_reaction(-100123, 5, "👍")
+
+
+async def test_slowmode_is_not_classified_as_send_forbidden(fake_client):
+    # slow-mode is a transient wait, NOT a read-only state — it must NOT be folded
+    # into SendForbiddenError (that would mislabel a writable chat as read-only).
+    from telethon.errors import SlowModeWaitError
+
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.send_message_raises = SlowModeWaitError(request=None)
+    with pytest.raises(SlowModeWaitError):
+        await client.send_text(-100123, "too fast")
+
+
+async def test_send_text_floodwait_still_retries(fake_client, monkeypatch):
+    # классификация прав НЕ должна ломать обычный FloodWait-ретрай:
+    # первый вызов кидает транзиентный FloodWait(0), второй — успех.
+    from tests.conftest import patch_flood_error
+
+    flood_error = patch_flood_error(monkeypatch)
+    client = _build(fake_client)
+    await client.connect()
+    calls = {"n": 0}
+    orig = fake_client.send_message
+
+    async def flaky(peer, text, reply_to=None, schedule=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise flood_error(0)
+        return await orig(peer, text, reply_to=reply_to, schedule=schedule)
+
+    fake_client.send_message = flaky
+    msg = await client.send_text(7, "hi")
+    assert calls["n"] == 2
+    assert msg.text == "hi"
 
 
 async def test_history_maps_messages(fake_client):

@@ -21,6 +21,7 @@ from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 
 from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
 from tg_messenger.core.auth import LoginError, LoginSession, delivery_hint
+from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
 
 logger = logging.getLogger(__name__)
 
@@ -652,6 +653,7 @@ class MessengerTUI(App):
             self._save_current_compose_state()
             self._current = item.dialog_id
             self._restore_compose_state(item.dialog_id)
+            self._apply_composer_writable(item.dialog_id)
             self._clear_suggestion()
             self._bubble_index.clear()
             # exclusive group: selecting another dialog cancels a still-loading history
@@ -765,6 +767,12 @@ class MessengerTUI(App):
             return
         text = event.value
         dialog_id = self._current
+        if not self._dialog_can_send(dialog_id):
+            # belt-and-suspenders with the disabled composer (cache may be momentarily stale)
+            # NB: this also blocks /react in a read-only chat — reactions are a separate
+            # capability from posting; the reaction-vs-post split is tracked in #86.
+            self.notify(READ_ONLY_MESSAGE, severity="warning")
+            return
         state = self._compose_state_for(dialog_id)
         state.draft = text
         try:
@@ -777,9 +785,10 @@ class MessengerTUI(App):
             message_id, emoticon = reaction
             state.draft = ""
             self._clear_pending_outbound(dialog_id)
-            event.input.value = ""
+            event.input.value = ""  # clear optimistically; restored on failure
             self.run_worker(
-                self._send_reaction(dialog_id, message_id, emoticon), exclusive=False
+                self._send_reaction(dialog_id, message_id, emoticon, source_text=text),
+                exclusive=False,
             )
             return
         try:
@@ -810,7 +819,8 @@ class MessengerTUI(App):
             self._clear_pending_outbound(dialog_id)
             event.input.value = ""  # clear optimistically; restored on failure
             self.run_worker(
-                self._send_media(dialog_id, path, caption), exclusive=False
+                self._send_media(dialog_id, path, caption, source_text=text),
+                exclusive=False,
             )
             return
         if state.source_text is not None:
@@ -964,6 +974,18 @@ class MessengerTUI(App):
                 if not composer.value:
                     composer.value = text
             return
+        except SendForbiddenError:
+            # TOCTOU net: composer was enabled but Telegram rejected the write on rights
+            logger.warning("send rejected (rights) (dialog %s)", peer)
+            self.notify(READ_ONLY_MESSAGE, severity="warning")
+            state = self._compose_state_for(peer)
+            state.draft = text  # restore — the optimistic clear must not lose the message
+            if peer == self._current:
+                composer = self.query_one("#composer", Input)
+                if not composer.value:  # don't clobber a draft typed meanwhile
+                    composer.value = text
+            self._apply_composer_writable(peer)  # reflect the now-known read-only state
+            return
         except Exception as exc:
             logger.exception("send failed (dialog %s)", peer)
             self.notify(f"Send failed: {exc}", severity="error")
@@ -986,12 +1008,32 @@ class MessengerTUI(App):
             await pane.mount(bubble)
             self._scroll_messages_to_end(pane)
 
-    async def _send_media(self, peer: int, path: str, caption: str | None) -> None:
+    async def _send_media(
+        self, peer: int, path: str, caption: str | None, source_text: str | None = None,
+    ) -> None:
+        # source_text is the original "@file ... caption" command, cleared optimistically
+        # in on_input_submitted — restore it on any failure so a typed command is not lost.
+        def _restore() -> None:
+            if source_text is None:
+                return
+            self._compose_state_for(peer).draft = source_text
+            if peer == self._current:
+                composer = self.query_one("#composer", Input)
+                if not composer.value:  # don't clobber a draft typed meanwhile
+                    composer.value = source_text
+
         try:
             msg = await self._client.send_media(peer, path, caption=caption)
+        except SendForbiddenError:
+            logger.warning("send media rejected (rights) (dialog %s)", peer)
+            self.notify(READ_ONLY_MESSAGE, severity="warning")
+            _restore()
+            self._apply_composer_writable(peer)  # reflect the now-known read-only state
+            return
         except Exception as exc:
             logger.exception("send media failed (dialog %s, %s)", peer, path)
             self.notify(f"Send failed: {exc}", severity="error")
+            _restore()
             return
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         await self._touch_dialog_for_message(peer, msg, incoming=False)
@@ -1002,12 +1044,31 @@ class MessengerTUI(App):
             await pane.mount(bubble)
             self._scroll_messages_to_end(pane)
 
-    async def _send_reaction(self, peer: int, message_id: int, emoticon: str) -> None:
+    async def _send_reaction(
+        self, peer: int, message_id: int, emoticon: str, source_text: str | None = None,
+    ) -> None:
+        # source_text is the original "/react ..." command, cleared optimistically in
+        # on_input_submitted — restore it on any failure so the typed command is not lost.
+        def _restore() -> None:
+            if source_text is None:
+                return
+            self._compose_state_for(peer).draft = source_text
+            if peer == self._current:
+                composer = self.query_one("#composer", Input)
+                if not composer.value:  # don't clobber a draft typed meanwhile
+                    composer.value = source_text
+
         try:
             await self._client.send_reaction(peer, message_id, emoticon)
+        except SendForbiddenError:
+            logger.warning("reaction rejected (rights) (dialog %s, message %s)", peer, message_id)
+            self.notify(READ_ONLY_MESSAGE, severity="warning")
+            _restore()
+            return
         except Exception as exc:
             logger.exception("send reaction failed (dialog %s, message %s)", peer, message_id)
             self.notify(f"Reaction failed: {exc}", severity="error")
+            _restore()
             return
         self._remember_sent_reaction(peer, message_id, emoticon)
         if peer == self._current:
@@ -1104,6 +1165,19 @@ class MessengerTUI(App):
 
     def _is_dm_dialog(self, dialog_id: int) -> bool:
         return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
+
+    def _dialog_can_send(self, dialog_id: int) -> bool:
+        # default True for an unknown dialog (fail-safe writable, matches core)
+        return next(
+            (d.can_send for d in self._all_dialogs if d.id == dialog_id), True
+        )
+
+    def _apply_composer_writable(self, dialog_id: int) -> None:
+        """Disable the composer in a read-only chat (mirrors the real Telegram client)."""
+        composer = self.query_one("#composer", Input)
+        can = self._dialog_can_send(dialog_id)
+        composer.disabled = not can
+        composer.placeholder = "Message…" if can else "Только чтение"
 
     def _dialog_telegram_lang_hint(self, dialog_id: int) -> str | None:
         for dialog in self._all_dialogs:
