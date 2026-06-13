@@ -1849,6 +1849,22 @@ async def test_tg_login_form_resumes_password_step_on_reload():
         assert "htmx.org" in r.text
 
 
+async def test_tg_login_form_while_sending_shows_phone_not_code_card():
+    # #49 follow-up: a reload WHILE send_code is still in flight (state "sending", no hash
+    # bound yet) must show the phone form — NOT a hash-less code card, which would 500 on a
+    # resend/code POST. "sending" falls through to the default phone-form branch.
+    sess = FakeLoginSession()
+    sess.state = "sending"  # simulate the in-flight send window
+    sess.last_delivery = None
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        r = await ac.get("/tg-login")
+        assert r.status_code == 200
+        assert sess.state == "sending"  # reset is a no-op; window untouched
+        assert "Введите код" not in r.text  # no premature code card
+        assert "Войти в Telegram" in r.text  # the phone form is shown
+
+
 async def test_tg_login_success_saves_session():
     saved = []
     sess = FakeLoginSession()
