@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import click
@@ -290,6 +291,42 @@ def make_optional_outbound(store, storage):
     except Exception as exc:
         logger.warning("outbound translator disabled: %s", exc)
         return None
+
+
+@dataclass
+class TuiDeps:
+    """The full dependency set the TUI needs, built for one chosen profile (#52)."""
+
+    client: object
+    session_name: str
+    suggester: object
+    store: object
+    translator: object
+    outbound: object
+
+
+def make_tui_deps(profile: str, *, log_kwargs: dict) -> TuiDeps:
+    """Build the whole TUI dependency set for ``profile`` (#52 point 2).
+
+    Used after the in-app ProfileScreen picks a profile, so the `tui` command no longer
+    has to resolve the profile via a CLI menu before constructing the TUI. Re-inits the
+    per-profile log file first (point 3) — idempotent, ``console=False`` carried in
+    ``log_kwargs`` so the alternate screen stays intact.
+    """
+    setup_logging(profile=profile, **log_kwargs)
+    client = make_client(session_name=profile)
+    suggester = make_optional_suggester(client, session=profile)
+    store, storage = make_message_store(client, session=profile)
+    translator = make_optional_translator(storage)
+    outbound = make_optional_outbound(store, storage)
+    return TuiDeps(
+        client=client,
+        session_name=profile,
+        suggester=suggester,
+        store=store,
+        translator=translator,
+        outbound=outbound,
+    )
 
 
 def _print_message_with_translation(message) -> None:
@@ -1939,22 +1976,47 @@ def tui(ctx: click.Context, session: str) -> None:
         raise click.ClickException("TUI requires: pip install 'tg-messenger[tui]'") from exc
 
     # stderr handler would corrupt the alternate screen — file log only. Keep these kwargs
-    # in ctx so a menu-resolved profile re-inits the log WITHOUT a console handler (#52).
-    ctx.obj["_log_kwargs"] = {"verbose": ctx.obj["verbose"], "console": False}
-    setup_logging(profile=ctx.obj.get("profile"), **ctx.obj["_log_kwargs"])
-    session = _effective_session(ctx, session)
-    client = make_client(session_name=session)
-    suggester = make_optional_suggester(client, session=session)
-    store, storage = make_message_store(client, session=session)
-    translator = make_optional_translator(storage)
-    outbound = make_optional_outbound(store, storage)
+    # so a profile picked LATER (CLI fallback or the in-app ProfileScreen) re-inits the
+    # log WITHOUT a console handler (#52). make_tui_deps replays setup_logging per profile.
+    log_kwargs = {"verbose": ctx.obj["verbose"], "console": False}
+    ctx.obj["_log_kwargs"] = log_kwargs
+    setup_logging(profile=ctx.obj.get("profile"), **log_kwargs)
+
+    # #52 point 2: when no profile is fixed up front and >1 exist, defer selection to the
+    # in-app ProfileScreen instead of the CLI menu — pass profiles + a deps_factory that
+    # builds the whole dependency set (and re-inits per-profile logging) for the pick.
+    explicit_profile = ctx.obj.get("profile")
+    explicit_session = (
+        ctx.get_parameter_source("session") == ParameterSource.COMMANDLINE
+    )
+    if explicit_profile:
+        resolved = explicit_profile
+    elif explicit_session:
+        resolved = session
+    else:
+        profiles = _session_store().list_profiles()
+        if len(profiles) <= 1:
+            resolved = profiles[0] if profiles else session
+        elif not _is_interactive():
+            raise click.ClickException(
+                f"multiple profiles ({', '.join(profiles)}) — pass --profile NAME"
+            )
+        else:
+            # >1 profiles + interactive tty → let the TUI's ProfileScreen pick
+            MessengerTUI(
+                profiles=profiles,
+                deps_factory=lambda p: make_tui_deps(p, log_kwargs=log_kwargs),
+            ).run()
+            return
+
+    deps = make_tui_deps(resolved, log_kwargs=log_kwargs)
     MessengerTUI(
-        client=client,
-        session_name=session,
-        suggester=suggester,
-        store=store,
-        translator=translator,
-        outbound=outbound,
+        client=deps.client,
+        session_name=deps.session_name,
+        suggester=deps.suggester,
+        store=deps.store,
+        translator=deps.translator,
+        outbound=deps.outbound,
     ).run()
 
 

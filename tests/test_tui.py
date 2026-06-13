@@ -1659,6 +1659,79 @@ async def test_tui_single_profile_skips_screen():
     assert captured.get("session_name") == "solo"
 
 
+# --- #52 point 2: ProfileScreen reachable from the `tui` entrypoint ---
+# A deps_factory builds the WHOLE dependency set (client + suggester/store/translator/
+# outbound) AFTER the in-app ProfileScreen picks a profile, so the command no longer
+# has to resolve the profile via a CLI menu before constructing the TUI.
+
+
+class _FakeDeps:
+    def __init__(self, session_name):
+        self.session_name = session_name
+        self.client = TuiStubClient()
+        self.suggester = object()
+        self.store = None  # keep None so _startup's store block is a no-op in tests
+        self.translator = object()
+        self.outbound = object()
+
+
+async def test_tui_startup_calls_deps_factory_after_profile_screen():
+    calls = []
+
+    def deps_factory(profile):
+        calls.append(profile)
+        return _FakeDeps(profile)
+
+    app = MessengerTUI(profiles=["alice", "bob"], deps_factory=deps_factory)
+    async with app.run_test() as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if app.screen.query(ProfileItem):
+                break
+        lv = app.screen.query_one("#profiles", ListView)
+        lv.index = 1  # alice, bob -> bob
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause()
+            if calls:
+                break
+    assert calls == ["bob"]
+    # every dep slot is populated from the factory result, not left at __init__ defaults
+    assert app._session_name == "bob"
+    assert isinstance(app._client, TuiStubClient)
+    assert app._suggester is not None
+    assert app._translator is not None
+    assert app._outbound is not None
+
+
+async def test_tui_startup_deps_factory_none_falls_back_to_client_factory():
+    # When no deps_factory is injected (the library path), _startup keeps using
+    # client_factory and leaves the other deps as the __init__ values (None here).
+    built = {}
+
+    def client_factory(profile):
+        built["profile"] = profile
+        return TuiStubClient()
+
+    app = MessengerTUI(profiles=["alice", "bob"], client_factory=client_factory)
+    async with app.run_test() as pilot:
+        for _ in range(20):
+            await pilot.pause()
+            if app.screen.query(ProfileItem):
+                break
+        lv = app.screen.query_one("#profiles", ListView)
+        lv.index = 0  # alice
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause()
+            if built.get("profile"):
+                break
+    assert built.get("profile") == "alice"
+    assert isinstance(app._client, TuiStubClient)
+    assert app._suggester is None  # untouched __init__ default
+    assert app._store is None
+
+
 async def test_tui_at_command_sends_media(tmp_path):
     f = tmp_path / "pic.jpg"
     f.write_bytes(b"x")
