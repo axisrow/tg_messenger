@@ -19,14 +19,8 @@ from telethon import TelegramClient, events
 from telethon import utils as tl_utils
 from telethon.errors import (
     ChatAdminRequiredError,
-    ChatForbiddenError,
-    ChatGuestSendForbiddenError,
     ChatRestrictedError,
-    ChatSendGifsForbiddenError,
-    ChatSendMediaForbiddenError,
-    ChatSendPollForbiddenError,
-    ChatSendStickersForbiddenError,
-    ChatWriteForbiddenError,
+    ForbiddenError,
     UserBannedInChannelError,
     UsernameInvalidError,
     UsernameOccupiedError,
@@ -89,21 +83,23 @@ READ_ONLY_MESSAGE = "Сюда писать нельзя — чат только 
 
 
 # Telegram rights-rejection errors reclassified into SendForbiddenError at the send seam.
-# SlowModeWaitError is deliberately EXCLUDED — it's a transient wait, not a read-only
-# state; folding it in would mislabel a perfectly writable slow-mode chat as read-only.
-_SEND_FORBIDDEN_ERRORS = (
+# Classification is CATEGORY-based (#88), not a hand-list — that list was found incomplete
+# three times during #85. Telethon's rights errors split across two HTTP categories with
+# no shared base, so we catch:
+#   1. every ForbiddenError (HTTP 403) — covers ChatWriteForbidden, ChatForbidden,
+#      ChatSendMedia/Gifs/Stickers/PollForbidden, ChatGuestSendForbidden AND any future
+#      *ForbiddenError automatically;
+#   2. an explicit short tuple of the read-only-by-meaning BadRequestError (HTTP 400)
+#      classes, which do NOT inherit ForbiddenError and so must be named.
+# SlowModeWaitError/FloodWaitError are FloodError (transient) — a separate branch, never
+# folded in (that would mislabel a perfectly writable slow-mode chat as read-only).
+_SEND_FORBIDDEN_BADREQUEST = (
     ChatAdminRequiredError,
-    ChatForbiddenError,  # "You cannot write in this chat" — read-only after a stale cache
-    ChatWriteForbiddenError,
-    ChatSendMediaForbiddenError,
     UserBannedInChannelError,
-    ChatGuestSendForbiddenError,
     ChatRestrictedError,
-    ChatSendGifsForbiddenError,
-    ChatSendStickersForbiddenError,
-    ChatSendPollForbiddenError,
     VoiceMessagesForbiddenError,
 )
+_SEND_FORBIDDEN_ERRORS = (ForbiddenError, *_SEND_FORBIDDEN_BADREQUEST)
 
 
 def is_channel_or_megagroup_id(peer: int) -> bool:

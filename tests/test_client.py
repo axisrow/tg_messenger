@@ -316,6 +316,35 @@ async def test_slowmode_is_not_classified_as_send_forbidden(fake_client):
         await client.send_text(-100123, "too fast")
 
 
+async def test_unknown_forbidden_subclass_is_classified(fake_client):
+    # The whole point of category-based classification (#88): a NEW Telethon
+    # *ForbiddenError we never hard-listed must still be reclassified — no more
+    # "hole in the manual list" (that bug was found three times in #85).
+    from telethon.errors import ForbiddenError
+
+    class FutureSendForbiddenError(ForbiddenError):
+        def __init__(self):
+            super().__init__(request=None, message="CHAT_SEND_FOO_FORBIDDEN")
+
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.send_message_raises = FutureSendForbiddenError()
+    with pytest.raises(SendForbiddenError):
+        await client.send_text(-100123, "nope")
+
+
+async def test_unrelated_badrequest_is_not_classified(fake_client):
+    # The category must not be too wide: a BadRequestError that is NOT one of the
+    # explicit read-only ones must propagate, not masquerade as read-only.
+    from telethon.errors import MessageEmptyError  # a BadRequestError, unrelated to rights
+
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.send_message_raises = MessageEmptyError(request=None)
+    with pytest.raises(MessageEmptyError):
+        await client.send_text(-100123, "")
+
+
 async def test_send_text_floodwait_still_retries(fake_client, monkeypatch):
     # классификация прав НЕ должна ломать обычный FloodWait-ретрай:
     # первый вызов кидает транзиентный FloodWait(0), второй — успех.
