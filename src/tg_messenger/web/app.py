@@ -32,6 +32,7 @@ from fastapi.responses import (
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
+from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
 from tg_messenger.core.auth import (
     LoginError,
     LoginSession,
@@ -45,8 +46,8 @@ logger = logging.getLogger(__name__)
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 SUGGEST_CSRF_HEADER = "x-tg-messenger-csrf"
-OUTBOUND_NONCE_TTL_SECONDS = 5 * 60
-OUTBOUND_NONCE_MAX = 200
+# Outbound prepare timeout is owned by OutboundSendCoordinator now (#73); this constant
+# is still used to bound the SSE inbound-translation task (#69).
 OUTBOUND_TIMEOUT_SECONDS = 20
 # #69: cap concurrent best-effort live translations per SSE connection. Translation runs
 # off the live-event race (non-blocking), so a foreign-language burst in the active dialog
@@ -240,66 +241,8 @@ def _bounded_client_id(client_id: str) -> str:
     return client_id[:80]
 
 
-def _prune_outbound_nonces(nonces: OrderedDict, *, now: float | None = None) -> None:
-    now = time.monotonic() if now is None else now
-    expired = [
-        nonce for nonce, payload in nonces.items()
-        if payload["expires_at"] <= now
-    ]
-    for nonce in expired:
-        nonces.pop(nonce, None)
-    while len(nonces) > OUTBOUND_NONCE_MAX:
-        nonces.popitem(last=False)
-
-
-def _remember_outbound_nonce(
-    nonces: OrderedDict,
-    *,
-    dialog_id: int,
-    web_client_id: str,
-    source_text: str,
-    variants: list[str],
-) -> str:
-    now = time.monotonic()
-    _prune_outbound_nonces(nonces, now=now)
-    nonce = secrets.token_urlsafe(24)
-    nonces[nonce] = {
-        "dialog_id": dialog_id,
-        "web_client_id": _bounded_client_id(web_client_id),
-        "source_text": source_text,
-        "variants": tuple(variants),
-        "expires_at": now + OUTBOUND_NONCE_TTL_SECONDS,
-    }
-    nonces.move_to_end(nonce)
-    _prune_outbound_nonces(nonces, now=now)
-    return nonce
-
-
-def _consume_outbound_nonce(
-    nonces: OrderedDict,
-    *,
-    nonce: str,
-    dialog_id: int,
-    web_client_id: str,
-    text: str,
-) -> tuple[bool, str | None]:
-    if not nonce.strip():
-        return True, None
-    _prune_outbound_nonces(nonces)
-    payload = nonces.pop(nonce, None)
-    if payload is None:
-        logger.warning("rejecting missing or expired outbound nonce for dialog %s", dialog_id)
-        return False, None
-    if payload["dialog_id"] != dialog_id:
-        logger.warning("rejecting outbound nonce for wrong dialog %s", dialog_id)
-        return False, None
-    if payload["web_client_id"] != _bounded_client_id(web_client_id):
-        logger.warning("rejecting outbound nonce for wrong web client")
-        return False, None
-    if text not in payload["variants"]:
-        logger.warning("rejecting outbound nonce for non-variant send in dialog %s", dialog_id)
-        return False, None
-    return True, payload["source_text"]
+# #73: the outbound token/nonce lifecycle moved into OutboundSendCoordinator (agent
+# layer, UI-agnostic) — the web routes no longer keep local nonce helpers.
 
 
 def _remember_sent(sent_ids: OrderedDict, dialog_id: int, message_id: int) -> None:
@@ -537,13 +480,18 @@ def build_app(
         # them because its POST already returned the optimistic bubble.
         app.state.sent_ids_by_client = OrderedDict()
         app.state.sent_reactions_by_client = OrderedDict()
-        app.state.outbound_nonces = OrderedDict()
         app.state.client = client or _make_real_client(session_name)
         # reply suggester (#17) — optional; None disables the /suggest endpoint
         app.state.suggester = suggester
         app.state.store = store
         app.state.translator = translator
         app.state.outbound = outbound
+        # #73: one UI-agnostic coordinator owns the outbound flow (token lifecycle,
+        # prepare timeout, send + source recording). The routes call it instead of
+        # chaining applies()->variants()->nonce->send_text->record_outgoing by hand.
+        app.state.outbound_coordinator = OutboundSendCoordinator(
+            outbound=outbound, store=store,
+        )
         await app.state.client.connect()
         app.state.store_task = None
         if app.state.store is not None:
@@ -772,31 +720,25 @@ def build_app(
             return _error_response("Cannot send an empty message.", 400)
         dialog_id_int = int(dialog_id)
         reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
-        nonce_ok, source_text = _consume_outbound_nonce(
-            request.app.state.outbound_nonces,
-            nonce=outbound_nonce,
-            dialog_id=dialog_id_int,
-            web_client_id=web_client_id,
-            text=text,
-        )
-        if not nonce_ok:
-            return _error_response("Outbound selection expired. Pick a variant again.", 409)
-        msg = await request.app.state.client.send_text(dialog_id_int, text, reply_to=reply_to_id)
-        if source_text and request.app.state.store is not None:
-            from tg_messenger.agent.translate import get_user_lang
+        client = request.app.state.client
+        coordinator = request.app.state.outbound_coordinator
 
+        async def _send_fn(peer, body):
+            return await client.send_text(peer, body, reply_to=reply_to_id)
+
+        # #73: a variant-token path goes through the coordinator (validates the token,
+        # marks-sending before the network send, records the source, consumes the token);
+        # restores the token on failure. A plain send (no token) goes straight out.
+        if outbound_nonce.strip():
             try:
-                source_lang = await get_user_lang(request.app.state.store.storage)
-                if source_lang:
-                    await request.app.state.store.record_outgoing(
-                        dialog_id_int,
-                        msg,
-                        source_text=source_text,
-                        source_lang=source_lang,
-                    )
-                    msg = msg.model_copy(update={"translated_text": source_text})
-            except Exception:
-                logger.exception("failed to record outbound source text after send")
+                msg = await coordinator.send_variant(
+                    dialog_id_int, outbound_nonce, text, _send_fn,
+                    owner_id=_bounded_client_id(web_client_id),
+                )
+            except OutboundError:
+                return _error_response("Outbound selection expired. Pick a variant again.", 409)
+        else:
+            msg = await coordinator.send_original(dialog_id_int, text, _send_fn)
         sent_ids = _sent_bucket(request.app.state.sent_ids_by_client, web_client_id)
         _remember_sent(sent_ids, dialog_id_int, msg.id)  # suppress only this client's SSE echo
         return HTMLResponse(_message_div(msg))
@@ -887,9 +829,9 @@ def build_app(
         same_origin_error = _same_origin_json_error(request)
         if same_origin_error is not None:
             return same_origin_error
-        outbound = request.app.state.outbound
-        if outbound is None:
+        if request.app.state.outbound is None:
             return JSONResponse({"applies": False, "status": "disabled"})
+        # dialog lookup stays here for the telegram_lang_code hint + the 403/503 contract
         try:
             dialog = await _outbound_dialog(request.app.state.client, dialog_id)
         except DialogLookupError:
@@ -903,34 +845,33 @@ def build_app(
             )
         if dialog is None:
             return JSONResponse(
-                {
-                    "applies": False,
-                    "status": "error",
-                    "error": "Dialog is not available.",
-                },
+                {"applies": False, "status": "error", "error": "Dialog is not available."},
                 status_code=403,
             )
-        try:
-            target_lang, variants = await asyncio.wait_for(
-                _build_outbound_variants(
-                    outbound,
-                    dialog_id,
-                    text,
-                    telegram_lang_code=getattr(dialog, "telegram_lang_code", None),
-                ),
-                timeout=OUTBOUND_TIMEOUT_SECONDS,
-            )
-        except TimeoutError:
-            logger.warning("outbound variants timed out for dialog %s", dialog_id)
+        # #73: the coordinator owns prepare (applies+variants), the timeout and the token
+        result = await request.app.state.outbound_coordinator.prepare(
+            dialog_id,
+            text,
+            telegram_lang_code=getattr(dialog, "telegram_lang_code", None),
+            owner_id=_bounded_client_id(web_client_id),
+        )
+        if result.status == "ready":
             return JSONResponse(
                 {
-                    "applies": False,
-                    "status": "error",
-                    "error": "Translation timed out. Use Send original to send without translation.",
+                    "applies": True,
+                    "status": "ready",
+                    "target_lang": result.target_lang,
+                    "variants": result.variants,
+                    "nonce": result.token,
                 }
             )
-        except Exception:
-            logger.exception("outbound variants failed for dialog %s", dialog_id)
+        if result.status == "invalid_empty":
+            return JSONResponse(
+                {"applies": False, "status": "invalid_empty",
+                 "error": "Cannot translate an empty message."},
+                status_code=400,
+            )
+        if result.status == "error":
             return JSONResponse(
                 {
                     "applies": False,
@@ -938,24 +879,8 @@ def build_app(
                     "error": "Translation failed. Use Send original to send without translation.",
                 }
             )
-        if target_lang is None:
-            return JSONResponse({"applies": False, "status": "not_applicable"})
-        nonce = _remember_outbound_nonce(
-            request.app.state.outbound_nonces,
-            dialog_id=dialog_id,
-            web_client_id=web_client_id,
-            source_text=text,
-            variants=variants,
-        )
-        return JSONResponse(
-            {
-                "applies": True,
-                "status": "ready",
-                "target_lang": target_lang,
-                "variants": variants,
-                "nonce": nonce,
-            }
-        )
+        # disabled / not_applicable
+        return JSONResponse({"applies": False, "status": result.status})
 
     @app.post("/dialogs/{dialog_id}/lang", response_class=HTMLResponse)
     async def outbound_lang(
@@ -1094,22 +1019,5 @@ async def _restore_outbound_settings(
         logger.exception("failed to restore outbound settings for dialog %s", dialog_id)
 
 
-async def _build_outbound_variants(
-    outbound,
-    dialog_id: int,
-    text: str,
-    *,
-    telegram_lang_code: str | None = None,
-) -> tuple[str | None, list[str]]:
-    prepare = getattr(outbound, "prepare_variants", None)
-    if prepare is not None:
-        return await prepare(dialog_id, text, telegram_lang_code=telegram_lang_code)
-    target_lang = await outbound.applies(
-        dialog_id,
-        text,
-        telegram_lang_code=telegram_lang_code,
-    )
-    if target_lang is None:
-        return None, []
-    variants = await outbound.variants(dialog_id, text, target_lang)
-    return target_lang, variants
+# #73: _build_outbound_variants (the local applies()->variants() fallback) was removed —
+# OutboundSendCoordinator.prepare (via OutboundTranslator.prepare_variants) owns it now.

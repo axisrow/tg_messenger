@@ -204,6 +204,13 @@ class RecordingOutbound:
             raise RuntimeError("llm down")
         return list(self.variant_values)
 
+    async def prepare_variants(self, dialog_id, text, *, telegram_lang_code=None):
+        # mirrors OutboundTranslator: one entry point composing applies()+variants()
+        target_lang = await self.applies(dialog_id, text, telegram_lang_code=telegram_lang_code)
+        if target_lang is None:
+            return None, []
+        return target_lang, await self.variants(dialog_id, text, target_lang)
+
 
 class BlockingOutbound(RecordingOutbound):
     def __init__(self):
@@ -1583,10 +1590,16 @@ async def test_tui_outbound_cancel_restores_current_dialog_draft():
         assert stub.sent == []
 
 
-def test_tui_outbound_flow_has_one_timeout_budget_for_legacy_fallback():
+def test_tui_outbound_flow_delegates_to_coordinator_not_applies_variants():
+    # #73 architecture regression: the TUI flow goes through the coordinator's prepare();
+    # it no longer calls applies()/variants() directly, owns no local timeout, and the old
+    # _prepare_outbound_variants fallback is gone.
     source = inspect.getsource(MessengerTUI._outbound_flow)
-    assert source.count("asyncio.wait_for(") == 1
-    assert "_prepare_outbound_variants(" in source
+    assert "_coordinator.prepare(" in source
+    assert ".applies(" not in source
+    assert ".variants(" not in source
+    assert "asyncio.wait_for(" not in source  # timeout lives in the coordinator
+    assert not hasattr(MessengerTUI, "_prepare_outbound_variants")
 
 
 async def test_tui_outbound_clears_composer_and_repeated_enter_does_not_restart_worker():

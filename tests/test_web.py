@@ -1155,6 +1155,18 @@ async def test_suggest_endpoint_returns_draft(suggest_app):
     assert suggester.calls == [7]
 
 
+def test_web_outbound_routes_delegate_to_coordinator_not_manual_fallback():
+    # #73 architecture regression: the web routes go through the coordinator; the local
+    # nonce helpers and the manual applies()->variants() fallback were removed.
+    import inspect
+
+    src = inspect.getsource(web_app)
+    assert "outbound_coordinator" in src
+    assert not hasattr(web_app, "_build_outbound_variants")
+    assert not hasattr(web_app, "_consume_outbound_nonce")
+    assert not hasattr(web_app, "_remember_outbound_nonce")
+
+
 async def test_outbound_endpoint_returns_variants():
     stub = WebStubClient()
     app = build_app(client=stub, outbound=WebOutboundStub())
@@ -1173,6 +1185,24 @@ async def test_outbound_endpoint_returns_variants():
     assert data["target_lang"] == "en"
     assert data["variants"] == ["hi", "hello"]
     assert data["nonce"]
+
+
+async def test_outbound_endpoint_blank_text_is_invalid_empty():
+    # #73: a whitespace draft is rejected as invalid_empty (400), no LLM call
+    stub = WebStubClient()
+    outbound = WebOutboundRecordingHint()
+    app = build_app(client=stub, outbound=outbound)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/outbound",
+                data={"text": "   ", "web_client_id": "browser-a"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 400
+    assert r.json()["status"] == "invalid_empty"
+    assert outbound.applies_calls == []
 
 
 async def test_outbound_endpoint_passes_dialog_telegram_lang_hint():
@@ -1225,11 +1255,18 @@ async def test_outbound_endpoint_dialog_lookup_failure_returns_503_without_llm()
 
 
 class WebOutboundStub:
+    # mirrors OutboundTranslator: prepare_variants composes applies()+variants()
     async def applies(self, dialog_id, text, *, telegram_lang_code=None):
         return "en"
 
     async def variants(self, dialog_id, text, target_lang):
         return ["hi", "hello"]
+
+    async def prepare_variants(self, dialog_id, text, *, telegram_lang_code=None):
+        target_lang = await self.applies(dialog_id, text, telegram_lang_code=telegram_lang_code)
+        if target_lang is None:
+            return None, []
+        return target_lang, await self.variants(dialog_id, text, target_lang)
 
 
 class WebOutboundNotApplicableStub(WebOutboundStub):
@@ -1404,13 +1441,14 @@ async def test_send_with_wrong_dialog_outbound_nonce_does_not_send_or_record():
     assert store.recorded == []
 
 
-async def test_send_with_expired_outbound_nonce_does_not_send_or_record(monkeypatch):
-    monkeypatch.setattr(web_app, "OUTBOUND_NONCE_TTL_SECONDS", -1)
+async def test_send_with_expired_outbound_nonce_does_not_send_or_record():
     stub = WebStubClient()
     store = WebSourceStore()
     app = build_app(client=stub, store=store, outbound=WebOutboundStub())
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
+        # force every issued token to be already expired (#73: TTL is on the coordinator)
+        app.state.outbound_coordinator._token_ttl = -1
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
             outbound = await ac.post(
                 "/dialogs/7/outbound",

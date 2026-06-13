@@ -19,6 +19,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 
+from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
 from tg_messenger.core.auth import LoginError, LoginSession, delivery_hint
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 # shown before a draft in the suggestion strip; Tab accepts it into the composer
 SUGGEST_PREFIX = "💡 Tab: "
 ORIGINAL_SENTINEL = "__tg_messenger_original__"
-OUTBOUND_TIMEOUT_SECONDS = 20
+# #73: the outbound prepare timeout now lives in OutboundSendCoordinator.
 
 
 @dataclass
@@ -35,6 +36,8 @@ class ComposeState:
     source_text: str | None = None
     original_confirm_text: str | None = None
     ignore_next_empty_change: bool = False
+    # #73: the coordinator token for the picked variant; consumed on the send that follows
+    outbound_token: str | None = None
 
 
 def parse_media_command(text: str) -> tuple[str, str | None] | None:
@@ -377,6 +380,9 @@ class MessengerTUI(App):
         self._store = store
         self._translator = translator
         self._outbound = outbound
+        # #73: one UI-agnostic coordinator owns the outbound flow (prepare/timeout/token/
+        # send/source-recording). Rebuilt after a ProfileScreen pick swaps the deps.
+        self._coordinator = self._build_coordinator()
         self._compose_states: dict[int, ComposeState] = {}
         self._bubble_index: dict[int, MessageBubble] = {}
         self._pending_suggestion: str | None = None
@@ -387,6 +393,9 @@ class MessengerTUI(App):
         # (dialog_id, message_id, emoticon) keys we reacted with from this composer.
         # Telegram echoes the update via listen_reactions(); skip the local echo only.
         self._sent_reactions: OrderedDict[tuple[int, int, str | None], bool] = OrderedDict()
+
+    def _build_coordinator(self) -> OutboundSendCoordinator:
+        return OutboundSendCoordinator(outbound=self._outbound, store=self._store)
 
     def _scroll_messages_to_end(self, pane=None) -> None:
         pane = pane or self.query_one("#messages", Vertical)
@@ -422,6 +431,7 @@ class MessengerTUI(App):
     def _clear_pending_outbound(self, dialog_id: int) -> None:
         state = self._compose_state_for(dialog_id)
         state.source_text = None
+        state.outbound_token = None
         state.original_confirm_text = None
 
     def _clear_compose_state_after_send(self, dialog_id: int, sent_text: str) -> None:
@@ -429,6 +439,7 @@ class MessengerTUI(App):
         if state.draft == sent_text:
             state.draft = ""
         state.source_text = None
+        state.outbound_token = None
         state.original_confirm_text = None
         if dialog_id == self._current:
             composer = self.query_one("#composer", Input)
@@ -490,6 +501,7 @@ class MessengerTUI(App):
                         self._store = deps.store
                         self._translator = deps.translator
                         self._outbound = deps.outbound
+                        self._coordinator = self._build_coordinator()  # #73: deps swapped
                     else:
                         self._session_name = chosen
                         self._client = self._client_factory(chosen)
@@ -732,6 +744,7 @@ class MessengerTUI(App):
                 state.draft = event.value
                 if state.source_text is not None and event.value != previous_draft:
                     state.source_text = None
+                    state.outbound_token = None  # edited draft invalidates the variant (#73)
                 if state.original_confirm_text is not None and event.value != state.original_confirm_text:
                     state.original_confirm_text = None
             if not event.value:
@@ -802,10 +815,14 @@ class MessengerTUI(App):
             return
         if state.source_text is not None:
             source = state.source_text
+            token = state.outbound_token
             state.draft = ""
             self._clear_pending_outbound(dialog_id)
             event.input.value = ""
-            self.run_worker(self._send_text(dialog_id, text, source_text=source), exclusive=False)
+            self.run_worker(
+                self._send_text(dialog_id, text, source_text=source, token=token),
+                exclusive=False,
+            )
             return
         if state.original_confirm_text == text:
             state.draft = ""
@@ -871,45 +888,35 @@ class MessengerTUI(App):
         self.notify("Language setting saved.")
 
     async def _outbound_flow(self, dialog_id: int, text: str) -> None:
+        # #73: the coordinator owns prepare (applies+variants), the timeout AND the token —
+        # the TUI no longer calls applies()/variants() directly, and there is one timeout
+        # budget inside prepare() instead of a separate asyncio.wait_for here.
         composer = self.query_one("#composer", Input)
         state = self._compose_state_for(dialog_id)
         state.draft = text
-        try:
-            telegram_lang_code = self._dialog_telegram_lang_hint(dialog_id)
-            target_lang, variants = await asyncio.wait_for(
-                self._prepare_outbound_variants(
-                    dialog_id,
-                    text,
-                    telegram_lang_code=telegram_lang_code,
-                ),
-                timeout=OUTBOUND_TIMEOUT_SECONDS,
-            )
-            if target_lang is None:
-                state.draft = ""
-                self._clear_pending_outbound(dialog_id)
-                if dialog_id == self._current and composer.value == text:
-                    composer.value = ""
-                await self._send_text(dialog_id, text)
-                return
-        except TimeoutError:
-            logger.warning("outbound translation timed out (dialog %s)", dialog_id)
+        telegram_lang_code = self._dialog_telegram_lang_hint(dialog_id)
+        result = await self._coordinator.prepare(
+            dialog_id, text, telegram_lang_code=telegram_lang_code, owner_id=str(dialog_id)
+        )
+        if result.status == "not_applicable":
+            state.draft = ""
+            self._clear_pending_outbound(dialog_id)
+            if dialog_id == self._current and composer.value == text:
+                composer.value = ""
+            await self._send_text(dialog_id, text)
+            return
+        if result.status != "ready":
+            # disabled / invalid_empty / error → fall back to sending the original on Enter
             state.draft = text
             state.source_text = None
+            state.outbound_token = None
             state.original_confirm_text = text
             if dialog_id == self._current:
                 composer.value = text
-            self.notify("Перевод не удался — Enter отправит оригинал", severity="warning")
+            if result.status == "error":
+                self.notify("Перевод не удался — Enter отправит оригинал", severity="warning")
             return
-        except Exception:
-            logger.exception("outbound translation failed (dialog %s)", dialog_id)
-            state.draft = text
-            state.source_text = None
-            state.original_confirm_text = text
-            if dialog_id == self._current:
-                composer.value = text
-            self.notify("Перевод не удался — Enter отправит оригинал", severity="warning")
-            return
-        picked = await self.push_screen_wait(VariantPickScreen(variants, text))
+        picked = await self.push_screen_wait(VariantPickScreen(result.variants, text))
         if picked is None:
             if dialog_id == self._current:
                 composer.value = text
@@ -918,6 +925,7 @@ class MessengerTUI(App):
         if picked == ORIGINAL_SENTINEL:
             state.draft = text
             state.source_text = None
+            state.outbound_token = None
             state.original_confirm_text = text
             self.notify("Enter отправит оригинал")
             if dialog_id == self._current:
@@ -926,34 +934,36 @@ class MessengerTUI(App):
             return
         state.draft = picked
         state.source_text = text
+        state.outbound_token = result.token  # consumed on the send that follows
         state.original_confirm_text = None
         if dialog_id == self._current:
             composer.value = picked
             composer.focus()
 
-    async def _prepare_outbound_variants(
-        self,
-        dialog_id: int,
-        text: str,
-        *,
-        telegram_lang_code: str | None,
-    ) -> tuple[str | None, list[str]]:
-        prepare = getattr(self._outbound, "prepare_variants", None)
-        if prepare is not None:
-            return await prepare(dialog_id, text, telegram_lang_code=telegram_lang_code)
-        target_lang = await self._outbound.applies(
-            dialog_id,
-            text,
-            telegram_lang_code=telegram_lang_code,
-        )
-        if target_lang is None:
-            return None, []
-        variants = await self._outbound.variants(dialog_id, text, target_lang)
-        return target_lang, variants
+    async def _send_text(
+        self, peer: int, text: str, source_text: str | None = None, token: str | None = None,
+    ) -> None:
+        async def _do_send(target, body):
+            return await self._client.send_text(target, body)
 
-    async def _send_text(self, peer: int, text: str, source_text: str | None = None) -> None:
         try:
-            msg = await self._client.send_text(peer, text)
+            if token is not None:
+                # variant path: coordinator validates the token, records the source itself
+                msg = await self._coordinator.send_variant(
+                    peer, token, text, _do_send, owner_id=str(peer)
+                )
+            else:
+                msg = await self._coordinator.send_original(peer, text, _do_send)
+        except OutboundError:
+            logger.warning("outbound token rejected on send (dialog %s)", peer)
+            self.notify("Выбор перевода истёк — выберите вариант заново", severity="warning")
+            state = self._compose_state_for(peer)
+            state.draft = text
+            if peer == self._current:
+                composer = self.query_one("#composer", Input)
+                if not composer.value:
+                    composer.value = text
+            return
         except Exception as exc:
             logger.exception("send failed (dialog %s)", peer)
             self.notify(f"Send failed: {exc}", severity="error")
@@ -965,18 +975,6 @@ class MessengerTUI(App):
                     composer.value = text
             return
         self._clear_compose_state_after_send(peer, text)
-        if source_text and self._store is not None:
-            from tg_messenger.agent.translate import get_user_lang
-
-            try:
-                source_lang = await get_user_lang(self._store.storage)
-                if source_lang:
-                    await self._store.record_outgoing(
-                        peer, msg, source_text=source_text, source_lang=source_lang
-                    )
-                    msg = msg.model_copy(update={"translated_text": source_text})
-            except Exception:
-                logger.exception("failed to record outbound source text")
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
