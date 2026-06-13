@@ -4,7 +4,11 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from tg_messenger.core.message_store import MessageStore, register_message_store_migrations
+from tg_messenger.core.message_store import (
+    MESSAGE_STORE_PEER_STATE_MAX,
+    MessageStore,
+    register_message_store_migrations,
+)
 from tg_messenger.core.models import Message, MessagesDeletedEvent
 from tg_messenger.core.storage import Storage
 
@@ -237,6 +241,22 @@ async def test_record_outgoing_waits_for_peer_sync_lock(tmp_path):
     finally:
         await store.close()
     assert upsert_started.is_set() is True
+
+
+async def test_message_store_peer_state_is_lru_bounded(tmp_path):
+    store = MessageStore(client=StoreClient(), storage=await _storage(tmp_path))
+    try:
+        for peer in range(MESSAGE_STORE_PEER_STATE_MAX + 5):
+            store._peer_lock(peer)
+            store._remember_sync(peer)
+    finally:
+        await store.close()
+    assert len(store._sync_locks) == MESSAGE_STORE_PEER_STATE_MAX
+    assert len(store._last_sync) == MESSAGE_STORE_PEER_STATE_MAX
+    assert 0 not in store._sync_locks
+    assert 0 not in store._last_sync
+    assert (MESSAGE_STORE_PEER_STATE_MAX + 4) in store._sync_locks
+    assert (MESSAGE_STORE_PEER_STATE_MAX + 4) in store._last_sync
 
 
 async def test_message_store_prunes_cached_window_when_no_newer_messages(tmp_path):

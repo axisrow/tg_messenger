@@ -855,22 +855,14 @@ class MessengerTUI(App):
         state.draft = text
         try:
             telegram_lang_code = self._dialog_telegram_lang_hint(dialog_id)
-            prepare = getattr(self._outbound, "prepare_variants", None)
-            if prepare is not None:
-                target_lang, variants = await asyncio.wait_for(
-                    prepare(dialog_id, text, telegram_lang_code=telegram_lang_code),
-                    timeout=OUTBOUND_TIMEOUT_SECONDS,
-                )
-            else:
-                target_lang = await asyncio.wait_for(
-                    self._outbound.applies(
-                        dialog_id,
-                        text,
-                        telegram_lang_code=telegram_lang_code,
-                    ),
-                    timeout=OUTBOUND_TIMEOUT_SECONDS,
-                )
-                variants = []
+            target_lang, variants = await asyncio.wait_for(
+                self._prepare_outbound_variants(
+                    dialog_id,
+                    text,
+                    telegram_lang_code=telegram_lang_code,
+                ),
+                timeout=OUTBOUND_TIMEOUT_SECONDS,
+            )
             if target_lang is None:
                 state.draft = ""
                 self._clear_pending_outbound(dialog_id)
@@ -878,11 +870,6 @@ class MessengerTUI(App):
                     composer.value = ""
                 await self._send_text(dialog_id, text)
                 return
-            if not variants:
-                variants = await asyncio.wait_for(
-                    self._outbound.variants(dialog_id, text, target_lang),
-                    timeout=OUTBOUND_TIMEOUT_SECONDS,
-                )
         except TimeoutError:
             logger.warning("outbound translation timed out (dialog %s)", dialog_id)
             state.draft = text
@@ -922,6 +909,26 @@ class MessengerTUI(App):
         if dialog_id == self._current:
             composer.value = picked
             composer.focus()
+
+    async def _prepare_outbound_variants(
+        self,
+        dialog_id: int,
+        text: str,
+        *,
+        telegram_lang_code: str | None,
+    ) -> tuple[str | None, list[str]]:
+        prepare = getattr(self._outbound, "prepare_variants", None)
+        if prepare is not None:
+            return await prepare(dialog_id, text, telegram_lang_code=telegram_lang_code)
+        target_lang = await self._outbound.applies(
+            dialog_id,
+            text,
+            telegram_lang_code=telegram_lang_code,
+        )
+        if target_lang is None:
+            return None, []
+        variants = await self._outbound.variants(dialog_id, text, target_lang)
+        return target_lang, variants
 
     async def _send_text(self, peer: int, text: str, source_text: str | None = None) -> None:
         try:

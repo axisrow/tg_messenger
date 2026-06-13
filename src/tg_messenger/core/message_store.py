@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from datetime import datetime
 from typing import Any
 
@@ -37,6 +38,7 @@ MESSAGE_STORE_MIGRATIONS = [
     " low_id INTEGER NOT NULL,"
     " high_id INTEGER NOT NULL)",
 ]
+MESSAGE_STORE_PEER_STATE_MAX = 1000
 
 
 def register_message_store_migrations(storage) -> None:
@@ -61,8 +63,8 @@ class MessageStore:
         self._clock = clock
         self._connected = False
         self._connect_lock = asyncio.Lock()
-        self._sync_locks: dict[int, asyncio.Lock] = {}
-        self._last_sync: dict[int, float] = {}
+        self._sync_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
+        self._last_sync: OrderedDict[int, float] = OrderedDict()
 
     @property
     def storage(self):
@@ -87,7 +89,7 @@ class MessageStore:
         await self.connect()
         peer = int(peer)
         limit = int(limit)
-        lock = self._sync_locks.setdefault(peer, asyncio.Lock())
+        lock = self._peer_lock(peer)
         async with lock:
             row = await self._sync_row(peer)
             if (
@@ -105,7 +107,7 @@ class MessageStore:
     async def ingest(self, message: Message) -> None:
         """Persist a live message without advancing the contiguous sync window."""
         await self.connect()
-        lock = self._sync_locks.setdefault(int(message.dialog_id), asyncio.Lock())
+        lock = self._peer_lock(message.dialog_id)
         async with lock:
             await self._upsert_message(message)
 
@@ -182,7 +184,7 @@ class MessageStore:
         await self.connect()
         peer = int(dialog_id)
         msg = message.model_copy(update={"dialog_id": peer})
-        lock = self._sync_locks.setdefault(peer, asyncio.Lock())
+        lock = self._peer_lock(peer)
         async with lock:
             await self._upsert_message(
                 msg,
@@ -190,6 +192,44 @@ class MessageStore:
                 translated_lang=source_lang,
                 preserve_translation=False,
             )
+
+    def _peer_lock(self, peer: int) -> asyncio.Lock:
+        peer = int(peer)
+        lock = self._sync_locks.get(peer)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._sync_locks[peer] = lock
+        self._sync_locks.move_to_end(peer)
+        self._evict_idle_peer_state()
+        return lock
+
+    def _remember_sync(self, peer: int) -> None:
+        peer = int(peer)
+        self._last_sync[peer] = self._clock()
+        self._last_sync.move_to_end(peer)
+        self._evict_idle_peer_state()
+
+    def _evict_idle_peer_state(self) -> None:
+        checked = 0
+        while len(self._sync_locks) > MESSAGE_STORE_PEER_STATE_MAX and checked < len(self._sync_locks):
+            old_peer, old_lock = next(iter(self._sync_locks.items()))
+            if old_lock.locked():
+                self._sync_locks.move_to_end(old_peer)
+                checked += 1
+                continue
+            self._sync_locks.popitem(last=False)
+            self._last_sync.pop(old_peer, None)
+            checked = 0
+        while len(self._last_sync) > MESSAGE_STORE_PEER_STATE_MAX:
+            old_peer, _ = self._last_sync.popitem(last=False)
+            if old_peer not in self._sync_locks:
+                continue
+            lock = self._sync_locks[old_peer]
+            if lock.locked():
+                self._last_sync[old_peer] = self._clock()
+                self._last_sync.move_to_end(old_peer)
+                break
+            self._sync_locks.pop(old_peer, None)
 
     async def _consume_incoming(self) -> None:
         async for ev in self._client.listen_all():
@@ -232,12 +272,12 @@ class MessageStore:
         else:
             await self._sync_full_window(peer, limit)
             return
-        self._last_sync[peer] = self._clock()
+        self._remember_sync(peer)
 
     async def _sync_full_window(self, peer: int, limit: int) -> None:
         fetched = await self._client.history_since(peer, min_id=0, limit=limit)
         await self._replace_window(peer, fetched, limit)
-        self._last_sync[peer] = self._clock()
+        self._remember_sync(peer)
 
     async def _replace_window(self, peer: int, fetched: list[Message], limit: int) -> tuple[int, int]:
         if not fetched:

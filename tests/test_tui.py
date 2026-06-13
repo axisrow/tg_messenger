@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from datetime import datetime, timezone
 
 import pytest
@@ -1580,6 +1581,12 @@ async def test_tui_outbound_cancel_restores_current_dialog_draft():
 
         assert composer.value == "привет"
         assert stub.sent == []
+
+
+def test_tui_outbound_flow_has_one_timeout_budget_for_legacy_fallback():
+    source = inspect.getsource(MessengerTUI._outbound_flow)
+    assert source.count("asyncio.wait_for(") == 1
+    assert "_prepare_outbound_variants(" in source
 
 
 async def test_tui_outbound_clears_composer_and_repeated_enter_does_not_restart_worker():

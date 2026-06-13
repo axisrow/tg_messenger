@@ -808,7 +808,17 @@ def build_app(
         outbound = request.app.state.outbound
         if outbound is None:
             return JSONResponse({"applies": False, "status": "disabled"})
-        dialog = await _outbound_dialog(request.app.state.client, dialog_id)
+        try:
+            dialog = await _outbound_dialog(request.app.state.client, dialog_id)
+        except DialogLookupError:
+            return JSONResponse(
+                {
+                    "applies": False,
+                    "status": "error",
+                    "error": "Dialogs are temporarily unavailable.",
+                },
+                status_code=503,
+            )
         if dialog is None:
             return JSONResponse(
                 {
@@ -878,16 +888,41 @@ def build_app(
         outbound = request.app.state.outbound
         if outbound is None:
             return _error_response("Outbound translation is not configured.", 503)
-        if await _outbound_dialog(request.app.state.client, dialog_id) is None:
-            return _error_response("Dialog is not available.", 403)
-        from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
-
         try:
+            dialog = await _outbound_dialog(request.app.state.client, dialog_id)
+        except DialogLookupError:
+            return _error_response("Dialogs are temporarily unavailable.", 503)
+        if dialog is None:
+            return _error_response("Dialog is not available.", 403)
+        from tg_messenger.agent.outbound import (
+            get_dialog_lang,
+            is_outbound_enabled,
+            set_dialog_lang,
+            set_outbound_enabled,
+        )
+
+        previous_lang = None
+        previous_enabled = True
+        previous_loaded = False
+        try:
+            previous_lang = await get_dialog_lang(outbound.storage, dialog_id)
+            previous_enabled = await is_outbound_enabled(outbound.storage, dialog_id)
+            previous_loaded = True
             await set_dialog_lang(outbound.storage, dialog_id, code.strip() or None, source="manual")
+            await set_outbound_enabled(outbound.storage, dialog_id, enabled != "off")
         except ValueError as exc:
             logger.warning("invalid outbound language code for dialog %s: %s", dialog_id, exc)
             return _error_response(str(exc), 400)
-        await set_outbound_enabled(outbound.storage, dialog_id, enabled != "off")
+        except Exception:
+            logger.exception("failed to update outbound settings for dialog %s", dialog_id)
+            if previous_loaded:
+                await _restore_outbound_settings(
+                    outbound.storage,
+                    dialog_id,
+                    previous_lang=previous_lang,
+                    previous_enabled=previous_enabled,
+                )
+            return _error_response("Outbound settings could not be saved.", 503)
         return HTMLResponse('<div id="outbound-lang-status">saved</div>')
 
     @app.get("/settings/lang", response_class=HTMLResponse)
@@ -936,16 +971,45 @@ def build_app(
     return app
 
 
+class DialogLookupError(RuntimeError):
+    pass
+
+
 async def _outbound_dialog(client, dialog_id: int):
     try:
         dialogs = await client.dialogs(dm_only=False)
-    except Exception:
+    except Exception as exc:
         logger.warning("failed to verify outbound dialog access", exc_info=True)
-        return None
+        raise DialogLookupError from exc
     for dialog in dialogs:
         if dialog.id == dialog_id:
             return dialog
     return None
+
+
+async def _restore_outbound_settings(
+    storage,
+    dialog_id: int,
+    *,
+    previous_lang,
+    previous_enabled: bool,
+) -> None:
+    from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
+
+    try:
+        if previous_lang is None:
+            await set_dialog_lang(storage, dialog_id, None)
+        else:
+            await set_dialog_lang(
+                storage,
+                dialog_id,
+                previous_lang.lang,
+                source=previous_lang.source,
+                detected_at=previous_lang.detected_at,
+            )
+        await set_outbound_enabled(storage, dialog_id, previous_enabled)
+    except Exception:
+        logger.exception("failed to restore outbound settings for dialog %s", dialog_id)
 
 
 async def _build_outbound_variants(

@@ -82,6 +82,11 @@ class WebStubClient:
             yield ev
 
 
+class FailingDialogsClient(WebStubClient):
+    async def dialogs(self, dm_only=True):
+        raise RuntimeError("dialogs unavailable")
+
+
 class WebTranslatorStub:
     def __init__(self):
         self.lang = "en"
@@ -1055,6 +1060,22 @@ async def test_outbound_endpoint_rejects_unknown_dialog_before_llm():
     assert outbound.applies_calls == []
 
 
+async def test_outbound_endpoint_dialog_lookup_failure_returns_503_without_llm():
+    outbound = WebOutboundRecordingHint()
+    app = build_app(client=FailingDialogsClient(), outbound=outbound)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/outbound",
+                data={"text": "привет", "web_client_id": "browser-a"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 503
+    assert r.json()["status"] == "error"
+    assert outbound.applies_calls == []
+
+
 class WebOutboundStub:
     async def applies(self, dialog_id, text, *, telegram_lang_code=None):
         return "en"
@@ -1103,6 +1124,13 @@ class RecordingLangStorage:
             self.values.pop(params[0], None)
 
 
+class FailingEnabledStorage(RecordingLangStorage):
+    async def set_value(self, key, value):
+        if key.startswith("outbound_enabled_"):
+            raise RuntimeError("enabled write failed")
+        await super().set_value(key, value)
+
+
 class WebOutboundWithStorage(WebOutboundStub):
     storage = WebLangStorage()
 
@@ -1110,6 +1138,11 @@ class WebOutboundWithStorage(WebOutboundStub):
 class WebOutboundWithRecordingStorage(WebOutboundStub):
     def __init__(self):
         self.storage = RecordingLangStorage()
+
+
+class WebOutboundWithFailingEnabledStorage(WebOutboundStub):
+    def __init__(self):
+        self.storage = FailingEnabledStorage()
 
 
 async def test_send_without_nonce_ignores_untrusted_source_text():
@@ -1298,6 +1331,37 @@ async def test_outbound_lang_rejects_unknown_dialog_without_write():
             )
     assert r.status_code == 403
     assert outbound.storage.values == {}
+
+
+async def test_outbound_lang_dialog_lookup_failure_returns_503_without_write():
+    outbound = WebOutboundWithRecordingStorage()
+    app = build_app(client=FailingDialogsClient(), outbound=outbound)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/lang",
+                data={"code": "en", "enabled": "off"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 503
+    assert outbound.storage.values == {}
+
+
+async def test_outbound_lang_rolls_back_when_enabled_write_fails():
+    outbound = WebOutboundWithFailingEnabledStorage()
+    app = build_app(client=WebStubClient(), outbound=outbound)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/lang",
+                data={"code": "en", "enabled": "off"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 503
+    assert await get_dialog_lang(outbound.storage, 7) is None
+    assert await is_outbound_enabled(outbound.storage, 7) is True
 
 
 async def test_outbound_lang_requires_csrf_header():
