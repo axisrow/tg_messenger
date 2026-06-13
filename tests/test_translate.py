@@ -70,6 +70,26 @@ async def test_set_user_lang_validates_code(tmp_path):
         await storage.close()
 
 
+async def test_get_user_lang_warns_for_unsupported_stored_or_env_code(tmp_path, caplog):
+    storage = Storage(tmp_path / "t.db")
+    await storage.connect()
+    try:
+        await storage.set_value("user_lang", "fr")
+        with caplog.at_level("WARNING", logger="tg_messenger.agent.translate"):
+            assert await get_user_lang(storage, {"TG_USER_LANG": "de"}) is None
+        assert any("unsupported stored user language code" in rec.message for rec in caplog.records)
+        assert all("fr" not in rec.message for rec in caplog.records)
+
+        await storage.execute("DELETE FROM kv WHERE key = ?", ("user_lang",))
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="tg_messenger.agent.translate"):
+            assert await get_user_lang(storage, {"TG_USER_LANG": "de"}) is None
+        assert any("unsupported TG_USER_LANG value" in rec.message for rec in caplog.records)
+        assert all("de" not in rec.message for rec in caplog.records)
+    finally:
+        await storage.close()
+
+
 def test_translate_model_from_env_prefers_translate_model():
     assert translate_model_from_env({"TG_TRANSLATE_MODEL": "openai:x", "TG_AGENT_MODEL": "openai:y"}) == "openai:x"
     assert translate_model_from_env({"TG_AGENT_MODEL": "openai:y"}) == "openai:y"

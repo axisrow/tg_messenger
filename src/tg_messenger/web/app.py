@@ -270,23 +270,24 @@ def _consume_outbound_nonce(
     dialog_id: int,
     web_client_id: str,
     text: str,
-) -> str | None:
+) -> tuple[bool, str | None]:
     if not nonce.strip():
-        return None
+        return True, None
     _prune_outbound_nonces(nonces)
     payload = nonces.pop(nonce, None)
     if payload is None:
-        return None
+        logger.warning("rejecting missing or expired outbound nonce for dialog %s", dialog_id)
+        return False, None
     if payload["dialog_id"] != dialog_id:
         logger.warning("rejecting outbound nonce for wrong dialog %s", dialog_id)
-        return None
+        return False, None
     if payload["web_client_id"] != _bounded_client_id(web_client_id):
         logger.warning("rejecting outbound nonce for wrong web client")
-        return None
+        return False, None
     if text not in payload["variants"]:
         logger.warning("rejecting outbound nonce for non-variant send in dialog %s", dialog_id)
-        return None
-    return payload["source_text"]
+        return False, None
+    return True, payload["source_text"]
 
 
 def _remember_sent(sent_ids: OrderedDict, dialog_id: int, message_id: int) -> None:
@@ -682,21 +683,23 @@ def build_app(
     @app.post("/send", response_class=HTMLResponse)
     async def send(request: Request, dialog_id: str = Form(""), text: str = Form(""),
                    reply_to: str = Form(""), web_client_id: str = Form(""),
-                   source_text: str = Form(""), outbound_nonce: str = Form("")):
+                   outbound_nonce: str = Form("")):
         if not dialog_id.strip().lstrip("-").isdigit():
             return _error_response("Select a dialog first.", 400)
         if not text.strip():
             return _error_response("Cannot send an empty message.", 400)
         dialog_id_int = int(dialog_id)
         reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
-        msg = await request.app.state.client.send_text(dialog_id_int, text, reply_to=reply_to_id)
-        source_text = _consume_outbound_nonce(
+        nonce_ok, source_text = _consume_outbound_nonce(
             request.app.state.outbound_nonces,
             nonce=outbound_nonce,
             dialog_id=dialog_id_int,
             web_client_id=web_client_id,
             text=text,
         )
+        if not nonce_ok:
+            return _error_response("Outbound selection expired. Pick a variant again.", 409)
+        msg = await request.app.state.client.send_text(dialog_id_int, text, reply_to=reply_to_id)
         if source_text and request.app.state.store is not None:
             from tg_messenger.agent.translate import get_user_lang
 
@@ -766,7 +769,10 @@ def build_app(
                 return _error_response("Empty file.", 400)
             msg = await request.app.state.client.send_media(dialog_id, tmp_path, caption=caption)
         finally:
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                logger.warning("failed to remove temporary upload %s", tmp_path, exc_info=True)
         sent_ids = _sent_bucket(request.app.state.sent_ids_by_client, web_client_id)
         _remember_sent(sent_ids, dialog_id, msg.id)  # suppress only this client's SSE echo
         return HTMLResponse(_message_div(msg))

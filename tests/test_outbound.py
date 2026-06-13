@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -255,6 +256,40 @@ async def test_dialog_lang_auto_cache_ttl_before_telegram_hint(tmp_path):
     finally:
         await storage.close()
     assert calls == [["hola"]]
+
+
+async def test_dialog_lang_concurrent_auto_detection_is_single_flight(tmp_path):
+    storage = await _storage(tmp_path)
+    first_started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        first_started.set()
+        await release.wait()
+        return "en"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "hello")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        tasks = [
+            asyncio.create_task(outbound.dialog_lang(7)),
+            asyncio.create_task(outbound.dialog_lang(7)),
+        ]
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        release.set()
+        assert await asyncio.gather(*tasks) == ["en", "en"]
+        stored = await get_dialog_lang(storage, 7)
+    finally:
+        await storage.close()
+    assert stored.lang == "en"
+    assert calls == [["hello"]]
 
 
 async def test_dialog_lang_ignores_unsupported_telegram_hint_and_detector_code(tmp_path, caplog):

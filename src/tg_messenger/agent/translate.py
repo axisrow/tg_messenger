@@ -49,10 +49,18 @@ def needs_translation(text: str | None, target_lang: str | None) -> bool:
 async def get_user_lang(storage, env=None) -> str | None:
     value = await storage.get_value(USER_LANG_KEY)
     if value:
-        return clean_supported_lang_code(str(value))
+        lang = clean_supported_lang_code(str(value))
+        if lang is None:
+            logger.warning("unsupported stored user language code")
+        return lang
     source = os.environ if env is None else env
     value = source.get("TG_USER_LANG")
-    return clean_supported_lang_code(str(value)) if value is not None else None
+    if value is None:
+        return None
+    lang = clean_supported_lang_code(str(value))
+    if lang is None and str(value).strip():
+        logger.warning("unsupported TG_USER_LANG value")
+    return lang
 
 
 async def set_user_lang(storage, code: str | None) -> None:

@@ -8,6 +8,7 @@ from telethon.sessions import StringSession
 from tg_messenger.agent.outbound import get_dialog_lang, is_outbound_enabled
 from tg_messenger.core.events import EventBus
 from tg_messenger.core.models import Dialog, IncomingEvent, Message, ReactionEvent
+from tg_messenger.web import app as web_app
 from tg_messenger.web.app import _error_response, build_app
 
 
@@ -512,6 +513,29 @@ async def test_media_upload_empty_file_returns_400(client_app):
     )
     assert r.status_code == 400
     assert stub.sent == []
+
+
+async def test_media_upload_unlink_failure_does_not_mask_response(monkeypatch, caplog):
+    stub = WebStubClient()
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    def fail_unlink(path):
+        raise OSError("temp cleanup failed")
+
+    monkeypatch.setattr(web_app.os, "unlink", fail_unlink)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            with caplog.at_level("WARNING", logger="tg_messenger.web.app"):
+                r = await ac.post(
+                    "/dialogs/7/media",
+                    files={"file": ("pic.jpg", b"binarydata", "image/jpeg")},
+                    data={"caption": "look"},
+                )
+
+    assert r.status_code == 200
+    assert stub.sent == [(7, "media", "look")]
+    assert any("failed to remove temporary upload" in rec.message for rec in caplog.records)
 
 
 async def test_profiles_route_lists_saved_profiles(monkeypatch, tmp_path):
@@ -1149,13 +1173,14 @@ async def test_send_with_valid_outbound_nonce_records_source_once():
                 },
             )
     assert sent.status_code == 200
-    assert reused.status_code == 200
+    assert reused.status_code == 409
+    assert stub.sent == [(7, "hi", None)]
     assert store.recorded == [(7, "hi", "привет", "ru")]
     assert "↳ привет" in sent.text
     assert "↳ привет" not in reused.text
 
 
-async def test_send_with_wrong_dialog_outbound_nonce_does_not_record():
+async def test_send_with_wrong_dialog_outbound_nonce_does_not_send_or_record():
     stub = WebStubClient()
     store = WebSourceStore()
     app = build_app(client=stub, store=store, outbound=WebOutboundStub())
@@ -1176,13 +1201,12 @@ async def test_send_with_wrong_dialog_outbound_nonce_does_not_record():
                     "outbound_nonce": outbound.json()["nonce"],
                 },
             )
-    assert r.status_code == 200
+    assert r.status_code == 409
+    assert stub.sent == []
     assert store.recorded == []
 
 
-async def test_send_with_expired_outbound_nonce_does_not_record(monkeypatch):
-    from tg_messenger.web import app as web_app
-
+async def test_send_with_expired_outbound_nonce_does_not_send_or_record(monkeypatch):
     monkeypatch.setattr(web_app, "OUTBOUND_NONCE_TTL_SECONDS", -1)
     stub = WebStubClient()
     store = WebSourceStore()
@@ -1204,7 +1228,8 @@ async def test_send_with_expired_outbound_nonce_does_not_record(monkeypatch):
                     "outbound_nonce": outbound.json()["nonce"],
                 },
             )
-    assert r.status_code == 200
+    assert r.status_code == 409
+    assert stub.sent == []
     assert store.recorded == []
 
 

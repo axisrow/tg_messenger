@@ -7,6 +7,7 @@ when ``applies`` returns None or when variant generation fails.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -167,6 +168,7 @@ class OutboundTranslator:
         self._history_limit = int(history_limit)
         self._env = env
         self._clock = clock
+        self._dialog_lang_locks: dict[int, asyncio.Lock] = {}
 
     @property
     def storage(self):
@@ -191,6 +193,26 @@ class OutboundTranslator:
             fresh = self._fresh_stored_dialog_lang(stored)
             if fresh is not None:
                 return fresh
+        lock = self._dialog_lang_locks.setdefault(int(dialog_id), asyncio.Lock())
+        async with lock:
+            stored = await get_dialog_lang(self._storage, dialog_id)
+            if stored is not None:
+                fresh = self._fresh_stored_dialog_lang(stored)
+                if fresh is not None:
+                    return fresh
+            return await self._detect_and_store_dialog_lang(
+                dialog_id,
+                telegram_lang_code=telegram_lang_code,
+                history=history,
+            )
+
+    async def _detect_and_store_dialog_lang(
+        self,
+        dialog_id: int,
+        *,
+        telegram_lang_code: str | None,
+        history: Sequence | None,
+    ) -> str | None:
         telegram_lang = clean_supported_lang_code(telegram_lang_code)
         if telegram_lang is not None:
             await set_dialog_lang(

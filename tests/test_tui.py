@@ -1472,6 +1472,36 @@ async def test_tui_outbound_variant_state_is_scoped_to_dialog():
     assert store.recorded == [(7, "hello", "привет", "ru")]
 
 
+async def test_tui_editing_selected_variant_clears_stale_source_text():
+    stub = TwoDmClient()
+    store = TuiSourceStore()
+    outbound = RecordingOutbound(variants=["hello"])
+    app = MessengerTUI(client=stub, store=store, outbound=outbound)
+
+    async def pick_variant(screen):
+        return "hello"
+
+    app.push_screen_wait = pick_variant  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        await _select_dialog(pilot, app, 7)
+        composer.value = "привет"
+        await app.on_input_submitted(Input.Submitted(composer, "привет"))
+        await _pause_until(pilot, lambda: composer.value == "hello")
+
+        outbound.target_lang = None
+        composer.value = "hello!"
+        await app.on_input_changed(Input.Changed(composer, "hello!"))
+        await app.on_input_submitted(Input.Submitted(composer, "hello!"))
+        await _pause_until(pilot, lambda: stub.sent)
+
+    assert stub.sent == [(7, "hello!", None)]
+    assert store.recorded == []
+    assert outbound.applies_calls == [(7, "привет"), (7, "hello!")]
+
+
 async def test_tui_outbound_error_original_confirm_is_scoped_to_dialog():
     stub = TwoDmClient()
     outbound = RecordingOutbound(fail=True)

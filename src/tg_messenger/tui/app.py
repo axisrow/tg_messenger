@@ -695,6 +695,8 @@ class MessengerTUI(App):
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "composer":
+            if event.value != event.input.value:
+                return
             # the user is typing their own reply — a stale suggestion must go
             if self._pending_suggestion is not None and event.value != self._pending_suggestion:
                 self._clear_suggestion()
@@ -703,7 +705,10 @@ class MessengerTUI(App):
                 if not event.value and state.ignore_next_empty_change:
                     state.ignore_next_empty_change = False
                     return
+                previous_draft = state.draft
                 state.draft = event.value
+                if state.source_text is not None and event.value != previous_draft:
+                    state.source_text = None
                 if state.original_confirm_text is not None and event.value != state.original_confirm_text:
                     state.original_confirm_text = None
             if not event.value:

@@ -77,9 +77,10 @@ class MessageStore:
                 self._connected = True
 
     async def close(self) -> None:
-        if self._connected:
-            await self._storage.close()
-            self._connected = False
+        async with self._connect_lock:
+            if self._connected:
+                await self._storage.close()
+                self._connected = False
 
     async def history(self, peer: int, limit: int = 50) -> list[Message]:
         """Sync newer messages when stale, then serve the contiguous DB window."""
@@ -104,7 +105,9 @@ class MessageStore:
     async def ingest(self, message: Message) -> None:
         """Persist a live message without advancing the contiguous sync window."""
         await self.connect()
-        await self._upsert_message(message)
+        lock = self._sync_locks.setdefault(int(message.dialog_id), asyncio.Lock())
+        async with lock:
+            await self._upsert_message(message)
 
     async def apply_deletion(self, event: MessagesDeletedEvent) -> None:
         await self.connect()
@@ -157,8 +160,14 @@ class MessageStore:
         try:
             await consume_fn()
             return False
+        except asyncio.CancelledError:
+            logger.info("message store consumer cancelled")
+            return True
         except KeyboardInterrupt:
             logger.info("message store interrupted")
+            return True
+        except Exception:
+            logger.exception("message store consumer failed")
             return True
 
     async def record_outgoing(

@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 MODEL_CALL_TIMEOUT_SECONDS = 30.0
 
 
+async def _ainvoke_with_timeout(model, messages):
+    async with asyncio.timeout(MODEL_CALL_TIMEOUT_SECONDS):
+        return await model.ainvoke(messages)
+
+
 def build_classify_prompt(intents: Sequence[IntentSpec] = ()) -> str:
     """Промпт роутера из встроенных интентов + кастомных (имя — критерий из конфига)."""
     lines = [
@@ -98,7 +103,8 @@ def make_classifier(model, intents: Sequence[IntentSpec] = ()) -> Callable[[str]
     valid = frozenset({"chat", "task", *(spec.name for spec in intents)})
 
     async def classify(text: str) -> str:
-        response = await model.ainvoke(
+        response = await _ainvoke_with_timeout(
+            model,
             [SystemMessage(content=prompt), HumanMessage(content=text)]
         )
         intent = str(response.content).strip().lower().strip(".!\"'")
@@ -114,7 +120,7 @@ def _make_prompted_fn(model, system_prompt: str) -> Callable[[list], Awaitable[s
     """A plain ainvoke under a fixed system prompt — chat and vision differ only here."""
 
     async def call(messages: list) -> str:
-        response = await model.ainvoke([SystemMessage(content=system_prompt), *messages])
+        response = await _ainvoke_with_timeout(model, [SystemMessage(content=system_prompt), *messages])
         return str(response.content)
 
     return call
@@ -165,7 +171,8 @@ def make_suggest_fn(model) -> Callable:
 
     async def suggest(context, profile: StyleProfile | None) -> str:
         payload = _render_suggest_payload(context, profile)
-        response = await model.ainvoke(
+        response = await _ainvoke_with_timeout(
+            model,
             [SystemMessage(content=SUGGEST_SYSTEM_PROMPT), HumanMessage(content=payload)]
         )
         return str(response.content).strip()
@@ -181,7 +188,8 @@ def make_translate_fn(model) -> Callable:
             "target_lang": target_lang,
             "messages": [{"id": int(mid), "text": text} for mid, text in messages],
         }
-        response = await model.ainvoke(
+        response = await _ainvoke_with_timeout(
+            model,
             [
                 SystemMessage(content=TRANSLATE_SYSTEM_PROMPT),
                 HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
@@ -239,13 +247,13 @@ def make_outbound_variants_fn(model) -> Callable:
             "style_profile": _style_lines(profile),
             "context": [{"out": msg.out, "text": msg.text} for msg in context],
         }
-        async with asyncio.timeout(MODEL_CALL_TIMEOUT_SECONDS):
-            response = await model.ainvoke(
-                [
-                    SystemMessage(content=OUTBOUND_VARIANTS_SYSTEM_PROMPT),
-                    HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
-                ]
-            )
+        response = await _ainvoke_with_timeout(
+            model,
+            [
+                SystemMessage(content=OUTBOUND_VARIANTS_SYSTEM_PROMPT),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+            ],
+        )
         raw = _strip_json_fence(str(response.content))
         try:
             parsed = json.loads(raw)
@@ -262,13 +270,13 @@ def make_outbound_variants_fn(model) -> Callable:
 
 def make_detect_lang_fn(model) -> Callable:
     async def detect(texts: Sequence[str]) -> str | None:
-        async with asyncio.timeout(MODEL_CALL_TIMEOUT_SECONDS):
-            response = await model.ainvoke(
-                [
-                    SystemMessage(content=DETECT_LANG_SYSTEM_PROMPT),
-                    HumanMessage(content="\n".join(texts[:10])),
-                ]
-            )
+        response = await _ainvoke_with_timeout(
+            model,
+            [
+                SystemMessage(content=DETECT_LANG_SYSTEM_PROMPT),
+                HumanMessage(content="\n".join(texts[:10])),
+            ],
+        )
         code = str(response.content).strip().lower().strip(".!\"'")
         cleaned = clean_supported_lang_code(code)
         if cleaned is not None:

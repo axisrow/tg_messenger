@@ -58,6 +58,23 @@ class InterruptingStoreClient(StoreClient):
         yield
 
 
+class BlockingConnectStorage:
+    def __init__(self):
+        self.connect_started = asyncio.Event()
+        self.release_connect = asyncio.Event()
+        self.connected = False
+        self.closed = False
+
+    async def connect(self):
+        self.connect_started.set()
+        await self.release_connect.wait()
+        self.connected = True
+
+    async def close(self):
+        self.closed = True
+        self.connected = False
+
+
 async def _storage(tmp_path):
     storage = Storage(tmp_path / "messages.db")
     register_message_store_migrations(storage)
@@ -72,6 +89,38 @@ async def test_message_store_run_handles_keyboard_interrupt(tmp_path, caplog):
     finally:
         await store.close()
     assert any("message store interrupted" in rec.message for rec in caplog.records)
+
+
+async def test_message_store_close_waits_for_connect_in_progress():
+    storage = BlockingConnectStorage()
+    store = MessageStore(client=StoreClient(), storage=storage)
+
+    connect_task = asyncio.create_task(store.connect())
+    await storage.connect_started.wait()
+    close_task = asyncio.create_task(store.close())
+    await asyncio.sleep(0)
+    assert storage.closed is False
+
+    storage.release_connect.set()
+    await asyncio.gather(connect_task, close_task)
+
+    assert storage.closed is True
+    assert storage.connected is False
+
+
+async def test_consumer_cancel_returns_clean_shutdown(tmp_path):
+    store = MessageStore(client=StoreClient(), storage=await _storage(tmp_path))
+    started = asyncio.Event()
+
+    async def consume():
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(store._consume_until_done(consume))
+    await started.wait()
+    task.cancel()
+
+    assert await task is True
 
 
 async def test_message_store_first_load_then_cooldown_serves_db(tmp_path):
@@ -133,6 +182,30 @@ async def test_message_store_window_excludes_live_ingest_above_unsynced_gap(tmp_
         assert [m.id for m in await store.history(7, limit=50)] == list(range(51, 101))
     finally:
         await store.close()
+
+
+async def test_message_store_ingest_waits_for_peer_sync_lock(tmp_path):
+    storage = await _storage(tmp_path)
+    store = MessageStore(client=StoreClient(), storage=storage)
+    await store.connect()
+    lock = store._sync_locks.setdefault(7, asyncio.Lock())
+    await lock.acquire()
+    upsert_started = asyncio.Event()
+
+    async def upsert(message, **kwargs):
+        upsert_started.set()
+
+    store._upsert_message = upsert
+    task = asyncio.create_task(store.ingest(_msg(42)))
+    await asyncio.sleep(0)
+    assert upsert_started.is_set() is False
+
+    lock.release()
+    try:
+        await task
+    finally:
+        await store.close()
+    assert upsert_started.is_set() is True
 
 
 async def test_message_store_prunes_cached_window_when_no_newer_messages(tmp_path):
