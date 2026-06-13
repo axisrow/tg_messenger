@@ -39,6 +39,7 @@ from tg_messenger.core.auth import (
     delivery_hint,
     session_store_from_env,
 )
+from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.search import filter_dialogs
 
@@ -109,8 +110,12 @@ def _make_real_client(session_name: str):
 def _dialog_li(d) -> str:
     uname = f" @{escape(d.username)}" if d.username else ""
     unread = f' <span class="unread">{d.unread}</span>' if d.unread else ""
+    # data-can-send drives the composer enable/disable on the client (zero round-trip):
+    # chat.html reads li.dataset.canSend when a dialog opens
+    can_send = "1" if getattr(d, "can_send", True) else "0"
     return (
-        f'<li hx-get="/dialogs/{d.id}/messages" hx-target="#messages" data-kind="{d.kind}">'
+        f'<li hx-get="/dialogs/{d.id}/messages" hx-target="#messages" '
+        f'data-kind="{d.kind}" data-can-send="{can_send}">'
         f"{d.id} — {escape(d.title)}{uname}{unread}</li>"
     )
 
@@ -662,6 +667,12 @@ def build_app(
         logger.warning("%s: flood wait %ss", exc.operation, exc.wait_seconds)
         return _error_response(exc.user_message, 503)
 
+    @app.exception_handler(SendForbiddenError)
+    async def send_forbidden(request: Request, exc: SendForbiddenError):
+        # TOCTOU net: the can_send flag (cached) said OK but Telegram rejected on rights.
+        logger.warning("send rejected (rights): %s %s", request.url.path, exc)
+        return _error_response(READ_ONLY_MESSAGE, 403)
+
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception):
         logger.error(
@@ -721,6 +732,8 @@ def build_app(
         dialog_id_int = int(dialog_id)
         reply_to_id = int(reply_to) if reply_to.strip().lstrip("-").isdigit() else None
         client = request.app.state.client
+        if (readonly := await _readonly_error(client, dialog_id_int)) is not None:
+            return readonly
         coordinator = request.app.state.outbound_coordinator
 
         async def _send_fn(peer, body):
@@ -757,7 +770,12 @@ def build_app(
         if not emoticon:
             return _error_response("Reaction cannot be empty.", 400)
         msg_id = int(message_id)
-        await request.app.state.client.send_reaction(dialog_id, msg_id, emoticon)
+        client = request.app.state.client
+        # NB: this gate reuses the posting permission (can_send) — reactions are really a
+        # separate capability; the reaction-vs-post split is tracked in #86.
+        if (readonly := await _readonly_error(client, dialog_id)) is not None:
+            return readonly
+        await client.send_reaction(dialog_id, msg_id, emoticon)
         sent_reactions = _sent_bucket(request.app.state.sent_reactions_by_client, web_client_id)
         _remember_sent_reaction(sent_reactions, dialog_id, msg_id, emoticon)
         return HTMLResponse(_reaction_div(msg_id, emoticon))
@@ -770,6 +788,10 @@ def build_app(
         caption: str | None = Form(None),
         web_client_id: str = Form(""),
     ):
+        client = request.app.state.client
+        # refuse a read-only chat BEFORE streaming the upload to disk
+        if (readonly := await _readonly_error(client, dialog_id)) is not None:
+            return readonly
         max_mb = _max_upload_mb()
         max_bytes = max_mb * 1024 * 1024
         suffix = Path(file.filename or "").suffix
@@ -791,7 +813,7 @@ def build_app(
             if size == 0:
                 logger.warning("media upload for dialog %s rejected: empty file", dialog_id)
                 return _error_response("Empty file.", 400)
-            msg = await request.app.state.client.send_media(dialog_id, tmp_path, caption=caption)
+            msg = await client.send_media(dialog_id, tmp_path, caption=caption)
         finally:
             try:
                 os.unlink(tmp_path)
@@ -998,6 +1020,21 @@ async def _outbound_dialog(client, dialog_id: int):
     for dialog in dialogs:
         if dialog.id == dialog_id:
             return dialog
+    return None
+
+
+async def _readonly_error(client, dialog_id: int) -> HTMLResponse | None:
+    """Pre-flight read-only guard: a clean 403 fragment when the dialog can't be
+    posted to, else None. Reads the (cached) dialog list — no extra network call when
+    warm; an unknown dialog or a lookup failure stays permissive (the core
+    SendForbiddenError handler is the authoritative net, also covering a stale cache).
+    """
+    try:
+        dialog = await _outbound_dialog(client, dialog_id)
+    except DialogLookupError:
+        return None
+    if dialog is not None and not getattr(dialog, "can_send", True):
+        return _error_response(READ_ONLY_MESSAGE, 403)
     return None
 
 

@@ -83,23 +83,56 @@ class FakeUser:
         self.lang_code = lang_code
 
 
-class FakeChannel:
-    """Telethon Channel: supergroup (broadcast=False) or broadcast channel (True)."""
+class FakeBannedRights:
+    """Telethon ChatBannedRights — True means RESTRICTED (the raw MTProto flag)."""
 
-    def __init__(self, id, title=None, username=None, broadcast=False):
+    def __init__(self, send_messages=False):
+        self.send_messages = send_messages
+
+
+class FakeAdminRights:
+    """Telethon ChatAdminRights — presence on an entity means the account is an admin."""
+
+    def __init__(self, post_messages=True):
+        self.post_messages = post_messages
+
+
+class FakeChannel:
+    """Telethon Channel: supergroup (broadcast=False) or broadcast channel (True).
+
+    creator/admin_rights/default_banned_rights/banned_rights/left default to the
+    writable shape (an ordinary subscriber of a broadcast is still read-only) — they
+    are the inputs for the can_send capability computed in _fetch_dialogs.
+    """
+
+    def __init__(self, id, title=None, username=None, broadcast=False, *,
+                 creator=False, admin_rights=None, default_banned_rights=None,
+                 banned_rights=None, left=False):
         self.id = id
         self.title = title
         self.username = username
         self.broadcast = broadcast
+        self.creator = creator
+        self.admin_rights = admin_rights
+        self.default_banned_rights = default_banned_rights
+        self.banned_rights = banned_rights
+        self.left = left
 
 
 class FakeChat:
     """Telethon Chat (small group) — carries a title and NO broadcast attribute."""
 
-    def __init__(self, id, title=None, username=None):
+    def __init__(self, id, title=None, username=None, *,
+                 creator=False, admin_rights=None, default_banned_rights=None,
+                 banned_rights=None, left=False):
         self.id = id
         self.title = title
         self.username = username
+        self.creator = creator
+        self.admin_rights = admin_rights
+        self.default_banned_rights = default_banned_rights
+        self.banned_rights = banned_rights
+        self.left = left
 
 
 class FakeDocument:
@@ -239,6 +272,10 @@ class FakeTelethonClient:
         self.iter_dialogs_calls = 0
         self.iter_messages_calls = 0
         self.last_min_id = None
+        # optional: make a send raise this (rights-error classification tests)
+        self.send_message_raises: BaseException | None = None
+        self.send_file_raises: BaseException | None = None
+        self.call_raises: BaseException | None = None  # raw __call__ (reactions)
 
     # --- connection / auth ---
     async def connect(self):
@@ -268,6 +305,8 @@ class FakeTelethonClient:
         # client uses it for SendReactionRequest etc. — record every raw call.
         self.requests.append(request)
         self.resend_requests.append(request)
+        if self.call_raises is not None:
+            raise self.call_raises
         # username RPCs: dispatch by class name (avoid importing telethon types here)
         cls = type(request).__name__
         if cls == "CheckUsernameRequest":
@@ -340,6 +379,8 @@ class FakeTelethonClient:
 
     # --- sending ---
     async def send_message(self, peer, text, reply_to=None, schedule=None):
+        if self.send_message_raises is not None:
+            raise self.send_message_raises
         msg = FakeMessage(id=999, sender_id=1, text=text, out=True, peer_id=int(peer),
                           reply_to=reply_to)
         self.sent.append({"peer": int(peer), "text": text, "reply_to": reply_to,
@@ -348,6 +389,8 @@ class FakeTelethonClient:
 
     async def send_file(self, peer, file, caption=None, voice_note=False,
                         video_note=False, force_document=False):
+        if self.send_file_raises is not None:
+            raise self.send_file_raises
         msg = FakeMessage(id=998, sender_id=1, text=caption, out=True, peer_id=int(peer))
         self.sent.append({
             "peer": int(peer), "file": str(file), "caption": caption,

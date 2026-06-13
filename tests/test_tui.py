@@ -6,6 +6,7 @@ import pytest
 from textual.containers import Vertical
 from textual.widgets import Input, ListView, Static, Tabs
 
+from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.models import Dialog, IncomingEvent, Message, OutgoingEvent, ReactionEvent
 from tg_messenger.tui.app import (
     DialogItem,
@@ -74,6 +75,7 @@ class TuiStubClient:
         self.dialogs_calls = 0
         self.save_session_calls = 0
         self.reactions = []
+        self.channel_can_send = True  # flip to False to simulate a read-only channel
 
     async def connect(self):
         self.connected = True
@@ -99,7 +101,7 @@ class TuiStubClient:
         # повторяет контракт core: dm_only=False — все диалоги с kind и marked id
         return dms + [
             Dialog(id=-100200, title="Devs", kind="group", unread=1),
-            Dialog(id=-100300, title="News", kind="channel"),
+            Dialog(id=-100300, title="News", kind="channel", can_send=self.channel_can_send),
             Dialog(id=9, title="HelperBot", kind="bot"),
         ]
 
@@ -329,6 +331,105 @@ async def test_tui_history_shows_visible_message_id():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
         assert any(str(b.render()).startswith("[1] ") for b in bubbles)
+
+
+# --- read-only chat gating (capability) ---
+
+
+async def test_tui_readonly_channel_disables_composer():
+    stub = TuiStubClient()
+    stub.channel_can_send = False
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        # the read-only channel item (-100300)
+        item = next(i for i in app.query(DialogItem) if i.dialog_id == -100300)
+        await app.on_list_view_selected(ListView.Selected(lv, item, 0))
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+        assert composer.disabled is True
+        assert composer.placeholder == "Только чтение"
+
+
+async def test_tui_writable_dialog_enables_composer():
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        item = next(i for i in app.query(DialogItem) if i.dialog_id == 7)  # a DM
+        await app.on_list_view_selected(ListView.Selected(lv, item, 0))
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+        assert composer.disabled is False
+        assert composer.placeholder == "Message…"
+
+
+async def test_tui_submit_in_readonly_channel_does_not_send():
+    stub = TuiStubClient()
+    stub.channel_can_send = False
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = -100300  # a read-only channel
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "hello"))
+        await pilot.pause()
+        assert stub.sent == []  # the guard refused before any send worker
+
+
+async def test_tui_send_forbidden_restores_draft():
+    # Regression: composer is enabled (can_send=True / stale), but Telegram rejects the
+    # write on rights at send time. on_input_submitted clears the composer optimistically
+    # BEFORE the send; the SendForbiddenError handler must restore the typed text — like
+    # the generic failure path — instead of silently dropping it.
+    stub = TuiStubClient()
+
+    async def forbidden(peer, text):
+        raise SendForbiddenError("ChatWriteForbiddenError")
+
+    stub.send_text = forbidden
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7  # a writable DM — composer is enabled
+        composer = app.query_one("#composer", Input)
+        # reproduce the optimistic clear done by on_input_submitted before the worker runs
+        composer.value = ""
+        app._compose_state_for(7).draft = ""
+        await app._send_text(7, "hello")  # the rejected send path
+        await pilot.pause()
+        assert stub.sent == []  # nothing went out
+        assert app._compose_state_for(7).draft == "hello"  # draft restored
+        assert composer.value == "hello"  # typed text back in the composer
+
+
+async def test_tui_send_media_forbidden_restores_command(tmp_path):
+    # Same regression as text, but for the @file media path: on_input_submitted clears the
+    # composer before _send_media; a rights rejection must restore the original command.
+    media = tmp_path / "photo.jpg"
+    media.write_bytes(b"x")
+    stub = TuiStubClient()
+
+    async def forbidden(peer, file_path, **kwargs):
+        raise SendForbiddenError("ChatSendMediaForbiddenError")
+
+    stub.send_media = forbidden
+    app = MessengerTUI(client=stub)
+    command = f'@"{media}" my caption'
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7  # a writable DM — composer is enabled
+        composer = app.query_one("#composer", Input)
+        # reproduce the optimistic clear done by on_input_submitted before the worker runs
+        composer.value = ""
+        app._compose_state_for(7).draft = ""
+        await app._send_media(7, str(media), "my caption", source_text=command)
+        await pilot.pause()
+        assert not hasattr(stub, "media_sent")  # nothing went out
+        assert app._compose_state_for(7).draft == command  # command restored
+        assert composer.value == command  # typed command back in the composer
 
 
 class LongHistoryClient(TuiStubClient):
@@ -606,6 +707,27 @@ async def test_tui_react_command_calls_client():
     assert stub.sent == []
     assert [str(b.render()) for b in bubbles] == ["reaction [1]: 👍"]
     assert all("out" in b.classes for b in bubbles)
+
+
+async def test_tui_react_forbidden_restores_command():
+    # Same optimistic-clear data-loss class as text/media: on_input_submitted clears the
+    # composer before the worker; a rejected /react must restore the typed command.
+    stub = TuiStubClient()
+
+    async def forbidden(peer, message_id, emoticon):
+        raise SendForbiddenError("ChatWriteForbiddenError")
+
+    stub.send_reaction = forbidden
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "/react 1 👍"))
+        await pilot.pause()
+        assert stub.reactions == []  # nothing reacted
+        assert app._compose_state_for(7).draft == "/react 1 👍"  # command restored
+        assert composer.value == "/react 1 👍"  # typed command back in the composer
 
 
 async def test_tui_bad_react_command_notifies_and_does_not_send_text():
