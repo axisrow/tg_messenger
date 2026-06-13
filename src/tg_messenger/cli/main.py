@@ -1768,18 +1768,26 @@ def username() -> None:
 @click.option("--limit", default=10, help="Max number of available usernames to return.")
 @click.option("--session", default="default")
 def username_suggest(base: str, limit: int, session: str) -> None:
-    """Suggest available usernames derived from BASE (checks candidates sequentially)."""
-    from tg_messenger.core.usernames import find_available
+    """Suggest available usernames derived from BASE (checks candidates sequentially).
+
+    Verified-free names are marked ``✓``; generated candidates past the limit that
+    were never checked (no extra network calls) are marked ``?``.
+    """
+    from tg_messenger.core.usernames import find_available_marked
 
     async def _do(client):
-        return await find_available(client, base, limit=limit)
+        return await find_available_marked(client, base, limit=limit)
 
-    found = _run(_with_client(session, _do), session=session)
-    if not found:
+    free, unchecked = _run(_with_client(session, _do), session=session)
+    if not free and not unchecked:
         click.echo("No available usernames found — try a different base.")
         return
-    for name in found:
-        click.echo(name)
+    # free names are verified available (✓); unchecked candidates are generated but
+    # their availability is unknown (?), so the user can probe them with `username set`
+    for name in free:
+        click.echo(f"{name} ✓")
+    for name in unchecked:
+        click.echo(f"{name} ?")
 
 
 @username.command("set")

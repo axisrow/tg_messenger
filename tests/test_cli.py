@@ -2044,7 +2044,33 @@ def test_username_suggest_prints_available(runner, monkeypatch):
     lines = [ln.strip() for ln in result.output.splitlines() if ln.strip()]
     assert lines, "expected at least one suggested username"
     for ln in lines:
-        assert ln not in stub.occupied
+        # every line carries an availability marker: ✓ (verified free) or ? (unchecked)
+        assert ln.endswith("✓") or ln.endswith("?"), ln
+        name = ln[:-1].strip()
+        if ln.endswith("✓"):
+            # verified-free names are genuinely not occupied
+            assert name not in stub.occupied
+
+
+def test_username_suggest_marks_unchecked_with_question(runner, monkeypatch):
+    cli, stub = runner
+    # nothing occupied → the first `limit` candidates verify free (✓), the rest of the
+    # generated pool is never checked and must be printed with the `?` marker (issue #53).
+    # The CLI uses the global rng (no seed injected here), so we assert on the marker
+    # structure, not on the concrete names.
+    stub.occupied = set()
+    result = cli.invoke(cli_main.cli, ["username", "suggest", "Ann", "--limit", "3"])
+    assert result.exit_code == 0, result.output
+    lines = [ln.strip() for ln in result.output.splitlines() if ln.strip()]
+    checked = [ln[:-1].strip() for ln in lines if ln.endswith("✓")]
+    unchecked = [ln[:-1].strip() for ln in lines if ln.endswith("?")]
+    assert len(checked) == 3, lines  # stopped at the limit
+    assert unchecked, "expected unchecked candidates past the limit to be marked ?"
+    # the ✓ block comes entirely before the ? block
+    assert lines[3].endswith("?"), lines
+    assert all(lines[i].endswith("✓") for i in range(3)), lines
+    # the two markers partition the printed names, no name appears in both
+    assert set(checked).isdisjoint(unchecked)
 
 
 def test_username_set_confirms(runner):
