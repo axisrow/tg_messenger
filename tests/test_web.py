@@ -1597,19 +1597,31 @@ class FakeLoginSession:
         self.codes = []
         self.passwords = []
         self.resends = 0
+        self.resets = 0
+        self.last_delivery = None
         self._needs_2fa = needs_2fa
         self._wrong_code = wrong_code
+
+    def reset(self):
+        # mirrors core.LoginSession.reset: only restarts from a finished flow
+        if self.state != "done":
+            return
+        self.state = "phone"
+        self.last_delivery = None
+        self.resets += 1
 
     async def submit_phone(self, phone):
         self.phones.append(phone)
         if getattr(self, "_wrong_phone", False):
             raise LoginError("Invalid phone number.")
         self.state = "code"
-        return CodeDelivery(kind="app", next_kind="sms", timeout=60)
+        self.last_delivery = CodeDelivery(kind="app", next_kind="sms", timeout=60)
+        return self.last_delivery
 
     async def resend(self):
         self.resends += 1
-        return CodeDelivery(kind="sms")
+        self.last_delivery = CodeDelivery(kind="sms")
+        return self.last_delivery
 
     async def submit_code(self, code):
         self.codes.append(code)
@@ -1741,6 +1753,69 @@ async def test_tg_login_second_phone_in_progress_shows_error_not_500():
         r = await ac.post("/tg-login/phone", data={"phone": "+19999999999"})
         assert r.status_code == 200
         assert "login already in progress" in r.text
+
+
+async def test_tg_login_wrong_code_keeps_resend_countdown():
+    # #49 follow-up: a mistyped code re-renders the code step, and the resend countdown
+    # must survive — otherwise the flood guard collapses to an immediately-active button.
+    sess = FakeLoginSession(wrong_code=True)
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})  # delivery timeout=60
+        r = await ac.post("/tg-login/code", data={"code": "00000"})
+        assert r.status_code == 200
+        assert "Wrong code" in r.text
+        # the countdown is preserved via session.last_delivery, not dropped to None
+        assert 'data-timeout="60"' in r.text
+
+
+async def test_tg_login_resend_error_keeps_resend_countdown():
+    # #49 follow-up: same guarantee on the resend error path.
+    class ResendFails(FakeLoginSession):
+        async def resend(self):
+            raise LoginError("Resend failed — try again.")
+
+    sess = ResendFails()
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})  # delivery timeout=60
+        r = await ac.post("/tg-login/resend")
+        assert r.status_code == 200
+        assert "Resend failed" in r.text
+        assert 'data-timeout="60"' in r.text
+
+
+async def test_tg_login_form_resets_after_done_allows_new_login():
+    # #49 follow-up: the process-wide LoginSession is never recreated, so without a reset
+    # path a finished flow would block every later phone POST on the in-progress guard.
+    # GET /tg-login resets a "done" flow so a fresh login can start.
+    sess = FakeLoginSession()
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        await ac.post("/tg-login/code", data={"code": "12345"})  # → state done
+        assert sess.state == "done"
+        r = await ac.get("/tg-login")  # reset back to phone
+        assert r.status_code == 200
+        assert sess.state == "phone"
+        assert sess.resets == 1
+        # a new phone POST is accepted, not blocked as "in progress"
+        r2 = await ac.post("/tg-login/phone", data={"phone": "+19999999999"})
+        assert r2.status_code == 200
+        assert sess.phones == ["+10000000000", "+19999999999"]
+
+
+async def test_tg_login_form_does_not_reset_in_progress_flow():
+    # #49 follow-up: a GET while mid-login (state "code") must NOT wipe the live flow —
+    # reset only fires from "done". Otherwise reloading the form loses the phone_code_hash.
+    sess = FakeLoginSession()
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})  # → state code
+        assert sess.state == "code"
+        await ac.get("/tg-login")
+        assert sess.state == "code"  # untouched
+        assert sess.resets == 0
 
 
 async def test_tg_login_success_saves_session():

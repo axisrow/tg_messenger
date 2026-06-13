@@ -271,6 +271,69 @@ async def test_login_session_second_submit_phone_in_progress_is_login_error():
     assert inner.code_requests == ["+10000000000"]
 
 
+async def test_login_session_concurrent_submit_phone_serialized():
+    # #49 follow-up (TOCTOU): two phone POSTs interleaving at the send_code await must not
+    # both pass the guard. The slot is claimed (state→"code") BEFORE the await, so the
+    # second coroutine is rejected and send_code is issued exactly once (one phone_code_hash).
+    import asyncio
+
+    gate = asyncio.Event()
+
+    class _SlowInner(_FakeInnerLogin):
+        async def send_code_request(self, phone):
+            # park the first call inside the await so the second coroutine runs the guard
+            # while state has (without the fix) not yet advanced
+            await gate.wait()
+            return await super().send_code_request(phone)
+
+    inner = _SlowInner()
+    sess = auth.LoginSession(inner)
+
+    async def first():
+        return await sess.submit_phone("+10000000000")
+
+    async def second():
+        # let `first` reach the await and park, then attempt the racing submit
+        await asyncio.sleep(0)
+        try:
+            return await sess.submit_phone("+19999999999")
+        finally:
+            gate.set()  # release `first` regardless of outcome
+
+    results = await asyncio.gather(first(), second(), return_exceptions=True)
+    # exactly one succeeded; the racing one was rejected as a LoginError
+    errors = [r for r in results if isinstance(r, auth.LoginError)]
+    assert len(errors) == 1
+    # send_code reached Telegram exactly once → no clobbered hash
+    assert inner.code_requests == ["+10000000000"]
+    assert sess.state == "code"
+
+
+async def test_login_session_reset_from_done_restarts():
+    # #49 follow-up: a finished flow can be restarted (process-wide session is reused).
+    inner = _FakeInnerLogin()
+    sess = auth.LoginSession(inner)
+    await sess.submit_phone("+10000000000")
+    await sess.submit_code("12345")
+    assert sess.state == "done"
+    sess.reset()
+    assert sess.state == "phone"
+    assert sess.last_delivery is None
+    # a fresh phone submit works again after reset
+    await sess.submit_phone("+19999999999")
+    assert sess.state == "code"
+
+
+async def test_login_session_reset_is_noop_mid_flow():
+    # #49 follow-up: reset must NOT wipe a live (in-progress) flow — only a "done" one.
+    inner = _FakeInnerLogin()
+    sess = auth.LoginSession(inner)
+    await sess.submit_phone("+10000000000")  # → state "code"
+    assert sess.state == "code"
+    sess.reset()
+    assert sess.state == "code"  # untouched; the live phone_code_hash survives
+
+
 # --- цикл 135: телефон и код НЕ попадают в лог-файл ---
 
 

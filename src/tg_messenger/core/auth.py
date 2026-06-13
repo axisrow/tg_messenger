@@ -284,10 +284,28 @@ class LoginSession:
         else:
             self._flow = LoginFlow(client_or_flow)
         self._state = "phone"
+        # the delivery of the most recent send/resend, so the web can re-render the code
+        # step (with its resend countdown) after a user-correctable error without dropping
+        # the timeout to None — see _tg_login_code_fragment.
+        self.last_delivery: CodeDelivery | None = None
 
     @property
     def state(self) -> str:
         return self._state
+
+    def reset(self) -> None:
+        """Restart the wizard from a terminal/abandoned flow.
+
+        Only resets once the flow has finished (``done``); an in-progress flow is
+        left untouched so reloading the form mid-login can't wipe a live
+        ``phone_code_hash``. Rebuilds the underlying :class:`LoginFlow` so a stale
+        hash from the previous login never leaks into the next one.
+        """
+        if self._state != "done":
+            return
+        self._flow = LoginFlow(self._flow._client)
+        self._state = "phone"
+        self.last_delivery = None
 
     async def submit_phone(self, phone: str) -> CodeDelivery:
         from telethon.errors import (
@@ -301,21 +319,35 @@ class LoginSession:
         # renders it in the form) without touching state — the first flow stays intact.
         if self._state != "phone":
             raise LoginError("login already in progress — finish it or reload to restart")
+        # Claim the slot BEFORE the await: send_code yields to the event loop, so two
+        # concurrent phone POSTs could otherwise both pass the guard above and both call
+        # send_code, clobbering the phone_code_hash. Roll back to "phone" on a user-
+        # correctable error so the step can still be retried.
+        self._state = "code"
         try:
             delivery = await self._flow.send_code(phone)
         except PhoneNumberInvalidError as exc:
+            self._state = "phone"
             raise LoginError("Invalid phone number — use the international format (+...).") from exc
         except PhoneNumberBannedError as exc:
+            self._state = "phone"
             raise LoginError("This phone number is banned by Telegram.") from exc
         except PhoneNumberFloodError as exc:
+            self._state = "phone"
             raise LoginError("Too many attempts for this number — try again later.") from exc
-        self._state = "code"
+        except BaseException:
+            # any other failure (incl. cancellation) must not leave a half-claimed slot
+            self._state = "phone"
+            raise
+        self.last_delivery = delivery
         return delivery
 
     async def resend(self) -> CodeDelivery:
         if self._state not in ("code", "password"):
             raise RuntimeError("submit_phone must be called before resend")
-        return await self._flow.resend_code()
+        delivery = await self._flow.resend_code()
+        self.last_delivery = delivery
+        return delivery
 
     async def submit_code(self, code: str) -> None:
         from telethon.errors import (

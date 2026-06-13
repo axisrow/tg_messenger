@@ -601,6 +601,11 @@ def build_app(
 
     @app.get("/tg-login", response_class=HTMLResponse)
     async def tg_login_form(request: Request):
+        # #49: the LoginSession lives process-wide and is never recreated. Without this,
+        # once a flow reaches "done" every later phone POST hits the in-progress guard and
+        # the wizard is unrecoverable until restart. reset() only fires from "done", so a
+        # live mid-login flow (loaded in another tab) is left untouched.
+        request.app.state.login_session.reset()
         return TEMPLATES.TemplateResponse(request, "tg_login.html", {})
 
     @app.post("/tg-login/phone", response_class=HTMLResponse)
@@ -620,7 +625,9 @@ def build_app(
         try:
             delivery = await session.resend()
         except LoginError as exc:
-            return HTMLResponse(_tg_login_code_fragment(error=str(exc)))
+            # keep the resend countdown on error re-render — passing the last delivery
+            # back means the flood guard isn't dropped to an immediately-active button.
+            return HTMLResponse(_tg_login_code_fragment(session.last_delivery, error=str(exc)))
         return HTMLResponse(_tg_login_code_fragment(delivery))
 
     @app.post("/tg-login/code", response_class=HTMLResponse)
@@ -629,8 +636,10 @@ def build_app(
         try:
             await session.submit_code(code.strip())
         except LoginError as exc:
-            # wrong/expired code: re-render the code step with the message (not a 500)
-            return HTMLResponse(_tg_login_code_fragment(error=str(exc)))
+            # wrong/expired code: re-render the code step with the message (not a 500),
+            # preserving the resend countdown (last_delivery) so a mistyped code doesn't
+            # reset the resend button to immediately-active — see #49 flood guard.
+            return HTMLResponse(_tg_login_code_fragment(session.last_delivery, error=str(exc)))
         if session.state == "password":
             return HTMLResponse(_tg_login_password_fragment())
         _save_after_login(request)
