@@ -420,6 +420,30 @@ def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
     """HTMX fragment: the code-entry step of the /tg-login wizard."""
     hint = escape(delivery_hint(delivery)) if delivery is not None else ""
     err = f'<div class="error">{escape(error)}</div>' if error else ""
+    # #49: if Telegram told us when a resend is allowed, disable the button and count
+    # down — spamming resend is a flood risk on the number. No timeout → active as before.
+    timeout = getattr(delivery, "timeout", None) if delivery is not None else None
+    if timeout and timeout > 0:
+        resend_form = (
+            '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
+            f'<button type="submit" id="resend-btn" data-timeout="{int(timeout)}" disabled>'
+            f"Отправить код повторно ({int(timeout)})</button>"
+            "</form>"
+            "<script>(function(){"
+            "var b=document.getElementById('resend-btn');"
+            "if(!b)return;var n=parseInt(b.dataset.timeout,10)||0;"
+            "var t=setInterval(function(){n-=1;"
+            "if(n<=0){clearInterval(t);b.disabled=false;"
+            "b.textContent='Отправить код повторно';}"
+            "else{b.textContent='Отправить код повторно ('+n+')';}},1000);"
+            "})();</script>"
+        )
+    else:
+        resend_form = (
+            '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
+            '<button type="submit">Отправить код повторно</button>'
+            "</form>"
+        )
     return (
         '<div id="card">'
         "<h1>Введите код</h1>"
@@ -431,9 +455,7 @@ def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
         'autocomplete="one-time-code">'
         '<button type="submit">Войти</button>'
         "</form>"
-        '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
-        '<button type="submit">Отправить код повторно</button>'
-        "</form>"
+        f"{resend_form}"
         "</div>"
     )
 

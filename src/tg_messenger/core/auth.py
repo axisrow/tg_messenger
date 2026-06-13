@@ -296,6 +296,11 @@ class LoginSession:
             PhoneNumberInvalidError,
         )
 
+        # #49: a second tab re-posting the phone would silently restart the flow and lose
+        # the in-flight phone_code_hash. Reject it as a user-facing LoginError (the web
+        # renders it in the form) without touching state — the first flow stays intact.
+        if self._state != "phone":
+            raise LoginError("login already in progress — finish it or reload to restart")
         try:
             delivery = await self._flow.send_code(phone)
         except PhoneNumberInvalidError as exc:

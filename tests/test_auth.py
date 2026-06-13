@@ -255,6 +255,22 @@ async def test_login_session_password_before_code_raises():
         await sess.submit_password("hunter2")
 
 
+# --- #49: a second submit_phone while a flow is in progress is rejected ---
+
+
+async def test_login_session_second_submit_phone_in_progress_is_login_error():
+    # a parallel tab posting the phone again must NOT restart the flow (lose the hash)
+    inner = _FakeInnerLogin()
+    sess = auth.LoginSession(inner)
+    await sess.submit_phone("+10000000000")  # → state "code"
+    assert sess.state == "code"
+    with pytest.raises(auth.LoginError):
+        await sess.submit_phone("+19999999999")
+    # state preserved; the original code step is intact, send_code not called again
+    assert sess.state == "code"
+    assert inner.code_requests == ["+10000000000"]
+
+
 # --- цикл 135: телефон и код НЕ попадают в лог-файл ---
 
 

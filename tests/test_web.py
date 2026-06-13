@@ -1714,6 +1714,35 @@ async def test_tg_login_bad_phone_shows_error_not_500():
         assert sess.state == "phone"  # can retry the phone step
 
 
+async def test_tg_login_code_fragment_carries_resend_timeout():
+    # #49: CodeDelivery.timeout is surfaced so the resend button can count down
+    sess = FakeLoginSession()
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        r = await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        assert r.status_code == 200
+        # the delivery carries timeout=60 → the fragment exposes it for the countdown
+        assert 'data-timeout="60"' in r.text
+
+
+async def test_tg_login_second_phone_in_progress_shows_error_not_500():
+    # #49: a second tab posting the phone while a flow is in progress is rejected with a
+    # rendered error (LoginError), not a 500 and not a silent flow restart.
+    class InProgressSession(FakeLoginSession):
+        async def submit_phone(self, phone):
+            if self.state != "phone":
+                raise LoginError("login already in progress")
+            return await super().submit_phone(phone)
+
+    sess = InProgressSession()
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})  # → state code
+        r = await ac.post("/tg-login/phone", data={"phone": "+19999999999"})
+        assert r.status_code == 200
+        assert "login already in progress" in r.text
+
+
 async def test_tg_login_success_saves_session():
     saved = []
     sess = FakeLoginSession()
