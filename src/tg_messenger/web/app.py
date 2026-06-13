@@ -350,11 +350,39 @@ async def sse_event_stream(
         asyncio.create_task(it.__anext__()): kind
         for kind, it in iterators.items()
     }
+    # #69: translation runs as a SEPARATE task racing alongside the stream iterators —
+    # never awaited inline — so a slow LLM translation can't delay subsequent live frames.
+    # These tasks are tagged "translation"; they yield a frame when done and are NOT re-armed.
+
+    async def _translate(message):
+        # bounded so a hung translator can't leak a task or stall cleanup forever
+        return await asyncio.wait_for(
+            translator.translate_message(message), timeout=OUTBOUND_TIMEOUT_SECONDS
+        )
+
     try:
         while pending:
             done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 kind = pending.pop(task)
+                if kind == "translation":
+                    # a translation finished: emit its frame; do NOT re-queue
+                    try:
+                        translated = task.result()
+                    except Exception:
+                        logger.warning(
+                            "SSE translation failed for dialog %s — dropped", dialog_id,
+                            exc_info=True,
+                        )
+                        continue
+                    if translated.translated_text:
+                        payload = {
+                            "type": "translation",
+                            "message_id": translated.id,
+                            "text": translated.translated_text,
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    continue
                 try:
                     ev = task.result()
                 except StopAsyncIteration:
@@ -384,18 +412,8 @@ async def sse_event_stream(
                 payload = {"id": ev.message.id, "text": ev.message.text, "out": out}
                 yield f"data: {json.dumps(payload)}\n\n"
                 if translator is not None:
-                    try:
-                        translated = await translator.translate_message(ev.message)
-                    except Exception:
-                        logger.exception("SSE translation failed for dialog %s", dialog_id)
-                        continue
-                    if translated.translated_text:
-                        payload = {
-                            "type": "translation",
-                            "message_id": translated.id,
-                            "text": translated.translated_text,
-                        }
-                        yield f"data: {json.dumps(payload)}\n\n"
+                    # schedule translation as a racing task — keeps live frames flowing
+                    pending[asyncio.create_task(_translate(ev.message))] = "translation"
     finally:
         for task in pending:
             task.cancel()
