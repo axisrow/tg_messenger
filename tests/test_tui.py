@@ -1445,6 +1445,22 @@ async def test_tui_composer_drafts_are_scoped_to_dialog():
         assert composer.value == "draft B"
 
 
+async def test_tui_ignores_stale_composer_changed_event():
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        await _select_dialog(pilot, app, 7)
+        composer.value = "current"
+        state = app._compose_state_for(7)
+        state.draft = "current"
+
+        await app.on_input_changed(Input.Changed(composer, "stale"))
+
+    assert state.draft == "current"
+
+
 async def test_tui_outbound_variant_state_is_scoped_to_dialog():
     stub = TwoDmClient()
     store = TuiSourceStore()

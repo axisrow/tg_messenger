@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Literal
 
@@ -27,6 +28,7 @@ AUTO_DIALOG_LANG_TTL_SECONDS = 86400.0
 NON_LATIN_SCRIPT_LANGS = {"ar", "el", "he", "ja", "ko", "ru", "th", "zh"}
 CYRILLIC_SCRIPT_LANGS = {"be", "bg", "kk", "ky", "mk", "mn", "ru", "sr", "tg", "uk", "uz"}
 HAN_SCRIPT_LANGS = {"ja", "ko", "lzh", "yue", "zh"}
+DIALOG_LANG_LOCKS_MAX = 1000
 
 
 class DialogLang(BaseModel):
@@ -168,7 +170,7 @@ class OutboundTranslator:
         self._history_limit = int(history_limit)
         self._env = env
         self._clock = clock
-        self._dialog_lang_locks: dict[int, asyncio.Lock] = {}
+        self._dialog_lang_locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
 
     @property
     def storage(self):
@@ -193,7 +195,7 @@ class OutboundTranslator:
             fresh = self._fresh_stored_dialog_lang(stored)
             if fresh is not None:
                 return fresh
-        lock = self._dialog_lang_locks.setdefault(int(dialog_id), asyncio.Lock())
+        lock = self._dialog_lang_lock(dialog_id)
         async with lock:
             stored = await get_dialog_lang(self._storage, dialog_id)
             if stored is not None:
@@ -205,6 +207,24 @@ class OutboundTranslator:
                 telegram_lang_code=telegram_lang_code,
                 history=history,
             )
+
+    def _dialog_lang_lock(self, dialog_id: int) -> asyncio.Lock:
+        dialog_id = int(dialog_id)
+        lock = self._dialog_lang_locks.get(dialog_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._dialog_lang_locks[dialog_id] = lock
+        self._dialog_lang_locks.move_to_end(dialog_id)
+        checked = 0
+        while len(self._dialog_lang_locks) > DIALOG_LANG_LOCKS_MAX and checked < len(self._dialog_lang_locks):
+            old_id, old_lock = next(iter(self._dialog_lang_locks.items()))
+            if old_lock.locked():
+                self._dialog_lang_locks.move_to_end(old_id)
+                checked += 1
+                continue
+            self._dialog_lang_locks.popitem(last=False)
+            checked = 0
+        return lock
 
     async def _detect_and_store_dialog_lang(
         self,
@@ -237,7 +257,7 @@ class OutboundTranslator:
             except Exception:
                 logger.exception("dialog language detection failed for %s", dialog_id)
                 return None
-        if lang is None and self._detect_lang_fn is not None:
+        elif lang is None and self._detect_lang_fn is not None:
             try:
                 lang = await self._detect_lang_fn(incoming[:10])
             except Exception:

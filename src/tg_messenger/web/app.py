@@ -808,17 +808,23 @@ def build_app(
         outbound = request.app.state.outbound
         if outbound is None:
             return JSONResponse({"applies": False, "status": "disabled"})
-        try:
-            telegram_lang_code = await _dialog_telegram_lang_hint(
-                request.app.state.client,
-                dialog_id,
+        dialog = await _outbound_dialog(request.app.state.client, dialog_id)
+        if dialog is None:
+            return JSONResponse(
+                {
+                    "applies": False,
+                    "status": "error",
+                    "error": "Dialog is not available.",
+                },
+                status_code=403,
             )
+        try:
             target_lang, variants = await asyncio.wait_for(
                 _build_outbound_variants(
                     outbound,
                     dialog_id,
                     text,
-                    telegram_lang_code=telegram_lang_code,
+                    telegram_lang_code=getattr(dialog, "telegram_lang_code", None),
                 ),
                 timeout=OUTBOUND_TIMEOUT_SECONDS,
             )
@@ -872,6 +878,8 @@ def build_app(
         outbound = request.app.state.outbound
         if outbound is None:
             return _error_response("Outbound translation is not configured.", 503)
+        if await _outbound_dialog(request.app.state.client, dialog_id) is None:
+            return _error_response("Dialog is not available.", 403)
         from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
 
         try:
@@ -928,15 +936,15 @@ def build_app(
     return app
 
 
-async def _dialog_telegram_lang_hint(client, dialog_id: int) -> str | None:
+async def _outbound_dialog(client, dialog_id: int):
     try:
         dialogs = await client.dialogs(dm_only=False)
     except Exception:
-        logger.warning("failed to read dialogs for telegram language hint", exc_info=True)
+        logger.warning("failed to verify outbound dialog access", exc_info=True)
         return None
     for dialog in dialogs:
         if dialog.id == dialog_id:
-            return getattr(dialog, "telegram_lang_code", None)
+            return dialog
     return None
 
 

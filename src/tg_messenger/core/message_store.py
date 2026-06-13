@@ -180,13 +180,16 @@ class MessageStore:
     ) -> None:
         """Persist an outgoing translated send with its original user-language draft."""
         await self.connect()
-        msg = message.model_copy(update={"dialog_id": int(dialog_id)})
-        await self._upsert_message(
-            msg,
-            translated_text=source_text,
-            translated_lang=source_lang,
-            preserve_translation=False,
-        )
+        peer = int(dialog_id)
+        msg = message.model_copy(update={"dialog_id": peer})
+        lock = self._sync_locks.setdefault(peer, asyncio.Lock())
+        async with lock:
+            await self._upsert_message(
+                msg,
+                translated_text=source_text,
+                translated_lang=source_lang,
+                preserve_translation=False,
+            )
 
     async def _consume_incoming(self) -> None:
         async for ev in self._client.listen_all():

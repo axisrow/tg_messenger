@@ -208,6 +208,37 @@ async def test_message_store_ingest_waits_for_peer_sync_lock(tmp_path):
     assert upsert_started.is_set() is True
 
 
+async def test_record_outgoing_waits_for_peer_sync_lock(tmp_path):
+    storage = await _storage(tmp_path)
+    store = MessageStore(client=StoreClient(), storage=storage)
+    await store.connect()
+    lock = store._sync_locks.setdefault(7, asyncio.Lock())
+    await lock.acquire()
+    upsert_started = asyncio.Event()
+
+    async def upsert(message, **kwargs):
+        upsert_started.set()
+
+    store._upsert_message = upsert
+    task = asyncio.create_task(
+        store.record_outgoing(
+            7,
+            _msg(42, out=True),
+            source_text="привет",
+            source_lang="ru",
+        )
+    )
+    await asyncio.sleep(0)
+    assert upsert_started.is_set() is False
+
+    lock.release()
+    try:
+        await task
+    finally:
+        await store.close()
+    assert upsert_started.is_set() is True
+
+
 async def test_message_store_prunes_cached_window_when_no_newer_messages(tmp_path):
     t = {"now": 0.0}
     client = StoreClient()

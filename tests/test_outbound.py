@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from tg_messenger.agent.outbound import (
+    DIALOG_LANG_LOCKS_MAX,
     OutboundTranslator,
     detect_script_lang,
     get_dialog_lang,
@@ -126,6 +127,27 @@ async def test_dialog_lang_uses_detector_for_han_before_caching(tmp_path):
     try:
         assert await outbound.dialog_lang(7) == "ja"
         assert await outbound.dialog_lang(7) == "ja"
+    finally:
+        await storage.close()
+    assert calls == [["東京大学"]]
+
+
+async def test_dialog_lang_han_detector_none_runs_once(tmp_path):
+    storage = await _storage(tmp_path)
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return None
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "東京大学")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        assert await outbound.dialog_lang(7) is None
     finally:
         await storage.close()
     assert calls == [["東京大学"]]
@@ -290,6 +312,23 @@ async def test_dialog_lang_concurrent_auto_detection_is_single_flight(tmp_path):
         await storage.close()
     assert stored.lang == "en"
     assert calls == [["hello"]]
+
+
+async def test_dialog_lang_locks_are_lru_bounded(tmp_path):
+    storage = await _storage(tmp_path)
+    outbound = OutboundTranslator(
+        store=HistoryStore([]),
+        storage=storage,
+        variants_fn=None,
+    )
+    try:
+        for dialog_id in range(DIALOG_LANG_LOCKS_MAX + 5):
+            assert await outbound.dialog_lang(dialog_id) is None
+    finally:
+        await storage.close()
+    assert len(outbound._dialog_lang_locks) == DIALOG_LANG_LOCKS_MAX
+    assert 0 not in outbound._dialog_lang_locks
+    assert (DIALOG_LANG_LOCKS_MAX + 4) in outbound._dialog_lang_locks
 
 
 async def test_dialog_lang_ignores_unsupported_telegram_hint_and_detector_code(tmp_path, caplog):

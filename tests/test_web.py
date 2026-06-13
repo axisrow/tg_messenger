@@ -1038,6 +1038,23 @@ async def test_outbound_endpoint_passes_dialog_telegram_lang_hint():
     assert outbound.applies_calls == [(7, "привет", "en")]
 
 
+async def test_outbound_endpoint_rejects_unknown_dialog_before_llm():
+    stub = WebStubClient()
+    outbound = WebOutboundRecordingHint()
+    app = build_app(client=stub, outbound=outbound)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/999/outbound",
+                data={"text": "привет", "web_client_id": "browser-a"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 403
+    assert r.json()["status"] == "error"
+    assert outbound.applies_calls == []
+
+
 class WebOutboundStub:
     async def applies(self, dialog_id, text, *, telegram_lang_code=None):
         return "en"
@@ -1265,6 +1282,22 @@ async def test_outbound_lang_saves_code_and_enabled_flag():
     assert stored.lang == "en"
     assert stored.source == "manual"
     assert await is_outbound_enabled(outbound.storage, 7) is False
+
+
+async def test_outbound_lang_rejects_unknown_dialog_without_write():
+    stub = WebStubClient()
+    outbound = WebOutboundWithRecordingStorage()
+    app = build_app(client=stub, outbound=outbound)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/999/lang",
+                data={"code": "en", "enabled": "off"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 403
+    assert outbound.storage.values == {}
 
 
 async def test_outbound_lang_requires_csrf_header():

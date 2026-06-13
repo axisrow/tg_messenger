@@ -695,6 +695,8 @@ class MessengerTUI(App):
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "composer":
+            # Textual captures Changed.value when posting; by handler time a
+            # newer programmatic composer value may already be present.
             if event.value != event.input.value:
                 return
             # the user is typing their own reply — a stale suggestion must go
