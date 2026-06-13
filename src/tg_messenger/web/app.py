@@ -48,6 +48,11 @@ SUGGEST_CSRF_HEADER = "x-tg-messenger-csrf"
 OUTBOUND_NONCE_TTL_SECONDS = 5 * 60
 OUTBOUND_NONCE_MAX = 200
 OUTBOUND_TIMEOUT_SECONDS = 20
+# #69: cap concurrent best-effort live translations per SSE connection. Translation runs
+# off the live-event race (non-blocking), so a foreign-language burst in the active dialog
+# could otherwise spawn an unbounded number of concurrent LLM calls. Once this many are in
+# flight, excess live translations are skipped (the raw frame is still delivered).
+MAX_INFLIGHT_TRANSLATIONS = 4
 
 # --- web authorization (#24) -------------------------------------------------
 COOKIE_NAME = "tg_session"
@@ -412,8 +417,20 @@ async def sse_event_stream(
                 payload = {"id": ev.message.id, "text": ev.message.text, "out": out}
                 yield f"data: {json.dumps(payload)}\n\n"
                 if translator is not None:
-                    # schedule translation as a racing task — keeps live frames flowing
-                    pending[asyncio.create_task(_translate(ev.message))] = "translation"
+                    # schedule translation as a racing task — keeps live frames flowing.
+                    # Cap creation (not a semaphore): a semaphore would still let `pending`
+                    # grow unbounded with queued tasks; skipping excess bounds both the LLM
+                    # fan-out and the pending dict. Translation is best-effort, so dropping
+                    # the over-budget one only costs that message its translation.
+                    inflight = sum(1 for k in pending.values() if k == "translation")
+                    if inflight < MAX_INFLIGHT_TRANSLATIONS:
+                        pending[asyncio.create_task(_translate(ev.message))] = "translation"
+                    else:
+                        logger.warning(
+                            "SSE translation backlog for dialog %s (>=%d in flight) — "
+                            "skipping translation for message %s",
+                            dialog_id, MAX_INFLIGHT_TRANSLATIONS, ev.message.id,
+                        )
     finally:
         for task in pending:
             task.cancel()
