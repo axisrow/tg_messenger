@@ -48,6 +48,11 @@ SUGGEST_CSRF_HEADER = "x-tg-messenger-csrf"
 OUTBOUND_NONCE_TTL_SECONDS = 5 * 60
 OUTBOUND_NONCE_MAX = 200
 OUTBOUND_TIMEOUT_SECONDS = 20
+# #69: cap concurrent best-effort live translations per SSE connection. Translation runs
+# off the live-event race (non-blocking), so a foreign-language burst in the active dialog
+# could otherwise spawn an unbounded number of concurrent LLM calls. Once this many are in
+# flight, excess live translations are skipped (the raw frame is still delivered).
+MAX_INFLIGHT_TRANSLATIONS = 4
 
 # --- web authorization (#24) -------------------------------------------------
 COOKIE_NAME = "tg_session"
@@ -350,11 +355,39 @@ async def sse_event_stream(
         asyncio.create_task(it.__anext__()): kind
         for kind, it in iterators.items()
     }
+    # #69: translation runs as a SEPARATE task racing alongside the stream iterators —
+    # never awaited inline — so a slow LLM translation can't delay subsequent live frames.
+    # These tasks are tagged "translation"; they yield a frame when done and are NOT re-armed.
+
+    async def _translate(message):
+        # bounded so a hung translator can't leak a task or stall cleanup forever
+        return await asyncio.wait_for(
+            translator.translate_message(message), timeout=OUTBOUND_TIMEOUT_SECONDS
+        )
+
     try:
         while pending:
             done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 kind = pending.pop(task)
+                if kind == "translation":
+                    # a translation finished: emit its frame; do NOT re-queue
+                    try:
+                        translated = task.result()
+                    except Exception:
+                        logger.warning(
+                            "SSE translation failed for dialog %s — dropped", dialog_id,
+                            exc_info=True,
+                        )
+                        continue
+                    if translated.translated_text:
+                        payload = {
+                            "type": "translation",
+                            "message_id": translated.id,
+                            "text": translated.translated_text,
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    continue
                 try:
                     ev = task.result()
                 except StopAsyncIteration:
@@ -384,18 +417,20 @@ async def sse_event_stream(
                 payload = {"id": ev.message.id, "text": ev.message.text, "out": out}
                 yield f"data: {json.dumps(payload)}\n\n"
                 if translator is not None:
-                    try:
-                        translated = await translator.translate_message(ev.message)
-                    except Exception:
-                        logger.exception("SSE translation failed for dialog %s", dialog_id)
-                        continue
-                    if translated.translated_text:
-                        payload = {
-                            "type": "translation",
-                            "message_id": translated.id,
-                            "text": translated.translated_text,
-                        }
-                        yield f"data: {json.dumps(payload)}\n\n"
+                    # schedule translation as a racing task — keeps live frames flowing.
+                    # Cap creation (not a semaphore): a semaphore would still let `pending`
+                    # grow unbounded with queued tasks; skipping excess bounds both the LLM
+                    # fan-out and the pending dict. Translation is best-effort, so dropping
+                    # the over-budget one only costs that message its translation.
+                    inflight = sum(1 for k in pending.values() if k == "translation")
+                    if inflight < MAX_INFLIGHT_TRANSLATIONS:
+                        pending[asyncio.create_task(_translate(ev.message))] = "translation"
+                    else:
+                        logger.warning(
+                            "SSE translation backlog for dialog %s (>=%d in flight) — "
+                            "skipping translation for message %s",
+                            dialog_id, MAX_INFLIGHT_TRANSLATIONS, ev.message.id,
+                        )
     finally:
         for task in pending:
             task.cancel()

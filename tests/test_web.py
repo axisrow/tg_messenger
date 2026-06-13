@@ -797,6 +797,129 @@ async def test_stream_yields_reaction_frame():
     await gen.aclose()
 
 
+async def test_stream_translation_does_not_block_subsequent_frames():
+    # #69 regression: a slow translation must NOT delay later live frames. The first
+    # translate blocks on an Event; a second message's raw frame must arrive before the
+    # first translation resolves.
+    import asyncio
+    import json
+
+    from tg_messenger.web.app import sse_event_stream
+
+    gate = asyncio.Event()
+
+    class BlockingTranslator:
+        def __init__(self):
+            self.calls = 0
+
+        async def translate_message(self, message):
+            self.calls += 1
+            if self.calls == 1:
+                await gate.wait()  # block the FIRST translation indefinitely
+            message.translated_text = f"tr:{message.text}"
+            return message
+
+    stub = WebStubClient()
+    translator = BlockingTranslator()
+    gen = sse_event_stream(stub, dialog_id=7, translator=translator)
+
+    async def next_frame():
+        return await gen.__anext__()
+
+    # frame for message A (raw), then its translation task starts and blocks
+    task_a = asyncio.create_task(next_frame())
+    while stub.bus.subscriber_count == 0:
+        await asyncio.sleep(0)
+    msg_a = Message(id=1, dialog_id=7, sender_id=7, out=False, text="A",
+                    date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus.publish(IncomingEvent(dialog_id=7, message=msg_a))
+    frame_a = await asyncio.wait_for(task_a, timeout=2)
+    assert json.loads(frame_a.removeprefix("data: ").strip())["text"] == "A"
+
+    # message B arrives while A's translation is still blocked — its raw frame must come
+    msg_b = Message(id=2, dialog_id=7, sender_id=7, out=False, text="B",
+                    date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus.publish(IncomingEvent(dialog_id=7, message=msg_b))
+    frame_b = await asyncio.wait_for(next_frame(), timeout=2)
+    payload_b = json.loads(frame_b.removeprefix("data: ").strip())
+    assert payload_b.get("text") == "B", payload_b  # B raw frame, not A's translation
+    assert payload_b.get("type") != "translation"
+
+    # now release the first translation — its frame eventually arrives
+    gate.set()
+    seen_translation = False
+    for _ in range(5):
+        frame = await asyncio.wait_for(next_frame(), timeout=2)
+        data = json.loads(frame.removeprefix("data: ").strip())
+        if data.get("type") == "translation":
+            assert data["message_id"] in (1, 2)
+            seen_translation = True
+            break
+    assert seen_translation, "the blocked translation frame never arrived"
+    await gen.aclose()
+
+
+async def test_stream_caps_concurrent_translations(caplog):
+    # #69 follow-up: live translations are best-effort and run off the race, so a burst must
+    # not spawn unbounded concurrent LLM calls. Past MAX_INFLIGHT_TRANSLATIONS in flight, the
+    # excess is skipped (raw frame still delivered) and logged — bounding LLM fan-out and the
+    # pending dict.
+    import asyncio
+    import json
+    import logging
+
+    from tg_messenger.web.app import MAX_INFLIGHT_TRANSLATIONS, sse_event_stream
+
+    gate = asyncio.Event()
+
+    class BlockingTranslator:
+        def __init__(self):
+            self.calls = 0
+
+        async def translate_message(self, message):
+            self.calls += 1
+            await gate.wait()  # block EVERY translation so they all stay in flight
+            message.translated_text = f"tr:{message.text}"
+            return message
+
+    stub = WebStubClient()
+    translator = BlockingTranslator()
+    gen = sse_event_stream(stub, dialog_id=7, translator=translator)
+
+    async def next_frame():
+        return await gen.__anext__()
+
+    task0 = asyncio.create_task(next_frame())
+    while stub.bus.subscriber_count == 0:
+        await asyncio.sleep(0)
+
+    # A live message's translation task is scheduled AFTER its raw frame is yielded — i.e.
+    # on the loop pass that handles the NEXT frame. So to force the (MAX+1)-th translation
+    # spawn (the one that must be skipped) we publish MAX+2 messages and read MAX+2 raw
+    # frames: spawns happen for messages 0..MAX while handling frames 1..MAX+1, and at the
+    # spawn for message index MAX the cap is already full → it is skipped and logged.
+    n = MAX_INFLIGHT_TRANSLATIONS + 2
+    with caplog.at_level(logging.WARNING, logger="tg_messenger.web.app"):
+        for i in range(n):
+            msg = Message(id=100 + i, dialog_id=7, sender_id=7, out=False, text=f"m{i}",
+                          date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+            stub.bus.publish(IncomingEvent(dialog_id=7, message=msg))
+            frame = await asyncio.wait_for(task0 if i == 0 else next_frame(), timeout=2)
+            data = json.loads(frame.removeprefix("data: ").strip())
+            assert data.get("text") == f"m{i}"  # raw frame always delivered, never dropped
+        # let the loop run the scheduled (blocked) translation tasks up to the cap
+        for _ in range(4 * n):
+            await asyncio.sleep(0)
+
+    # at most MAX translations were ever started — the over-budget ones were skipped, not
+    # queued (so `pending` and the LLM fan-out stay bounded), and the skip was logged
+    assert translator.calls == MAX_INFLIGHT_TRANSLATIONS
+    assert any("backlog" in r.message for r in caplog.records), caplog.text
+
+    gate.set()
+    await gen.aclose()
+
+
 async def test_stream_skips_outgoing_echo_of_messages_we_sent():
     # сообщение, отправленное ЭТИМ сервером (id в sent_ids), не дублируется в SSE
     import asyncio
