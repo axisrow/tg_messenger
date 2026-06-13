@@ -330,13 +330,16 @@
     });
     composer.addEventListener('htmx:afterRequest', (evt) => {
       if (evt.detail.xhr && evt.detail.xhr.status >= 400) return;
-      clearReply();  // #48: reply consumed by a successful send
       const submittedDialogId = composer.dataset.submittingDialogId || activeDialogId;
       delete composer.dataset.submittingDialogId;
       if (submittedDialogId) {
         clearComposeState(stateFor(submittedDialogId));
       }
       if (submittedDialogId === activeDialogId) {
+        // #48: clear the reply only for the dialog whose send just completed — if the
+        // user switched dialogs mid-flight and picked a new reply target there, an older
+        // send must not wipe it (the banner would otherwise desync from the sent message).
+        clearReply();
         composer.reset();
         dialogInput.value = activeDialogId;
       } else if (activeDialogId) {
