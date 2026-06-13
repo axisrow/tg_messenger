@@ -436,6 +436,15 @@ async def test_send_reply_to_reaches_client(client_app):
     assert stub.sent == [(7, "re", 42)]
 
 
+async def test_send_garbage_reply_to_degrades_to_none(client_app):
+    # #48: a non-numeric reply_to (incl. the cleared empty field) must not reach the
+    # client as a string — the route parses it to None, a normal no-reply send.
+    ac, stub = client_app
+    r = await ac.post("/send", data={"dialog_id": "7", "text": "re", "reply_to": "nope"})
+    assert r.status_code == 200
+    assert stub.sent == [(7, "re", None)]
+
+
 async def test_send_empty_text_returns_400(client_app):
     ac, stub = client_app
     r = await ac.post("/send", data={"dialog_id": "7", "text": "   "})
