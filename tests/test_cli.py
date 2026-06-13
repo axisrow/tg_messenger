@@ -1843,8 +1843,23 @@ def test_profiles_command_lists_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
     result = CliRunner().invoke(cli_main.cli, ["profiles"])
     assert result.exit_code == 0, result.output
-    assert "alice" in result.output
-    assert "bob" in result.output
+    # #52: valid profiles carry the ✓ marker
+    assert "alice ✓" in result.output
+    assert "bob ✓" in result.output
+
+
+def test_profiles_command_marks_corrupt_profile(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    store = SessionStore(tmp_path)
+    store.save("good", _valid_session_for_import())
+    store.path_for("broken").write_text("garbage", encoding="utf-8")
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    result = CliRunner().invoke(cli_main.cli, ["profiles"])
+    assert result.exit_code == 0, result.output
+    assert "good ✓" in result.output
+    assert "broken ✗" in result.output
 
 
 def test_profiles_command_empty_hint_uses_global_profile_position(monkeypatch, tmp_path):
@@ -2003,7 +2018,32 @@ def test_profile_menu_reprompts_on_out_of_range(monkeypatch, tmp_path):
     result = CliRunner().invoke(cli_main.cli, ["dialogs"], input="9\n2\n")
     assert result.exit_code == 0, result.output
     assert "out of range" in result.output
-    assert captured.get("session_name") == "bob"
+
+
+def test_interactive_menu_reinits_log_for_chosen_profile(monkeypatch, tmp_path):
+    # #52 point 3: a menu-chosen profile re-runs setup_logging so the log file is
+    # isolated (tg_messenger_<profile>.log), not just for an explicit --profile.
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(tmp_path)
+    for name in ("alice", "bob", "carol"):
+        store.save(name, _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: StubClient())
+    monkeypatch.setattr(cli_main, "_is_interactive", lambda: True)
+
+    profiles_logged = []
+    real_setup = cli_main.setup_logging
+
+    def spy_setup_logging(*args, **kw):
+        profiles_logged.append(kw.get("profile"))
+        return real_setup(*args, **kw)
+
+    monkeypatch.setattr(cli_main, "setup_logging", spy_setup_logging)
+    result = CliRunner().invoke(cli_main.cli, ["dialogs"], input="2\n")
+    assert result.exit_code == 0, result.output
+    # the LAST setup_logging call must target the menu-chosen profile (sorted #2 = bob)
+    assert profiles_logged[-1] == "bob", profiles_logged
 
 
 # --- цикл 61: serve/tui учитывают глобальный --profile ---

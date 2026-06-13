@@ -112,6 +112,33 @@ class SessionStore:
             return []
         return sorted(p.stem for p in self.session_dir.glob("*.session") if p.is_file())
 
+    def is_valid_profile(self, name: str) -> bool:
+        """Whether ``name``'s session file is present and parseable — NO network (#52).
+
+        Encryption-aware: an ``enc:v2:`` file with no key is present and not corrupt, so
+        it counts as valid (we just can't decrypt it here). With a key, the session is
+        decrypted and parsed. A missing/empty/garbage file is invalid.
+        """
+        from tg_messenger.core.session_cipher import is_encrypted
+
+        path = self.path_for(name)
+        if not path.is_file():
+            return False
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return False
+        if not raw:
+            return False
+        # encrypted file without a key: present and intact, but undecryptable here → valid
+        if is_encrypted(raw) and not self._encryption_key:
+            return True
+        try:
+            self.load(name)
+        except Exception:
+            return False
+        return True
+
     def delete(self, name: str) -> bool:
         """Remove the profile's session file; True if it existed (#11 lifecycle)."""
         path = self.path_for(name)

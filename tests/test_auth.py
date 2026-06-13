@@ -365,3 +365,32 @@ def test_delete_profile_removes_file(session_dir):
 def test_delete_missing_profile_returns_false(session_dir):
     store = SessionStore(session_dir)
     assert store.delete("ghost") is False
+
+
+# --- #52: validity marker for `profiles` (no network) ---
+
+
+def test_is_valid_profile_true_for_saved_session(session_dir):
+    store = SessionStore(session_dir)
+    store.save("alice", VALID_SESSION)
+    assert store.is_valid_profile("alice") is True
+
+
+def test_is_valid_profile_false_for_missing(session_dir):
+    store = SessionStore(session_dir)
+    assert store.is_valid_profile("ghost") is False
+
+
+def test_is_valid_profile_false_for_corrupt_file(session_dir):
+    store = SessionStore(session_dir)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    store.path_for("broken").write_text("garbage", encoding="utf-8")
+    assert store.is_valid_profile("broken") is False
+
+
+def test_is_valid_profile_true_for_encrypted_without_key(session_dir):
+    # an enc:v2: file is present and not corrupt — valid even though we can't decrypt it
+    keyed = SessionStore(session_dir, encryption_key=_ENC_KEY)
+    keyed.save("enc", VALID_SESSION)
+    no_key = SessionStore(session_dir)
+    assert no_key.is_valid_profile("enc") is True

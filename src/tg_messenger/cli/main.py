@@ -454,11 +454,13 @@ def cli(ctx: click.Context, verbose: bool, profile: str | None) -> None:
     ctx.obj["profile"] = profile
     _load_dotenv()
     # the CLI reports its own errors via click — keep its log records off stderr.
-    # The final profile may still come from a menu, but an explicit --profile
-    # already isolates the log file (two accounts = two processes = two files).
-    setup_logging(
-        verbose=verbose, console_skip_prefixes=("tg_messenger.cli",), profile=profile
-    )
+    # The final profile may still come from a menu; we remember the logging kwargs so
+    # a menu-resolved profile can re-init the log file (#52, see _effective_session).
+    ctx.obj["_log_kwargs"] = {
+        "verbose": verbose,
+        "console_skip_prefixes": ("tg_messenger.cli",),
+    }
+    setup_logging(profile=profile, **ctx.obj["_log_kwargs"])
 
 
 def _effective_session(ctx: click.Context | None, session: str) -> str:
@@ -471,7 +473,15 @@ def _effective_session(ctx: click.Context | None, session: str) -> str:
         and ctx.get_parameter_source("session") == ParameterSource.COMMANDLINE
     ):
         return session
-    return _resolve_profile(session)
+    resolved = _resolve_profile(session)
+    # #52: a non-default profile picked via the interactive menu (no explicit --profile)
+    # must isolate its log file too — re-init logging with the chosen profile. cli() only
+    # set up logging with the global --profile (None here), so the menu pick is invisible
+    # to the log file otherwise. Idempotent (setup_logging replaces marked handlers).
+    if resolved != session and resolved != "default" and ctx is not None and ctx.obj:
+        log_kwargs = ctx.obj.get("_log_kwargs", {})
+        setup_logging(profile=resolved, **log_kwargs)
+    return resolved
 
 
 def _export_session(session: str) -> None:
@@ -603,12 +613,16 @@ def profiles(ctx: click.Context) -> None:
     """List saved account profiles (sessions on disk)."""
     if ctx.invoked_subcommand is not None:
         return
-    names = _session_store().list_profiles()
+    store = _session_store()
+    names = store.list_profiles()
     if not names:
         click.echo("No profiles yet — run: tg-messenger --profile NAME login")
         return
+    # #52: mark each profile valid (✓, session file present and parseable) or broken (✗).
+    # Validity is a local check — no network call.
     for name in names:
-        click.echo(name)
+        marker = "✓" if store.is_valid_profile(name) else "✗"
+        click.echo(f"{name} {marker}")
 
 
 @profiles.command("remove")
@@ -1924,8 +1938,10 @@ def tui(ctx: click.Context, session: str) -> None:
     except ImportError as exc:
         raise click.ClickException("TUI requires: pip install 'tg-messenger[tui]'") from exc
 
-    # stderr handler would corrupt the alternate screen — file log only
-    setup_logging(verbose=ctx.obj["verbose"], console=False, profile=ctx.obj.get("profile"))
+    # stderr handler would corrupt the alternate screen — file log only. Keep these kwargs
+    # in ctx so a menu-resolved profile re-inits the log WITHOUT a console handler (#52).
+    ctx.obj["_log_kwargs"] = {"verbose": ctx.obj["verbose"], "console": False}
+    setup_logging(profile=ctx.obj.get("profile"), **ctx.obj["_log_kwargs"])
     session = _effective_session(ctx, session)
     client = make_client(session_name=session)
     suggester = make_optional_suggester(client, session=session)
