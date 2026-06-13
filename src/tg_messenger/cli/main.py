@@ -70,6 +70,24 @@ def make_client(**kwargs):
     return client_from_env(**kwargs)
 
 
+def _warn_if_send_rate_off() -> None:
+    """Warn once if the outgoing rate limit is OFF (#50, Variant B).
+
+    The default is opt-in (``TG_SEND_RATE=0``); background senders (agent/heartbeat/
+    worker/ghostwrite/moderate) then run with no global ceiling. We do NOT change the
+    default — we make the off-state loud so a high send rate doesn't silently risk a ban.
+    """
+    try:
+        rate = float(os.environ.get("TG_SEND_RATE", "0") or 0)
+    except ValueError:
+        rate = 0.0
+    if rate <= 0:
+        logger.warning(
+            "outgoing rate limit is OFF (TG_SEND_RATE=0) — a high send rate can get the "
+            "account banned; set TG_SEND_RATE=20 to enable a global cap"
+        )
+
+
 def make_factory_client(*, base_url: str, password: str | None = None):
     """Build the interop FactoryClient; the seam worker tests patch.
 
@@ -1004,6 +1022,7 @@ def moderate(ctx: click.Context, session: str, enforce: bool) -> None:
     )
 
     session = _effective_session(ctx, session)
+    _warn_if_send_rate_off()  # #50: warn rules can send (mute/ban notices, warn_text)
 
     async def _do():
         client = make_client(session_name=session)
@@ -1333,6 +1352,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
 def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
     """AI assistant: auto-reply to incoming DMs, route tasks to a deep agent."""
     session = _effective_session(ctx, session)
+    _warn_if_send_rate_off()  # #50: loud when the global send cap is off
     # langchain/langgraph трассируются в LangSmith сами по LANGSMITH_* env —
     # здесь только fail-fast (включено без ключа) и видимый статус
     try:
@@ -1373,6 +1393,7 @@ def worker(ctx: click.Context, session: str, factory_url: str | None, types: str
     dm_reply/chat_answer send messages, fetch_history/fetch_dialogs read them.
     """
     session = _effective_session(ctx, session)
+    _warn_if_send_rate_off()  # #50: loud when the global send cap is off
     if not factory_url:
         raise click.ClickException(
             "--factory-url is required (or set TG_FACTORY_URL)."
@@ -1485,6 +1506,7 @@ def ghostwrite(ctx: click.Context, session: str, enforce: bool) -> None:
     )
     from tg_messenger.agent.suggest import register_suggest_migrations
     session = _effective_session(ctx, session)
+    _warn_if_send_rate_off()  # #50: loud when the global send cap is off
 
     async def _do():
         client = make_client(session_name=session)
@@ -1738,6 +1760,7 @@ def heartbeat_run(ctx: click.Context, session: str) -> None:
     """Run the heartbeat scheduler: send stored plans' pings on schedule (Ctrl+C to stop)."""
     from tg_messenger.core.heartbeat import HeartbeatService, register_heartbeat_migrations
     session = _effective_session(ctx, session)
+    _warn_if_send_rate_off()  # #50: loud when the global send cap is off
 
     async def _do():
         client = make_client(session_name=session)

@@ -1771,6 +1771,40 @@ def test_global_profile_reaches_direct_client_commands(
     assert profile_spy.get("session_name") == "work"
 
 
+# --- #50: loud WARNING when the outgoing rate limit is off on a sender command ---
+
+
+def _run_agent_with_interrupt(monkeypatch):
+    """Invoke the `agent` command with a stub client/runner that exits via Ctrl+C."""
+    class FakeAgentRunner:
+        async def run(self):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: StubClient())
+    monkeypatch.setattr(
+        cli_main, "make_agent_runner",
+        lambda client, *, notify_errors=False: FakeAgentRunner(),
+    )
+    return CliRunner().invoke(cli_main.cli, ["agent"])
+
+
+def test_sender_command_warns_when_send_rate_off(monkeypatch, caplog):
+    monkeypatch.delenv("TG_SEND_RATE", raising=False)
+    with caplog.at_level("WARNING", logger="tg_messenger.cli.main"):
+        result = _run_agent_with_interrupt(monkeypatch)
+    assert result.exit_code == 0, result.output
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("TG_SEND_RATE" in r.message for r in warnings), [r.message for r in warnings]
+
+
+def test_sender_command_no_warning_when_send_rate_set(monkeypatch, caplog):
+    monkeypatch.setenv("TG_SEND_RATE", "20")
+    with caplog.at_level("WARNING", logger="tg_messenger.cli.main"):
+        result = _run_agent_with_interrupt(monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert not any("TG_SEND_RATE" in r.message for r in caplog.records)
+
+
 def test_profiles_command_lists_saved(monkeypatch, tmp_path):
     from tg_messenger.core.auth import SessionStore
 
