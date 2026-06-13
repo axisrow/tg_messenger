@@ -1188,8 +1188,17 @@ async def test_outbound_endpoint_returns_variants():
 
 
 async def test_outbound_endpoint_blank_text_is_invalid_empty():
-    # #73: a whitespace draft is rejected as invalid_empty (400), no LLM call
+    # #73: a whitespace draft is rejected as invalid_empty (400), no LLM call AND no
+    # dialog lookup — the blank check short-circuits before _outbound_dialog().
     stub = WebStubClient()
+    dialog_calls = []
+    original_dialogs = stub.dialogs
+
+    async def counting_dialogs(dm_only=True):
+        dialog_calls.append(dm_only)
+        return await original_dialogs(dm_only=dm_only)
+
+    stub.dialogs = counting_dialogs
     outbound = WebOutboundRecordingHint()
     app = build_app(client=stub, outbound=outbound)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
@@ -1203,6 +1212,7 @@ async def test_outbound_endpoint_blank_text_is_invalid_empty():
     assert r.status_code == 400
     assert r.json()["status"] == "invalid_empty"
     assert outbound.applies_calls == []
+    assert dialog_calls == []  # short-circuited before the dialog lookup
 
 
 async def test_outbound_endpoint_passes_dialog_telegram_lang_hint():

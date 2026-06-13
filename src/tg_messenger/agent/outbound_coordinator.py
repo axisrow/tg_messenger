@@ -161,8 +161,7 @@ class OutboundSendCoordinator:
             await self._restore_token(token)
             raise
         await self._consume_token(token)
-        await self._record_source(dialog_id, msg, source_text=entry.source_text)
-        return msg
+        return await self._record_source(dialog_id, msg, source_text=entry.source_text)
 
     async def send_original(self, dialog_id: int, text: str, send_fn: SendFn) -> Message:
         """Send the untranslated original — no token, no source recording."""
@@ -170,9 +169,16 @@ class OutboundSendCoordinator:
 
     # --- source recording ----------------------------------------------------
 
-    async def _record_source(self, dialog_id: int, message: Message, *, source_text: str) -> None:
+    async def _record_source(self, dialog_id: int, message: Message, *, source_text: str) -> Message:
+        """Persist the local source text and return the message to surface to the UI.
+
+        Returns a copy carrying ``translated_text`` on success (so the UI renders the
+        original beneath the sent variant) — never mutates the caller's ``message``. On a
+        no-op (no source / no store) or a logged failure, the original message is returned
+        unchanged.
+        """
         if not source_text or self._store is None or self._storage is None:
-            return
+            return message
         from tg_messenger.agent.translate import get_user_lang
 
         try:
@@ -181,11 +187,12 @@ class OutboundSendCoordinator:
                 await self._store.record_outgoing(
                     dialog_id, message, source_text=source_text, source_lang=source_lang
                 )
-                message.translated_text = source_text
+                return message.model_copy(update={"translated_text": source_text})
         except Exception:
             logger.warning(
                 "failed to record outbound source for dialog %s", dialog_id, exc_info=True
             )
+        return message
 
     # --- token lifecycle -----------------------------------------------------
 

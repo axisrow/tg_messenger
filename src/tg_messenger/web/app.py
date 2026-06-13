@@ -831,6 +831,13 @@ def build_app(
             return same_origin_error
         if request.app.state.outbound is None:
             return JSONResponse({"applies": False, "status": "disabled"})
+        if not text.strip():
+            # short-circuit before the dialog lookup: a blank draft can't be translated
+            return JSONResponse(
+                {"applies": False, "status": "invalid_empty",
+                 "error": "Cannot translate an empty message."},
+                status_code=400,
+            )
         # dialog lookup stays here for the telegram_lang_code hint + the 403/503 contract
         try:
             dialog = await _outbound_dialog(request.app.state.client, dialog_id)

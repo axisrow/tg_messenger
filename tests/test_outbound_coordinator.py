@@ -153,9 +153,28 @@ async def test_send_variant_sends_records_and_consumes_token():
     assert sent == [(7, ready.variants[0])]
     # source recorded once, with the original draft and the user lang
     assert store.recorded == [(7, msg.id, "привет", "ru")]
+    # the returned message carries the original beneath the sent variant
+    assert msg.translated_text == "привет"
     # token consumed: a second use fails
     with pytest.raises(Exception):
         await coord.send_variant(7, ready.token, ready.variants[0], send_fn, owner_id="c1")
+
+
+async def test_send_variant_does_not_mutate_the_sent_message():
+    # #73 review nit: _record_source returns a copy with translated_text — it must NOT
+    # mutate the Message the send_fn returned (which a UI may hold/cache elsewhere).
+    store = FakeStore(FakeStorage(user_lang="ru"))
+    coord, _ = _coordinator(store=store)
+    ready = await coord.prepare(7, "привет", owner_id="c1")
+    original = _msg(text=ready.variants[0])
+
+    async def send_fn(peer, text):
+        return original
+
+    returned = await coord.send_variant(7, ready.token, ready.variants[0], send_fn, owner_id="c1")
+    assert original.translated_text is None  # caller's object untouched
+    assert returned is not original
+    assert returned.translated_text == "привет"
 
 
 async def test_send_variant_invalid_token_does_not_send():
