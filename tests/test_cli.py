@@ -2044,7 +2044,10 @@ def test_username_suggest_prints_available(runner, monkeypatch):
     lines = [ln.strip() for ln in result.output.splitlines() if ln.strip()]
     assert lines, "expected at least one suggested username"
     for ln in lines:
-        assert ln not in stub.occupied
+        # every line carries the availability marker
+        assert ln.endswith("✓"), ln
+        name = ln[:-1].strip()
+        assert name not in stub.occupied
 
 
 def test_username_set_confirms(runner):

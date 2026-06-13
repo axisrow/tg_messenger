@@ -1778,8 +1778,9 @@ def username_suggest(base: str, limit: int, session: str) -> None:
     if not found:
         click.echo("No available usernames found — try a different base.")
         return
+    # every name returned by find_available has been verified free → mark with ✓
     for name in found:
-        click.echo(name)
+        click.echo(f"{name} ✓")
 
 
 @username.command("set")
