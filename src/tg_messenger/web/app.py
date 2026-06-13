@@ -601,12 +601,21 @@ def build_app(
 
     @app.get("/tg-login", response_class=HTMLResponse)
     async def tg_login_form(request: Request):
-        # #49: the LoginSession lives process-wide and is never recreated. Without this,
-        # once a flow reaches "done" every later phone POST hits the in-progress guard and
-        # the wizard is unrecoverable until restart. reset() only fires from "done", so a
-        # live mid-login flow (loaded in another tab) is left untouched.
-        request.app.state.login_session.reset()
-        return TEMPLATES.TemplateResponse(request, "tg_login.html", {})
+        # #49: the LoginSession lives process-wide and is never recreated. reset() clears a
+        # FINISHED ("done") flow so a fresh login can start; it is a no-op mid-flow so a live
+        # phone_code_hash is never wiped.
+        session = request.app.state.login_session
+        session.reset()
+        # Resume the live step on reload: a mid-login refresh must not dead-end on the
+        # phone form (which the in-progress guard would then reject) — render the card
+        # matching the current state, wrapped in the full page so htmx/styles are present.
+        if session.state == "code":
+            card = _tg_login_code_fragment(session.last_delivery)
+        elif session.state == "password":
+            card = _tg_login_password_fragment()
+        else:
+            card = None
+        return TEMPLATES.TemplateResponse(request, "tg_login.html", {"card": card})
 
     @app.post("/tg-login/phone", response_class=HTMLResponse)
     async def tg_login_phone(request: Request, phone: str = Form("")):

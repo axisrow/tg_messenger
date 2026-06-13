@@ -1818,6 +1818,37 @@ async def test_tg_login_form_does_not_reset_in_progress_flow():
         assert sess.resets == 0
 
 
+async def test_tg_login_form_resumes_code_step_on_reload():
+    # #49 follow-up: reloading /tg-login mid-flow must RESUME the live step, not dead-end on
+    # the phone form (which the in-progress guard would then reject). state "code" → the
+    # GET renders the code card, wrapped in the full page (htmx present), with the countdown.
+    sess = FakeLoginSession()
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})  # → state code
+        r = await ac.get("/tg-login")
+        assert r.status_code == 200
+        assert sess.state == "code"  # not restarted
+        assert "Введите код" in r.text  # the code card, not the phone form
+        assert 'data-timeout="60"' in r.text  # countdown preserved via last_delivery
+        assert "htmx.org" in r.text  # full layout so the hx-post forms work after reload
+
+
+async def test_tg_login_form_resumes_password_step_on_reload():
+    # #49 follow-up: same resume guarantee for the 2FA step.
+    sess = FakeLoginSession(needs_2fa=True)
+    app = _login_app(sess)
+    async for ac in _login_client(app):
+        await ac.post("/tg-login/phone", data={"phone": "+10000000000"})
+        await ac.post("/tg-login/code", data={"code": "12345"})  # → state password
+        assert sess.state == "password"
+        r = await ac.get("/tg-login")
+        assert r.status_code == 200
+        assert sess.state == "password"
+        assert "Пароль 2FA" in r.text  # the password card
+        assert "htmx.org" in r.text
+
+
 async def test_tg_login_success_saves_session():
     saved = []
     sess = FakeLoginSession()

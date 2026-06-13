@@ -318,7 +318,7 @@ class LoginSession:
         # the in-flight phone_code_hash. Reject it as a user-facing LoginError (the web
         # renders it in the form) without touching state — the first flow stays intact.
         if self._state != "phone":
-            raise LoginError("login already in progress — finish it or reload to restart")
+            raise LoginError("login already in progress — finish the code step (reload to resume it)")
         # Claim the slot BEFORE the await: send_code yields to the event loop, so two
         # concurrent phone POSTs could otherwise both pass the guard above and both call
         # send_code, clobbering the phone_code_hash. Roll back to "phone" on a user-
