@@ -7,6 +7,8 @@ so tests are deterministic — never reaches for the global ``random``.
 ``find_available`` checks candidates SEQUENTIALLY through ``client.check_username``
 and stops as soon as ``limit`` free names are found (or candidates run out): a
 single sequential pass, never a parallel storm — the read anti-flood discipline.
+``find_available_marked`` is the same pass but also returns the unchecked tail
+(candidates past the limit), so the UI can mark them ``?`` next to the ``✓`` free.
 
 Telegram username rules (the only authority here): 5–32 chars, ``[a-z0-9_]``
 only, must start with a letter, must not end with ``_``, no ``__`` run.
@@ -159,11 +161,33 @@ async def find_available(
     collecting the free ones in generation order. Stops as soon as ``limit``
     free names are found, so at most ``count`` network checks ever happen.
     """
+    free, _ = await find_available_marked(client, base, limit=limit, count=count, rng=rng)
+    return free
+
+
+async def find_available_marked(
+    client: _UsernameChecker,
+    base: str,
+    *,
+    limit: int = 10,
+    count: int = 20,
+    rng: random.Random | None = None,
+) -> tuple[list[str], list[str]]:
+    """Like :func:`find_available`, but also report the *unchecked* candidates.
+
+    Returns ``(free, unchecked)`` where ``free`` are verified-available names (at
+    most ``limit``, same sequential flood-disciplined check as ``find_available``)
+    and ``unchecked`` are the remaining generated candidates that were never sent
+    to ``check_username`` because the ``limit`` was already reached — the UI marks
+    these ``?`` (generated but availability unknown). When the whole pool is
+    exhausted by checks, ``unchecked`` is empty.
+    """
     candidates = generate_candidates(base, count=count, rng=rng)
     free: list[str] = []
-    for name in candidates:
+    for i, name in enumerate(candidates):
         if len(free) >= limit:
-            break
+            # limit reached → stop checking; everything from here on is unknown
+            return free, candidates[i:]
         if await client.check_username(name):
             free.append(name)
-    return free
+    return free, []
