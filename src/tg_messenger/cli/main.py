@@ -72,18 +72,20 @@ def make_client(**kwargs):
 
 
 def _warn_if_send_rate_off() -> None:
-    """Warn once if the outgoing rate limit is OFF (#50, Variant B).
+    """Warn once if the outgoing rate limit is explicitly OFF.
 
-    The default is opt-in (``TG_SEND_RATE`` unset/0); background senders (agent/heartbeat/
-    worker/ghostwrite/moderate) then run with no global ceiling. We do NOT change the
-    default — we make the off-state loud so a high send rate doesn't silently risk a ban.
+    The safe default is 20/min; background senders (agent/heartbeat/worker/ghostwrite/
+    moderate) are capped unless the operator deliberately sets ``TG_SEND_RATE=0``.
 
     A non-numeric value is surfaced separately (not folded into "off"): ``client_from_env``
     would raise on it, so warning "limit is off" there would hide the real misconfiguration.
     """
-    raw = os.environ.get("TG_SEND_RATE", "") or ""
+    raw_env = os.environ.get("TG_SEND_RATE")
+    if raw_env is None:
+        return
+    raw = raw_env or ""
     try:
-        rate = float(raw or 0)
+        rate = float(raw or 20)
     except ValueError:
         logger.warning(
             "TG_SEND_RATE=%r is not a number — the outgoing rate limit cannot be parsed; "
@@ -93,8 +95,9 @@ def _warn_if_send_rate_off() -> None:
         return
     if rate <= 0:
         logger.warning(
-            "outgoing rate limit is OFF (TG_SEND_RATE unset/0) — a high send rate can get "
-            "the account banned; set TG_SEND_RATE=20 to enable a global cap"
+            "outgoing rate limit is OFF (TG_SEND_RATE=0) — a high send rate can get "
+            "the account banned; unset TG_SEND_RATE or set TG_SEND_RATE=20 to enable "
+            "the safe default cap"
         )
 
 

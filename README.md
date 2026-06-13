@@ -302,12 +302,13 @@ Several commands send on your behalf in the background — `agent`, `heartbeat r
 send rate is the main account-ban risk (worse than any single FloodWait), so a single
 global token-bucket caps **all** of them.
 
-It is **opt-in**: `TG_SEND_RATE` is the per-minute cap, and the default `0` means
-**off** (no ceiling). When it is off, those commands log a WARNING on start so the
-unbounded state is never silent. A conservative starting value is `20`:
+The default cap is **20 messages/minute**. You can override it with `TG_SEND_RATE`;
+setting `TG_SEND_RATE=0` explicitly turns the cap **off** (no ceiling). When it is
+off, automated sender commands log a WARNING on start so the unbounded state is never
+silent:
 
 ```bash
-TG_SEND_RATE=20 tg-messenger agent
+TG_SEND_RATE=0 tg-messenger agent
 ```
 
 When the cap is reached, a send **waits** for the next token (nothing is lost) and

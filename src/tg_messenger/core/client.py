@@ -148,7 +148,7 @@ class StandaloneTelegramClient:
         client_factory: Callable = _default_factory,
         dialogs_ttl: float = DEFAULT_DIALOGS_TTL_SEC,
         history_ttl: float = DEFAULT_HISTORY_TTL_SEC,
-        send_rate_per_min: float = 0.0,
+        send_rate_per_min: float = 20.0,
         clock: Callable[[], float] = time.monotonic,
     ):
         self._store = SessionStore(session_dir, encryption_key=encryption_key)
@@ -176,7 +176,7 @@ class StandaloneTelegramClient:
         self._history_cache: TTLCache[tuple[int, int, int], list[Message]] = TTLCache(
             history_ttl, maxsize=64, clock=clock
         )
-        # one global cap on outgoing sends across every caller (#25); 0 = disabled.
+        # one global cap on outgoing sends across every caller (#25); 0 explicitly disables.
         # burst = the rate (1 minute's worth) so a quiet account isn't throttled.
         self._send_bucket = TokenBucket(
             send_rate_per_min, burst=max(1, int(send_rate_per_min)), clock=clock
@@ -842,8 +842,8 @@ def client_from_env(**kwargs) -> StandaloneTelegramClient:
     # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
     kwargs.setdefault("encryption_key", os.environ.get("SESSION_ENCRYPTION_KEY") or None)
     kwargs.setdefault("session_dir", os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
-    # global outgoing rate cap (#25): TG_SEND_RATE sends/min, 0/unset = off
-    kwargs.setdefault("send_rate_per_min", float(os.environ.get("TG_SEND_RATE", "0") or 0))
+    # global outgoing rate cap (#25): default 20/min; TG_SEND_RATE=0 explicitly disables.
+    kwargs.setdefault("send_rate_per_min", float(os.environ.get("TG_SEND_RATE", "20") or 20))
     return StandaloneTelegramClient(
         api_id=int(os.environ.get("TG_API_ID", "0")),
         api_hash=os.environ.get("TG_API_HASH", ""),

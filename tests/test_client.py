@@ -16,6 +16,7 @@ from tests.conftest import (
     FakeMessageReadEvent,
     FakeUser,
 )
+from tg_messenger.core import client as client_module
 from tg_messenger.core.client import MessageDeleteValidationError, StandaloneTelegramClient, _dialog_kind
 from tg_messenger.core.models import (
     ChatActionEvent,
@@ -1837,12 +1838,70 @@ async def test_send_rate_limit_waits_when_exhausted(fake_client, caplog):
     assert any("rate limit" in r.message for r in caplog.records)
 
 
-async def test_send_rate_limit_disabled_by_default(fake_client):
-    # default send_rate_per_min=0 → no throttling (regression: existing send tests unaffected)
+async def test_send_rate_limit_enabled_by_default(fake_client):
     _seed_dm(fake_client)
     client = _build(fake_client)
+    await client.connect()
+    assert client._send_bucket.enabled is True
+    assert client._send_bucket._rate_per_sec == pytest.approx(20 / 60)
+
+
+async def test_send_rate_limit_zero_explicitly_disables(fake_client):
+    _seed_dm(fake_client)
+    client = _build(fake_client, send_rate_per_min=0)
     await client.connect()
     assert client._send_bucket.enabled is False
     for i in range(50):
         await client.send_text(7, f"msg{i}")  # never blocks
     assert len(fake_client.sent) == 50
+
+
+def test_client_from_env_defaults_send_rate_to_20(monkeypatch):
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.delenv("TG_SEND_RATE", raising=False)
+    monkeypatch.setattr(client_module, "StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    client_module.client_from_env()
+
+    assert captured["send_rate_per_min"] == 20.0
+
+
+def test_client_from_env_allows_explicit_zero_send_rate(monkeypatch):
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SEND_RATE", "0")
+    monkeypatch.setattr(client_module, "StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    client_module.client_from_env()
+
+    assert captured["send_rate_per_min"] == 0.0
+
+
+def test_client_from_env_uses_configured_send_rate(monkeypatch):
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SEND_RATE", "20")
+    monkeypatch.setattr(client_module, "StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    client_module.client_from_env()
+
+    assert captured["send_rate_per_min"] == 20.0
