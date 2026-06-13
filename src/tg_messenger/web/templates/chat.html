@@ -136,6 +136,10 @@
       const id = document.getElementById('dialog_id').value;
       const file = e.target.files[0];
       if (!id || !file) { e.target.value = ''; return; }
+      // #48: snapshot the reply target as it was when this upload started; `id` is the
+      // upload's own dialog. Both are compared after the await so a dialog switch or a
+      // newer reply pick made while the upload was in flight isn't clobbered.
+      const uploadReplyTo = replyToInput.value;
       const fd = new FormData();
       fd.append('file', file);
       fd.append('caption', document.getElementById('composer-text').value);
@@ -147,8 +151,12 @@
         document.getElementById('composer-text').value = '';
         const state = currentState();
         if (state) clearComposeState(state);
-        clearReply();  // #48: media has no reply_to — don't leave a stale target/banner
-                       // that the next text message would silently attach to.
+        // #48: media carries no reply_to, so clear the stale banner — but only if the user
+        // is still on this upload's dialog AND hasn't picked a newer target since; either
+        // change means the live reply state belongs to a later action, not this upload.
+        if (document.getElementById('dialog_id').value === id && replyToInput.value === uploadReplyTo) {
+          clearReply();
+        }
       } else {
         alert(html.replace(/<[^>]+>/g, '').trim() || 'Upload failed');
       }
@@ -254,6 +262,9 @@
     }
     function markSubmittingDialog(id) {
       composer.dataset.submittingDialogId = id;
+      // #48: snapshot the reply target this send carries, so afterRequest only clears it
+      // when the user hasn't picked a newer target while the send was in flight.
+      composer.dataset.submittingReplyTo = replyToInput.value;
     }
     function saveComposeState() {
       if (!activeDialogId) return;
@@ -333,17 +344,26 @@
     composer.addEventListener('htmx:afterRequest', (evt) => {
       if (evt.detail.xhr && evt.detail.xhr.status >= 400) return;
       const submittedDialogId = composer.dataset.submittingDialogId || activeDialogId;
+      const submittedReplyTo = composer.dataset.submittingReplyTo || '';
       delete composer.dataset.submittingDialogId;
+      delete composer.dataset.submittingReplyTo;
       if (submittedDialogId) {
         clearComposeState(stateFor(submittedDialogId));
       }
       if (submittedDialogId === activeDialogId) {
-        // #48: clear the reply only for the dialog whose send just completed — if the
-        // user switched dialogs mid-flight and picked a new reply target there, an older
-        // send must not wipe it (the banner would otherwise desync from the sent message).
-        clearReply();
-        composer.reset();
+        // #48: clear the reply only for the dialog whose send just completed AND only if
+        // the target hasn't changed since — if the user picked a newer target in the same
+        // dialog before this (slow) send returned, that newer selection must survive (the
+        // banner would otherwise desync from what the next send actually carries).
+        const targetUnchanged = replyToInput.value === submittedReplyTo;
+        const survivingReply = targetUnchanged ? '' : replyToInput.value;
+        composer.reset();  // blanks composer-text AND the hidden reply_to field
         dialogInput.value = activeDialogId;
+        if (targetUnchanged) {
+          clearReply();  // consumed by this send: clear the banner too
+        } else {
+          replyToInput.value = survivingReply;  // re-apply the newer target reset() wiped
+        }
       } else if (activeDialogId) {
         applyComposeState(stateFor(activeDialogId));
         dialogInput.value = activeDialogId;
