@@ -709,6 +709,27 @@ async def test_tui_react_command_calls_client():
     assert all("out" in b.classes for b in bubbles)
 
 
+async def test_tui_react_forbidden_restores_command():
+    # Same optimistic-clear data-loss class as text/media: on_input_submitted clears the
+    # composer before the worker; a rejected /react must restore the typed command.
+    stub = TuiStubClient()
+
+    async def forbidden(peer, message_id, emoticon):
+        raise SendForbiddenError("ChatWriteForbiddenError")
+
+    stub.send_reaction = forbidden
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "/react 1 👍"))
+        await pilot.pause()
+        assert stub.reactions == []  # nothing reacted
+        assert app._compose_state_for(7).draft == "/react 1 👍"  # command restored
+        assert composer.value == "/react 1 👍"  # typed command back in the composer
+
+
 async def test_tui_bad_react_command_notifies_and_does_not_send_text():
     stub = TuiStubClient()
     app = MessengerTUI(client=stub)

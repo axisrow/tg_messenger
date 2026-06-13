@@ -148,15 +148,21 @@
       const resp = await fetch('/dialogs/' + id + '/media', { method: 'POST', body: fd });
       const html = await resp.text();
       if (resp.ok) {
-        document.getElementById('messages').insertAdjacentHTML('beforeend', html);
-        document.getElementById('composer-text').value = '';
-        const state = currentState();
-        if (state) clearComposeState(state);
-        // #48: media carries no reply_to, so clear the stale banner — but only if the user
-        // is still on this upload's dialog AND hasn't picked a newer target since; either
-        // change means the live reply state belongs to a later action, not this upload.
-        if (document.getElementById('dialog_id').value === id && replyToInput.value === uploadReplyTo) {
-          clearReply();
+        // Clear THIS upload's compose state (clearComposeState only touches the visible
+        // composer when its dialog is still active), never currentState() — a dialog
+        // switch in flight must not erase the newly-active dialog's draft.
+        clearComposeState(stateFor(id));
+        // Append the bubble and clear the visible composer/reply banner only if the user
+        // is still on this upload's dialog (otherwise the bubble belongs to another chat,
+        // and the visible composer/draft is a later action's, not this upload's).
+        if (document.getElementById('dialog_id').value === id) {
+          document.getElementById('messages').insertAdjacentHTML('beforeend', html);
+          document.getElementById('composer-text').value = '';
+          // #48: media carries no reply_to, so clear the stale banner — but only if the
+          // user hasn't picked a newer target since this upload started.
+          if (replyToInput.value === uploadReplyTo) {
+            clearReply();
+          }
         }
       } else {
         alert(html.replace(/<[^>]+>/g, '').trim() || 'Upload failed');

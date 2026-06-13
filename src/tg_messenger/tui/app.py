@@ -785,9 +785,10 @@ class MessengerTUI(App):
             message_id, emoticon = reaction
             state.draft = ""
             self._clear_pending_outbound(dialog_id)
-            event.input.value = ""
+            event.input.value = ""  # clear optimistically; restored on failure
             self.run_worker(
-                self._send_reaction(dialog_id, message_id, emoticon), exclusive=False
+                self._send_reaction(dialog_id, message_id, emoticon, source_text=text),
+                exclusive=False,
             )
             return
         try:
@@ -1043,16 +1044,31 @@ class MessengerTUI(App):
             await pane.mount(bubble)
             self._scroll_messages_to_end(pane)
 
-    async def _send_reaction(self, peer: int, message_id: int, emoticon: str) -> None:
+    async def _send_reaction(
+        self, peer: int, message_id: int, emoticon: str, source_text: str | None = None,
+    ) -> None:
+        # source_text is the original "/react ..." command, cleared optimistically in
+        # on_input_submitted — restore it on any failure so the typed command is not lost.
+        def _restore() -> None:
+            if source_text is None:
+                return
+            self._compose_state_for(peer).draft = source_text
+            if peer == self._current:
+                composer = self.query_one("#composer", Input)
+                if not composer.value:  # don't clobber a draft typed meanwhile
+                    composer.value = source_text
+
         try:
             await self._client.send_reaction(peer, message_id, emoticon)
         except SendForbiddenError:
             logger.warning("reaction rejected (rights) (dialog %s, message %s)", peer, message_id)
             self.notify(READ_ONLY_MESSAGE, severity="warning")
+            _restore()
             return
         except Exception as exc:
             logger.exception("send reaction failed (dialog %s, message %s)", peer, message_id)
             self.notify(f"Reaction failed: {exc}", severity="error")
+            _restore()
             return
         self._remember_sent_reaction(peer, message_id, emoticon)
         if peer == self._current:

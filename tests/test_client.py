@@ -265,6 +265,7 @@ _RIGHTS_ERROR_NAMES = [
     "ChatSendStickersForbiddenError",
     "ChatSendPollForbiddenError",
     "VoiceMessagesForbiddenError",
+    "ChatForbiddenError",  # "You cannot write in this chat" — read-only after a stale cache
 ]
 
 

@@ -28,6 +28,7 @@ _RIGHTS_ERRORS = (
     "ChatSendStickersForbiddenError",
     "ChatSendPollForbiddenError",
     "VoiceMessagesForbiddenError",
+    "ChatForbiddenError",
 )
 
 

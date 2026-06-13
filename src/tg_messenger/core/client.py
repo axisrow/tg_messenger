@@ -19,6 +19,7 @@ from telethon import TelegramClient, events
 from telethon import utils as tl_utils
 from telethon.errors import (
     ChatAdminRequiredError,
+    ChatForbiddenError,
     ChatGuestSendForbiddenError,
     ChatRestrictedError,
     ChatSendGifsForbiddenError,
@@ -92,6 +93,7 @@ READ_ONLY_MESSAGE = "Сюда писать нельзя — чат только 
 # state; folding it in would mislabel a perfectly writable slow-mode chat as read-only.
 _SEND_FORBIDDEN_ERRORS = (
     ChatAdminRequiredError,
+    ChatForbiddenError,  # "You cannot write in this chat" — read-only after a stale cache
     ChatWriteForbiddenError,
     ChatSendMediaForbiddenError,
     UserBannedInChannelError,
