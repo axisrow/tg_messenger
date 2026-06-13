@@ -354,8 +354,9 @@ class MessengerTUI(App):
     """
 
     def __init__(self, *, client=None, session_name: str = "default",
-                 profiles: list[str] | None = None, client_factory=None, suggester=None,
-                 login_session=None, store=None, translator=None, outbound=None):
+                 profiles: list[str] | None = None, client_factory=None, deps_factory=None,
+                 suggester=None, login_session=None, store=None, translator=None,
+                 outbound=None):
         super().__init__()
         self._client = client
         self._session_name = session_name
@@ -364,6 +365,10 @@ class MessengerTUI(App):
         self._login_session = login_session
         # how a client is built once a profile is chosen (injectable for tests)
         self._client_factory = client_factory or _make_real_client
+        # #52: builds the WHOLE dependency set (client + suggester/store/translator/
+        # outbound) for a profile chosen via ProfileScreen — used by the `tui` entrypoint
+        # so the in-app picker, not a CLI menu, resolves the profile. None = library path.
+        self._deps_factory = deps_factory
         self._current: int | None = None
         self._tab = "all"
         self._started = False  # gates tab events until _startup finished
@@ -465,18 +470,34 @@ class MessengerTUI(App):
         self.run_worker(self._startup(), exclusive=False)
 
     async def _startup(self) -> None:
-        if self._client is None:
-            if len(self._profiles) > 1:
-                # >1 account and none preselected → ask which one, then build it
-                chosen = await self.push_screen_wait(ProfileScreen(self._profiles))
-                self._session_name = chosen
-                self._client = self._client_factory(chosen)
-            elif len(self._profiles) == 1:
-                self._session_name = self._profiles[0]
-                self._client = self._client_factory(self._profiles[0])
-            else:
-                self._client = self._client_factory(self._session_name)
+        # The client (and, via deps_factory, the whole dependency set) is built inside the
+        # try so a factory error — e.g. a bad TG_API_ID in .env making client_from_env raise
+        # — exits cleanly via the handler below instead of crashing run_worker with a raw
+        # traceback that tears down the alternate screen.
         try:
+            if self._client is None:
+                if len(self._profiles) > 1:
+                    # >1 account and none preselected → ask which one, then build it
+                    chosen = await self.push_screen_wait(ProfileScreen(self._profiles))
+                    if self._deps_factory is not None:
+                        # #52: the `tui` entrypoint builds the WHOLE dependency set for the
+                        # picked profile (client + suggester/store/translator/outbound) and
+                        # re-inits its per-profile log file — not just the client.
+                        deps = self._deps_factory(chosen)
+                        self._session_name = deps.session_name
+                        self._client = deps.client
+                        self._suggester = deps.suggester
+                        self._store = deps.store
+                        self._translator = deps.translator
+                        self._outbound = deps.outbound
+                    else:
+                        self._session_name = chosen
+                        self._client = self._client_factory(chosen)
+                elif len(self._profiles) == 1:
+                    self._session_name = self._profiles[0]
+                    self._client = self._client_factory(self._profiles[0])
+                else:
+                    self._client = self._client_factory(self._session_name)
             await self._client.connect()
             if not await self._client.is_authorized():
                 # show the login wizard instead of exiting; on success continue startup

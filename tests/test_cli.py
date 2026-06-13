@@ -1843,8 +1843,23 @@ def test_profiles_command_lists_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
     result = CliRunner().invoke(cli_main.cli, ["profiles"])
     assert result.exit_code == 0, result.output
-    assert "alice" in result.output
-    assert "bob" in result.output
+    # #52: valid profiles carry the ✓ marker
+    assert "alice ✓" in result.output
+    assert "bob ✓" in result.output
+
+
+def test_profiles_command_marks_corrupt_profile(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    monkeypatch.setenv("TG_SESSION_DIR", str(tmp_path))
+    store = SessionStore(tmp_path)
+    store.save("good", _valid_session_for_import())
+    store.path_for("broken").write_text("garbage", encoding="utf-8")
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    result = CliRunner().invoke(cli_main.cli, ["profiles"])
+    assert result.exit_code == 0, result.output
+    assert "good ✓" in result.output
+    assert "broken ✗" in result.output
 
 
 def test_profiles_command_empty_hint_uses_global_profile_position(monkeypatch, tmp_path):
@@ -2003,7 +2018,32 @@ def test_profile_menu_reprompts_on_out_of_range(monkeypatch, tmp_path):
     result = CliRunner().invoke(cli_main.cli, ["dialogs"], input="9\n2\n")
     assert result.exit_code == 0, result.output
     assert "out of range" in result.output
-    assert captured.get("session_name") == "bob"
+
+
+def test_interactive_menu_reinits_log_for_chosen_profile(monkeypatch, tmp_path):
+    # #52 point 3: a menu-chosen profile re-runs setup_logging so the log file is
+    # isolated (tg_messenger_<profile>.log), not just for an explicit --profile.
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(tmp_path)
+    for name in ("alice", "bob", "carol"):
+        store.save(name, _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: StubClient())
+    monkeypatch.setattr(cli_main, "_is_interactive", lambda: True)
+
+    profiles_logged = []
+    real_setup = cli_main.setup_logging
+
+    def spy_setup_logging(*args, **kw):
+        profiles_logged.append(kw.get("profile"))
+        return real_setup(*args, **kw)
+
+    monkeypatch.setattr(cli_main, "setup_logging", spy_setup_logging)
+    result = CliRunner().invoke(cli_main.cli, ["dialogs"], input="2\n")
+    assert result.exit_code == 0, result.output
+    # the LAST setup_logging call must target the menu-chosen profile (sorted #2 = bob)
+    assert profiles_logged[-1] == "bob", profiles_logged
 
 
 # --- цикл 61: serve/tui учитывают глобальный --profile ---
@@ -2087,6 +2127,155 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
     assert captured["client"] is client
     assert captured["suggester"] is suggester
     assert optional_kwargs == {"session": "work"}
+
+
+# --- #52 point 2: ProfileScreen reachable from the `tui` entrypoint ---
+
+
+class _FakeTUIAllKwargs:
+    """Records every constructor kwarg so a test can assert eager vs deferred wiring."""
+
+    captured: dict = {}
+
+    def __init__(self, **kw):
+        type(self).captured = dict(kw)
+
+    def run(self):
+        pass
+
+
+def _patch_tui(monkeypatch):
+    monkeypatch.setattr("tg_messenger.tui.app.MessengerTUI", _FakeTUIAllKwargs)
+    _FakeTUIAllKwargs.captured = {}
+
+
+def test_tui_eager_when_single_profile(monkeypatch, tmp_path):
+    # 0/1 profile: resolve silently, build deps eagerly, pass a ready client (no defer).
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(tmp_path)
+    store.save("solo", _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    deps_calls = []
+    monkeypatch.setattr(
+        cli_main, "make_tui_deps",
+        lambda profile, **kw: (deps_calls.append(profile) or cli_main.TuiDeps(
+            client=StubClient(), session_name=profile, suggester=None,
+            store=None, translator=None, outbound=None,
+        )),
+    )
+    _patch_tui(monkeypatch)
+    result = CliRunner().invoke(cli_main.cli, ["tui"])
+    assert result.exit_code == 0, result.output
+    assert deps_calls == ["solo"]
+    cap = _FakeTUIAllKwargs.captured
+    assert cap.get("client") is not None  # ready client, eager
+    assert cap.get("deps_factory") is None
+    assert cap.get("session_name") == "solo"
+
+
+def test_tui_eager_when_explicit_profile(monkeypatch, tmp_path):
+    # --profile wins: no menu, no defer, deps built for the named profile even with >1 saved.
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(tmp_path)
+    for name in ("alice", "bob"):
+        store.save(name, _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    deps_calls = []
+    monkeypatch.setattr(
+        cli_main, "make_tui_deps",
+        lambda profile, **kw: (deps_calls.append(profile) or cli_main.TuiDeps(
+            client=StubClient(), session_name=profile, suggester=None,
+            store=None, translator=None, outbound=None,
+        )),
+    )
+    _patch_tui(monkeypatch)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "alice", "tui"])
+    assert result.exit_code == 0, result.output
+    assert deps_calls == ["alice"]
+    assert _FakeTUIAllKwargs.captured.get("deps_factory") is None
+
+
+def test_tui_defers_to_screen_when_multi_profile_interactive(monkeypatch, tmp_path):
+    # >1 profiles + interactive: do NOT resolve up front — pass profiles + a deps_factory
+    # so the in-app ProfileScreen picks, then builds deps lazily.
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(tmp_path)
+    for name in ("alice", "bob"):
+        store.save(name, _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    monkeypatch.setattr(cli_main, "_is_interactive", lambda: True)
+    deps_calls = []
+    monkeypatch.setattr(
+        cli_main, "make_tui_deps", lambda profile, **kw: deps_calls.append(profile)
+    )
+    _patch_tui(monkeypatch)
+    result = CliRunner().invoke(cli_main.cli, ["tui"])
+    assert result.exit_code == 0, result.output
+    assert deps_calls == []  # built lazily inside the TUI, not up front
+    cap = _FakeTUIAllKwargs.captured
+    assert cap.get("client") is None
+    assert sorted(cap.get("profiles")) == ["alice", "bob"]
+    assert cap.get("deps_factory") is not None
+    # the factory routes to make_tui_deps for the chosen profile
+    cap["deps_factory"]("bob")
+    assert deps_calls == ["bob"]
+
+
+def test_tui_errors_when_multi_profile_non_interactive(monkeypatch, tmp_path):
+    from tg_messenger.core.auth import SessionStore
+
+    store = SessionStore(tmp_path)
+    for name in ("alice", "bob"):
+        store.save(name, _valid_session_for_import())
+    monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
+    monkeypatch.setattr(cli_main, "_is_interactive", lambda: False)
+    _patch_tui(monkeypatch)
+    result = CliRunner().invoke(cli_main.cli, ["tui"])
+    assert result.exit_code != 0
+    assert "--profile" in result.output
+
+
+def test_make_tui_deps_calls_setup_logging_and_threads_storage(monkeypatch):
+    # make_tui_deps re-inits per-profile logging (point 3) and threads the SAME storage
+    # object from make_message_store into both the translator and outbound builders.
+    log_calls = []
+    monkeypatch.setattr(
+        cli_main, "setup_logging", lambda **kw: log_calls.append(kw)
+    )
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: StubClient())
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c, **kw: "SUG")
+    sentinel_storage = object()
+    monkeypatch.setattr(
+        cli_main, "make_message_store", lambda client, **kw: ("STORE", sentinel_storage)
+    )
+    translator_storage = {}
+    outbound_args = {}
+
+    def fake_translator(storage):
+        translator_storage["storage"] = storage
+        return "TR"
+
+    def fake_outbound(store, storage):
+        outbound_args.update(store=store, storage=storage)
+        return "OUT"
+
+    monkeypatch.setattr(cli_main, "make_optional_translator", fake_translator)
+    monkeypatch.setattr(cli_main, "make_optional_outbound", fake_outbound)
+    deps = cli_main.make_tui_deps("myprofile", log_kwargs={"verbose": False, "console": False})
+    assert deps.session_name == "myprofile"
+    assert deps.suggester == "SUG"
+    assert deps.store == "STORE"
+    assert deps.translator == "TR"
+    assert deps.outbound == "OUT"
+    # per-profile log re-init with console=False
+    assert any(c.get("profile") == "myprofile" and c.get("console") is False for c in log_calls)
+    # same storage threaded everywhere
+    assert translator_storage["storage"] is sentinel_storage
+    assert outbound_args["storage"] is sentinel_storage
+    assert outbound_args["store"] == "STORE"
 
 
 # --- Цикл 122: username suggest / set / clear ---

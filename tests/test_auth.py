@@ -365,3 +365,56 @@ def test_delete_profile_removes_file(session_dir):
 def test_delete_missing_profile_returns_false(session_dir):
     store = SessionStore(session_dir)
     assert store.delete("ghost") is False
+
+
+# --- #52: validity marker for `profiles` (no network) ---
+
+
+def test_is_valid_profile_true_for_saved_session(session_dir):
+    store = SessionStore(session_dir)
+    store.save("alice", VALID_SESSION)
+    assert store.is_valid_profile("alice") is True
+
+
+def test_is_valid_profile_false_for_missing(session_dir):
+    store = SessionStore(session_dir)
+    assert store.is_valid_profile("ghost") is False
+
+
+def test_is_valid_profile_false_for_corrupt_file(session_dir):
+    store = SessionStore(session_dir)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    store.path_for("broken").write_text("garbage", encoding="utf-8")
+    assert store.is_valid_profile("broken") is False
+
+
+def test_is_valid_profile_true_for_encrypted_without_key(session_dir):
+    # an enc:v2: file is present and not corrupt — valid even though we can't decrypt it
+    keyed = SessionStore(session_dir, encryption_key=_ENC_KEY)
+    keyed.save("enc", VALID_SESSION)
+    no_key = SessionStore(session_dir)
+    assert no_key.is_valid_profile("enc") is True
+
+
+def test_is_valid_profile_false_for_non_utf8_file(session_dir):
+    # A binary/corrupt *.session file makes Path.read_text() raise UnicodeDecodeError
+    # (a ValueError, NOT an OSError). It must be caught → marked ✗, so one bad file never
+    # aborts the whole `profiles` listing (which calls is_valid_profile per profile).
+    store = SessionStore(session_dir)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    store.path_for("binary").write_bytes(b"\xff\xfe\x00\x01not-utf8")
+    assert store.is_valid_profile("binary") is False
+
+
+def test_is_valid_profile_does_not_rewrite_plaintext_under_key(session_dir):
+    # `profiles` listing is read-only: validating a plaintext file under a key must NOT
+    # trigger load()'s lazy encrypt-migration (which would self.save() the file). Otherwise
+    # a read-only mount / full disk makes `tg-messenger profiles` fail or silently rewrite.
+    plain = SessionStore(session_dir)
+    plain.save("default", VALID_SESSION)  # plaintext on disk
+    before = plain.path_for("default").read_text(encoding="utf-8")
+    keyed = SessionStore(session_dir, encryption_key=_ENC_KEY)
+    assert keyed.is_valid_profile("default") is True
+    after = keyed.path_for("default").read_text(encoding="utf-8")
+    assert after == before  # untouched — no enc:v2: rewrite
+    assert not after.startswith("enc:v2:")
