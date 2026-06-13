@@ -592,6 +592,27 @@ def test_chat_react_command_does_not_send_text(runner):
     assert stub.sent == []
 
 
+def test_chat_send_forbidden_warns_and_keeps_session(runner):
+    # F3: a SendForbiddenError on send must NOT crash the REPL — warn and continue.
+    r, stub = runner
+    stub.listen_interrupt = False
+    stub.send_text_raises = SendForbiddenError("ChatWriteForbiddenError")
+    # two lines then EOF: if the first send killed the session, the second wouldn't run
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="first\nsecond\n")
+    assert result.exit_code == 0, result.output
+    assert "read-only" in result.output.lower() or "нельзя" in result.output
+    assert stub.connected is False  # clean shutdown on EOF, not a crash
+
+
+def test_chat_react_forbidden_warns_and_keeps_session(runner):
+    r, stub = runner
+    stub.listen_interrupt = False
+    stub.send_reaction_raises = SendForbiddenError("ChatWriteForbiddenError")
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="/react 10 👍\nplain\n")
+    assert result.exit_code == 0, result.output
+    assert stub.connected is False
+
+
 def test_chat_outbound_variant_sends_pick(runner, monkeypatch):
     r, stub = runner
     stub.listen_interrupt = False

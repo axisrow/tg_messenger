@@ -254,14 +254,65 @@ async def test_dialogs_populates_can_send(fake_client):
     }
 
 
-async def test_send_text_classifies_rights_error(fake_client):
-    from telethon.errors import ChatWriteForbiddenError
+_RIGHTS_ERROR_NAMES = [
+    "ChatAdminRequiredError",
+    "ChatWriteForbiddenError",
+    "ChatSendMediaForbiddenError",
+    "UserBannedInChannelError",
+    "ChatGuestSendForbiddenError",
+    "ChatRestrictedError",
+    "ChatSendGifsForbiddenError",
+    "ChatSendStickersForbiddenError",
+    "ChatSendPollForbiddenError",
+    "VoiceMessagesForbiddenError",
+]
+
+
+def _rights_error(name):
+    from telethon import errors
+
+    return getattr(errors, name)(request=None)
+
+
+@pytest.mark.parametrize("err_name", _RIGHTS_ERROR_NAMES)
+async def test_send_text_classifies_rights_errors(fake_client, err_name):
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.send_message_raises = _rights_error(err_name)
+    with pytest.raises(SendForbiddenError):
+        await client.send_text(-100123, "nope")
+
+
+@pytest.mark.parametrize("err_name", _RIGHTS_ERROR_NAMES)
+async def test_send_media_classifies_rights_errors(fake_client, err_name, tmp_path):
+    f = tmp_path / "pic.jpg"
+    f.write_bytes(b"x")
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.send_file_raises = _rights_error(err_name)
+    with pytest.raises(SendForbiddenError):
+        await client.send_media(-100123, str(f))
+
+
+@pytest.mark.parametrize("err_name", _RIGHTS_ERROR_NAMES)
+async def test_send_reaction_classifies_rights_errors(fake_client, err_name):
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.call_raises = _rights_error(err_name)
+    with pytest.raises(SendForbiddenError):
+        await client.send_reaction(-100123, 5, "👍")
+
+
+async def test_slowmode_is_not_classified_as_send_forbidden(fake_client):
+    # slow-mode is a transient wait, NOT a read-only state — it must NOT be folded
+    # into SendForbiddenError (that would mislabel a writable chat as read-only).
+    from telethon.errors import SlowModeWaitError
 
     client = _build(fake_client)
     await client.connect()
-    fake_client.send_message_raises = ChatWriteForbiddenError(request=None)
-    with pytest.raises(SendForbiddenError):
-        await client.send_text(-100123, "nope")
+    fake_client.send_message_raises = SlowModeWaitError(request=None)
+    with pytest.raises(SlowModeWaitError):
+        await client.send_text(-100123, "too fast")
 
 
 async def test_send_text_floodwait_still_retries(fake_client, monkeypatch):

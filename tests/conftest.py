@@ -272,8 +272,10 @@ class FakeTelethonClient:
         self.iter_dialogs_calls = 0
         self.iter_messages_calls = 0
         self.last_min_id = None
-        # optional: make send_message raise this (rights-error classification tests)
+        # optional: make a send raise this (rights-error classification tests)
         self.send_message_raises: BaseException | None = None
+        self.send_file_raises: BaseException | None = None
+        self.call_raises: BaseException | None = None  # raw __call__ (reactions)
 
     # --- connection / auth ---
     async def connect(self):
@@ -303,6 +305,8 @@ class FakeTelethonClient:
         # client uses it for SendReactionRequest etc. — record every raw call.
         self.requests.append(request)
         self.resend_requests.append(request)
+        if self.call_raises is not None:
+            raise self.call_raises
         # username RPCs: dispatch by class name (avoid importing telethon types here)
         cls = type(request).__name__
         if cls == "CheckUsernameRequest":
@@ -385,6 +389,8 @@ class FakeTelethonClient:
 
     async def send_file(self, peer, file, caption=None, voice_note=False,
                         video_note=False, force_document=False):
+        if self.send_file_raises is not None:
+            raise self.send_file_raises
         msg = FakeMessage(id=998, sender_id=1, text=caption, out=True, peer_id=int(peer))
         self.sent.append({
             "peer": int(peer), "file": str(file), "caption": caption,

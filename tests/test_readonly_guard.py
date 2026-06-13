@@ -14,13 +14,20 @@ _SRC = Path(__file__).resolve().parent.parent / "src" / "tg_messenger"
 _CLIENT = (_SRC / "core" / "client.py").read_text(encoding="utf-8")
 _MODELS = (_SRC / "core" / "models.py").read_text(encoding="utf-8")
 
-# the Telegram rights-rejection errors a send may raise — all must be classified
+# the Telegram rights-rejection errors a send may raise — all must be classified.
+# NOTE: SlowModeWaitError is deliberately NOT here — it's a transient wait, not a
+# read-only state, so it must NOT be folded into SendForbiddenError.
 _RIGHTS_ERRORS = (
     "ChatAdminRequiredError",
     "ChatWriteForbiddenError",
     "ChatSendMediaForbiddenError",
     "UserBannedInChannelError",
-    "SlowModeWaitError",
+    "ChatGuestSendForbiddenError",
+    "ChatRestrictedError",
+    "ChatSendGifsForbiddenError",
+    "ChatSendStickersForbiddenError",
+    "ChatSendPollForbiddenError",
+    "VoiceMessagesForbiddenError",
 )
 
 

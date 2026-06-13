@@ -19,12 +19,17 @@ from telethon import TelegramClient, events
 from telethon import utils as tl_utils
 from telethon.errors import (
     ChatAdminRequiredError,
+    ChatGuestSendForbiddenError,
+    ChatRestrictedError,
+    ChatSendGifsForbiddenError,
     ChatSendMediaForbiddenError,
+    ChatSendPollForbiddenError,
+    ChatSendStickersForbiddenError,
     ChatWriteForbiddenError,
-    SlowModeWaitError,
     UserBannedInChannelError,
     UsernameInvalidError,
     UsernameOccupiedError,
+    VoiceMessagesForbiddenError,
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import CheckUsernameRequest, UpdateUsernameRequest
@@ -68,22 +73,34 @@ class MessageDeleteValidationError(ValueError):
 
 class SendForbiddenError(ValueError):
     """Raised by the send wrappers when Telegram rejects a write on a rights basis
-    (read-only channel, banned/restricted member, admin required, slow-mode).
+    (read-only channel, banned/restricted member, admin required).
 
     A ``ValueError`` subclass so the UIs map ONE error type to a clean "you can't
     post here" message — mirroring ``MessageDeleteValidationError``. The ``can_send``
     dialog flag pre-disables the composer; this is the authoritative TOCTOU net when
-    the (cached) flag is stale or a transient slow-mode wait fires.
+    the (cached) flag is stale. Slow-mode is NOT folded in here — it's transient.
     """
 
 
+# The single user-facing read-only message, shared by every UI (Russian per the
+# project's user-communication language). Avoids drift across cli/tui/web.
+READ_ONLY_MESSAGE = "Сюда писать нельзя — чат только для чтения."
+
+
 # Telegram rights-rejection errors reclassified into SendForbiddenError at the send seam.
+# SlowModeWaitError is deliberately EXCLUDED — it's a transient wait, not a read-only
+# state; folding it in would mislabel a perfectly writable slow-mode chat as read-only.
 _SEND_FORBIDDEN_ERRORS = (
     ChatAdminRequiredError,
     ChatWriteForbiddenError,
     ChatSendMediaForbiddenError,
     UserBannedInChannelError,
-    SlowModeWaitError,
+    ChatGuestSendForbiddenError,
+    ChatRestrictedError,
+    ChatSendGifsForbiddenError,
+    ChatSendStickersForbiddenError,
+    ChatSendPollForbiddenError,
+    VoiceMessagesForbiddenError,
 )
 
 
@@ -146,7 +163,9 @@ def _entity_can_send(entity) -> bool:
         if getattr(entity, "broadcast", False):
             return bool(getattr(admin, "post_messages", True))
         return True
-    # personal restriction on us (per-user ChatBannedRights) — True flag == forbidden
+    # personal restriction on us (per-user ChatBannedRights) — True flag == forbidden.
+    # Checked AFTER admin: an admin posts regardless (Telegram doesn't restrict admins
+    # this way), so admin-wins precedence is deliberate.
     banned = getattr(entity, "banned_rights", None)
     if banned is not None and getattr(banned, "send_messages", False):
         return False

@@ -39,7 +39,7 @@ from tg_messenger.core.auth import (
     delivery_hint,
     session_store_from_env,
 )
-from tg_messenger.core.client import SendForbiddenError
+from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.search import filter_dialogs
 
@@ -671,7 +671,7 @@ def build_app(
     async def send_forbidden(request: Request, exc: SendForbiddenError):
         # TOCTOU net: the can_send flag (cached) said OK but Telegram rejected on rights.
         logger.warning("send rejected (rights): %s %s", request.url.path, exc)
-        return _error_response("Сюда писать нельзя — чат только для чтения.", 403)
+        return _error_response(READ_ONLY_MESSAGE, 403)
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception):
@@ -1032,7 +1032,7 @@ async def _readonly_error(client, dialog_id: int) -> HTMLResponse | None:
     except DialogLookupError:
         return None
     if dialog is not None and not getattr(dialog, "can_send", True):
-        return _error_response("Сюда писать нельзя — чат только для чтения.", 403)
+        return _error_response(READ_ONLY_MESSAGE, 403)
     return None
 
 
