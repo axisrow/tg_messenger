@@ -139,15 +139,30 @@ def test_due_after_interval():
     assert is_due(plan, now=now, rng=lambda a, b: 0.0) is True
 
 
-def test_jitter_pushes_due_later_deterministic():
-    # interval 24h, jitter 60min; rng returns the max (+60min) → not yet due at +24h
+def test_jitter_offset_comes_from_stored_value():
+    # interval 24h, the per-interval jitter was drawn once (+60min) and stored on the plan;
+    # is_due reads that stored offset, it does NOT re-draw via rng.
     last = 1000.0
     now = last + 24 * 3600.0 + 1
-    plan = _plan(last_ping_at=last, jitter_minutes=60.0)
-    assert is_due(plan, now=now, rng=lambda a, b: b) is False
-    # but due once the jittered offset elapses
+    plan = _plan(last_ping_at=last, jitter_minutes=60.0, next_jitter_sec=60 * 60.0)
+    assert is_due(plan, now=now) is False
+    # but due once the stored offset elapses
     now2 = last + 24 * 3600.0 + 60 * 60.0 + 1
-    assert is_due(plan, now=now2, rng=lambda a, b: b) is True
+    assert is_due(plan, now=now2) is True
+
+
+def test_is_due_does_not_redraw_jitter_each_tick():
+    # The bug: is_due used to call rng() every tick, biasing the effective offset to the
+    # lower bound. Now is_due is a pure comparison against the stored next_jitter_sec —
+    # the result is identical across many calls and never consults rng.
+    def explode(a, b):
+        raise AssertionError("is_due must not call rng")
+
+    last = 1000.0
+    plan = _plan(last_ping_at=last, jitter_minutes=60.0, next_jitter_sec=60 * 60.0)
+    now = last + 24 * 3600.0 + 30 * 60.0  # +24h30m: inside the stored +60m jitter → not due
+    for _ in range(5):
+        assert is_due(plan, now=now, rng=explode) is False
 
 
 def test_quiet_hours_block_overnight_window():
@@ -339,6 +354,35 @@ async def test_tick_updates_last_ping_and_count(tmp_path):
         # immediately ticking again → not due (interval not elapsed)
         await svc.process_plans(now=1100.0)
         assert client.sent == [(PEER, "ping")]
+    finally:
+        await storage.close()
+
+
+async def test_record_ping_persists_drawn_jitter(tmp_path):
+    # After a ping, _record_ping draws the next interval's jitter ONCE via rng and stores it.
+    svc, client, storage, t = _mk_service(tmp_path, rng=lambda a, b: b)  # draw the max offset
+    await storage.connect()
+    try:
+        await add_plan(storage, HeartbeatPlan(
+            peer=PEER, templates=["ping"], interval_hours=24.0, jitter_minutes=60.0))
+        await svc.process_plans(now=5000.0)
+        plan = (await list_plans(storage))[0]
+        assert plan.last_ping_at == 5000.0
+        assert plan.next_jitter_sec == 60 * 60.0  # drawn once, persisted
+    finally:
+        await storage.close()
+
+
+async def test_record_ping_leaves_jitter_none_when_disabled(tmp_path):
+    # jitter_minutes == 0 → no offset stored (next_jitter_sec stays None).
+    svc, client, storage, t = _mk_service(tmp_path, rng=lambda a, b: b)
+    await storage.connect()
+    try:
+        await add_plan(storage, HeartbeatPlan(
+            peer=PEER, templates=["ping"], interval_hours=24.0, jitter_minutes=0.0))
+        await svc.process_plans(now=5000.0)
+        plan = (await list_plans(storage))[0]
+        assert plan.next_jitter_sec is None
     finally:
         await storage.close()
 
