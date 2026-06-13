@@ -23,6 +23,7 @@ from tg_messenger.agent.config import langsmith_tracing_enabled
 from tg_messenger.core.auth import LOGIN_HINT, session_store_from_env, validate_session_string
 from tg_messenger.core.client import (
     MessageDeleteValidationError,
+    SendForbiddenError,
     client_from_env,
     is_channel_or_megagroup_id,
 )
@@ -390,6 +391,11 @@ def _run(coro, session: str = "default"):
         raise click.ClickException(exc.user_message) from exc
     except MessageDeleteValidationError as exc:
         raise click.ClickException(str(exc)) from exc
+    except SendForbiddenError as exc:
+        logger.warning("send rejected (rights): %s", exc)
+        raise click.ClickException(
+            "This chat is read-only — you don't have permission to post here."
+        ) from exc
     except UnauthorizedError as exc:
         # session missing or revoked mid-command
         raise click.ClickException(_login_hint(session)) from exc
@@ -897,6 +903,21 @@ def dialog_lang(
     _run(_with_storage(session, lambda storage: None, _do), session=session)
 
 
+async def _require_can_send(client, dialog_id: int) -> None:
+    """Pre-flight: refuse to send into a read-only chat with a clean message.
+
+    Reads the (cached) dialog list — no extra network call when warm. A dialog not
+    found in the list stays permissive (unknown ⇒ try; the core SendForbiddenError
+    seam is the authoritative net). The core seam also covers a stale cache (TOCTOU).
+    """
+    dialogs = await client.dialogs(dm_only=False)
+    target = next((d for d in dialogs if d.id == dialog_id), None)
+    if target is not None and not target.can_send:
+        raise click.ClickException(
+            "This chat is read-only — you don't have permission to post here."
+        )
+
+
 @cli.command()
 @click.argument("dialog_id", type=int)
 @click.argument("text", required=False)
@@ -925,6 +946,7 @@ def send(dialog_id: int, text: str | None, file_path: str | None, caption: str |
         )
 
     async def _do(client):
+        await _require_can_send(client, dialog_id)
         if file_path:
             return await client.send_media(
                 dialog_id, file_path, caption=caption or text,
@@ -945,6 +967,7 @@ def react(dialog_id: int, message_id: int, emoticon: str, session: str) -> None:
     """React to a message with a standard emoji."""
 
     async def _do(client):
+        await _require_can_send(client, dialog_id)
         await client.send_reaction(dialog_id, message_id, emoticon)
 
     _run(_with_client(session, _do), session=session)

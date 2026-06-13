@@ -21,6 +21,8 @@ class WebStubClient:
         self.reactions = []
         self.searched = []
         self.read_acks = []
+        self.channel_can_send = True  # flip to False to simulate a read-only channel
+        self.send_text_raises = None  # set to an exception to exercise the TOCTOU net
 
     async def connect(self):
         pass
@@ -35,7 +37,7 @@ class WebStubClient:
             return dms
         return dms + [
             Dialog(id=-100200, title="Devs", kind="group"),
-            Dialog(id=-100123, title="News", kind="channel"),
+            Dialog(id=-100123, title="News", kind="channel", can_send=self.channel_can_send),
             Dialog(id=9, title="HelperBot", kind="bot"),
         ]
 
@@ -47,6 +49,8 @@ class WebStubClient:
                         date=datetime(2024, 1, 1, tzinfo=timezone.utc))]
 
     async def send_text(self, peer, text, reply_to=None):
+        if self.send_text_raises is not None:
+            raise self.send_text_raises
         self.sent.append((peer, text, reply_to))
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
@@ -543,6 +547,85 @@ async def test_media_upload_empty_file_returns_400(client_app):
     )
     assert r.status_code == 400
     assert stub.sent == []
+
+
+# --- read-only chat gating (capability) ---
+
+
+async def test_dialog_li_marks_readonly_channel():
+    stub = WebStubClient()
+    stub.channel_can_send = False
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/dialogs?tab=groups")
+    assert 'data-can-send="0"' in r.text  # the read-only channel
+    assert 'data-can-send="1"' in r.text  # the writable group
+
+
+async def test_send_to_readonly_channel_returns_403():
+    stub = WebStubClient()
+    stub.channel_can_send = False
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/send", data={"dialog_id": "-100123", "text": "x"})
+    assert r.status_code == 403
+    assert stub.sent == []
+
+
+async def test_reaction_in_readonly_channel_returns_403():
+    stub = WebStubClient()
+    stub.channel_can_send = False
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/dialogs/-100123/reaction",
+                              data={"message_id": "5", "emoticon": "👍"})
+    assert r.status_code == 403
+    assert stub.reactions == []
+
+
+async def test_media_in_readonly_channel_returns_403_without_temp_file(monkeypatch):
+    stub = WebStubClient()
+    stub.channel_can_send = False
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    # the guard must fire BEFORE any temp file is created
+    called = {"tempfile": False}
+    orig = web_app.tempfile.NamedTemporaryFile
+
+    def spy(*a, **k):
+        called["tempfile"] = True
+        return orig(*a, **k)
+
+    monkeypatch.setattr(web_app.tempfile, "NamedTemporaryFile", spy)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/-100123/media",
+                files={"file": ("pic.jpg", b"binarydata", "image/jpeg")},
+            )
+    assert r.status_code == 403
+    assert stub.sent == []
+    assert called["tempfile"] is False  # never streamed to disk
+
+
+async def test_send_maps_send_forbidden_error_to_403():
+    # TOCTOU net: can_send said OK (stale cache) but Telegram rejected at send time.
+    from tg_messenger.core.client import SendForbiddenError
+
+    stub = WebStubClient()
+    stub.send_text_raises = SendForbiddenError("ChatWriteForbiddenError")
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/send", data={"dialog_id": "7", "text": "hi"})
+    assert r.status_code == 403
 
 
 async def test_media_upload_unlink_failure_does_not_mask_response(monkeypatch, caplog):

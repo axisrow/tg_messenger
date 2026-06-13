@@ -17,7 +17,15 @@ from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon import utils as tl_utils
-from telethon.errors import UsernameInvalidError, UsernameOccupiedError
+from telethon.errors import (
+    ChatAdminRequiredError,
+    ChatSendMediaForbiddenError,
+    ChatWriteForbiddenError,
+    SlowModeWaitError,
+    UserBannedInChannelError,
+    UsernameInvalidError,
+    UsernameOccupiedError,
+)
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import CheckUsernameRequest, UpdateUsernameRequest
 from telethon.tl.functions.messages import SendReactionRequest
@@ -58,6 +66,27 @@ class MessageDeleteValidationError(ValueError):
     """Raised before a delete call when Telegram could delete outside the intended peer."""
 
 
+class SendForbiddenError(ValueError):
+    """Raised by the send wrappers when Telegram rejects a write on a rights basis
+    (read-only channel, banned/restricted member, admin required, slow-mode).
+
+    A ``ValueError`` subclass so the UIs map ONE error type to a clean "you can't
+    post here" message — mirroring ``MessageDeleteValidationError``. The ``can_send``
+    dialog flag pre-disables the composer; this is the authoritative TOCTOU net when
+    the (cached) flag is stale or a transient slow-mode wait fires.
+    """
+
+
+# Telegram rights-rejection errors reclassified into SendForbiddenError at the send seam.
+_SEND_FORBIDDEN_ERRORS = (
+    ChatAdminRequiredError,
+    ChatWriteForbiddenError,
+    ChatSendMediaForbiddenError,
+    UserBannedInChannelError,
+    SlowModeWaitError,
+)
+
+
 def is_channel_or_megagroup_id(peer: int) -> bool:
     """Telethon marks channels/supergroups as ``-(10^12 + channel_id)``."""
     return int(peer) <= _CHANNEL_ID_THRESHOLD
@@ -91,6 +120,44 @@ def _dialog_kind(entity) -> DialogKind:
     if hasattr(entity, "first_name") or hasattr(entity, "last_name"):
         return "dm"
     return "group"  # unknown entity — fail-safe NOT a DM (keeps the old filter's semantics)
+
+
+def _entity_can_send(entity) -> bool:
+    """Whether OUR account may post in this entity, computed PURELY from the
+    already-fetched dialog entity (zero extra network calls — rides the dialogs TTL
+    cache). Fail-safe: any unknown/missing shape returns True so a writable chat is
+    never wrongly locked; only positively-detected restrictions return False.
+
+    NOT a slow-mode check — slow-mode is transient and surfaces at send time as
+    SendForbiddenError, never as a permanent read-only state here.
+    """
+    # users/bots (no title) are always writable
+    if getattr(entity, "title", None) is None:
+        return True
+    # we left the chat/channel — can't post
+    if getattr(entity, "left", False):
+        return False
+    # creator and any admin may post — checked BEFORE banned/broadcast, since an admin
+    # posts despite a chat-wide restriction. In a broadcast, an admin needs post_messages.
+    if getattr(entity, "creator", False):
+        return True
+    admin = getattr(entity, "admin_rights", None)
+    if admin is not None:
+        if getattr(entity, "broadcast", False):
+            return bool(getattr(admin, "post_messages", True))
+        return True
+    # personal restriction on us (per-user ChatBannedRights) — True flag == forbidden
+    banned = getattr(entity, "banned_rights", None)
+    if banned is not None and getattr(banned, "send_messages", False):
+        return False
+    # broadcast channel: a plain subscriber (no creator/admin) is read-only
+    if getattr(entity, "broadcast", False):
+        return False
+    # group / megagroup: default_banned_rights.send_messages True == everyone restricted
+    default_banned = getattr(entity, "default_banned_rights", None)
+    if default_banned is not None and getattr(default_banned, "send_messages", False):
+        return False
+    return True
 
 
 def _entity_title(entity) -> str:
@@ -280,6 +347,7 @@ class StandaloneTelegramClient:
                         clean_supported_lang_code(getattr(entity, "lang_code", None))
                         if kind == "dm" else None
                     ),
+                    can_send=_entity_can_send(entity),
                 )
             )
         return result
@@ -353,10 +421,13 @@ class StandaloneTelegramClient:
     ) -> Message:
         """Send ``text`` to ``peer``; ``schedule`` (a delay or absolute time) defers it server-side."""
         await self._send_bucket.acquire()  # global outgoing cap (#25), before the retry loop
-        msg = await run_with_flood_wait_retry(
-            lambda: self._client.send_message(peer, text, reply_to=reply_to, schedule=schedule),
-            operation="send_text",
-        )
+        try:
+            msg = await run_with_flood_wait_retry(
+                lambda: self._client.send_message(peer, text, reply_to=reply_to, schedule=schedule),
+                operation="send_text",
+            )
+        except _SEND_FORBIDDEN_ERRORS as exc:
+            raise SendForbiddenError(str(exc)) from exc
         self._invalidate_history(peer)  # the new message must show on reopen
         return self._to_message(msg, dialog_id=int(peer))
 
@@ -559,27 +630,34 @@ class StandaloneTelegramClient:
         if not path.is_file():
             raise ValueError(f"file not found: {file_path}")
         await self._send_bucket.acquire()  # global outgoing cap (#25), after the cheap path check
-        msg = await run_with_flood_wait_retry(
-            lambda: self._client.send_file(
-                peer, str(path), caption=caption, voice_note=voice_note,
-                video_note=video_note, force_document=force_document,
-            ),
-            operation="send_media",
-        )
+        try:
+            msg = await run_with_flood_wait_retry(
+                lambda: self._client.send_file(
+                    peer, str(path), caption=caption, voice_note=voice_note,
+                    video_note=video_note, force_document=force_document,
+                ),
+                operation="send_media",
+            )
+        except _SEND_FORBIDDEN_ERRORS as exc:
+            raise SendForbiddenError(str(exc)) from exc
         self._invalidate_history(peer)
         return self._to_message(msg, dialog_id=int(peer))
 
     async def send_reaction(self, peer: int, message_id: int, emoticon: str) -> None:
         """React to a message with a standard emoji, routed through flood-wait retry."""
         await self._send_bucket.acquire()  # global outgoing cap (#25)
-        await run_with_flood_wait_retry(
-            lambda: self._client(
-                SendReactionRequest(
-                    peer=peer, msg_id=int(message_id), reaction=[ReactionEmoji(emoticon=emoticon)]
-                )
-            ),
-            operation="send_reaction",
-        )
+        try:
+            await run_with_flood_wait_retry(
+                lambda: self._client(
+                    SendReactionRequest(
+                        peer=peer, msg_id=int(message_id),
+                        reaction=[ReactionEmoji(emoticon=emoticon)],
+                    )
+                ),
+                operation="send_reaction",
+            )
+        except _SEND_FORBIDDEN_ERRORS as exc:
+            raise SendForbiddenError(str(exc)) from exc
 
     def typing(self, peer: int):
         """Async context manager: show the 'typing…' chat action while the body runs.

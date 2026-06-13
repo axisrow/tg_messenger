@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from tests.conftest import make_sent_code
 from tg_messenger.cli import main as cli_main
+from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.models import (
     Dialog,
@@ -36,6 +37,9 @@ class StubClient:
         self.authorized = True
         self.logged_out = False
         self.listen_interrupt = True  # emulate Ctrl+C after the first event
+        self.channel_can_send = True  # flip to False to simulate a read-only channel
+        self.send_text_raises = None  # set to an exception to exercise error mapping
+        self.send_reaction_raises = None
 
     async def is_authorized(self):
         return self.authorized
@@ -73,7 +77,7 @@ class StubClient:
         # повторяет контракт core: dm_only=False — все диалоги с kind и marked id
         return dms + [
             Dialog(id=-100200, title="Devs", kind="group"),
-            Dialog(id=-100123, title="News", kind="channel"),
+            Dialog(id=-100123, title="News", kind="channel", can_send=self.channel_can_send),
             Dialog(id=9, title="HelperBot", kind="bot"),
         ]
 
@@ -98,6 +102,8 @@ class StubClient:
         return str(dest)
 
     async def send_text(self, peer, text, reply_to=None, schedule=None):
+        if self.send_text_raises is not None:
+            raise self.send_text_raises
         self.sent.append((peer, text, reply_to, schedule))
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
@@ -127,6 +133,8 @@ class StubClient:
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
     async def send_reaction(self, peer, message_id, emoticon):
+        if self.send_reaction_raises is not None:
+            raise self.send_reaction_raises
         self.reactions.append((peer, message_id, emoticon))
 
     async def get_me(self):
@@ -372,6 +380,46 @@ def test_react_command_calls_client(runner):
     assert result.exit_code == 0, result.output
     assert stub.reactions == [(7, 10, "👍")]
     assert "reacted." in result.output
+
+
+# --- read-only chat gating (capability) ---
+
+
+def test_send_to_readonly_channel_refused(runner):
+    r, stub = runner
+    stub.channel_can_send = False
+    # `--` separates options from a negative DIALOG_ID (a marked channel id)
+    result = r.invoke(cli_main.cli, ["send", "--", "-100123", "hello"])
+    assert result.exit_code != 0
+    assert "read-only" in result.output
+    assert stub.sent == []  # never attempted the send
+
+
+def test_react_in_readonly_channel_refused(runner):
+    r, stub = runner
+    stub.channel_can_send = False
+    result = r.invoke(cli_main.cli, ["react", "--", "-100123", "10", "👍"])
+    assert result.exit_code != 0
+    assert "read-only" in result.output
+    assert stub.reactions == []
+
+
+def test_send_to_writable_channel_allowed(runner):
+    r, stub = runner
+    stub.channel_can_send = True  # default — guard must not block a writable chat
+    result = r.invoke(cli_main.cli, ["send", "--", "-100123", "hi"])
+    assert result.exit_code == 0, result.output
+    assert stub.sent == [(-100123, "hi", None, None)]
+
+
+def test_send_maps_send_forbidden_error(runner):
+    # TOCTOU net: can_send said OK (stale), Telegram rejected at send time.
+    r, stub = runner
+    stub.send_text_raises = SendForbiddenError("ChatWriteForbiddenError")
+    result = r.invoke(cli_main.cli, ["send", "7", "hi"])
+    assert result.exit_code != 0
+    assert "read-only" in result.output
+    assert "Traceback" not in result.output  # clean message, no raw traceback
 
 
 # --- цикл 80: reply/forward/edit/delete/read команды ---
