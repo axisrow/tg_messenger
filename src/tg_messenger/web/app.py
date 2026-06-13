@@ -803,8 +803,17 @@ def build_app(
         if outbound is None:
             return JSONResponse({"applies": False, "status": "disabled"})
         try:
+            telegram_lang_code = await _dialog_telegram_lang_hint(
+                request.app.state.client,
+                dialog_id,
+            )
             target_lang, variants = await asyncio.wait_for(
-                _build_outbound_variants(outbound, dialog_id, text),
+                _build_outbound_variants(
+                    outbound,
+                    dialog_id,
+                    text,
+                    telegram_lang_code=telegram_lang_code,
+                ),
                 timeout=OUTBOUND_TIMEOUT_SECONDS,
             )
         except TimeoutError:
@@ -890,7 +899,11 @@ def build_app(
         if translator is None:
             return _error_response("Translation is not configured.", 503)
         value = code.strip().lower() or None
-        await translator.set_target_lang(value)
+        try:
+            await translator.set_target_lang(value)
+        except ValueError as exc:
+            logger.warning("invalid user language code: %s", exc)
+            return _error_response(str(exc), 400)
         return HTMLResponse(f'<div id="lang-status">Language: {escape(value or "unset")}</div>')
 
     @app.get("/stream/{dialog_id}")
@@ -909,8 +922,33 @@ def build_app(
     return app
 
 
-async def _build_outbound_variants(outbound, dialog_id: int, text: str) -> tuple[str | None, list[str]]:
-    target_lang = await outbound.applies(dialog_id, text)
+async def _dialog_telegram_lang_hint(client, dialog_id: int) -> str | None:
+    try:
+        dialogs = await client.dialogs(dm_only=False)
+    except Exception:
+        logger.warning("failed to read dialogs for telegram language hint", exc_info=True)
+        return None
+    for dialog in dialogs:
+        if dialog.id == dialog_id:
+            return getattr(dialog, "telegram_lang_code", None)
+    return None
+
+
+async def _build_outbound_variants(
+    outbound,
+    dialog_id: int,
+    text: str,
+    *,
+    telegram_lang_code: str | None = None,
+) -> tuple[str | None, list[str]]:
+    prepare = getattr(outbound, "prepare_variants", None)
+    if prepare is not None:
+        return await prepare(dialog_id, text, telegram_lang_code=telegram_lang_code)
+    target_lang = await outbound.applies(
+        dialog_id,
+        text,
+        telegram_lang_code=telegram_lang_code,
+    )
     if target_lang is None:
         return None, []
     variants = await outbound.variants(dialog_id, text, target_lang)

@@ -64,13 +64,23 @@ def patch_flood_error(monkeypatch) -> type[FakeFloodWaitError]:
 
 
 class FakeUser:
-    def __init__(self, id, first_name=None, last_name=None, username=None, bot=False, contact=False):
+    def __init__(
+        self,
+        id,
+        first_name=None,
+        last_name=None,
+        username=None,
+        bot=False,
+        contact=False,
+        lang_code=None,
+    ):
         self.id = id
         self.first_name = first_name
         self.last_name = last_name
         self.username = username
         self.bot = bot
         self.contact = contact
+        self.lang_code = lang_code
 
 
 class FakeChannel:

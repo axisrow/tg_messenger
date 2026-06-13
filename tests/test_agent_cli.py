@@ -212,7 +212,11 @@ async def test_make_outbound_variants_fn_times_out(monkeypatch):
 
 
 async def test_make_detect_lang_fn_validates_code():
-    assert await factory.make_detect_lang_fn(FakeModel(reply="EN."))(["hello"]) == "en"
+    model = FakeModel(reply="EN.")
+    assert await factory.make_detect_lang_fn(model)(["hello"]) == "en"
+    rendered = "\n".join(str(m.content) for m in model.calls[0])
+    assert "ru, en, es, uk, ja, zh, ko, ar, he, el, th" in rendered
+    assert await factory.make_detect_lang_fn(FakeModel(reply="FR."))(["bonjour"]) is None
     assert await factory.make_detect_lang_fn(FakeModel(reply="English"))(["hello"]) is None
 
 

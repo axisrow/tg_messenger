@@ -562,7 +562,7 @@ def test_chat_outbound_variant_sends_pick(runner, monkeypatch):
             self.recorded.append((dialog_id, message.text, source_text, source_lang))
 
     class FakeOutbound:
-        async def applies(self, dialog_id, text):
+        async def applies(self, dialog_id, text, *, telegram_lang_code=None):
             return "en"
 
         async def variants(self, dialog_id, text, target_lang):
@@ -606,7 +606,7 @@ def test_chat_lang_command_is_handled_before_outbound(runner, monkeypatch):
             self.storage = storage
             self.applies_calls = []
 
-        async def applies(self, dialog_id, text):
+        async def applies(self, dialog_id, text, *, telegram_lang_code=None):
             self.applies_calls.append((dialog_id, text))
             return "en"
 
@@ -632,7 +632,7 @@ def test_chat_outbound_timeout_sends_original(runner, monkeypatch):
     stub.listen_interrupt = False
 
     class FakeOutbound:
-        async def applies(self, dialog_id, text):
+        async def applies(self, dialog_id, text, *, telegram_lang_code=None):
             raise TimeoutError
 
     monkeypatch.setattr(cli_main, "make_optional_outbound", lambda s, storage: FakeOutbound())
@@ -659,6 +659,44 @@ def test_dialog_lang_show_set_and_off(monkeypatch, tmp_path):
     assert "source=manual" in show_result.output
     assert auto_result.exit_code == 0, auto_result.output
     assert "lang=unset" in auto_result.output and "outbound=on" in auto_result.output
+
+
+def test_lang_rejects_unsupported_code(monkeypatch, tmp_path):
+    from tg_messenger.core.storage import Storage
+
+    def fake_make_storage(profile="default"):
+        return Storage(tmp_path / f"{profile}.db")
+
+    monkeypatch.setattr(cli_main, "make_storage", fake_make_storage)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_main.cli, ["lang", "fr"])
+    show_result = runner.invoke(cli_main.cli, ["lang"])
+
+    assert result.exit_code != 0
+    assert "invalid language code" in result.output
+    assert "fr" not in result.output
+    assert show_result.exit_code == 0, show_result.output
+    assert "unset" in show_result.output
+
+
+def test_dialog_lang_rejects_unsupported_code(monkeypatch, tmp_path):
+    from tg_messenger.core.storage import Storage
+
+    def fake_make_storage(profile="default"):
+        return Storage(tmp_path / f"{profile}.db")
+
+    monkeypatch.setattr(cli_main, "make_storage", fake_make_storage)
+    runner = CliRunner()
+
+    result = runner.invoke(cli_main.cli, ["dialog-lang", "7", "fr"])
+    show_result = runner.invoke(cli_main.cli, ["dialog-lang", "7"])
+
+    assert result.exit_code != 0
+    assert "invalid language code" in result.output
+    assert "fr" not in result.output
+    assert show_result.exit_code == 0, show_result.output
+    assert "lang=unset" in show_result.output
 
 
 def test_chat_prints_own_message_sent_from_another_device(runner, monkeypatch):

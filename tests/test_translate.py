@@ -63,6 +63,8 @@ async def test_set_user_lang_validates_code(tmp_path):
         assert await get_user_lang(storage, {}) == "en"
         with pytest.raises(ValueError, match="invalid language code"):
             await set_user_lang(storage, "english")
+        with pytest.raises(ValueError, match="invalid language code"):
+            await set_user_lang(storage, "fr")
         assert await get_user_lang(storage, {}) == "en"
     finally:
         await storage.close()

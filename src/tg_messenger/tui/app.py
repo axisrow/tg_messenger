@@ -832,6 +832,10 @@ class MessengerTUI(App):
                 await set_outbound_enabled(self._outbound.storage, dialog_id, False)
             elif action == "set" and value is not None:
                 await set_dialog_lang(self._outbound.storage, dialog_id, value, source="manual")
+        except ValueError as exc:
+            logger.warning("invalid dialog language code: %s", exc)
+            self.notify(str(exc), severity="error")
+            return
         except Exception as exc:
             logger.exception("dialog language command failed")
             self.notify(f"Language setting failed: {exc}", severity="error")
@@ -843,10 +847,23 @@ class MessengerTUI(App):
         state = self._compose_state_for(dialog_id)
         state.draft = text
         try:
-            target_lang = await asyncio.wait_for(
-                self._outbound.applies(dialog_id, text),
-                timeout=OUTBOUND_TIMEOUT_SECONDS,
-            )
+            telegram_lang_code = self._dialog_telegram_lang_hint(dialog_id)
+            prepare = getattr(self._outbound, "prepare_variants", None)
+            if prepare is not None:
+                target_lang, variants = await asyncio.wait_for(
+                    prepare(dialog_id, text, telegram_lang_code=telegram_lang_code),
+                    timeout=OUTBOUND_TIMEOUT_SECONDS,
+                )
+            else:
+                target_lang = await asyncio.wait_for(
+                    self._outbound.applies(
+                        dialog_id,
+                        text,
+                        telegram_lang_code=telegram_lang_code,
+                    ),
+                    timeout=OUTBOUND_TIMEOUT_SECONDS,
+                )
+                variants = []
             if target_lang is None:
                 state.draft = ""
                 self._clear_pending_outbound(dialog_id)
@@ -854,10 +871,11 @@ class MessengerTUI(App):
                     composer.value = ""
                 await self._send_text(dialog_id, text)
                 return
-            variants = await asyncio.wait_for(
-                self._outbound.variants(dialog_id, text, target_lang),
-                timeout=OUTBOUND_TIMEOUT_SECONDS,
-            )
+            if not variants:
+                variants = await asyncio.wait_for(
+                    self._outbound.variants(dialog_id, text, target_lang),
+                    timeout=OUTBOUND_TIMEOUT_SECONDS,
+                )
         except TimeoutError:
             logger.warning("outbound translation timed out (dialog %s)", dialog_id)
             state.draft = text
@@ -1053,6 +1071,12 @@ class MessengerTUI(App):
 
     def _is_dm_dialog(self, dialog_id: int) -> bool:
         return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
+
+    def _dialog_telegram_lang_hint(self, dialog_id: int) -> str | None:
+        for dialog in self._all_dialogs:
+            if dialog.id == dialog_id:
+                return getattr(dialog, "telegram_lang_code", None)
+        return None
 
     async def _suggest(self, dialog_id: int) -> None:
         try:

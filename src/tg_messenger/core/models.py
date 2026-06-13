@@ -39,6 +39,7 @@ class Dialog(BaseModel):
     last_text: str | None = None
     is_contact: bool | None = None
     archived: bool = False
+    telegram_lang_code: str | None = None
 
 
 class Message(BaseModel):

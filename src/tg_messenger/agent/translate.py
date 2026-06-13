@@ -11,6 +11,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
+from tg_messenger.core.languages import clean_supported_lang_code, validate_supported_lang_code
 from tg_messenger.core.message_store import (
     get_message_translation,
     set_message_translation,
@@ -26,7 +27,6 @@ USER_LANG_KEY = "user_lang"
 DEFAULT_BATCH_SIZE = 20
 
 _LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
-LANG_CODE_RE = re.compile(r"^[a-z]{2,3}$")
 
 
 def needs_translation(text: str | None, target_lang: str | None) -> bool:
@@ -49,19 +49,17 @@ def needs_translation(text: str | None, target_lang: str | None) -> bool:
 async def get_user_lang(storage, env=None) -> str | None:
     value = await storage.get_value(USER_LANG_KEY)
     if value:
-        return str(value)
+        return clean_supported_lang_code(str(value))
     source = os.environ if env is None else env
     value = source.get("TG_USER_LANG")
-    return str(value).strip() or None if value is not None else None
+    return clean_supported_lang_code(str(value)) if value is not None else None
 
 
 async def set_user_lang(storage, code: str | None) -> None:
     if code is None:
         await storage.execute("DELETE FROM kv WHERE key = ?", (USER_LANG_KEY,))
         return
-    lang = code.strip().lower()
-    if not LANG_CODE_RE.fullmatch(lang):
-        raise ValueError(f"invalid language code: {code}")
+    lang = validate_supported_lang_code(code)
     await storage.set_value(USER_LANG_KEY, lang)
 
 

@@ -29,7 +29,7 @@ class WebStubClient:
 
     async def dialogs(self, dm_only=True):
         # повторяет контракт core: dm_only=False — все диалоги с kind и marked id
-        dms = [Dialog(id=7, title="Ann", username="ann", unread=1)]
+        dms = [Dialog(id=7, title="Ann", username="ann", unread=1, telegram_lang_code="en")]
         if dm_only:
             return dms
         return dms + [
@@ -96,6 +96,11 @@ class WebTranslatorStub:
 
     async def translate_message(self, message):
         return message
+
+
+class RejectingTranslator(WebTranslatorStub):
+    async def set_target_lang(self, code):
+        raise ValueError("invalid language code")
 
 
 class WebSourceStorage:
@@ -954,6 +959,17 @@ async def test_language_settings_post_saves_with_csrf_header(translation_app):
     assert translator.lang == "ru"
 
 
+async def test_language_settings_post_invalid_code_returns_400():
+    stub = WebStubClient()
+    app = build_app(client=stub, translator=RejectingTranslator())
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/settings/lang", data={"code": "fr"}, headers=SUGGEST_HEADERS)
+    assert r.status_code == 400
+    assert "invalid language code" in r.text
+
+
 async def test_suggest_endpoint_returns_draft(suggest_app):
     ac, suggester = suggest_app
     r = await ac.post("/dialogs/7/suggest", headers=SUGGEST_HEADERS)
@@ -982,8 +998,24 @@ async def test_outbound_endpoint_returns_variants():
     assert data["nonce"]
 
 
+async def test_outbound_endpoint_passes_dialog_telegram_lang_hint():
+    stub = WebStubClient()
+    outbound = WebOutboundRecordingHint()
+    app = build_app(client=stub, outbound=outbound)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post(
+                "/dialogs/7/outbound",
+                data={"text": "привет", "web_client_id": "browser-a"},
+                headers=SUGGEST_HEADERS,
+            )
+    assert r.status_code == 200
+    assert outbound.applies_calls == [(7, "привет", "en")]
+
+
 class WebOutboundStub:
-    async def applies(self, dialog_id, text):
+    async def applies(self, dialog_id, text, *, telegram_lang_code=None):
         return "en"
 
     async def variants(self, dialog_id, text, target_lang):
@@ -991,8 +1023,17 @@ class WebOutboundStub:
 
 
 class WebOutboundNotApplicableStub(WebOutboundStub):
-    async def applies(self, dialog_id, text):
+    async def applies(self, dialog_id, text, *, telegram_lang_code=None):
         return None
+
+
+class WebOutboundRecordingHint(WebOutboundStub):
+    def __init__(self):
+        self.applies_calls = []
+
+    async def applies(self, dialog_id, text, *, telegram_lang_code=None):
+        self.applies_calls.append((dialog_id, text, telegram_lang_code))
+        return "en"
 
 
 class WebLangStorage:
@@ -1241,7 +1282,7 @@ async def test_outbound_endpoint_timeout_returns_json(monkeypatch):
     monkeypatch.setattr(web_app, "OUTBOUND_TIMEOUT_SECONDS", 0, raising=False)
 
     class HangingOutbound:
-        async def applies(self, dialog_id, text):
+        async def applies(self, dialog_id, text, *, telegram_lang_code=None):
             return "en"
 
         async def variants(self, dialog_id, text, target_lang):

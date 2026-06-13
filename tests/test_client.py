@@ -109,6 +109,33 @@ async def test_dialogs_all_returns_every_kind_with_marked_ids(fake_client):
     assert all(d.archived is False for d in dialogs)
 
 
+async def test_dialogs_maps_supported_dm_telegram_lang_code(fake_client):
+    fake_client.dialogs = [
+        FakeDialog(FakeUser(id=7, first_name="Ann", lang_code="EN"), name="Ann"),
+    ]
+    client = _build(fake_client)
+    await client.connect()
+
+    (dialog,) = await client.dialogs(dm_only=False)
+
+    assert dialog.telegram_lang_code == "en"
+
+
+async def test_dialogs_ignore_unsupported_and_non_dm_telegram_lang_code(fake_client):
+    channel = FakeChannel(id=123, title="News", broadcast=True)
+    channel.lang_code = "en"
+    fake_client.dialogs = [
+        FakeDialog(FakeUser(id=7, first_name="Ann", lang_code="fr"), name="Ann"),
+        FakeDialog(channel, name="News"),
+    ]
+    client = _build(fake_client)
+    await client.connect()
+
+    dialogs = await client.dialogs(dm_only=False)
+
+    assert {d.id: d.telegram_lang_code for d in dialogs} == {7: None, -100123: None}
+
+
 async def test_dialogs_dm_only_excludes_bots_and_groups(fake_client):
     _seed_all_kinds(fake_client)
     client = _build(fake_client)

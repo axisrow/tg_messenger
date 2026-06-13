@@ -184,7 +184,7 @@ class RecordingOutbound:
         self.applies_calls = []
         self.variants_calls = []
 
-    async def applies(self, dialog_id, text):
+    async def applies(self, dialog_id, text, *, telegram_lang_code=None):
         self.applies_calls.append((dialog_id, text))
         return self.target_lang
 

@@ -24,6 +24,7 @@ from tg_messenger.agent.search import build_search_fn
 from tg_messenger.agent.suggest import ContextMessage, StyleProfile, Suggester
 from tg_messenger.agent.tools import make_telegram_tools
 from tg_messenger.agent.translate import Translator
+from tg_messenger.core.languages import SUPPORTED_LANG_CODES_PROMPT, clean_supported_lang_code
 
 logger = logging.getLogger(__name__)
 MODEL_CALL_TIMEOUT_SECONDS = 30.0
@@ -80,8 +81,8 @@ OUTBOUND_VARIANTS_SYSTEM_PROMPT = (
 )
 
 DETECT_LANG_SYSTEM_PROMPT = (
-    "Detect the dominant language of these Telegram messages. Answer with ONLY the ISO 639-1 "
-    "or ISO 639-2 lowercase language code, no punctuation."
+    "Detect the dominant language of these Telegram messages. Answer with ONLY one of: "
+    f"{SUPPORTED_LANG_CODES_PROMPT}. If none apply, answer null."
 )
 
 
@@ -269,8 +270,11 @@ def make_detect_lang_fn(model) -> Callable:
                 ]
             )
         code = str(response.content).strip().lower().strip(".!\"'")
-        if re.fullmatch(r"[a-z]{2,3}", code):
-            return code
+        cleaned = clean_supported_lang_code(code)
+        if cleaned is not None:
+            return cleaned
+        if code == "null":
+            return None
         logger.warning("language detector returned invalid code %r", response.content)
         return None
 

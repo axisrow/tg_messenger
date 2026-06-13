@@ -722,9 +722,16 @@ def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> 
 def lang(ctx: click.Context, code: str | None, clear: bool, session: str) -> None:
     """Show or set the user's target language for cached message translation."""
     from tg_messenger.agent.translate import USER_LANG_KEY, get_user_lang, set_user_lang
+    from tg_messenger.core.languages import validate_supported_lang_code
 
     if clear and code is not None:
         raise click.ClickException("CODE and --clear are mutually exclusive")
+    language_code = None
+    if code is not None:
+        try:
+            language_code = validate_supported_lang_code(code)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
     session = _effective_session(ctx, session)
 
     async def _do(storage):
@@ -732,9 +739,9 @@ def lang(ctx: click.Context, code: str | None, clear: bool, session: str) -> Non
             await set_user_lang(storage, None)
             click.echo("language override cleared.")
             return
-        if code is not None:
-            await set_user_lang(storage, code)
-            click.echo(f"language set to {code.strip().lower()}.")
+        if language_code is not None:
+            await set_user_lang(storage, language_code)
+            click.echo(f"language set to {language_code}.")
             return
         stored = await storage.get_value(USER_LANG_KEY)
         effective = await get_user_lang(storage)
@@ -773,16 +780,23 @@ def dialog_lang(
         set_dialog_lang,
         set_outbound_enabled,
     )
+    from tg_messenger.core.languages import validate_supported_lang_code
 
     if sum([code is not None, auto]) > 1:
         raise click.ClickException("CODE and --auto are mutually exclusive")
     if turn_on and turn_off:
         raise click.ClickException("--on and --off are mutually exclusive")
+    language_code = None
+    if code is not None:
+        try:
+            language_code = validate_supported_lang_code(code)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
     session = _effective_session(ctx, session)
 
     async def _do(storage):
-        if code is not None:
-            await set_dialog_lang(storage, dialog_id, code, source="manual")
+        if language_code is not None:
+            await set_dialog_lang(storage, dialog_id, language_code, source="manual")
         if auto:
             await set_dialog_lang(storage, dialog_id, None)
         if turn_on:
@@ -1112,6 +1126,16 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
             from tg_messenger.agent.translate import get_user_lang
 
+            telegram_lang_code = None
+            if outbound is not None:
+                try:
+                    for dialog in await client.dialogs(dm_only=False):
+                        if dialog.id == dialog_id:
+                            telegram_lang_code = getattr(dialog, "telegram_lang_code", None)
+                            break
+                except Exception:
+                    logger.warning("failed to read dialogs for telegram language hint", exc_info=True)
+
             # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();
             # skip them so our own input isn't printed back. Bounded (deque).
             sent_ids: deque[tuple[int, int]] = deque(maxlen=200)
@@ -1193,10 +1217,26 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                             continue
                         if outbound is not None:
                             try:
-                                target_lang = await asyncio.wait_for(
-                                    outbound.applies(dialog_id, line),
-                                    timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS,
-                                )
+                                prepare = getattr(outbound, "prepare_variants", None)
+                                if prepare is not None:
+                                    target_lang, variants = await asyncio.wait_for(
+                                        prepare(
+                                            dialog_id,
+                                            line,
+                                            telegram_lang_code=telegram_lang_code,
+                                        ),
+                                        timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS,
+                                    )
+                                else:
+                                    target_lang = await asyncio.wait_for(
+                                        outbound.applies(
+                                            dialog_id,
+                                            line,
+                                            telegram_lang_code=telegram_lang_code,
+                                        ),
+                                        timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS,
+                                    )
+                                    variants = []
                             except TimeoutError:
                                 logger.warning(
                                     "outbound applicability timed out (dialog %s)", dialog_id
@@ -1207,10 +1247,11 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 continue
                             if target_lang is not None:
                                 try:
-                                    variants = await asyncio.wait_for(
-                                        outbound.variants(dialog_id, line, target_lang),
-                                        timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS,
-                                    )
+                                    if not variants:
+                                        variants = await asyncio.wait_for(
+                                            outbound.variants(dialog_id, line, target_lang),
+                                            timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS,
+                                        )
                                 except TimeoutError:
                                     logger.warning("outbound variants timed out (dialog %s)", dialog_id)
                                     click.echo("translation timed out — sending original.", err=True)

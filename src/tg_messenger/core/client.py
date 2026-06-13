@@ -27,6 +27,7 @@ from tg_messenger.core.auth import DEFAULT_SESSION_DIR, SessionStore
 from tg_messenger.core.cache import TTLCache
 from tg_messenger.core.events import EventBus
 from tg_messenger.core.flood import run_with_flood_wait_retry
+from tg_messenger.core.languages import clean_supported_lang_code
 from tg_messenger.core.models import (
     ChatActionEvent,
     Dialog,
@@ -275,6 +276,10 @@ class StandaloneTelegramClient:
                     last_message_at=getattr(last_msg, "date", None),
                     is_contact=bool(getattr(entity, "contact", False)) if kind == "dm" else None,
                     archived=archived or getattr(d, "folder_id", None) == 1,
+                    telegram_lang_code=(
+                        clean_supported_lang_code(getattr(entity, "lang_code", None))
+                        if kind == "dm" else None
+                    ),
                 )
             )
         return result
