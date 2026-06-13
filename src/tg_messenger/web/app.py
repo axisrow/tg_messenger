@@ -420,6 +420,30 @@ def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
     """HTMX fragment: the code-entry step of the /tg-login wizard."""
     hint = escape(delivery_hint(delivery)) if delivery is not None else ""
     err = f'<div class="error">{escape(error)}</div>' if error else ""
+    # #49: if Telegram told us when a resend is allowed, disable the button and count
+    # down — spamming resend is a flood risk on the number. No timeout → active as before.
+    timeout = getattr(delivery, "timeout", None) if delivery is not None else None
+    if timeout and timeout > 0:
+        resend_form = (
+            '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
+            f'<button type="submit" id="resend-btn" data-timeout="{int(timeout)}" disabled>'
+            f"Отправить код повторно ({int(timeout)})</button>"
+            "</form>"
+            "<script>(function(){"
+            "var b=document.getElementById('resend-btn');"
+            "if(!b)return;var n=parseInt(b.dataset.timeout,10)||0;"
+            "var t=setInterval(function(){n-=1;"
+            "if(n<=0){clearInterval(t);b.disabled=false;"
+            "b.textContent='Отправить код повторно';}"
+            "else{b.textContent='Отправить код повторно ('+n+')';}},1000);"
+            "})();</script>"
+        )
+    else:
+        resend_form = (
+            '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
+            '<button type="submit">Отправить код повторно</button>'
+            "</form>"
+        )
     return (
         '<div id="card">'
         "<h1>Введите код</h1>"
@@ -431,9 +455,7 @@ def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
         'autocomplete="one-time-code">'
         '<button type="submit">Войти</button>'
         "</form>"
-        '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
-        '<button type="submit">Отправить код повторно</button>'
-        "</form>"
+        f"{resend_form}"
         "</div>"
     )
 
@@ -579,7 +601,21 @@ def build_app(
 
     @app.get("/tg-login", response_class=HTMLResponse)
     async def tg_login_form(request: Request):
-        return TEMPLATES.TemplateResponse(request, "tg_login.html", {})
+        # #49: the LoginSession lives process-wide and is never recreated. reset() clears a
+        # FINISHED ("done") flow so a fresh login can start; it is a no-op mid-flow so a live
+        # phone_code_hash is never wiped.
+        session = request.app.state.login_session
+        session.reset()
+        # Resume the live step on reload: a mid-login refresh must not dead-end on the
+        # phone form (which the in-progress guard would then reject) — render the card
+        # matching the current state, wrapped in the full page so htmx/styles are present.
+        if session.state == "code":
+            card = _tg_login_code_fragment(session.last_delivery)
+        elif session.state == "password":
+            card = _tg_login_password_fragment()
+        else:
+            card = None
+        return TEMPLATES.TemplateResponse(request, "tg_login.html", {"card": card})
 
     @app.post("/tg-login/phone", response_class=HTMLResponse)
     async def tg_login_phone(request: Request, phone: str = Form("")):
@@ -598,7 +634,9 @@ def build_app(
         try:
             delivery = await session.resend()
         except LoginError as exc:
-            return HTMLResponse(_tg_login_code_fragment(error=str(exc)))
+            # keep the resend countdown on error re-render — passing the last delivery
+            # back means the flood guard isn't dropped to an immediately-active button.
+            return HTMLResponse(_tg_login_code_fragment(session.last_delivery, error=str(exc)))
         return HTMLResponse(_tg_login_code_fragment(delivery))
 
     @app.post("/tg-login/code", response_class=HTMLResponse)
@@ -607,8 +645,10 @@ def build_app(
         try:
             await session.submit_code(code.strip())
         except LoginError as exc:
-            # wrong/expired code: re-render the code step with the message (not a 500)
-            return HTMLResponse(_tg_login_code_fragment(error=str(exc)))
+            # wrong/expired code: re-render the code step with the message (not a 500),
+            # preserving the resend countdown (last_delivery) so a mistyped code doesn't
+            # reset the resend button to immediately-active — see #49 flood guard.
+            return HTMLResponse(_tg_login_code_fragment(session.last_delivery, error=str(exc)))
         if session.state == "password":
             return HTMLResponse(_tg_login_password_fragment())
         _save_after_login(request)

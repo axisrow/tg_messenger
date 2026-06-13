@@ -15,7 +15,7 @@ from typing import NamedTuple
 from telethon.sessions import StringSession
 from telethon.tl.functions.auth import ResendCodeRequest
 
-from tg_messenger.core.flood import run_with_flood_wait_retry
+from tg_messenger.core.flood import HandledFloodWaitError, run_with_flood_wait_retry
 from tg_messenger.core.names import sanitize_profile_name
 
 logger = logging.getLogger(__name__)
@@ -284,10 +284,28 @@ class LoginSession:
         else:
             self._flow = LoginFlow(client_or_flow)
         self._state = "phone"
+        # the delivery of the most recent send/resend, so the web can re-render the code
+        # step (with its resend countdown) after a user-correctable error without dropping
+        # the timeout to None — see _tg_login_code_fragment.
+        self.last_delivery: CodeDelivery | None = None
 
     @property
     def state(self) -> str:
         return self._state
+
+    def reset(self) -> None:
+        """Restart the wizard from a terminal/abandoned flow.
+
+        Only resets once the flow has finished (``done``); an in-progress flow is
+        left untouched so reloading the form mid-login can't wipe a live
+        ``phone_code_hash``. Rebuilds the underlying :class:`LoginFlow` so a stale
+        hash from the previous login never leaks into the next one.
+        """
+        if self._state != "done":
+            return
+        self._flow = LoginFlow(self._flow._client)
+        self._state = "phone"
+        self.last_delivery = None
 
     async def submit_phone(self, phone: str) -> CodeDelivery:
         from telethon.errors import (
@@ -296,21 +314,54 @@ class LoginSession:
             PhoneNumberInvalidError,
         )
 
+        # #49: a second tab re-posting the phone would silently restart the flow and lose
+        # the in-flight phone_code_hash. Reject it as a user-facing LoginError (the web
+        # renders it in the form) without touching state — the first flow stays intact.
+        if self._state != "phone":
+            raise LoginError("login already in progress — finish the code step (reload to resume it)")
+        # Claim the slot BEFORE the await: send_code yields to the event loop, so two
+        # concurrent phone POSTs could otherwise both pass the guard above and both call
+        # send_code, clobbering the phone_code_hash. The interim "sending" state (not
+        # "phone", so the guard still rejects a racing phone POST) is deliberately NOT
+        # "code": until send_code returns there is no phone_code_hash, so the web must not
+        # render a usable code step (a resend/code POST then would hit a hash-less
+        # RuntimeError → 500). Promote to "code" only once the delivery is bound. Roll back
+        # to "phone" on a user-correctable error so the step can still be retried.
+        self._state = "sending"
         try:
             delivery = await self._flow.send_code(phone)
         except PhoneNumberInvalidError as exc:
+            self._state = "phone"
             raise LoginError("Invalid phone number — use the international format (+...).") from exc
         except PhoneNumberBannedError as exc:
+            self._state = "phone"
             raise LoginError("This phone number is banned by Telegram.") from exc
         except PhoneNumberFloodError as exc:
+            self._state = "phone"
             raise LoginError("Too many attempts for this number — try again later.") from exc
-        self._state = "code"
+        except BaseException:
+            # any other failure (incl. cancellation) must not leave a half-claimed slot
+            self._state = "phone"
+            raise
+        self.last_delivery = delivery
+        self._state = "code"  # hash is now bound — the code step is safe to expose
         return delivery
 
     async def resend(self) -> CodeDelivery:
+        from telethon.errors import PhoneCodeExpiredError, SendCodeUnavailableError
+
         if self._state not in ("code", "password"):
             raise RuntimeError("submit_phone must be called before resend")
-        return await self._flow.resend_code()
+        # Normalize the resend failure modes to LoginError so the web re-renders the code
+        # step (not a 500): a flood-exhausted resend is exactly the spam this guard targets.
+        try:
+            delivery = await self._flow.resend_code()
+        except HandledFloodWaitError as exc:
+            raise LoginError(exc.user_message) from exc
+        except (PhoneCodeExpiredError, SendCodeUnavailableError) as exc:
+            raise LoginError("Couldn't resend the code — reload to restart the login.") from exc
+        self.last_delivery = delivery
+        return delivery
 
     async def submit_code(self, code: str) -> None:
         from telethon.errors import (

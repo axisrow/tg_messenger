@@ -18,6 +18,7 @@
   </style>
 </head>
 <body>
+  {% if card %}{{ card | safe }}{% else %}
   <div id="card">
     <h1>Войти в Telegram</h1>
     <form hx-post="/tg-login/phone" hx-target="#card" hx-swap="outerHTML">
@@ -27,5 +28,6 @@
       <button type="submit">Отправить код</button>
     </form>
   </div>
+  {% endif %}
 </body>
 </html>
