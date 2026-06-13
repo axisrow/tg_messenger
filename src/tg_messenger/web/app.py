@@ -154,7 +154,14 @@ def _message_div(m) -> str:
     translation = ""
     if getattr(m, "translated_text", None):
         translation = f'<div class="translation">↳ {escape(m.translated_text)}</div>'
-    return f'<div class="msg {cls}" data-id="{m.id}">{body}{translation}</div>'
+    # #48: a reply control referencing this message id; chat.html wires it to the composer
+    reply_btn = (
+        f'<button type="button" class="reply-btn" data-reply="{m.id}" '
+        f'title="Reply">↩</button>'
+    )
+    return (
+        f'<div class="msg {cls}" data-id="{m.id}">{body}{reply_btn}{translation}</div>'
+    )
 
 
 def _reaction_emoticon(emoticon: str | None) -> str:

@@ -326,6 +326,22 @@ async def test_messages_fragment_shows_visible_message_id(client_app):
     assert "[1]" in r.text
 
 
+async def test_messages_fragment_has_reply_button(client_app):
+    # #48: each message carries a reply control referencing its id
+    ac, _ = client_app
+    r = await ac.get("/dialogs/7/messages")
+    assert r.status_code == 200
+    assert 'data-reply="1"' in r.text
+
+
+async def test_index_has_reply_to_field(client_app):
+    # #48: the composer can submit reply_to (backend already accepts it)
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert 'name="reply_to"' in r.text
+    assert 'id="reply_to"' in r.text
+
+
 async def test_send_returns_fragment(client_app):
     ac, stub = client_app
     r = await ac.post("/send", data={"dialog_id": "7", "text": "hello"})
@@ -418,6 +434,15 @@ async def test_send_reply_to_reaches_client(client_app):
     r = await ac.post("/send", data={"dialog_id": "7", "text": "re", "reply_to": "42"})
     assert r.status_code == 200
     assert stub.sent == [(7, "re", 42)]
+
+
+async def test_send_garbage_reply_to_degrades_to_none(client_app):
+    # #48: a non-numeric reply_to (incl. the cleared empty field) must not reach the
+    # client as a string — the route parses it to None, a normal no-reply send.
+    ac, stub = client_app
+    r = await ac.post("/send", data={"dialog_id": "7", "text": "re", "reply_to": "nope"})
+    assert r.status_code == 200
+    assert stub.sent == [(7, "re", None)]
 
 
 async def test_send_empty_text_returns_400(client_app):
