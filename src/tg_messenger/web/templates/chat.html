@@ -147,6 +147,8 @@
         document.getElementById('composer-text').value = '';
         const state = currentState();
         if (state) clearComposeState(state);
+        clearReply();  // #48: media has no reply_to — don't leave a stale target/banner
+                       // that the next text message would silently attach to.
       } else {
         alert(html.replace(/<[^>]+>/g, '').trim() || 'Upload failed');
       }
