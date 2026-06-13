@@ -126,7 +126,9 @@ class SessionStore:
             return False
         try:
             raw = path.read_text(encoding="utf-8").strip()
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # a binary/corrupt file → ✗, never abort the whole `profiles` listing.
+            # UnicodeDecodeError is a ValueError, not an OSError — catch it explicitly.
             return False
         if not raw:
             return False

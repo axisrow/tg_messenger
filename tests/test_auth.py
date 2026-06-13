@@ -396,6 +396,16 @@ def test_is_valid_profile_true_for_encrypted_without_key(session_dir):
     assert no_key.is_valid_profile("enc") is True
 
 
+def test_is_valid_profile_false_for_non_utf8_file(session_dir):
+    # A binary/corrupt *.session file makes Path.read_text() raise UnicodeDecodeError
+    # (a ValueError, NOT an OSError). It must be caught → marked ✗, so one bad file never
+    # aborts the whole `profiles` listing (which calls is_valid_profile per profile).
+    store = SessionStore(session_dir)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    store.path_for("binary").write_bytes(b"\xff\xfe\x00\x01not-utf8")
+    assert store.is_valid_profile("binary") is False
+
+
 def test_is_valid_profile_does_not_rewrite_plaintext_under_key(session_dir):
     # `profiles` listing is read-only: validating a plaintext file under a key must NOT
     # trigger load()'s lazy encrypt-migration (which would self.save() the file). Otherwise
