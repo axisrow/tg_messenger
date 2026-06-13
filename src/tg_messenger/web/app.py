@@ -771,6 +771,8 @@ def build_app(
             return _error_response("Reaction cannot be empty.", 400)
         msg_id = int(message_id)
         client = request.app.state.client
+        # NB: this gate reuses the posting permission (can_send) — reactions are really a
+        # separate capability; the reaction-vs-post split is tracked in #86.
         if (readonly := await _readonly_error(client, dialog_id)) is not None:
             return readonly
         await client.send_reaction(dialog_id, msg_id, emoticon)

@@ -769,6 +769,8 @@ class MessengerTUI(App):
         dialog_id = self._current
         if not self._dialog_can_send(dialog_id):
             # belt-and-suspenders with the disabled composer (cache may be momentarily stale)
+            # NB: this also blocks /react in a read-only chat — reactions are a separate
+            # capability from posting; the reaction-vs-post split is tracked in #86.
             self.notify(READ_ONLY_MESSAGE, severity="warning")
             return
         state = self._compose_state_for(dialog_id)
@@ -974,6 +976,12 @@ class MessengerTUI(App):
             # TOCTOU net: composer was enabled but Telegram rejected the write on rights
             logger.warning("send rejected (rights) (dialog %s)", peer)
             self.notify(READ_ONLY_MESSAGE, severity="warning")
+            state = self._compose_state_for(peer)
+            state.draft = text  # restore — the optimistic clear must not lose the message
+            if peer == self._current:
+                composer = self.query_one("#composer", Input)
+                if not composer.value:  # don't clobber a draft typed meanwhile
+                    composer.value = text
             self._apply_composer_writable(peer)  # reflect the now-known read-only state
             return
         except Exception as exc:

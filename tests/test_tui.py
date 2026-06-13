@@ -6,6 +6,7 @@ import pytest
 from textual.containers import Vertical
 from textual.widgets import Input, ListView, Static, Tabs
 
+from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.models import Dialog, IncomingEvent, Message, OutgoingEvent, ReactionEvent
 from tg_messenger.tui.app import (
     DialogItem,
@@ -376,6 +377,32 @@ async def test_tui_submit_in_readonly_channel_does_not_send():
         await app.on_input_submitted(Input.Submitted(composer, "hello"))
         await pilot.pause()
         assert stub.sent == []  # the guard refused before any send worker
+
+
+async def test_tui_send_forbidden_restores_draft():
+    # Regression: composer is enabled (can_send=True / stale), but Telegram rejects the
+    # write on rights at send time. on_input_submitted clears the composer optimistically
+    # BEFORE the send; the SendForbiddenError handler must restore the typed text — like
+    # the generic failure path — instead of silently dropping it.
+    stub = TuiStubClient()
+
+    async def forbidden(peer, text):
+        raise SendForbiddenError("ChatWriteForbiddenError")
+
+    stub.send_text = forbidden
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7  # a writable DM — composer is enabled
+        composer = app.query_one("#composer", Input)
+        # reproduce the optimistic clear done by on_input_submitted before the worker runs
+        composer.value = ""
+        app._compose_state_for(7).draft = ""
+        await app._send_text(7, "hello")  # the rejected send path
+        await pilot.pause()
+        assert stub.sent == []  # nothing went out
+        assert app._compose_state_for(7).draft == "hello"  # draft restored
+        assert composer.value == "hello"  # typed text back in the composer
 
 
 class LongHistoryClient(TuiStubClient):
