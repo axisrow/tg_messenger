@@ -405,6 +405,33 @@ async def test_tui_send_forbidden_restores_draft():
         assert composer.value == "hello"  # typed text back in the composer
 
 
+async def test_tui_send_media_forbidden_restores_command(tmp_path):
+    # Same regression as text, but for the @file media path: on_input_submitted clears the
+    # composer before _send_media; a rights rejection must restore the original command.
+    media = tmp_path / "photo.jpg"
+    media.write_bytes(b"x")
+    stub = TuiStubClient()
+
+    async def forbidden(peer, file_path, **kwargs):
+        raise SendForbiddenError("ChatSendMediaForbiddenError")
+
+    stub.send_media = forbidden
+    app = MessengerTUI(client=stub)
+    command = f'@"{media}" my caption'
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7  # a writable DM — composer is enabled
+        composer = app.query_one("#composer", Input)
+        # reproduce the optimistic clear done by on_input_submitted before the worker runs
+        composer.value = ""
+        app._compose_state_for(7).draft = ""
+        await app._send_media(7, str(media), "my caption", source_text=command)
+        await pilot.pause()
+        assert not hasattr(stub, "media_sent")  # nothing went out
+        assert app._compose_state_for(7).draft == command  # command restored
+        assert composer.value == command  # typed command back in the composer
+
+
 class LongHistoryClient(TuiStubClient):
     async def history(self, peer, limit=50, offset_id=0):
         date = datetime(2024, 1, 1, tzinfo=timezone.utc)

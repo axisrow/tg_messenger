@@ -818,7 +818,8 @@ class MessengerTUI(App):
             self._clear_pending_outbound(dialog_id)
             event.input.value = ""  # clear optimistically; restored on failure
             self.run_worker(
-                self._send_media(dialog_id, path, caption), exclusive=False
+                self._send_media(dialog_id, path, caption, source_text=text),
+                exclusive=False,
             )
             return
         if state.source_text is not None:
@@ -1006,17 +1007,32 @@ class MessengerTUI(App):
             await pane.mount(bubble)
             self._scroll_messages_to_end(pane)
 
-    async def _send_media(self, peer: int, path: str, caption: str | None) -> None:
+    async def _send_media(
+        self, peer: int, path: str, caption: str | None, source_text: str | None = None,
+    ) -> None:
+        # source_text is the original "@file ... caption" command, cleared optimistically
+        # in on_input_submitted — restore it on any failure so a typed command is not lost.
+        def _restore() -> None:
+            if source_text is None:
+                return
+            self._compose_state_for(peer).draft = source_text
+            if peer == self._current:
+                composer = self.query_one("#composer", Input)
+                if not composer.value:  # don't clobber a draft typed meanwhile
+                    composer.value = source_text
+
         try:
             msg = await self._client.send_media(peer, path, caption=caption)
         except SendForbiddenError:
             logger.warning("send media rejected (rights) (dialog %s)", peer)
             self.notify(READ_ONLY_MESSAGE, severity="warning")
-            self._apply_composer_writable(peer)
+            _restore()
+            self._apply_composer_writable(peer)  # reflect the now-known read-only state
             return
         except Exception as exc:
             logger.exception("send media failed (dialog %s, %s)", peer, path)
             self.notify(f"Send failed: {exc}", severity="error")
+            _restore()
             return
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         await self._touch_dialog_for_message(peer, msg, incoming=False)
