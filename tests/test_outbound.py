@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 
 import pytest
 
 from tg_messenger.agent.outbound import (
+    DIALOG_LANG_LOCKS_MAX,
     OutboundTranslator,
     detect_script_lang,
     get_dialog_lang,
@@ -60,6 +63,9 @@ async def test_dialog_lang_and_enabled_kv(tmp_path):
         await set_outbound_enabled(storage, 7, True)
         assert await get_dialog_lang(storage, 7) is None
         assert await is_outbound_enabled(storage, 7) is True
+        with pytest.raises(ValueError, match="invalid language code") as exc:
+            await set_dialog_lang(storage, 7, "fr", source="manual")
+        assert "fr" not in str(exc.value)
     finally:
         await storage.close()
 
@@ -71,8 +77,9 @@ async def test_dialog_lang_and_enabled_kv(tmp_path):
         (["привіт", "як справи"], None),
         (["안녕하세요"], "ko"),
         (["こんにちは"], "ja"),
-        (["你好"], None),
-        (["東京大学"], None),
+        (["今日は東京"], "ja"),
+        (["你好"], "zh"),
+        (["東京大学"], "zh"),
         (["hello world"], None),
         (["123 😀"], None),
     ],
@@ -125,6 +132,27 @@ async def test_dialog_lang_uses_detector_for_han_before_caching(tmp_path):
     assert calls == [["東京大学"]]
 
 
+async def test_dialog_lang_han_detector_none_runs_once(tmp_path):
+    storage = await _storage(tmp_path)
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return None
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "東京大学")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        assert await outbound.dialog_lang(7) is None
+    finally:
+        await storage.close()
+    assert calls == [["東京大学"]]
+
+
 async def test_dialog_lang_uses_llm_for_latin_and_caches(tmp_path):
     storage = await _storage(tmp_path)
     calls = []
@@ -145,6 +173,186 @@ async def test_dialog_lang_uses_llm_for_latin_and_caches(tmp_path):
     finally:
         await storage.close()
     assert calls == [["hello", "how are you"]]
+
+
+async def test_dialog_lang_detector_exception_returns_none(tmp_path, caplog):
+    storage = await _storage(tmp_path)
+
+    async def detect(texts):
+        raise RuntimeError("detector down")
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "hello")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        with caplog.at_level(logging.ERROR, logger="tg_messenger.agent.outbound"):
+            assert await outbound.dialog_lang(7) is None
+    finally:
+        await storage.close()
+    assert any("dialog language detection failed" in rec.message for rec in caplog.records)
+
+
+async def test_dialog_lang_invalid_detector_code_warns(tmp_path, caplog):
+    storage = await _storage(tmp_path)
+
+    async def detect(texts):
+        return "english"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "hello")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="tg_messenger.agent.outbound"):
+            assert await outbound.dialog_lang(7) is None
+    finally:
+        await storage.close()
+    assert any("invalid code" in rec.message for rec in caplog.records)
+
+
+async def test_dialog_lang_uses_supported_telegram_hint_without_detector(tmp_path):
+    storage = await _storage(tmp_path)
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return "es"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "hello")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        assert await outbound.dialog_lang(7, telegram_lang_code="EN") == "en"
+        stored = await get_dialog_lang(storage, 7)
+    finally:
+        await storage.close()
+    assert stored.lang == "en"
+    assert stored.source == "auto"
+    assert calls == []
+
+
+async def test_dialog_lang_manual_override_wins_over_telegram_hint(tmp_path):
+    storage = await _storage(tmp_path)
+    await set_dialog_lang(storage, 7, "es", source="manual")
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "hello")]),
+        storage=storage,
+        variants_fn=None,
+    )
+    try:
+        assert await outbound.dialog_lang(7, telegram_lang_code="en") == "es"
+    finally:
+        await storage.close()
+
+
+async def test_dialog_lang_auto_cache_ttl_before_telegram_hint(tmp_path):
+    now = {"value": 1000.0}
+    storage = await _storage(tmp_path)
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return "es"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "hola")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+        clock=lambda: now["value"],
+    )
+    try:
+        assert await outbound.dialog_lang(7) == "es"
+        now["value"] += 1
+        assert await outbound.dialog_lang(7, telegram_lang_code="en") == "es"
+        now["value"] += 86401
+        assert await outbound.dialog_lang(7, telegram_lang_code="en") == "en"
+    finally:
+        await storage.close()
+    assert calls == [["hola"]]
+
+
+async def test_dialog_lang_concurrent_auto_detection_is_single_flight(tmp_path):
+    storage = await _storage(tmp_path)
+    first_started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        first_started.set()
+        await release.wait()
+        return "en"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "hello")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        tasks = [
+            asyncio.create_task(outbound.dialog_lang(7)),
+            asyncio.create_task(outbound.dialog_lang(7)),
+        ]
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        release.set()
+        assert await asyncio.gather(*tasks) == ["en", "en"]
+        stored = await get_dialog_lang(storage, 7)
+    finally:
+        await storage.close()
+    assert stored.lang == "en"
+    assert calls == [["hello"]]
+
+
+async def test_dialog_lang_locks_are_lru_bounded(tmp_path):
+    storage = await _storage(tmp_path)
+    outbound = OutboundTranslator(
+        store=HistoryStore([]),
+        storage=storage,
+        variants_fn=None,
+    )
+    try:
+        for dialog_id in range(DIALOG_LANG_LOCKS_MAX + 5):
+            assert await outbound.dialog_lang(dialog_id) is None
+    finally:
+        await storage.close()
+    assert len(outbound._dialog_lang_locks) == DIALOG_LANG_LOCKS_MAX
+    assert 0 not in outbound._dialog_lang_locks
+    assert (DIALOG_LANG_LOCKS_MAX + 4) in outbound._dialog_lang_locks
+
+
+async def test_dialog_lang_ignores_unsupported_telegram_hint_and_detector_code(tmp_path, caplog):
+    storage = await _storage(tmp_path)
+    calls = []
+
+    async def detect(texts):
+        calls.append(list(texts))
+        return "fr"
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([_msg(1, "bonjour")]),
+        storage=storage,
+        variants_fn=None,
+        detect_lang_fn=detect,
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="tg_messenger.agent.outbound"):
+            assert await outbound.dialog_lang(7, telegram_lang_code="fr") is None
+    finally:
+        await storage.close()
+    assert calls == [["bonjour"]]
+    assert any("unsupported telegram language code" in rec.message for rec in caplog.records)
+    assert any("invalid code" in rec.message for rec in caplog.records)
 
 
 async def test_applies_truth_table_and_groups(tmp_path):
@@ -257,6 +465,55 @@ async def test_applies_han_user_to_non_han_dialog_uses_exact_detection(tmp_path)
     assert calls == [["東京大学"]]
 
 
+async def test_applies_storage_error_returns_none(caplog):
+    class BrokenStorage:
+        async def get_value(self, key):
+            raise RuntimeError("storage down")
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([]),
+        storage=BrokenStorage(),
+        variants_fn=None,
+    )
+    with caplog.at_level(logging.ERROR, logger="tg_messenger.agent.outbound"):
+        assert await outbound.applies(7, "hello") is None
+    assert any("outbound translation applicability failed" in rec.message for rec in caplog.records)
+
+
+async def test_prepare_variants_uses_one_history_read_for_detection_and_context(tmp_path):
+    storage = await _storage(tmp_path)
+    await set_user_lang(storage, "ru")
+    store = HistoryStore([_msg(1, "hello"), _msg(2, "ok", out=True)])
+    detector_calls = []
+    variant_calls = []
+
+    async def detect(texts):
+        detector_calls.append(list(texts))
+        if texts == ["привет"]:
+            return "ru"
+        return "en"
+
+    async def variants(draft, target_lang, profile, context):
+        variant_calls.append((draft, target_lang, [m.text for m in context]))
+        return [" hi "]
+
+    outbound = OutboundTranslator(
+        store=store,
+        storage=storage,
+        variants_fn=variants,
+        detect_lang_fn=detect,
+    )
+    try:
+        target_lang, result = await outbound.prepare_variants(7, "привет")
+    finally:
+        await storage.close()
+    assert target_lang == "en"
+    assert result == ["hi"]
+    assert detector_calls == [["hello"], ["привет"]]
+    assert variant_calls == [("привет", "en", ["hello", "ok"])]
+    assert store.calls == [(7, 30)]
+
+
 async def test_variants_passes_profile_and_context(tmp_path):
     storage = await _storage(tmp_path)
     await save_style_profile(storage, 7, StyleProfile(avg_length=4.0, examples=["ok"]))
@@ -281,3 +538,21 @@ async def test_variants_passes_profile_and_context(tmp_path):
     assert target == "en"
     assert profile.examples == ["ok"]
     assert [m.text for m in context] == ["hello", "ок"]
+
+
+async def test_variants_all_empty_raises(tmp_path):
+    storage = await _storage(tmp_path)
+
+    async def variants(draft, target_lang, profile, context):
+        return ["", "   ", None]
+
+    outbound = OutboundTranslator(
+        store=HistoryStore([]),
+        storage=storage,
+        variants_fn=variants,
+    )
+    try:
+        with pytest.raises(ValueError, match="no variants"):
+            await outbound.variants(7, "привет", "en")
+    finally:
+        await storage.close()

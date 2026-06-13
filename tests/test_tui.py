@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from datetime import datetime, timezone
 
 import pytest
@@ -7,12 +8,10 @@ from textual.widgets import Input, ListView, Static, Tabs
 
 from tg_messenger.core.models import Dialog, IncomingEvent, Message, OutgoingEvent, ReactionEvent
 from tg_messenger.tui.app import (
-    ORIGINAL_SENTINEL,
     DialogItem,
     MessageBubble,
     MessengerTUI,
     ProfileItem,
-    _OutboundPending,
     parse_lang_command,
     parse_media_command,
     parse_reaction_command,
@@ -68,6 +67,7 @@ def test_parse_reaction_command_rejects_bad_shape():
 class TuiStubClient:
     def __init__(self):
         self.sent = []
+        self.sent_event = asyncio.Event()
         self.read_acks = []
         self.connected = False
         self.authorized = True
@@ -90,13 +90,23 @@ class TuiStubClient:
     async def dialogs(self, dm_only=True):
         self.dialogs_calls += 1
         # title contains markup-hostile brackets on purpose
-        dms = [Dialog(id=7, title="Ann [/x", username="ann", unread=0)]
+        dms = [
+            Dialog(id=7, title="Ann [/x", username="ann", unread=0, is_contact=True),
+            Dialog(id=8, title="Stranger", username="stranger", unread=2, is_contact=False),
+        ]
         if dm_only:
             return dms
         # повторяет контракт core: dm_only=False — все диалоги с kind и marked id
         return dms + [
-            Dialog(id=-100200, title="Devs", kind="group"),
+            Dialog(id=-100200, title="Devs", kind="group", unread=1),
+            Dialog(id=-100300, title="News", kind="channel"),
             Dialog(id=9, title="HelperBot", kind="bot"),
+        ]
+
+    async def archived_dialogs(self):
+        return [
+            Dialog(id=10, title="Archived Ann", username="oldann", is_contact=True, archived=True),
+            Dialog(id=-100400, title="Archived Channel", kind="channel", archived=True),
         ]
 
     async def group_dialogs(self):
@@ -109,8 +119,16 @@ class TuiStubClient:
 
     async def send_text(self, peer, text, reply_to=None):
         self.sent.append((peer, text, reply_to))
+        self.sent_event.set()
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    async def wait_sent_count(self, count=1, timeout=2.0):
+        while len(self.sent) < count:
+            self.sent_event.clear()
+            if len(self.sent) >= count:
+                break
+            await asyncio.wait_for(self.sent_event.wait(), timeout=timeout)
 
     async def send_media(self, peer, file_path, *, caption=None, voice_note=False,
                          video_note=False, force_document=False):
@@ -137,6 +155,65 @@ class TuiStubClient:
     async def listen_reactions(self):
         await asyncio.Event().wait()
         yield  # pragma: no cover
+
+
+class TuiSourceStorage:
+    async def get_value(self, key):
+        if key == "user_lang":
+            return "ru"
+        return None
+
+
+class TuiSourceStore:
+    def __init__(self):
+        self.storage = TuiSourceStorage()
+        self.recorded = []
+
+    async def connect(self):
+        pass
+
+    async def close(self):
+        pass
+
+    async def run(self):
+        await asyncio.Event().wait()
+
+    async def history(self, peer, limit=50):
+        return [Message(id=1, dialog_id=peer, sender_id=peer, out=False,
+                        text="history", date=datetime(2024, 1, 1, tzinfo=timezone.utc))]
+
+    async def record_outgoing(self, dialog_id, message, *, source_text, source_lang):
+        self.recorded.append((dialog_id, message.text, source_text, source_lang))
+
+
+class RecordingOutbound:
+    def __init__(self, *, target_lang="en", variants=None, fail=False):
+        self.target_lang = target_lang
+        self.variant_values = variants or ["hello"]
+        self.fail = fail
+        self.applies_calls = []
+        self.variants_calls = []
+
+    async def applies(self, dialog_id, text, *, telegram_lang_code=None):
+        self.applies_calls.append((dialog_id, text))
+        return self.target_lang
+
+    async def variants(self, dialog_id, text, target_lang):
+        self.variants_calls.append((dialog_id, text, target_lang))
+        if self.fail:
+            raise RuntimeError("llm down")
+        return list(self.variant_values)
+
+
+class BlockingOutbound(RecordingOutbound):
+    def __init__(self):
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def variants(self, dialog_id, text, target_lang):
+        self.variants_calls.append((dialog_id, text, target_lang))
+        await self.release.wait()
+        raise RuntimeError("llm down")
 
 
 def test_real_tui_client_gets_session_encryption_key(monkeypatch, tmp_path):
@@ -184,9 +261,7 @@ async def test_tui_mounts_and_lists_dialogs():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
         await pilot.pause()
-        items = list(app.query(DialogItem))
-        assert len(items) == 1
-        assert items[0].dialog_id == 7
+        assert [item.dialog_id for item in app.query(DialogItem)] == [7, 8, -100200, -100300, 9]
 
 
 async def test_tui_dialog_item_shows_id():
@@ -297,6 +372,25 @@ async def test_tui_scroll_helper_supports_textual_060_signature(monkeypatch):
         await pilot.pause()
 
     assert calls
+
+
+class LongMessageClient(TuiStubClient):
+    async def history(self, peer, limit=50, offset_id=0):
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        text = "long-message-" + "x" * 400
+        return [Message(id=1, dialog_id=peer, sender_id=1, out=True, text=text, date=date)]
+
+
+async def test_tui_long_message_bubble_stays_within_message_pane():
+    app = MessengerTUI(client=LongMessageClient())
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        await app._show_history(7)
+        await pilot.pause()
+        pane = app.query_one("#messages")
+        bubble = list(app.query(MessageBubble))[0]
+        assert bubble.size.width <= pane.size.width
+        assert "long-message-" in str(bubble.render())
 
 
 async def test_tui_survives_markup_hostile_text():
@@ -596,7 +690,7 @@ async def test_tui_loads_dialogs_under_eager_task_factory():
         app = MessengerTUI(client=EagerSensitiveClient())
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert len(list(app.query(DialogItem))) == 1
+            assert [item.dialog_id for item in app.query(DialogItem)] == [7, 8, -100200, -100300, 9]
     finally:
         loop.set_task_factory(None)
 
@@ -683,7 +777,7 @@ async def test_tui_shows_loading_until_dialogs_arrive():
         gate.set()
         await pilot.pause()
         assert app.query_one("#dialogs", ListView).loading is False
-        assert len(list(app.query(DialogItem))) == 1
+        assert [item.dialog_id for item in app.query(DialogItem)] == [7, 8, -100200, -100300, 9]
 
 
 # --- цикл 66: локальный поиск диалогов в TUI ---
@@ -693,7 +787,7 @@ async def test_tui_search_filters_dialogs():
     app = MessengerTUI(client=TwoDmClient())
     async with app.run_test() as pilot:
         await pilot.pause()
-        assert {item.dialog_id for item in app.query(DialogItem)} == {7, 8}
+        assert {item.dialog_id for item in app.query(DialogItem)} == {7, 8, -100200}
         search = app.query_one("#search", Input)
         search.value = "Bob"
         await app.on_input_changed(Input.Changed(search, "Bob"))
@@ -713,7 +807,7 @@ async def test_tui_search_clear_restores_full_list():
         search.value = ""
         await app.on_input_changed(Input.Changed(search, ""))
         await pilot.pause()
-        assert {item.dialog_id for item in app.query(DialogItem)} == {7, 8}
+        assert {item.dialog_id for item in app.query(DialogItem)} == {7, 8, -100200}
 
 
 async def test_tui_search_does_not_hit_network():
@@ -730,41 +824,105 @@ async def test_tui_search_does_not_hit_network():
         assert stub.dialogs_calls == calls_before
 
 
-# --- Цикл 36: вкладки DM / Группы ---
+# --- Цикл 36: вкладки Все / Контакты / Не контакты / Группы / Каналы / Боты / Непрочитанные / Архив ---
 
 
 def _listed_ids(app):
     return [item.dialog_id for item in app.query(DialogItem)]
 
 
-async def test_tui_has_tabs_dm_active_by_default():
+async def test_tui_has_all_tab_active_by_default():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
         await pilot.pause()
         tabs = app.query_one(Tabs)
-        assert tabs.active == "dm"
+        assert tabs.active == "all"
+        assert [tab.label.plain for tab in tabs.query("Tab")] == [
+            "Все",
+            "Контакты",
+            "Не контакты",
+            "Группы/супер",
+            "Каналы",
+            "Боты",
+            "Непрочитанные",
+            "Архив",
+        ]
+        assert _listed_ids(app) == [7, 8, -100200, -100300, 9]
+
+
+async def test_tui_contacts_tab_lists_contact_dialogs():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "contacts"
+        await pilot.pause()
         assert _listed_ids(app) == [7]
 
 
-async def test_tui_groups_tab_lists_non_dm_dialogs():
+async def test_tui_non_contacts_tab_lists_non_contact_dialogs():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "non_contacts"
+        await pilot.pause()
+        assert _listed_ids(app) == [8]
+
+
+async def test_tui_groups_tab_lists_groups_only():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
         await pilot.pause()
         app.query_one(Tabs).active = "groups"
         await pilot.pause()
-        assert _listed_ids(app) == [-100200, 9]  # без DM
+        assert _listed_ids(app) == [-100200]
 
 
-async def test_tui_tab_switch_back_reloads_dm():
+async def test_tui_channels_tab_lists_channel_dialogs():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "channels"
+        await pilot.pause()
+        assert _listed_ids(app) == [-100300]
+
+
+async def test_tui_bots_tab_lists_bot_dialogs():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "bots"
+        await pilot.pause()
+        assert _listed_ids(app) == [9]
+
+
+async def test_tui_unread_tab_lists_unread_non_archived_dialogs():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "unread"
+        await pilot.pause()
+        assert _listed_ids(app) == [8, -100200]
+
+
+async def test_tui_archive_tab_lists_archived_dialogs():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "archive"
+        await pilot.pause()
+        assert _listed_ids(app) == [10, -100400]
+
+
+async def test_tui_tab_switch_back_reloads_all():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
         await pilot.pause()
         tabs = app.query_one(Tabs)
         tabs.active = "groups"
         await pilot.pause()
-        tabs.active = "dm"
+        tabs.active = "all"
         await pilot.pause()
-        assert _listed_ids(app) == [7]  # список перезагружен, не накоплен
+        assert _listed_ids(app) == [7, 8, -100200, -100300, 9]  # список перезагружен, не накоплен
 
 
 async def test_tui_tab_activation_before_startup_is_safe():
@@ -864,8 +1022,7 @@ async def test_tui_incoming_updates_dialog_list_without_network_reload():
         stub.fire.set()
         await pilot.pause()
         rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
-    assert rendered[0] == "8 — Bob (1)"
-    assert rendered[1] == "7 — Ann"
+    assert rendered == ["8 — Bob (1)", "7 — Ann", "-100200 — Devs"]
     assert stub.dialogs_calls == calls_before
 
 
@@ -899,7 +1056,7 @@ async def test_tui_open_dialog_live_message_stays_read_and_marks_new_id():
         await pilot.pause()
         rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
         bubbles = [str(b.render()) for b in app.query(MessageBubble)]
-    assert rendered[0] == "8 — Bob"
+    assert rendered == ["8 — Bob", "7 — Ann", "-100200 — Devs"]
     assert bubbles == ["[22] fresh"]
     assert stub.read_acks == [(8, 22)]
 
@@ -956,6 +1113,48 @@ async def test_tui_outgoing_from_another_device_appends_out_bubble_for_open_dial
         # своё сообщение в открытый диалог дорисовано (out=True), в чужой — нет
         assert [str(b.render()) for b in bubbles] == ["[30] с телефона"]
         assert all("out" in b.classes for b in bubbles)
+
+
+class OutgoingDialogListClient(IncomingDialogListClient):
+    async def listen_all(self):
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+    async def listen_outgoing(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield OutgoingEvent(
+            dialog_id=8,
+            message=Message(id=24, dialog_id=8, sender_id=1, out=True, text="from laptop", date=date),
+        )
+        await asyncio.Event().wait()
+
+
+async def test_tui_outgoing_updates_dialog_list_without_unread_increment():
+    stub = OutgoingDialogListClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        calls_before = stub.dialogs_calls
+        stub.fire.set()
+        await pilot.pause()
+        rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
+    assert rendered == ["8 — Bob", "7 — Ann", "-100200 — Devs"]
+    assert stub.dialogs_calls == calls_before
+
+
+async def test_tui_local_send_updates_dialog_list_without_waiting_for_echo():
+    stub = TwoDmClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        calls_before = stub.dialogs_calls
+        app._current = 8
+        await app._send_text(8, "from composer")
+        await pilot.pause()
+        rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
+    assert rendered == ["8 — Bob", "7 — Ann", "-100200 — Devs"]
+    assert stub.dialogs_calls == calls_before
 
 
 class OutgoingEchoClient(TuiStubClient):
@@ -1123,181 +1322,6 @@ async def test_tui_switching_dialogs_clears_pending_suggestion():
         assert str(app.query_one("#suggestion", Static).render()) == ""
 
 
-async def test_tui_outbound_clears_composer_while_worker_runs():
-    class BlockingOutbound:
-        def __init__(self):
-            self.entered = asyncio.Event()
-            self.release = asyncio.Event()
-
-        async def applies(self, dialog_id, text):
-            self.entered.set()
-            await self.release.wait()
-            return None
-
-    outbound = BlockingOutbound()
-    app = MessengerTUI(client=TuiStubClient(), outbound=outbound)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        app._current = 7
-        composer = app.query_one("#composer", Input)
-        composer.value = "hello"
-        await app.on_input_submitted(Input.Submitted(composer, "hello"))
-        await asyncio.wait_for(outbound.entered.wait(), timeout=5)
-        assert composer.value == ""
-        outbound.release.set()
-        await pilot.pause()
-
-
-async def test_tui_outbound_cancel_restores_original_draft(monkeypatch):
-    class VariantOutbound:
-        async def applies(self, dialog_id, text):
-            return "es"
-
-        async def variants(self, dialog_id, text, target_lang):
-            return ["hola"]
-
-    app = MessengerTUI(client=TuiStubClient(), outbound=VariantOutbound())
-    async with app.run_test() as pilot:
-        await pilot.pause()
-
-        async def cancel(_screen):
-            return None
-
-        monkeypatch.setattr(app, "push_screen_wait", cancel)
-        composer = app.query_one("#composer", Input)
-        composer.value = ""
-        await app._outbound_flow(7, "hello")
-        assert composer.value == "hello"
-
-
-async def test_tui_outbound_error_restores_original_for_bypass():
-    class FailingOutbound:
-        async def applies(self, dialog_id, text):
-            return "es"
-
-        async def variants(self, dialog_id, text, target_lang):
-            raise RuntimeError("llm down")
-
-    app = MessengerTUI(client=TuiStubClient(), outbound=FailingOutbound())
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        composer = app.query_one("#composer", Input)
-        composer.value = ""
-        await app._outbound_flow(7, "hello")
-        assert composer.value == "hello"
-        assert app._outbound_bypass == _OutboundPending(7, "hello")
-
-
-async def test_tui_outbound_applies_timeout_sends_original():
-    class TimeoutOutbound:
-        async def applies(self, dialog_id, text):
-            raise TimeoutError
-
-    stub = TuiStubClient()
-    app = MessengerTUI(client=stub, outbound=TimeoutOutbound())
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        app._current = 7
-        composer = app.query_one("#composer", Input)
-        composer.value = "hello"
-        await app.on_input_submitted(Input.Submitted(composer, "hello"))
-        await pilot.pause()
-        await pilot.pause()
-
-    assert stub.sent == [(7, "hello", None)]
-
-
-async def test_tui_outbound_variants_timeout_sends_original():
-    class TimeoutOutbound:
-        async def applies(self, dialog_id, text):
-            return "es"
-
-        async def variants(self, dialog_id, text, target_lang):
-            raise TimeoutError
-
-    stub = TuiStubClient()
-    app = MessengerTUI(client=stub, outbound=TimeoutOutbound())
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        app._current = 7
-        composer = app.query_one("#composer", Input)
-        composer.value = "hello"
-        await app.on_input_submitted(Input.Submitted(composer, "hello"))
-        await pilot.pause()
-        await pilot.pause()
-
-    assert stub.sent == [(7, "hello", None)]
-
-
-async def test_tui_outbound_original_choice_restores_original_for_bypass(monkeypatch):
-    class VariantOutbound:
-        async def applies(self, dialog_id, text):
-            return "es"
-
-        async def variants(self, dialog_id, text, target_lang):
-            return ["hola"]
-
-    app = MessengerTUI(client=TuiStubClient(), outbound=VariantOutbound())
-    async with app.run_test() as pilot:
-        await pilot.pause()
-
-        async def pick_original(_screen):
-            return ORIGINAL_SENTINEL
-
-        monkeypatch.setattr(app, "push_screen_wait", pick_original)
-        composer = app.query_one("#composer", Input)
-        composer.value = ""
-        await app._outbound_flow(7, "hello")
-        assert composer.value == "hello"
-        assert app._outbound_bypass == _OutboundPending(7, "hello")
-
-
-async def test_tui_switching_dialogs_clears_pending_outbound_variant():
-    stub = TwoDmClient()
-    app = MessengerTUI(client=stub)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        composer = app.query_one("#composer", Input)
-        composer.value = "hola"
-        app._held_source = _OutboundPending(7, "hola", source_text="hello")
-
-        lv = app.query_one("#dialogs", ListView)
-        lv.index = 1
-        lv.focus()
-        await pilot.press("enter")
-        await pilot.pause()
-
-        assert app._held_source is None
-        assert composer.value == ""
-        await app.on_input_submitted(Input.Submitted(composer, composer.value))
-        await pilot.pause()
-
-    assert stub.sent == []
-
-
-async def test_tui_switching_dialogs_clears_pending_outbound_original_bypass():
-    stub = TwoDmClient()
-    app = MessengerTUI(client=stub)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        composer = app.query_one("#composer", Input)
-        composer.value = "hello"
-        app._outbound_bypass = _OutboundPending(7, "hello")
-
-        lv = app.query_one("#dialogs", ListView)
-        lv.index = 1
-        lv.focus()
-        await pilot.press("enter")
-        await pilot.pause()
-
-        assert app._outbound_bypass is None
-        assert composer.value == ""
-        await app.on_input_submitted(Input.Submitted(composer, composer.value))
-        await pilot.pause()
-
-    assert stub.sent == []
-
-
 # --- UX: Enter / стрелка-вниз с вкладок → фокус на список диалогов ---
 
 
@@ -1372,12 +1396,224 @@ class TwoDmClient(TuiStubClient):
     async def dialogs(self, dm_only=True):
         self.dialogs_calls += 1
         dms = [
-            Dialog(id=7, title="Ann", username="ann", unread=0),
-            Dialog(id=8, title="Bob", username="bob", unread=0),
+            Dialog(id=7, title="Ann", username="ann", unread=0, is_contact=True),
+            Dialog(id=8, title="Bob", username="bob", unread=0, is_contact=False),
         ]
         if dm_only:
             return dms
         return dms + [Dialog(id=-100200, title="Devs", kind="group")]
+
+
+async def _pause_until(pilot, predicate, attempts=20):
+    for _ in range(attempts):
+        await pilot.pause()
+        if predicate():
+            return
+    assert predicate()
+
+
+async def _select_dialog(pilot, app, dialog_id: int):
+    lv = app.query_one("#dialogs", ListView)
+    for idx, item in enumerate(app.query(DialogItem)):
+        if item.dialog_id == dialog_id:
+            lv.index = idx
+            lv.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            return
+    raise AssertionError(f"dialog {dialog_id} not found")
+
+
+async def test_tui_composer_drafts_are_scoped_to_dialog():
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        await _select_dialog(pilot, app, 7)
+        composer.value = "draft A"
+        await _select_dialog(pilot, app, 8)
+        await pilot.pause()
+        assert composer.value == ""
+
+        composer.value = "draft B"
+        await _select_dialog(pilot, app, 7)
+        await pilot.pause()
+        assert composer.value == "draft A"
+
+        await _select_dialog(pilot, app, 8)
+        await pilot.pause()
+        assert composer.value == "draft B"
+
+
+async def test_tui_ignores_stale_composer_changed_event():
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        await _select_dialog(pilot, app, 7)
+        composer.value = "current"
+        state = app._compose_state_for(7)
+        state.draft = "current"
+
+        await app.on_input_changed(Input.Changed(composer, "stale"))
+
+    assert state.draft == "current"
+
+
+async def test_tui_outbound_variant_state_is_scoped_to_dialog():
+    stub = TwoDmClient()
+    store = TuiSourceStore()
+    outbound = RecordingOutbound(variants=["hello"])
+    app = MessengerTUI(client=stub, store=store, outbound=outbound)
+
+    async def pick_variant(screen):
+        return "hello"
+
+    app.push_screen_wait = pick_variant  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        await _select_dialog(pilot, app, 7)
+        composer.value = "привет"
+        await app.on_input_submitted(Input.Submitted(composer, "привет"))
+        await _pause_until(pilot, lambda: composer.value == "hello")
+
+        await _select_dialog(pilot, app, 8)
+        await pilot.pause()
+        assert composer.value == ""
+        await app.on_input_submitted(Input.Submitted(composer, composer.value))
+        await pilot.pause()
+        assert stub.sent == []
+
+        await _select_dialog(pilot, app, 7)
+        await pilot.pause()
+        assert composer.value == "hello"
+        await app.on_input_submitted(Input.Submitted(composer, "hello"))
+        await stub.wait_sent_count()
+
+    assert stub.sent == [(7, "hello", None)]
+    assert store.recorded == [(7, "hello", "привет", "ru")]
+
+
+async def test_tui_editing_selected_variant_clears_stale_source_text():
+    stub = TwoDmClient()
+    store = TuiSourceStore()
+    outbound = RecordingOutbound(variants=["hello"])
+    app = MessengerTUI(client=stub, store=store, outbound=outbound)
+
+    async def pick_variant(screen):
+        return "hello"
+
+    app.push_screen_wait = pick_variant  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        await _select_dialog(pilot, app, 7)
+        composer.value = "привет"
+        await app.on_input_submitted(Input.Submitted(composer, "привет"))
+        await _pause_until(pilot, lambda: composer.value == "hello")
+
+        outbound.target_lang = None
+        composer.value = "hello!"
+        await app.on_input_changed(Input.Changed(composer, "hello!"))
+        await app.on_input_submitted(Input.Submitted(composer, "hello!"))
+        await stub.wait_sent_count()
+
+    assert stub.sent == [(7, "hello!", None)]
+    assert store.recorded == []
+    assert outbound.applies_calls == [(7, "привет"), (7, "hello!")]
+
+
+async def test_tui_outbound_error_original_confirm_is_scoped_to_dialog():
+    stub = TwoDmClient()
+    outbound = RecordingOutbound(fail=True)
+    app = MessengerTUI(client=stub, outbound=outbound)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        await _select_dialog(pilot, app, 7)
+        composer.value = "привет"
+        await app.on_input_submitted(Input.Submitted(composer, "привет"))
+        await _pause_until(pilot, lambda: outbound.variants_calls)
+        assert stub.sent == []
+        assert composer.value == "привет"
+
+        await _select_dialog(pilot, app, 8)
+        await pilot.pause()
+        assert composer.value == ""
+        composer.value = "привет"
+        await app.on_input_submitted(Input.Submitted(composer, "привет"))
+        await pilot.pause()
+        assert stub.sent == []
+
+        await _select_dialog(pilot, app, 7)
+        await pilot.pause()
+        assert composer.value == "привет"
+        await app.on_input_submitted(Input.Submitted(composer, "привет"))
+        await stub.wait_sent_count()
+
+    assert stub.sent == [(7, "привет", None)]
+
+
+async def test_tui_outbound_cancel_restores_current_dialog_draft():
+    stub = TwoDmClient()
+    outbound = RecordingOutbound(variants=["hello"])
+    app = MessengerTUI(client=stub, outbound=outbound)
+
+    async def cancel_variant_picker(screen):
+        return None
+
+    app.push_screen_wait = cancel_variant_picker  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        await _select_dialog(pilot, app, 7)
+        composer.value = "привет"
+        await app.on_input_submitted(Input.Submitted(composer, "привет"))
+        await _pause_until(pilot, lambda: outbound.variants_calls)
+
+        assert composer.value == "привет"
+        assert stub.sent == []
+
+
+def test_tui_outbound_flow_has_one_timeout_budget_for_legacy_fallback():
+    source = inspect.getsource(MessengerTUI._outbound_flow)
+    assert source.count("asyncio.wait_for(") == 1
+    assert "_prepare_outbound_variants(" in source
+
+
+async def test_tui_outbound_clears_composer_and_repeated_enter_does_not_restart_worker():
+    stub = TwoDmClient()
+    outbound = BlockingOutbound()
+    app = MessengerTUI(client=stub, outbound=outbound)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+
+        await _select_dialog(pilot, app, 7)
+        composer.value = "привет"
+        await app.on_input_submitted(Input.Submitted(composer, "привет"))
+        await _pause_until(pilot, lambda: outbound.variants_calls)
+        assert composer.value == ""
+
+        await app.on_input_submitted(Input.Submitted(composer, composer.value))
+        await pilot.pause()
+        assert outbound.applies_calls == [(7, "привет")]
+        assert outbound.variants_calls == [(7, "привет", "en")]
+        assert stub.sent == []
+
+        outbound.release.set()
+        await _pause_until(pilot, lambda: composer.value == "привет")
+
+    assert stub.sent == []
 
 
 # --- цикл 60: TUI выбор профиля (мультилогин) ---

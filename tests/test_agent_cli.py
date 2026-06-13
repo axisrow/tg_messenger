@@ -4,6 +4,7 @@ LLM-стек не вызывается: init_chat_model/create_deep_agent пат
 CLI тестируется через CliRunner со стабами make_client/make_agent_runner.
 """
 
+import asyncio
 import logging
 import sys
 from types import SimpleNamespace
@@ -36,6 +37,11 @@ class FakeModel:
     async def ainvoke(self, messages):
         self.calls.append(list(messages))
         return SimpleNamespace(content=self.reply)
+
+
+class HangingModel:
+    async def ainvoke(self, messages):
+        await asyncio.Event().wait()
 
 
 def test_build_orchestrator_wires_model_and_tools(monkeypatch):
@@ -85,6 +91,13 @@ async def test_classifier_sends_user_text_to_model():
     assert messages[-1].content == "привет, бот"
 
 
+async def test_classifier_times_out(monkeypatch):
+    monkeypatch.setattr(factory, "MODEL_CALL_TIMEOUT_SECONDS", 0.01)
+    classify = factory.make_classifier(HangingModel())
+    with pytest.raises(TimeoutError):
+        await classify("привет")
+
+
 async def test_chat_fn_returns_content_and_keeps_history():
     model = FakeModel(reply="ответ")
     chat = factory.make_chat_fn(model)
@@ -92,6 +105,13 @@ async def test_chat_fn_returns_content_and_keeps_history():
     assert await chat(history) == "ответ"
     (messages,) = model.calls
     assert messages[-2:] == history  # история ушла модели целиком, в конце
+
+
+async def test_chat_fn_times_out(monkeypatch):
+    monkeypatch.setattr(factory, "MODEL_CALL_TIMEOUT_SECONDS", 0.01)
+    chat = factory.make_chat_fn(HangingModel())
+    with pytest.raises(TimeoutError):
+        await chat([])
 
 
 # --- Цикл 22: vision-функция и vision-модель ---
@@ -158,6 +178,15 @@ async def test_make_suggest_fn_works_without_profile():
     assert draft == "черновик"
 
 
+async def test_make_suggest_fn_times_out(monkeypatch):
+    from tg_messenger.agent.suggest import ContextMessage
+
+    monkeypatch.setattr(factory, "MODEL_CALL_TIMEOUT_SECONDS", 0.01)
+    suggest_fn = factory.make_suggest_fn(HangingModel())
+    with pytest.raises(TimeoutError):
+        await suggest_fn([ContextMessage(out=False, text="hi")], None)
+
+
 def test_build_suggester_wires_model(monkeypatch):
     from tg_messenger.agent.suggest import Suggester
 
@@ -184,6 +213,13 @@ async def test_make_translate_fn_garbage_returns_empty(caplog):
     assert any("translator returned non-json" in rec.message for rec in caplog.records)
 
 
+async def test_make_translate_fn_times_out(monkeypatch):
+    monkeypatch.setattr(factory, "MODEL_CALL_TIMEOUT_SECONDS", 0.01)
+    translate_fn = factory.make_translate_fn(HangingModel())
+    with pytest.raises(TimeoutError):
+        await translate_fn([(1, "hello")], "ru")
+
+
 async def test_make_outbound_variants_fn_parses_array():
     variants_fn = factory.make_outbound_variants_fn(FakeModel(reply='```json\n["hi", "hello"]\n```'))
     result = await variants_fn("привет", "en", None, [])
@@ -198,9 +234,27 @@ async def test_make_outbound_variants_fn_garbage_raises(caplog):
     assert any("outbound variants returned non-json" in rec.message for rec in caplog.records)
 
 
+async def test_make_outbound_variants_fn_times_out(monkeypatch):
+    monkeypatch.setattr(factory, "MODEL_CALL_TIMEOUT_SECONDS", 0.01)
+    variants_fn = factory.make_outbound_variants_fn(HangingModel())
+    with pytest.raises(TimeoutError):
+        await variants_fn("привет", "en", None, [])
+
+
 async def test_make_detect_lang_fn_validates_code():
-    assert await factory.make_detect_lang_fn(FakeModel(reply="EN."))(["hello"]) == "en"
+    model = FakeModel(reply="EN.")
+    assert await factory.make_detect_lang_fn(model)(["hello"]) == "en"
+    rendered = "\n".join(str(m.content) for m in model.calls[0])
+    assert "ru, en, es, uk, ja, zh, ko, ar, he, el, th" in rendered
+    assert await factory.make_detect_lang_fn(FakeModel(reply="FR."))(["bonjour"]) is None
     assert await factory.make_detect_lang_fn(FakeModel(reply="English"))(["hello"]) is None
+
+
+async def test_make_detect_lang_fn_times_out(monkeypatch):
+    monkeypatch.setattr(factory, "MODEL_CALL_TIMEOUT_SECONDS", 0.01)
+    detect_fn = factory.make_detect_lang_fn(HangingModel())
+    with pytest.raises(TimeoutError):
+        await detect_fn(["hello"])
 
 
 # --- Цикл 25: классификатор по списку интентов + видимость конфига в CLI ---

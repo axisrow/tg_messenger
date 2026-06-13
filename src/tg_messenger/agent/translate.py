@@ -11,6 +11,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
+from tg_messenger.core.languages import clean_supported_lang_code, validate_supported_lang_code
 from tg_messenger.core.message_store import (
     get_message_translation,
     set_message_translation,
@@ -48,17 +49,26 @@ def needs_translation(text: str | None, target_lang: str | None) -> bool:
 async def get_user_lang(storage, env=None) -> str | None:
     value = await storage.get_value(USER_LANG_KEY)
     if value:
-        return str(value)
+        lang = clean_supported_lang_code(str(value))
+        if lang is None:
+            logger.warning("unsupported stored user language code")
+        return lang
     source = os.environ if env is None else env
     value = source.get("TG_USER_LANG")
-    return str(value).strip() or None if value is not None else None
+    if value is None:
+        return None
+    lang = clean_supported_lang_code(str(value))
+    if lang is None and str(value).strip():
+        logger.warning("unsupported TG_USER_LANG value")
+    return lang
 
 
 async def set_user_lang(storage, code: str | None) -> None:
     if code is None:
         await storage.execute("DELETE FROM kv WHERE key = ?", (USER_LANG_KEY,))
         return
-    await storage.set_value(USER_LANG_KEY, code.strip().lower())
+    lang = validate_supported_lang_code(code)
+    await storage.set_value(USER_LANG_KEY, lang)
 
 
 def translate_model_from_env(env=None) -> str | None:
