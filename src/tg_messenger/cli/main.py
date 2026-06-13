@@ -903,21 +903,6 @@ def dialog_lang(
     _run(_with_storage(session, lambda storage: None, _do), session=session)
 
 
-async def _require_can_send(client, dialog_id: int) -> None:
-    """Pre-flight: refuse to send into a read-only chat with a clean message.
-
-    Reads the (cached) dialog list — no extra network call when warm. A dialog not
-    found in the list stays permissive (unknown ⇒ try; the core SendForbiddenError
-    seam is the authoritative net). The core seam also covers a stale cache (TOCTOU).
-    """
-    dialogs = await client.dialogs(dm_only=False)
-    target = next((d for d in dialogs if d.id == dialog_id), None)
-    if target is not None and not target.can_send:
-        raise click.ClickException(
-            "This chat is read-only — you don't have permission to post here."
-        )
-
-
 @cli.command()
 @click.argument("dialog_id", type=int)
 @click.argument("text", required=False)
@@ -946,7 +931,10 @@ def send(dialog_id: int, text: str | None, file_path: str | None, caption: str |
         )
 
     async def _do(client):
-        await _require_can_send(client, dialog_id)
+        # No pre-flight dialog fetch: a one-shot CLI process has a cold cache, so a
+        # read-only check would cost a full dialog list every time. send_media's own
+        # offline path check runs first; the core SendForbiddenError seam (mapped in
+        # _run) is the authoritative net for a read-only chat.
         if file_path:
             return await client.send_media(
                 dialog_id, file_path, caption=caption or text,
@@ -967,7 +955,9 @@ def react(dialog_id: int, message_id: int, emoticon: str, session: str) -> None:
     """React to a message with a standard emoji."""
 
     async def _do(client):
-        await _require_can_send(client, dialog_id)
+        # No pre-flight gate: reactions are a separate capability from posting, and a
+        # one-shot CLI has a cold cache. Telegram rejects (→ SendForbiddenError) if the
+        # channel truly forbids reactions. Proper per-message reaction UI: issue #86.
         await client.send_reaction(dialog_id, message_id, emoticon)
 
     _run(_with_client(session, _do), session=session)
