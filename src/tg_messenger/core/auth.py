@@ -119,7 +119,7 @@ class SessionStore:
         it counts as valid (we just can't decrypt it here). With a key, the session is
         decrypted and parsed. A missing/empty/garbage file is invalid.
         """
-        from tg_messenger.core.session_cipher import is_encrypted
+        from tg_messenger.core.session_cipher import decrypt_session, is_encrypted
 
         path = self.path_for(name)
         if not path.is_file():
@@ -133,8 +133,11 @@ class SessionStore:
         # encrypted file without a key: present and intact, but undecryptable here → valid
         if is_encrypted(raw) and not self._encryption_key:
             return True
+        # Validate WITHOUT self.load(): load() lazily re-encrypts a plaintext file under a
+        # key (self.save()), which must never fire from a read-only `profiles` listing.
         try:
-            self.load(name)
+            plaintext = decrypt_session(raw, self._encryption_key) if self._encryption_key else raw
+            validate_session_string(plaintext)
         except Exception:
             return False
         return True

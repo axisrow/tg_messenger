@@ -394,3 +394,17 @@ def test_is_valid_profile_true_for_encrypted_without_key(session_dir):
     keyed.save("enc", VALID_SESSION)
     no_key = SessionStore(session_dir)
     assert no_key.is_valid_profile("enc") is True
+
+
+def test_is_valid_profile_does_not_rewrite_plaintext_under_key(session_dir):
+    # `profiles` listing is read-only: validating a plaintext file under a key must NOT
+    # trigger load()'s lazy encrypt-migration (which would self.save() the file). Otherwise
+    # a read-only mount / full disk makes `tg-messenger profiles` fail or silently rewrite.
+    plain = SessionStore(session_dir)
+    plain.save("default", VALID_SESSION)  # plaintext on disk
+    before = plain.path_for("default").read_text(encoding="utf-8")
+    keyed = SessionStore(session_dir, encryption_key=_ENC_KEY)
+    assert keyed.is_valid_profile("default") is True
+    after = keyed.path_for("default").read_text(encoding="utf-8")
+    assert after == before  # untouched — no enc:v2: rewrite
+    assert not after.startswith("enc:v2:")
