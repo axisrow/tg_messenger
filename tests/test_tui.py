@@ -66,6 +66,7 @@ def test_parse_reaction_command_rejects_bad_shape():
 class TuiStubClient:
     def __init__(self):
         self.sent = []
+        self.sent_event = asyncio.Event()
         self.read_acks = []
         self.connected = False
         self.authorized = True
@@ -117,8 +118,16 @@ class TuiStubClient:
 
     async def send_text(self, peer, text, reply_to=None):
         self.sent.append((peer, text, reply_to))
+        self.sent_event.set()
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    async def wait_sent_count(self, count=1, timeout=2.0):
+        while len(self.sent) < count:
+            self.sent_event.clear()
+            if len(self.sent) >= count:
+                break
+            await asyncio.wait_for(self.sent_event.wait(), timeout=timeout)
 
     async def send_media(self, peer, file_path, *, caption=None, voice_note=False,
                          video_note=False, force_document=False):
@@ -1466,7 +1475,7 @@ async def test_tui_outbound_variant_state_is_scoped_to_dialog():
         await pilot.pause()
         assert composer.value == "hello"
         await app.on_input_submitted(Input.Submitted(composer, "hello"))
-        await _pause_until(pilot, lambda: stub.sent)
+        await stub.wait_sent_count()
 
     assert stub.sent == [(7, "hello", None)]
     assert store.recorded == [(7, "hello", "привет", "ru")]
@@ -1495,7 +1504,7 @@ async def test_tui_editing_selected_variant_clears_stale_source_text():
         composer.value = "hello!"
         await app.on_input_changed(Input.Changed(composer, "hello!"))
         await app.on_input_submitted(Input.Submitted(composer, "hello!"))
-        await _pause_until(pilot, lambda: stub.sent)
+        await stub.wait_sent_count()
 
     assert stub.sent == [(7, "hello!", None)]
     assert store.recorded == []
@@ -1530,7 +1539,7 @@ async def test_tui_outbound_error_original_confirm_is_scoped_to_dialog():
         await pilot.pause()
         assert composer.value == "привет"
         await app.on_input_submitted(Input.Submitted(composer, "привет"))
-        await _pause_until(pilot, lambda: stub.sent)
+        await stub.wait_sent_count()
 
     assert stub.sent == [(7, "привет", None)]
 
