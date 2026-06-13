@@ -63,6 +63,7 @@ class HeartbeatPlan(BaseModel):
     max_per_day: int = DEFAULT_MAX_PER_DAY
     pings_today: int = 0
     day_start: float | None = None  # Unix ts the current daily counter started
+    next_jitter_sec: float | None = None  # jitter offset for the NEXT interval, drawn once
 
     @field_validator("templates")
     @classmethod
@@ -93,6 +94,9 @@ HEARTBEAT_MIGRATIONS = [
     " peer INTEGER NOT NULL,"
     " text TEXT NOT NULL,"
     " ts TEXT NOT NULL)",
+    # #51: per-interval jitter is drawn once and stored, not re-rolled each tick.
+    # ALTER (not a CREATE edit) so existing databases gain the column on next connect.
+    "ALTER TABLE heartbeat_plans ADD COLUMN next_jitter_sec REAL",
 ]
 
 
@@ -103,7 +107,7 @@ def register_heartbeat_migrations(storage) -> None:
 
 _COLUMNS = (
     "peer, templates, interval_hours, jitter_minutes, quiet_start, quiet_end, "
-    "enabled, last_ping_at, max_per_day, pings_today, day_start"
+    "enabled, last_ping_at, max_per_day, pings_today, day_start, next_jitter_sec"
 )
 
 
@@ -120,6 +124,7 @@ def _row_to_plan(row) -> HeartbeatPlan:
         max_per_day=row[8],
         pings_today=row[9],
         day_start=row[10],
+        next_jitter_sec=row[11],
     )
 
 
@@ -128,14 +133,15 @@ async def add_plan(storage, plan: HeartbeatPlan) -> None:
     await storage.execute(
         "INSERT INTO heartbeat_plans "
         "(peer, templates, interval_hours, jitter_minutes, quiet_start, quiet_end, "
-        " enabled, last_ping_at, max_per_day, pings_today, day_start) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        " enabled, last_ping_at, max_per_day, pings_today, day_start, next_jitter_sec) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(peer) DO UPDATE SET "
         "templates = excluded.templates, interval_hours = excluded.interval_hours, "
         "jitter_minutes = excluded.jitter_minutes, quiet_start = excluded.quiet_start, "
         "quiet_end = excluded.quiet_end, enabled = excluded.enabled, "
         "last_ping_at = excluded.last_ping_at, max_per_day = excluded.max_per_day, "
-        "pings_today = excluded.pings_today, day_start = excluded.day_start",
+        "pings_today = excluded.pings_today, day_start = excluded.day_start, "
+        "next_jitter_sec = excluded.next_jitter_sec",
         (
             plan.peer,
             json.dumps(plan.templates),
@@ -148,6 +154,7 @@ async def add_plan(storage, plan: HeartbeatPlan) -> None:
             plan.max_per_day,
             plan.pings_today,
             plan.day_start,
+            plan.next_jitter_sec,
         ),
     )
 
@@ -183,11 +190,18 @@ def _in_quiet_window(local_hour: int, start: int, end: int) -> bool:
     return local_hour >= start or local_hour < end
 
 
-def is_due(plan: HeartbeatPlan, *, now: float, rng: Callable[[float, float], float]) -> bool:
+def is_due(
+    plan: HeartbeatPlan,
+    *,
+    now: float,
+    rng: Callable[[float, float], float] | None = None,
+) -> bool:
     """Whether ``plan`` should ping at ``now`` (Unix ts), honouring every safety.
 
-    ``rng(a, b)`` is injected (deterministic in tests). It is consulted for the jitter
-    offset only — quiet hours / max_per_day are pure comparisons.
+    ``is_due`` is a PURE comparison: the jitter offset for this interval is the value
+    drawn once and stored on the plan (``next_jitter_sec``, set by ``_record_ping``), NOT
+    re-rolled here. Re-rolling each tick biased the effective offset to the lower bound
+    (#51). ``rng`` is accepted but ignored — kept so existing callers don't break.
     """
     # quiet hours (local time)
     if plan.quiet_start is not None and plan.quiet_end is not None:
@@ -200,12 +214,10 @@ def is_due(plan: HeartbeatPlan, *, now: float, rng: Callable[[float, float], flo
         if plan.pings_today >= plan.max_per_day:
             return False
 
-    # interval + jitter
+    # interval + jitter (jitter was drawn once for this interval and stored)
     if plan.last_ping_at is None:
         return True
-    jitter_sec = 0.0
-    if plan.jitter_minutes > 0:
-        jitter_sec = rng(0.0, plan.jitter_minutes * 60.0)
+    jitter_sec = plan.next_jitter_sec or 0.0
     due_at = plan.last_ping_at + plan.interval_hours * 3600.0 + jitter_sec
     return now >= due_at
 
@@ -315,10 +327,14 @@ class HeartbeatService:
         else:
             day_start = plan.day_start
             pings_today = plan.pings_today + 1
+        # draw the NEXT interval's jitter ONCE here (#51) — is_due reads it, never re-rolls
+        next_jitter_sec = (
+            self._rng(0.0, plan.jitter_minutes * 60.0) if plan.jitter_minutes > 0 else None
+        )
         await self._storage.execute(
-            "UPDATE heartbeat_plans SET last_ping_at = ?, pings_today = ?, day_start = ? "
-            "WHERE peer = ?",
-            (now, pings_today, day_start, plan.peer),
+            "UPDATE heartbeat_plans SET last_ping_at = ?, pings_today = ?, day_start = ?, "
+            "next_jitter_sec = ? WHERE peer = ?",
+            (now, pings_today, day_start, next_jitter_sec, plan.peer),
         )
 
     async def _journal(self, peer: int, text: str) -> None:
