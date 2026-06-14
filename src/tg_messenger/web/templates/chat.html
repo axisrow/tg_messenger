@@ -164,10 +164,8 @@
           document.getElementById('messages').insertAdjacentHTML('beforeend', html);
           document.getElementById('composer-text').value = '';
           // #48: media carries no reply_to, so clear the stale banner — but only if the
-          // user hasn't picked a newer target since this upload started.
-          if (replyToInput.value === uploadReplyTo) {
-            clearReply();
-          }
+          // user hasn't picked a newer target since this upload started (#89 shared helper).
+          clearReplyIfConsumed(uploadReplyTo);
         }
       } else {
         alert(html.replace(/<[^>]+>/g, '').trim() || 'Upload failed');
@@ -276,6 +274,12 @@
     function clearReply() {
       replyToInput.value = '';
       replyBanner.style.display = 'none';
+    }
+    // #89: the success-path reply-clear shared by the send (afterRequest) and media (attach)
+    // paths — clear the banner only if the user hasn't picked a NEWER reply target while the
+    // send/upload was in flight (compare against the target snapshotted when it started).
+    function clearReplyIfConsumed(oldReplyTo) {
+      if (replyToInput.value === oldReplyTo) clearReply();
     }
     document.getElementById('messages').addEventListener('click', (e) => {
       const btn = e.target.closest('.reply-btn');
@@ -429,13 +433,12 @@
         // the target hasn't changed since — if the user picked a newer target in the same
         // dialog before this (slow) send returned, that newer selection must survive (the
         // banner would otherwise desync from what the next send actually carries).
-        const targetUnchanged = replyToInput.value === submittedReplyTo;
-        const survivingReply = targetUnchanged ? '' : replyToInput.value;
+        // Capture the surviving target BEFORE reset() wipes the hidden field.
+        const survivingReply = replyToInput.value === submittedReplyTo ? '' : replyToInput.value;
+        clearReplyIfConsumed(submittedReplyTo);  // #89 shared helper — banner gone if consumed
         composer.reset();  // blanks composer-text AND the hidden reply_to field
         dialogInput.value = activeDialogId;
-        if (targetUnchanged) {
-          clearReply();  // consumed by this send: clear the banner too
-        } else {
+        if (survivingReply) {
           replyToInput.value = survivingReply;  // re-apply the newer target reset() wiped
         }
       } else if (activeDialogId) {

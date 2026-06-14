@@ -435,6 +435,34 @@ class MessengerTUI(App):
         state.outbound_token = None
         state.original_confirm_text = None
 
+    def _optimistic_clear(self, dialog_id: int, event_input: Input) -> None:
+        """Clear the draft, pending outbound and composer before a send (#89).
+
+        The single optimistic-clear used by every send branch in on_input_submitted
+        (except the outbound-flow branch, which keeps the draft). Its failure-path
+        counterpart is _restore_draft, called by the send workers if the network rejects.
+        """
+        self._compose_state_for(dialog_id).draft = ""
+        self._clear_pending_outbound(dialog_id)
+        event_input.value = ""
+
+    def _restore_draft(self, dialog_id: int, text: str | None) -> None:
+        """Put an optimistically-cleared draft back after a failed send (#89).
+
+        Mirror of _optimistic_clear: restore ``text`` as the dialog's draft and, only if
+        this dialog is current AND the composer is empty, back into the composer (the
+        non-clobber guard — never overwrite a draft typed while the send was in flight).
+        ``text is None`` is a no-op, so media/reaction workers can call it unconditionally
+        with their optional source_text.
+        """
+        if text is None:
+            return
+        self._compose_state_for(dialog_id).draft = text
+        if dialog_id == self._current:
+            composer = self.query_one("#composer", Input)
+            if not composer.value:  # don't clobber a draft typed meanwhile
+                composer.value = text
+
     def _clear_compose_state_after_send(self, dialog_id: int, sent_text: str) -> None:
         state = self._compose_state_for(dialog_id)
         if state.draft == sent_text:
@@ -782,9 +810,7 @@ class MessengerTUI(App):
             return
         if reaction is not None:
             message_id, emoticon = reaction
-            state.draft = ""
-            self._clear_pending_outbound(dialog_id)
-            event.input.value = ""  # clear optimistically; restored on failure
+            self._optimistic_clear(dialog_id, event.input)
             self.run_worker(
                 self._send_reaction(dialog_id, message_id, emoticon, source_text=text),
                 exclusive=False,
@@ -803,9 +829,7 @@ class MessengerTUI(App):
             self.notify(str(exc), severity="error")
             return
         if lang_command is not None:
-            state.draft = ""
-            self._clear_pending_outbound(dialog_id)
-            event.input.value = ""
+            self._optimistic_clear(dialog_id, event.input)
             self.run_worker(
                 self._apply_lang_command(dialog_id, lang_command),
                 group="outbound-lang",
@@ -820,9 +844,7 @@ class MessengerTUI(App):
                 logger.warning("media path not found: %s (dialog %s)", path, dialog_id)
                 self.notify(f"File not found: {path}", severity="error")
                 return
-            state.draft = ""
-            self._clear_pending_outbound(dialog_id)
-            event.input.value = ""  # clear optimistically; restored on failure
+            self._optimistic_clear(dialog_id, event.input)
             self.run_worker(
                 self._send_media(dialog_id, path, caption, source_text=text),
                 exclusive=False,
@@ -831,18 +853,14 @@ class MessengerTUI(App):
         if state.source_text is not None:
             source = state.source_text
             token = state.outbound_token
-            state.draft = ""
-            self._clear_pending_outbound(dialog_id)
-            event.input.value = ""
+            self._optimistic_clear(dialog_id, event.input)
             self.run_worker(
                 self._send_text(dialog_id, text, source_text=source, token=token),
                 exclusive=False,
             )
             return
         if state.original_confirm_text == text:
-            state.draft = ""
-            self._clear_pending_outbound(dialog_id)
-            event.input.value = ""
+            self._optimistic_clear(dialog_id, event.input)
             self.run_worker(self._send_text(dialog_id, text), exclusive=False)
             return
         if self._outbound is not None:
@@ -855,9 +873,7 @@ class MessengerTUI(App):
                 exclusive=True,
             )
             return
-        state.draft = ""
-        self._clear_pending_outbound(dialog_id)
-        event.input.value = ""  # clear optimistically; restored on failure
+        self._optimistic_clear(dialog_id, event.input)
         self.run_worker(self._send_text(dialog_id, text), exclusive=False)
 
     def _remember_sent(self, dialog_id: int, message_id: int) -> None:
@@ -972,34 +988,19 @@ class MessengerTUI(App):
         except OutboundError:
             logger.warning("outbound token rejected on send (dialog %s)", peer)
             self.notify("Выбор перевода истёк — выберите вариант заново", severity="warning")
-            state = self._compose_state_for(peer)
-            state.draft = text
-            if peer == self._current:
-                composer = self.query_one("#composer", Input)
-                if not composer.value:
-                    composer.value = text
+            self._restore_draft(peer, text)
             return
         except SendForbiddenError:
             # TOCTOU net: composer was enabled but Telegram rejected the write on rights
             logger.warning("send rejected (rights) (dialog %s)", peer)
             self.notify(READ_ONLY_MESSAGE, severity="warning")
-            state = self._compose_state_for(peer)
-            state.draft = text  # restore — the optimistic clear must not lose the message
-            if peer == self._current:
-                composer = self.query_one("#composer", Input)
-                if not composer.value:  # don't clobber a draft typed meanwhile
-                    composer.value = text
+            self._restore_draft(peer, text)
             self._apply_composer_writable(peer)  # reflect the now-known read-only state
             return
         except Exception as exc:
             logger.exception("send failed (dialog %s)", peer)
             self.notify(f"Send failed: {exc}", severity="error")
-            state = self._compose_state_for(peer)
-            state.draft = text
-            if peer == self._current:
-                composer = self.query_one("#composer", Input)
-                if not composer.value:  # don't clobber a draft typed meanwhile
-                    composer.value = text
+            self._restore_draft(peer, text)
             return
         self._clear_compose_state_after_send(peer, text)
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
@@ -1017,28 +1018,19 @@ class MessengerTUI(App):
         self, peer: int, path: str, caption: str | None, source_text: str | None = None,
     ) -> None:
         # source_text is the original "@file ... caption" command, cleared optimistically
-        # in on_input_submitted — restore it on any failure so a typed command is not lost.
-        def _restore() -> None:
-            if source_text is None:
-                return
-            self._compose_state_for(peer).draft = source_text
-            if peer == self._current:
-                composer = self.query_one("#composer", Input)
-                if not composer.value:  # don't clobber a draft typed meanwhile
-                    composer.value = source_text
-
+        # in on_input_submitted — _restore_draft puts it back on failure (#89).
         try:
             msg = await self._client.send_media(peer, path, caption=caption)
         except SendForbiddenError:
             logger.warning("send media rejected (rights) (dialog %s)", peer)
             self.notify(READ_ONLY_MESSAGE, severity="warning")
-            _restore()
+            self._restore_draft(peer, source_text)
             self._apply_composer_writable(peer)  # reflect the now-known read-only state
             return
         except Exception as exc:
             logger.exception("send media failed (dialog %s, %s)", peer, path)
             self.notify(f"Send failed: {exc}", severity="error")
-            _restore()
+            self._restore_draft(peer, source_text)
             return
         self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         await self._touch_dialog_for_message(peer, msg, incoming=False)
@@ -1053,27 +1045,19 @@ class MessengerTUI(App):
         self, peer: int, message_id: int, emoticon: str, source_text: str | None = None,
     ) -> None:
         # source_text is the original "/react ..." command, cleared optimistically in
-        # on_input_submitted — restore it on any failure so the typed command is not lost.
-        def _restore() -> None:
-            if source_text is None:
-                return
-            self._compose_state_for(peer).draft = source_text
-            if peer == self._current:
-                composer = self.query_one("#composer", Input)
-                if not composer.value:  # don't clobber a draft typed meanwhile
-                    composer.value = source_text
-
+        # on_input_submitted — _restore_draft puts it back on failure (#89). Reactions are
+        # NOT gated by posting permission, so no _apply_composer_writable here (unlike text/media).
         try:
             await self._client.send_reaction(peer, message_id, emoticon)
         except SendForbiddenError:
             logger.warning("reaction rejected (rights) (dialog %s, message %s)", peer, message_id)
             self.notify(READ_ONLY_MESSAGE, severity="warning")
-            _restore()
+            self._restore_draft(peer, source_text)
             return
         except Exception as exc:
             logger.exception("send reaction failed (dialog %s, message %s)", peer, message_id)
             self.notify(f"Reaction failed: {exc}", severity="error")
-            _restore()
+            self._restore_draft(peer, source_text)
             return
         self._remember_sent_reaction(peer, message_id, emoticon)
         if peer == self._current:
