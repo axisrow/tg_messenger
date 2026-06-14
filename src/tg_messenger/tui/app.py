@@ -702,11 +702,21 @@ class MessengerTUI(App):
         # dialog, or the archived set on the archive tab) — NOT the tab projection. _render_dialogs
         # projects it through _filter_by_tab, so a live touch that flips a dialog read<->unread is
         # reflected on the unread tab without a reload (the dialog stays in the snapshot either way).
-        if self._tab == "archive":
+        # archive vs the rest use DIFFERENT endpoints, so the snapshot SOURCE depends on the tab.
+        requested_tab = self._tab  # capture the scope before any await
+        if requested_tab == "archive":
             archived_dialogs = getattr(self._client, "archived_dialogs", None)
             items = [] if archived_dialogs is None else await archived_dialogs()
         else:
             items = [dialog for dialog in await self._client.dialogs(dm_only=False) if not dialog.archived]
+        # #110 (Codex 3rd pass): the tab may have changed across the await (e.g. a pre-startup switch
+        # to/from archive, which returns under the _started gate and schedules no reload). If the
+        # snapshot source no longer matches the active tab's source, reload under the new scope —
+        # else archive could render the non-archived snapshot (or vice versa). archive<->non-archive
+        # is the only source split, so only that transition needs a refetch.
+        if (requested_tab == "archive") != (self._tab == "archive"):
+            await self._load_dialogs()
+            return
         self._all_dialogs = list(items)  # full source snapshot; _render_dialogs applies the tab filter
         await self._render_dialogs()
 

@@ -1352,6 +1352,45 @@ async def test_tui_tab_switch_clears_search_even_before_startup():
     assert app.return_code == 0
 
 
+class SlowDialogsClient(TuiStubClient):
+    """dialogs() blocks until released, so a tab switch can race the initial load."""
+
+    def __init__(self):
+        super().__init__()
+        self.dialogs_entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        self.dialogs_entered.set()
+        await self.release.wait()
+        dms = [
+            Dialog(id=7, title="Ann", username="ann", unread=0, is_contact=True),
+            Dialog(id=8, title="Stranger", username="stranger", unread=2, is_contact=False),
+        ]
+        if dm_only:
+            return dms
+        return dms + [Dialog(id=-100200, title="Devs", kind="group", unread=1)]
+
+
+async def test_tui_pre_startup_switch_to_archive_does_not_render_non_archived():
+    # #110 (Codex 3rd pass): if the user switches to Archive while the initial dialogs() is still
+    # pending (before _started), the finished load must NOT render the non-archived snapshot on the
+    # Archive tab — the load re-runs under the new scope (archive endpoint), not pass-through.
+    stub = SlowDialogsClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(stub.dialogs_entered.wait(), 5)  # _load_dialogs is in dialogs()
+        app._tab = "archive"  # user switched tab mid-load (on_tabs_tab_activated under _started gate)
+        stub.release.set()  # let the initial non-archive dialogs() return
+        await _pause_until(pilot, lambda: app._started)
+        await pilot.pause()
+        # Archive shows the archived set (10, -100400), NOT the non-archived snapshot (7, 8, -100200)
+        assert _listed_ids(app) == [10, -100400]
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
 # --- Цикл 37: live-входящие из групп ---
 
 
