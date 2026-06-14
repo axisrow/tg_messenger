@@ -538,6 +538,16 @@ async def test_tui_long_message_bubble_stays_within_message_pane():
         assert "long-message-" in str(bubble.render())
 
 
+async def test_tui_messages_pane_does_not_collapse_on_narrow_terminal():
+    # #110 bug #2: a fixed-width sidebar must yield space on a narrow terminal so the chat
+    # pane (and composer) don't collapse / slide off-screen.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test(size=(33, 24)) as pilot:
+        await pilot.pause()
+        msgs = app.query_one("#messages", Vertical)
+        assert msgs.region.width >= 5
+
+
 async def test_tui_survives_markup_hostile_text():
     # dialog titles and message text with [brackets] must render literally,
     # not be parsed as Textual markup (which raises MarkupError)
@@ -1126,6 +1136,13 @@ def _listed_ids(app):
     return [item.dialog_id for item in app.query(DialogItem)]
 
 
+def _regions_overlap(a, b) -> bool:
+    # rectangle intersection over two Textual Region objects (x/y/width/height)
+    ix, iy = max(a.x, b.x), max(a.y, b.y)
+    ax, ay = min(a.x + a.width, b.x + b.width), min(a.y + a.height, b.y + b.height)
+    return (ax - ix) > 0 and (ay - iy) > 0
+
+
 async def test_tui_has_all_tab_active_by_default():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
@@ -1199,6 +1216,22 @@ async def test_tui_unread_tab_lists_unread_non_archived_dialogs():
         assert _listed_ids(app) == [8, -100200]
 
 
+async def test_tui_unread_tab_drops_dialog_that_became_read_on_live_message():
+    # #110 bug #4: a live message in the OPEN dialog zeroes its unread; on the "Непрочитанные"
+    # tab the now-read dialog must disappear, not linger until the next reload.
+    stub = UnreadTouchClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "unread"
+        await pilot.pause()
+        assert _listed_ids(app) == [8, -100200]
+        app._current = 8  # dialog 8 is open → the live message marks it read
+        stub.fire.set()
+        await pilot.pause()
+        assert _listed_ids(app) == [-100200]
+
+
 async def test_tui_archive_tab_lists_archived_dialogs():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
@@ -1218,6 +1251,24 @@ async def test_tui_tab_switch_back_reloads_all():
         tabs.active = "all"
         await pilot.pause()
         assert _listed_ids(app) == [7, 8, -100200, -100300, 9]  # список перезагружен, не накоплен
+
+
+async def test_tui_tab_switch_clears_stale_search_filter():
+    # #110 bug #3: a search filter that matched on one tab must not leak onto the next
+    # tab and make it look empty. Switching tabs resets #search.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.value = "Ann"  # matches id=7 on "all", nothing among groups
+        await app.on_input_changed(Input.Changed(search, "Ann"))
+        await pilot.pause()
+        assert _listed_ids(app) == [7]
+        app.query_one(Tabs).active = "groups"
+        await pilot.pause()
+        # the stale "Ann" filter must be gone, so the groups tab shows its dialog
+        assert app.query_one("#search", Input).value == ""
+        assert _listed_ids(app) == [-100200]
 
 
 async def test_tui_tab_activation_before_startup_is_safe():
@@ -1371,6 +1422,30 @@ class IncomingAnnDialogListClient(IncomingDialogListClient):
         yield IncomingEvent(
             dialog_id=7,
             message=Message(id=23, dialog_id=7, sender_id=7, out=False, text="fresh", date=date),
+        )
+        await asyncio.Event().wait()
+
+
+class UnreadTouchClient(TuiStubClient):
+    """A live message lands in the OPEN dialog (id=8), zeroing its unread badge."""
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        dms = [Dialog(id=8, title="Stranger", username="stranger", unread=2, is_contact=False)]
+        if dm_only:
+            return dms
+        return dms + [Dialog(id=-100200, title="Devs", kind="group", unread=1)]
+
+    async def listen_all(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield IncomingEvent(
+            dialog_id=8,
+            message=Message(id=22, dialog_id=8, sender_id=8, out=False, text="fresh", date=date),
         )
         await asyncio.Event().wait()
 
@@ -1842,6 +1917,20 @@ async def test_tui_switching_dialogs_clears_pending_suggestion():
 
         assert app._pending_suggestion is None
         assert str(app.query_one("#suggestion", Static).render()) == ""
+
+
+async def test_tui_suggestion_line_not_covered_by_composer():
+    # #110 bug #1: #suggestion and #composer must not overlap — the "💡 Tab:" hint has to be
+    # visible above the composer, not hidden under it.
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        app.query_one("#suggestion", Static).update("💡 Tab: draft")  # give it a line to render
+        await pilot.pause()
+        sug = app.query_one("#suggestion", Static)
+        comp = app.query_one("#composer", Input)
+        assert sug.region.height >= 1 and sug.region.width >= 1
+        assert not _regions_overlap(sug.region, comp.region)
 
 
 # --- UX: Enter / стрелка-вниз с вкладок → фокус на список диалогов ---

@@ -422,13 +422,17 @@ class MessengerTUI(App):
     ]
 
     CSS = """
-    #sidebar { width: 32; border-right: solid $primary; }
+    /* #110: max-width lets the fixed 32-wide sidebar yield space on narrow terminals so the
+       chat pane (and composer) don't collapse off-screen; on terminals >=64 cols 50% >= 32,
+       so the default 32 width is unchanged. */
+    #sidebar { width: 32; max-width: 50%; border-right: solid $primary; }
+    #chat { width: 1fr; min-width: 16; }
     #messages { overflow-y: auto; }
     #messages MessageBubble { width: 100%; text-wrap: wrap; text-overflow: fold; }
     #messages MessageBubble:focus { background: $boost; }
     .out { color: $accent; text-align: right; }
     .in { color: $text; }
-    #suggestion { dock: bottom; color: $text-muted; height: auto; }
+    #suggestion { color: $text-muted; height: auto; }
     #composer { dock: bottom; }
     """
 
@@ -575,7 +579,7 @@ class MessengerTUI(App):
                     id="tabs",
                 )
                 yield DialogListView(id="dialogs")
-            with Vertical():
+            with Vertical(id="chat"):
                 yield Vertical(id="messages")
                 yield Static("", id="suggestion", markup=False)
                 yield Input(placeholder="Message…", id="composer")
@@ -672,27 +676,31 @@ class MessengerTUI(App):
         except Exception:
             logger.exception("message store task failed")
 
+    def _filter_by_tab(self, dialogs: list) -> list:
+        """Tab-specific subset of an already-fetched, non-archived dialog list (#110 bug #4).
+
+        Pure (no network). Shared by _load_dialogs (initial fetch) AND _render_dialogs, so a
+        dialog whose unread was zeroed by a live message no longer lingers on the 'unread' tab.
+        'all'/'archive' are already the correct set (archive uses a separate endpoint).
+        """
+        if self._tab == "contacts":
+            return [d for d in dialogs if d.kind == "dm" and d.is_contact is True]
+        if self._tab == "non_contacts":
+            return [d for d in dialogs if d.kind == "dm" and d.is_contact is False]
+        if self._tab == "unread":
+            return [d for d in dialogs if d.unread > 0]
+        if self._tab in {"groups", "channels", "bots"}:
+            kind = {"groups": "group", "channels": "channel", "bots": "bot"}[self._tab]
+            return [d for d in dialogs if d.kind == kind]
+        return dialogs
+
     async def _load_dialogs(self) -> None:
         if self._tab == "archive":
             archived_dialogs = getattr(self._client, "archived_dialogs", None)
-            if archived_dialogs is None:
-                items = []
-            else:
-                items = await archived_dialogs()
-        elif self._tab in {"contacts", "non_contacts", "groups", "channels", "bots", "unread"}:
-            all_dialogs = [dialog for dialog in await self._client.dialogs(dm_only=False) if not dialog.archived]
-            if self._tab == "contacts":
-                items = [dialog for dialog in all_dialogs if dialog.kind == "dm" and dialog.is_contact is True]
-            elif self._tab == "non_contacts":
-                items = [dialog for dialog in all_dialogs if dialog.kind == "dm" and dialog.is_contact is False]
-            elif self._tab == "unread":
-                items = [dialog for dialog in all_dialogs if dialog.unread > 0]
-            else:
-                kind_by_tab = {"groups": "group", "channels": "channel", "bots": "bot"}
-                kind = kind_by_tab[self._tab]
-                items = [dialog for dialog in all_dialogs if dialog.kind == kind]
+            items = [] if archived_dialogs is None else await archived_dialogs()
         else:
-            items = [dialog for dialog in await self._client.dialogs(dm_only=False) if not dialog.archived]
+            all_dialogs = [dialog for dialog in await self._client.dialogs(dm_only=False) if not dialog.archived]
+            items = self._filter_by_tab(all_dialogs)
         self._all_dialogs = list(items)  # keep the full list for local search
         await self._render_dialogs()
 
@@ -709,7 +717,9 @@ class MessengerTUI(App):
         selected_id = None
         if isinstance(lv.highlighted_child, DialogItem):
             selected_id = lv.highlighted_child.dialog_id
-        filtered = list(filter_dialogs(self._all_dialogs, query))
+        # #110: re-apply the tab filter so a live unread→0 touch drops the dialog from "unread"
+        # (idempotent for every other tab — _all_dialogs is already the tab's subset).
+        filtered = list(filter_dialogs(self._filter_by_tab(self._all_dialogs), query))
         await lv.clear()
         for d in filtered:
             await lv.append(DialogItem(d.id, d.title, d.unread, d.kind))
@@ -745,6 +755,9 @@ class MessengerTUI(App):
         self._tab = event.tab.id or "all"
         if not self._started:
             return
+        # #110: a stale search filter must not leak onto the new tab (it would make a tab
+        # with no match look empty). Resetting an already-empty value is a no-op.
+        self.query_one("#search", Input).value = ""
         self.run_worker(self._reload_dialogs(), group="dialogs", exclusive=True)
 
     async def _reload_dialogs(self) -> None:
