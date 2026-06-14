@@ -538,6 +538,16 @@ async def test_tui_long_message_bubble_stays_within_message_pane():
         assert "long-message-" in str(bubble.render())
 
 
+async def test_tui_messages_pane_does_not_collapse_on_narrow_terminal():
+    # #110 bug #2: a fixed-width sidebar must yield space on a narrow terminal so the chat
+    # pane (and composer) don't collapse / slide off-screen.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test(size=(33, 24)) as pilot:
+        await pilot.pause()
+        msgs = app.query_one("#messages", Vertical)
+        assert msgs.region.width >= 5
+
+
 async def test_tui_survives_markup_hostile_text():
     # dialog titles and message text with [brackets] must render literally,
     # not be parsed as Textual markup (which raises MarkupError)
@@ -1126,6 +1136,13 @@ def _listed_ids(app):
     return [item.dialog_id for item in app.query(DialogItem)]
 
 
+def _regions_overlap(a, b) -> bool:
+    # rectangle intersection over two Textual Region objects (x/y/width/height)
+    ix, iy = max(a.x, b.x), max(a.y, b.y)
+    ax, ay = min(a.x + a.width, b.x + b.width), min(a.y + a.height, b.y + b.height)
+    return (ax - ix) > 0 and (ay - iy) > 0
+
+
 async def test_tui_has_all_tab_active_by_default():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
@@ -1199,6 +1216,67 @@ async def test_tui_unread_tab_lists_unread_non_archived_dialogs():
         assert _listed_ids(app) == [8, -100200]
 
 
+async def test_tui_unread_tab_drops_dialog_that_became_read_on_live_message():
+    # #110 bug #4: a live message in the OPEN dialog zeroes its unread; on the "Непрочитанные"
+    # tab the now-read dialog must disappear, not linger until the next reload.
+    stub = UnreadTouchClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "unread"
+        await pilot.pause()
+        assert _listed_ids(app) == [8, -100200]
+        app._current = 8  # dialog 8 is open → the live message marks it read
+        stub.fire.set()
+        await pilot.pause()
+        assert _listed_ids(app) == [-100200]
+
+
+class ReadToUnreadClient(TuiStubClient):
+    """A live message arrives for a NON-open, initially-read dialog (id=7)."""
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        dms = [
+            Dialog(id=7, title="Ann", username="ann", unread=0, is_contact=True),
+            Dialog(id=8, title="Stranger", username="stranger", unread=3, is_contact=False),
+        ]
+        if dm_only:
+            return dms
+        return dms
+
+    async def listen_all(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield IncomingEvent(
+            dialog_id=7,
+            message=Message(id=22, dialog_id=7, sender_id=7, out=False, text="fresh", date=date),
+        )
+        await asyncio.Event().wait()
+
+
+async def test_tui_unread_tab_surfaces_dialog_that_became_unread_on_live_message():
+    # #110 (Codex re-review): a live message for a NON-open, initially-read dialog must SURFACE on
+    # the open "Непрочитанные" tab without a reload — the live touch updates the full snapshot, and
+    # the tab projection re-includes it.
+    stub = ReadToUnreadClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "unread"
+        await pilot.pause()
+        assert _listed_ids(app) == [8]  # only Stranger is unread at load time (Ann is read)
+        app._current = 8  # a DIFFERENT dialog is open, so the message for 7 increments its unread
+        stub.fire.set()
+        await pilot.pause()
+        # Ann (7) just became unread → it must appear on the unread tab live
+        assert set(_listed_ids(app)) == {7, 8}
+
+
 async def test_tui_archive_tab_lists_archived_dialogs():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
@@ -1220,6 +1298,24 @@ async def test_tui_tab_switch_back_reloads_all():
         assert _listed_ids(app) == [7, 8, -100200, -100300, 9]  # список перезагружен, не накоплен
 
 
+async def test_tui_tab_switch_clears_stale_search_filter():
+    # #110 bug #3: a search filter that matched on one tab must not leak onto the next
+    # tab and make it look empty. Switching tabs resets #search.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.value = "Ann"  # matches id=7 on "all", nothing among groups
+        await app.on_input_changed(Input.Changed(search, "Ann"))
+        await pilot.pause()
+        assert _listed_ids(app) == [7]
+        app.query_one(Tabs).active = "groups"
+        await pilot.pause()
+        # the stale "Ann" filter must be gone, so the groups tab shows its dialog
+        assert app.query_one("#search", Input).value == ""
+        assert _listed_ids(app) == [-100200]
+
+
 async def test_tui_tab_activation_before_startup_is_safe():
     # переключение вкладки, пока connect ещё висит, не должно дёргать сеть
     stub = TuiStubClient()
@@ -1233,6 +1329,115 @@ async def test_tui_tab_activation_before_startup_is_safe():
         await pilot.pause()
         assert stub.dialogs_calls == 0  # клиент ещё не готов — запроса не было
         assert app.return_code is None  # и приложение живо
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
+async def test_tui_tab_switch_clears_search_even_before_startup():
+    # #110 (Codex re-review): a tab switch during a slow connect must still clear #search, so when
+    # startup finishes it does not render the picked tab with a stale query (the pre-startup path).
+    stub = TuiStubClient()
+    connect_entered = asyncio.Event()
+    stub.connect = hangs_forever(connect_entered)
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(connect_entered.wait(), 5)
+        await pilot.pause()
+        app.query_one("#search", Input).value = "zzz"  # user typed during the slow connect
+        app.query_one(Tabs).active = "groups"
+        await pilot.pause()
+        assert app.query_one("#search", Input).value == ""  # cleared even though _started is False
+        assert stub.dialogs_calls == 0  # still no network — the worker is gated by _started
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
+class SlowDialogsClient(TuiStubClient):
+    """dialogs() blocks until released, so a tab switch can race the initial load."""
+
+    def __init__(self):
+        super().__init__()
+        self.dialogs_entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        self.dialogs_entered.set()
+        await self.release.wait()
+        dms = [
+            Dialog(id=7, title="Ann", username="ann", unread=0, is_contact=True),
+            Dialog(id=8, title="Stranger", username="stranger", unread=2, is_contact=False),
+        ]
+        if dm_only:
+            return dms
+        return dms + [Dialog(id=-100200, title="Devs", kind="group", unread=1)]
+
+
+async def test_tui_pre_startup_switch_to_archive_does_not_render_non_archived():
+    # #110 (Codex 3rd pass): if the user switches to Archive while the initial dialogs() is still
+    # pending (before _started), the finished load must NOT render the non-archived snapshot on the
+    # Archive tab — the load re-runs under the new scope (archive endpoint), not pass-through.
+    stub = SlowDialogsClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(stub.dialogs_entered.wait(), 5)  # _load_dialogs is in dialogs()
+        app._tab = "archive"  # user switched tab mid-load (on_tabs_tab_activated under _started gate)
+        stub.release.set()  # let the initial non-archive dialogs() return
+        await _pause_until(pilot, lambda: app._started)
+        await pilot.pause()
+        # Archive shows the archived set (10, -100400), NOT the non-archived snapshot (7, 8, -100200)
+        assert _listed_ids(app) == [10, -100400]
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
+class SlowConnectStore(TuiSourceStore):
+    """store.connect() blocks until released — the pre-startup window AFTER the initial load."""
+
+    def __init__(self):
+        super().__init__()
+        self.connect_entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def connect(self):
+        self.connect_entered.set()
+        await self.release.wait()
+
+
+async def test_tui_pre_startup_switch_during_store_connect_reconciles_tab():
+    # #110 (Codex 4th pass): a tab switch during the store.connect() await — AFTER the initial
+    # _load_dialogs, still before _started — must be reconciled once startup finishes. Otherwise the
+    # archive tab would render the non-archived snapshot forever (no reload is ever scheduled).
+    stub = TuiStubClient()
+    store = SlowConnectStore()
+    app = MessengerTUI(client=stub, store=store)
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(store.connect_entered.wait(), 5)  # dialogs loaded; stuck in store.connect
+        assert app._tab == "all"
+        app._tab = "archive"  # user switched tab in the post-load, pre-_started window
+        store.release.set()
+        await _pause_until(pilot, lambda: app._started)
+        await _pause_until(pilot, lambda: _listed_ids(app) == [10, -100400])
+        assert _listed_ids(app) == [10, -100400]  # reconciled to the archived set, not the DM snapshot
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
+async def test_tui_pre_startup_switch_to_same_source_tab_reconciles_projection():
+    # #110 (Codex 4th pass): a same-source switch (all→groups) during store.connect must re-project
+    # without a refetch when startup finishes.
+    stub = TuiStubClient()
+    store = SlowConnectStore()
+    app = MessengerTUI(client=stub, store=store)
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(store.connect_entered.wait(), 5)
+        calls_after_load = stub.dialogs_calls
+        app._tab = "groups"  # same source (non-archive), different projection
+        store.release.set()
+        await _pause_until(pilot, lambda: app._started)
+        await _pause_until(pilot, lambda: _listed_ids(app) == [-100200])
+        assert _listed_ids(app) == [-100200]  # projected to groups
+        assert stub.dialogs_calls == calls_after_load  # no refetch — same source, just re-projected
         await pilot.press("ctrl+c")
     assert app.return_code == 0
 
@@ -1371,6 +1576,30 @@ class IncomingAnnDialogListClient(IncomingDialogListClient):
         yield IncomingEvent(
             dialog_id=7,
             message=Message(id=23, dialog_id=7, sender_id=7, out=False, text="fresh", date=date),
+        )
+        await asyncio.Event().wait()
+
+
+class UnreadTouchClient(TuiStubClient):
+    """A live message lands in the OPEN dialog (id=8), zeroing its unread badge."""
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        dms = [Dialog(id=8, title="Stranger", username="stranger", unread=2, is_contact=False)]
+        if dm_only:
+            return dms
+        return dms + [Dialog(id=-100200, title="Devs", kind="group", unread=1)]
+
+    async def listen_all(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield IncomingEvent(
+            dialog_id=8,
+            message=Message(id=22, dialog_id=8, sender_id=8, out=False, text="fresh", date=date),
         )
         await asyncio.Event().wait()
 
@@ -1842,6 +2071,20 @@ async def test_tui_switching_dialogs_clears_pending_suggestion():
 
         assert app._pending_suggestion is None
         assert str(app.query_one("#suggestion", Static).render()) == ""
+
+
+async def test_tui_suggestion_line_not_covered_by_composer():
+    # #110 bug #1: #suggestion and #composer must not overlap — the "💡 Tab:" hint has to be
+    # visible above the composer, not hidden under it.
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        app.query_one("#suggestion", Static).update("💡 Tab: draft")  # give it a line to render
+        await pilot.pause()
+        sug = app.query_one("#suggestion", Static)
+        comp = app.query_one("#composer", Input)
+        assert sug.region.height >= 1 and sug.region.width >= 1
+        assert not _regions_overlap(sug.region, comp.region)
 
 
 # --- UX: Enter / стрелка-вниз с вкладок → фокус на список диалогов ---
