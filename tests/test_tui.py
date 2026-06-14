@@ -1391,6 +1391,57 @@ async def test_tui_pre_startup_switch_to_archive_does_not_render_non_archived():
     assert app.return_code == 0
 
 
+class SlowConnectStore(TuiSourceStore):
+    """store.connect() blocks until released — the pre-startup window AFTER the initial load."""
+
+    def __init__(self):
+        super().__init__()
+        self.connect_entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def connect(self):
+        self.connect_entered.set()
+        await self.release.wait()
+
+
+async def test_tui_pre_startup_switch_during_store_connect_reconciles_tab():
+    # #110 (Codex 4th pass): a tab switch during the store.connect() await — AFTER the initial
+    # _load_dialogs, still before _started — must be reconciled once startup finishes. Otherwise the
+    # archive tab would render the non-archived snapshot forever (no reload is ever scheduled).
+    stub = TuiStubClient()
+    store = SlowConnectStore()
+    app = MessengerTUI(client=stub, store=store)
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(store.connect_entered.wait(), 5)  # dialogs loaded; stuck in store.connect
+        assert app._tab == "all"
+        app._tab = "archive"  # user switched tab in the post-load, pre-_started window
+        store.release.set()
+        await _pause_until(pilot, lambda: app._started)
+        await _pause_until(pilot, lambda: _listed_ids(app) == [10, -100400])
+        assert _listed_ids(app) == [10, -100400]  # reconciled to the archived set, not the DM snapshot
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
+async def test_tui_pre_startup_switch_to_same_source_tab_reconciles_projection():
+    # #110 (Codex 4th pass): a same-source switch (all→groups) during store.connect must re-project
+    # without a refetch when startup finishes.
+    stub = TuiStubClient()
+    store = SlowConnectStore()
+    app = MessengerTUI(client=stub, store=store)
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(store.connect_entered.wait(), 5)
+        calls_after_load = stub.dialogs_calls
+        app._tab = "groups"  # same source (non-archive), different projection
+        store.release.set()
+        await _pause_until(pilot, lambda: app._started)
+        await _pause_until(pilot, lambda: _listed_ids(app) == [-100200])
+        assert _listed_ids(app) == [-100200]  # projected to groups
+        assert stub.dialogs_calls == calls_after_load  # no refetch — same source, just re-projected
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
 # --- Цикл 37: live-входящие из групп ---
 
 

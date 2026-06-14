@@ -463,6 +463,10 @@ class MessengerTUI(App):
         # #110: the FULL source snapshot (every non-archived dialog, or the archived set on the
         # archive tab) — NOT a tab subset. _render_dialogs projects it via _filter_by_tab + search.
         self._all_dialogs: list = []
+        # #110 (Codex 4th pass): which tab's SOURCE the current snapshot was loaded under. _startup
+        # reconciles it against _tab after _started flips, so a tab switch during ANY pre-startup
+        # await (connect / login / store.connect) can't leave the wrong dialog population rendered.
+        self._loaded_tab: str | None = None
         self._suggester = suggester
         self._store = store
         self._translator = translator
@@ -656,6 +660,16 @@ class MessengerTUI(App):
             return
         self.query_one("#dialogs", ListView).loading = False
         self._started = True
+        # #110 (Codex 4th pass): a tab switch during ANY pre-startup await (connect / login /
+        # _load_dialogs / store.connect) only set _tab — on_tabs_tab_activated returns under the
+        # _started gate and schedules no reload. Now that the gate is open, reconcile once: if the
+        # active tab's source differs from what the initial snapshot was loaded under, reload it;
+        # otherwise just re-project (same source, different tab — e.g. all→groups).
+        if self._tab != self._loaded_tab:
+            if (self._tab == "archive") != (self._loaded_tab == "archive"):
+                self.run_worker(self._reload_dialogs(), group="dialogs", exclusive=True)
+            else:
+                await self._render_dialogs()
         self.run_worker(self._drain_incoming(), exclusive=False)
         self.run_worker(self._drain_outgoing(), exclusive=False)
         self.run_worker(self._drain_reactions(), exclusive=False)
@@ -703,21 +717,14 @@ class MessengerTUI(App):
         # projects it through _filter_by_tab, so a live touch that flips a dialog read<->unread is
         # reflected on the unread tab without a reload (the dialog stays in the snapshot either way).
         # archive vs the rest use DIFFERENT endpoints, so the snapshot SOURCE depends on the tab.
-        requested_tab = self._tab  # capture the scope before any await
+        requested_tab = self._tab  # capture the scope this load fetches under
         if requested_tab == "archive":
             archived_dialogs = getattr(self._client, "archived_dialogs", None)
             items = [] if archived_dialogs is None else await archived_dialogs()
         else:
             items = [dialog for dialog in await self._client.dialogs(dm_only=False) if not dialog.archived]
-        # #110 (Codex 3rd pass): the tab may have changed across the await (e.g. a pre-startup switch
-        # to/from archive, which returns under the _started gate and schedules no reload). If the
-        # snapshot source no longer matches the active tab's source, reload under the new scope —
-        # else archive could render the non-archived snapshot (or vice versa). archive<->non-archive
-        # is the only source split, so only that transition needs a refetch.
-        if (requested_tab == "archive") != (self._tab == "archive"):
-            await self._load_dialogs()
-            return
         self._all_dialogs = list(items)  # full source snapshot; _render_dialogs applies the tab filter
+        self._loaded_tab = requested_tab  # remember the source this snapshot came from
         await self._render_dialogs()
 
     async def _render_dialogs(self) -> None:
