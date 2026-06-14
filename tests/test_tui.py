@@ -17,6 +17,8 @@ from tg_messenger.core.models import (
 )
 from tg_messenger.tui.app import (
     REACTION_PRESETS,
+    AccountItem,
+    AccountsScreen,
     DialogItem,
     EmojiPickerScreen,
     MessageBubble,
@@ -2775,3 +2777,148 @@ async def test_tui_at_command_missing_file_notifies(tmp_path):
         await pilot.pause()
         assert getattr(stub, "media_sent", None) is None
         assert app.return_code is None  # still alive
+
+
+# --- #115: accounts settings screen (add / list / remove a profile; no in-session switch) ---
+
+
+class FakeSessionStore:
+    """In-memory SessionStore stand-in: list/save/delete profiles, no disk, no network."""
+
+    def __init__(self, profiles=()):
+        self._profiles = list(profiles)
+        self.saved = []
+
+    def list_profiles(self):
+        return sorted(self._profiles)
+
+    def save(self, name, session_string):
+        if name not in self._profiles:
+            self._profiles.append(name)
+        self.saved.append((name, session_string))
+
+    def delete(self, name):
+        if name in self._profiles:
+            self._profiles.remove(name)
+            return True
+        return False
+
+    def is_valid_profile(self, name):
+        return name in self._profiles
+
+
+class SavingStubClient(TuiStubClient):
+    """A new-profile client whose save_session() persists into a FakeSessionStore.
+
+    Lets the add-account test exercise the production path (client.save_session()) while the
+    store records the save — no real network/disk.
+    """
+
+    def __init__(self, name, store):
+        super().__init__()
+        self._name = name
+        self._store = store
+
+    def save_session(self):
+        super().save_session()
+        self._store.save(self._name, "session-string-stub")
+
+
+async def test_tui_open_settings_lists_profiles_with_active_marked():
+    store = FakeSessionStore(["alice", "bob"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+s")
+        await _pause_until(pilot, lambda: isinstance(app.screen, AccountsScreen))
+        items = list(app.screen.query(AccountItem))
+        assert [it.profile for it in items] == ["alice", "bob"]
+        alice_row = next(str(it.query_one(Static).render()) for it in items if it.profile == "alice")
+        bob_row = next(str(it.query_one(Static).render()) for it in items if it.profile == "bob")
+        assert "(текущий)" in alice_row  # active profile marked
+        assert "(текущий)" not in bob_row
+
+
+async def test_tui_settings_add_profile_runs_wizard_and_saves(caplog):
+    store = FakeSessionStore(["alice"])
+    sess = FakeTuiLoginSession()
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store,
+            account_client_factory=lambda name: SavingStubClient(name, store),
+            login_session=sess,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#new-profile", Input).value = "bob"
+        with caplog.at_level("INFO"):
+            await pilot.press("a")  # add_account → pushes LoginScreen
+            await _pause_until(pilot, lambda: app.screen.query("#login-input"))
+            # drive the wizard: phone then code
+            app.screen.query_one("#login-input", Input).value = "+10000000000"
+            await pilot.press("enter")
+            await pilot.pause()
+            app.screen.query_one("#login-input", Input).value = "12345"
+            await pilot.press("enter")
+            await _pause_until(pilot, lambda: "bob" in store.list_profiles())
+        assert "bob" in store.list_profiles()
+        assert sess.phones == ["+10000000000"] and sess.codes == ["12345"]
+        # the new profile now shows in the list
+        await _pause_until(
+            pilot, lambda: "bob" in [it.profile for it in app.screen.query(AccountItem)]
+        )
+        # no secrets (phone/code) reached the logs
+        for rec in caplog.records:
+            msg = rec.getMessage()
+            assert "+10000000000" not in msg and "12345" not in msg
+
+
+async def test_tui_settings_remove_non_active_profile():
+    store = FakeSessionStore(["alice", "bob"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="alice", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        lv = screen.query_one("#accounts", ListView)
+        lv.index = 1  # "bob"
+        await screen.action_remove_account()
+        await pilot.pause()
+        assert store.list_profiles() == ["alice"]
+        assert [it.profile for it in screen.query(AccountItem)] == ["alice"]
+
+
+async def test_tui_settings_cannot_remove_active_profile():
+    store = FakeSessionStore(["alice", "bob"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="alice", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        lv = screen.query_one("#accounts", ListView)
+        lv.index = 0  # "alice" — the active profile
+        await screen.action_remove_account()
+        await pilot.pause()
+        assert "alice" in store.list_profiles()  # active profile is protected
+
+
+async def test_tui_settings_add_empty_name_is_noop():
+    store = FakeSessionStore(["alice"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store,
+            login_session=FakeTuiLoginSession(),
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#new-profile", Input).value = "   "  # whitespace only
+        await pilot.press("a")
+        await pilot.pause()
+        assert app.screen is screen  # no LoginScreen pushed (still on AccountsScreen)
+        assert store.list_profiles() == ["alice"]  # nothing added

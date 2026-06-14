@@ -21,7 +21,12 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 
 from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
-from tg_messenger.core.auth import LoginError, LoginSession, delivery_hint
+from tg_messenger.core.auth import (
+    LoginError,
+    LoginSession,
+    delivery_hint,
+    session_store_from_env,
+)
 from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
 from tg_messenger.core.models import format_author
 from tg_messenger.core.search import can_send_in
@@ -478,6 +483,117 @@ class EmojiPickerScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class AccountItem(ListItem):
+    """One saved account profile in the settings screen; the active one is marked."""
+
+    def __init__(self, profile: str, active: bool):
+        mark = "  (текущий)" if active else ""
+        super().__init__(Static(f"{profile}{mark}", markup=False))
+        self.profile = profile
+
+
+class AccountsScreen(ModalScreen[None]):
+    """Account settings (#115): list saved profiles (active marked), add a new one, remove one.
+
+    Adding runs the SAME LoginScreen/LoginSession wizard against a freshly-built client for the
+    typed profile name, then persists via the client's save_session() (→ SessionStore). Switching
+    the active profile in-session is deferred (it would need a full deps rebuild + reconnect).
+    Reuses LoginSession + SessionStore — login is NOT reimplemented here.
+    """
+
+    # #116-parity: a centered, bordered card (the box geometry mirrors the other modals).
+    DEFAULT_CSS = (
+        "AccountsScreen { align: center middle; } "
+        "#accounts-box { width: 60%; max-width: 64; height: auto; max-height: 80%; "
+        "padding: 1 2; border: round $primary; background: $surface; }"
+    )
+
+    BINDINGS = [
+        Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
+        Binding("escape", "close", "Close", show=False),
+        Binding("a", "add_account", "Add account", show=False),
+        Binding("d", "remove_account", "Remove", show=False),
+    ]
+
+    def __init__(self, *, profiles, active, store, account_client_factory=None,
+                 login_session=None):
+        super().__init__()
+        self._profiles = list(profiles)
+        self._active = active
+        self._store = store
+        # test seams: build the new-profile client / skip the network login flow
+        self._account_client_factory = account_client_factory or _make_real_client
+        self._login_session = login_session
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="accounts-box"):
+            yield Label("Аккаунты", id="accounts-title")
+            yield ListView(
+                *(AccountItem(p, p == self._active) for p in self._profiles),
+                id="accounts",
+            )
+            yield Label("a — добавить · d — удалить · Esc — закрыть", id="accounts-help")
+            yield Input(placeholder="Имя нового профиля", id="new-profile")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def action_add_account(self) -> None:
+        name = self.query_one("#new-profile", Input).value.strip()
+        if not name:
+            self.query_one("#new-profile", Input).focus()
+            return
+        self.run_worker(self._add_account(name), exclusive=True)
+
+    async def _add_account(self, name: str) -> None:
+        # build + connect a client for the NEW profile, then run the existing login wizard.
+        client = None
+        try:
+            if self._login_session is not None:  # test seam: skip the real client/network
+                session = self._login_session
+                client = self._account_client_factory(name)
+            else:
+                client = self._account_client_factory(name)
+                await client.connect()
+                session = LoginSession(getattr(client, "_client", client))
+            ok = await self.app.push_screen_wait(LoginScreen(session))
+            if not ok:
+                return
+            save_session = getattr(client, "save_session", None)
+            if save_session is not None:
+                save_session()  # → SessionStore.save(name, ...)
+        except Exception:
+            logger.exception("settings: add account failed")  # name only; no secrets logged
+            self.notify(f"Не удалось добавить профиль: {name}", severity="error")
+            return
+        finally:
+            if client is not None:
+                disconnect = getattr(client, "disconnect", None)
+                if disconnect is not None:
+                    try:
+                        await disconnect()
+                    except Exception:
+                        logger.warning("settings: client disconnect failed", exc_info=True)
+        await self._refresh(self._store.list_profiles() or [*self._profiles, name])
+        self.query_one("#new-profile", Input).value = ""
+        self.notify(f"Профиль добавлен: {name}")
+
+    async def action_remove_account(self) -> None:
+        lv = self.query_one("#accounts", ListView)
+        item = lv.highlighted_child
+        if not isinstance(item, AccountItem) or item.profile == self._active:
+            return  # never remove the active profile
+        self._store.delete(item.profile)
+        await self._refresh(self._store.list_profiles())
+
+    async def _refresh(self, profiles) -> None:
+        self._profiles = list(profiles)
+        lv = self.query_one("#accounts", ListView)
+        await lv.clear()
+        for p in self._profiles:
+            await lv.append(AccountItem(p, p == self._active))
+
+
 class MessengerTUI(App):
     # priority: quitting must work even while focus sits in the composer Input.
     # Tab accepts a pending reply suggestion (priority so the Input doesn't eat it
@@ -491,6 +607,9 @@ class MessengerTUI(App):
         # edges (up-at-top-of-dialogs → tabs, down/enter on tabs → dialogs, up/down between bubbles).
         Binding("tab", "accept_suggestion", "Accept suggestion", priority=True, show=False),
         Binding("shift+tab", "focus_previous", "Back", show=False),
+        # #115: open account settings (add/list/remove a profile). priority so it works from
+        # inside the composer Input.
+        Binding("ctrl+s", "open_settings", "Settings", priority=True),
     ]
 
     CSS = """
@@ -534,11 +653,16 @@ class MessengerTUI(App):
     def __init__(self, *, client=None, session_name: str = "default",
                  profiles: list[str] | None = None, client_factory=None, deps_factory=None,
                  suggester=None, login_session=None, store=None, translator=None,
-                 outbound=None):
+                 outbound=None, session_store=None, account_client_factory=None):
         super().__init__()
         self._client = client
         self._session_name = session_name
         self._profiles = profiles or []
+        # #115: account settings seams — the SessionStore for listing/saving/removing profiles
+        # (lazy: resolved from env when None) and the factory that builds a client for a NEW
+        # profile during the add-account wizard (defaults to the real env client).
+        self._session_store = session_store
+        self._account_client_factory = account_client_factory or _make_real_client
         # login wizard state machine (test seam); built from the client otherwise
         self._login_session = login_session
         # how a client is built once a profile is chosen (injectable for tests)
@@ -1514,3 +1638,15 @@ class MessengerTUI(App):
     def _clear_suggestion(self) -> None:
         self._pending_suggestion = None
         self.query_one("#suggestion", Static).update("")
+
+    def action_open_settings(self) -> None:
+        """Ctrl+S — open account settings (add/list/remove a profile, #115)."""
+        store = self._session_store or session_store_from_env()
+        self.push_screen(
+            AccountsScreen(
+                profiles=store.list_profiles(),
+                active=self._session_name,
+                store=store,
+                account_client_factory=self._account_client_factory,
+            )
+        )
