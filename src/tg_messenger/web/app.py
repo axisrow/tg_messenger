@@ -41,6 +41,7 @@ from tg_messenger.core.auth import (
 )
 from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
 from tg_messenger.core.flood import HandledFloodWaitError
+from tg_messenger.core.models import format_author
 from tg_messenger.core.search import filter_dialogs
 
 logger = logging.getLogger(__name__)
@@ -163,10 +164,13 @@ def _profile_li(name: str, *, active: bool) -> str:
     return f'<li{cls} data-profile="{escape(name)}">{escape(name)}{marker}</li>'
 
 
-def _message_div(m) -> str:
+def _message_div(m, *, show_author: bool = False) -> str:
     cls = "out" if m.out else "in"
     body = escape(m.text) if m.text else "&lt;media&gt;"
     body = f"[{m.id}] {body}"
+    # #108: author line above the text, only in groups/supergroups for incoming messages
+    # (the route decides via dialog kind + out). Escaped — author fields are user-controlled.
+    author = f'<div class="author">{escape(format_author(m))}</div>' if show_author else ""
     translation = ""
     if getattr(m, "translated_text", None):
         translation = f'<div class="translation">↳ {escape(m.translated_text)}</div>'
@@ -185,7 +189,7 @@ def _message_div(m) -> str:
     # while these bubbles are still briefly live in the DOM (HTMX swaps #messages async).
     return (
         f'<div class="msg {cls}" data-id="{m.id}" data-dialog="{m.dialog_id}">'
-        f"{body}{reply_btn}{react_btn}{translation}</div>"
+        f"{author}{body}{reply_btn}{react_btn}{translation}</div>"
     )
 
 
@@ -295,6 +299,11 @@ async def sse_event_stream(
     """
     sent_ids = sent_ids if sent_ids is not None else OrderedDict()
     sent_reactions = sent_reactions if sent_reactions is not None else OrderedDict()
+    # #108 (Codex review): resolve the dialog kind ONCE from the #8 cached dialog list (network-
+    # free, no get_entity) — the stream's dialog_id is fixed, so the author-line decision is
+    # carried in each frame instead of re-derived client-side from the mutable #dialogs sidebar
+    # (a tab switch / search replaces those <li>s while this stream stays live → author dropped).
+    is_group = (await _dialog_kind(client, dialog_id)) == "group"
     # Merge incoming, outgoing and reaction streams by racing their __anext__
     # coroutines. The iterators are created here, before the first await, so an
     # EventBus subscription is live by the time anything is published.
@@ -367,7 +376,16 @@ async def sse_event_stream(
                 out = kind == "outgoing"
                 if out and (ev.dialog_id, ev.message.id) in sent_ids:
                     continue  # our own optimistic bubble already shows it
-                payload = {"id": ev.message.id, "text": ev.message.text, "out": out}
+                # #108: carry the author AND the group flag so the client renders the author line
+                # without re-deriving kind from the mutable #dialogs sidebar (resolved once above).
+                payload = {
+                    "id": ev.message.id,
+                    "text": ev.message.text,
+                    "out": out,
+                    "is_group": is_group,
+                    "sender_id": ev.message.sender_id,
+                    "sender": ev.message.sender.model_dump() if ev.message.sender else None,
+                }
                 yield f"data: {json.dumps(payload)}\n\n"
                 if translator is not None:
                     # schedule translation as a racing task — keeps live frames flowing.
@@ -711,8 +729,12 @@ def build_app(
     @app.get("/dialogs/{dialog_id}/search", response_class=HTMLResponse)
     async def search_dialog(request: Request, dialog_id: int, q: str = ""):
         # серверный поиск сообщений внутри диалога (Telegram search=)
-        items = await request.app.state.client.search_messages(dialog_id, q)
-        return HTMLResponse("".join(_message_div(m) for m in items))
+        client = request.app.state.client
+        items = await client.search_messages(dialog_id, q)
+        is_group = await _dialog_kind(client, dialog_id) == "group"  # #108
+        return HTMLResponse(
+            "".join(_message_div(m, show_author=is_group and not m.out) for m in items)
+        )
 
     @app.get("/dialogs/{dialog_id}/messages", response_class=HTMLResponse)
     async def messages(request: Request, dialog_id: int):
@@ -725,7 +747,10 @@ def build_app(
         # opening a dialog clears its unread counter, but it must never block rendering history
         if items:
             _schedule_mark_read(request.app, client, dialog_id, max(m.id for m in items))
-        return HTMLResponse("".join(_message_div(m) for m in items))
+        is_group = await _dialog_kind(client, dialog_id) == "group"  # #108
+        return HTMLResponse(
+            "".join(_message_div(m, show_author=is_group and not m.out) for m in items)
+        )
 
     @app.post("/send", response_class=HTMLResponse)
     async def send(request: Request, dialog_id: str = Form(""), text: str = Form(""),
@@ -1029,6 +1054,17 @@ async def _outbound_dialog(client, dialog_id: int):
         if dialog.id == dialog_id:
             return dialog
     return None
+
+
+async def _dialog_kind(client, dialog_id: int) -> str | None:
+    # #108: dialog kind for the author-line decision. Reads the cached dialog list (#8 TTL
+    # cache — network-free when warm); a lookup failure degrades to None (no author line),
+    # never blocks rendering.
+    try:
+        dialog = await _outbound_dialog(client, dialog_id)
+    except DialogLookupError:
+        return None
+    return dialog.kind if dialog is not None else None
 
 
 async def _readonly_error(client, dialog_id: int) -> HTMLResponse | None:

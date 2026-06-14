@@ -7,7 +7,7 @@ from telethon.sessions import StringSession
 
 from tg_messenger.agent.outbound import get_dialog_lang, is_outbound_enabled
 from tg_messenger.core.events import EventBus
-from tg_messenger.core.models import Dialog, IncomingEvent, Message, ReactionEvent
+from tg_messenger.core.models import Dialog, IncomingEvent, Message, ReactionEvent, User
 from tg_messenger.web import app as web_app
 from tg_messenger.web.app import _error_response, build_app
 
@@ -898,7 +898,8 @@ async def test_stream_yields_group_frame():
     frame = await asyncio.wait_for(task, timeout=2)
     import json
     payload = json.loads(frame.removeprefix("data: ").strip())
-    assert payload == {"id": 11, "text": "в группе", "out": False}  # не DM, а групповое
+    assert payload == {"id": 11, "text": "в группе", "out": False, "is_group": True,
+                       "sender_id": 9, "sender": None}  # #108: sender + group flag в фрейме
     await gen.aclose()
 
 
@@ -922,7 +923,8 @@ async def test_stream_yields_outgoing_frame_for_own_message_from_another_device(
 
     frame = await asyncio.wait_for(task, timeout=2)
     payload = json.loads(frame.removeprefix("data: ").strip())
-    assert payload == {"id": 42, "text": "с телефона", "out": True}
+    assert payload == {"id": 42, "text": "с телефона", "out": True, "is_group": False,
+                       "sender_id": 1, "sender": None}  # #108 (dialog 7 = DM)
     await gen.aclose()
 
 
@@ -1099,7 +1101,8 @@ async def test_stream_skips_outgoing_echo_of_messages_we_sent():
     frame = await asyncio.wait_for(task, timeout=2)
     payload = json.loads(frame.removeprefix("data: ").strip())
     # эхо (id=42) пропущено, пришло следующее своё сообщение (id=43)
-    assert payload == {"id": 43, "text": "новое", "out": True}
+    assert payload == {"id": 43, "text": "новое", "out": True, "is_group": False,
+                       "sender_id": 1, "sender": None}  # #108 (dialog 7 = DM)
     await gen.aclose()
 
 
@@ -1125,7 +1128,8 @@ async def test_stream_does_not_skip_same_message_id_from_other_dialog():
 
     frame = await asyncio.wait_for(task, timeout=2)
     payload = json.loads(frame.removeprefix("data: ").strip())
-    assert payload == {"id": 42, "text": "same id", "out": True}
+    assert payload == {"id": 42, "text": "same id", "out": True, "is_group": False,
+                       "sender_id": 1, "sender": None}  # #108 (dialog 7 = DM)
     await gen.aclose()
 
 
@@ -1156,7 +1160,8 @@ async def test_stream_does_not_skip_message_sent_by_other_web_client():
 
         frame = await asyncio.wait_for(task, timeout=2)
         payload = json.loads(frame.removeprefix("data: ").strip())
-        assert payload == {"id": 2, "text": "from a", "out": True}
+        assert payload == {"id": 2, "text": "from a", "out": True, "is_group": False,
+                           "sender_id": 1, "sender": None}  # #108 (dialog 7 = DM)
         await gen.aclose()
 
 
@@ -1983,6 +1988,70 @@ def test_message_div_has_react_button():
     # #95: the bubble stamps its own dialog id so a per-message action targets the
     # source dialog, not the (possibly switched) global #dialog_id.
     assert 'data-dialog="7"' in html
+    # #108: default call shows no author line (unchanged behavior).
+    assert 'class="author"' not in html
+
+
+def test_message_div_shows_author_when_requested():
+    # #108: a group incoming message renders 'userid @username First Last' above the text.
+    from tg_messenger.web.app import _message_div
+
+    m = Message(id=21, dialog_id=-100200, sender_id=9, out=False, text="hi",
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                sender=User(id=9, username="ann", first_name="Anna", last_name="Smith"))
+    html = _message_div(m, show_author=True)
+    assert '<div class="author">9 @ann Anna Smith</div>' in html
+    # author sits ABOVE the body inside the same bubble
+    assert html.index('class="author"') < html.index("[21] hi")
+
+
+def test_message_div_author_bare_userid_when_no_sender():
+    from tg_messenger.web.app import _message_div
+
+    m = Message(id=21, dialog_id=-100200, sender_id=9, out=False, text="hi",
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    assert '<div class="author">9</div>' in _message_div(m, show_author=True)
+
+
+def test_message_div_author_is_html_escaped():
+    # author fields are user-controlled — must be escaped (XSS).
+    from tg_messenger.web.app import _message_div
+
+    m = Message(id=21, dialog_id=-100200, sender_id=9, out=False, text="hi",
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                sender=User(id=9, first_name='<b>x</b>'))
+    html = _message_div(m, show_author=True)
+    assert "&lt;b&gt;x&lt;/b&gt;" in html
+    assert "<b>x</b>" not in html
+
+
+async def test_group_history_shows_author_dm_does_not(client_app):
+    # #108: GET messages for a group dialog renders author lines on incoming; a DM does not.
+    ac, _ = client_app
+    grp = await ac.get("/dialogs/-100200/messages")  # WebStubClient: -100200 kind=group
+    assert 'class="author"' in grp.text
+    dm = await ac.get("/dialogs/7/messages")  # 7 is a DM
+    assert 'class="author"' not in dm.text
+
+
+async def test_channel_history_has_no_author(client_app):
+    ac, _ = client_app
+    chan = await ac.get("/dialogs/-100123/messages")  # WebStubClient: -100123 kind=channel
+    assert 'class="author"' not in chan.text
+
+
+async def test_index_has_author_line_plumbing(client_app):
+    # #108: inline chat.html JS has no unit harness → grep-guard the author plumbing.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "function authorLine(" in r.text  # the JS formatter mirrors format_author
+    assert "author.textContent = authorLine(" in r.text  # XSS-safe via textContent
+    assert "class=\"author\"" in r.text or "'author'" in r.text
+    # #108 (Codex review): the live author decision comes from the SSE frame's is_group flag,
+    # NOT a #dialogs <li data-kind> lookup — a tab switch/search can replace those <li>s while
+    # the stream stays live, which would drop the author line.
+    assert "data.is_group" in r.text  # the SSE-carried group flag drives the author line
+    assert "li.dataset.kind" not in r.text  # the mutable-sidebar lookup is gone
 
 
 async def test_reaction_routes_to_path_dialog_not_global(client_app):

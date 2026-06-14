@@ -11,6 +11,7 @@ from tg_messenger.core.models import (
     MessagesDeletedEvent,
     OutgoingEvent,
     User,
+    format_author,
 )
 
 
@@ -187,3 +188,32 @@ def test_incoming_event_album_id_set():
     msg = Message(id=1, dialog_id=7, sender_id=7, out=False, text="x", date=_now())
     ev = IncomingEvent(dialog_id=7, message=msg, album_id=555)
     assert ev.album_id == 555
+
+
+def _gmsg(sender=None, sender_id=9):
+    return Message(id=21, dialog_id=-100200, sender_id=sender_id, out=False,
+                   text="hi", date=_now(), sender=sender)
+
+
+def test_format_author_all_fields():
+    m = _gmsg(User(id=9, username="ann", first_name="Anna", last_name="Smith"))
+    assert format_author(m) == "9 @ann Anna Smith"
+
+
+def test_format_author_no_username():
+    m = _gmsg(User(id=9, first_name="Anna", last_name="Smith"))
+    assert format_author(m) == "9 Anna Smith"
+
+
+def test_format_author_no_last_name():
+    m = _gmsg(User(id=9, username="ann", first_name="Anna"))
+    assert format_author(m) == "9 @ann Anna"
+
+
+def test_format_author_only_userid_when_no_sender():
+    assert format_author(_gmsg(None)) == "9"
+
+
+def test_format_author_only_userid_when_sender_empty():
+    m = _gmsg(User(id=9))  # sender present but no name/username
+    assert format_author(m) == "9"

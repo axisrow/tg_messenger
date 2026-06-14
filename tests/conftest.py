@@ -153,10 +153,13 @@ class FakeMessage:
     def __init__(
         self, id, sender_id, text=None, out=False, date=None, media=None, peer_id=None,
         photo=None, document=None, voice=None, file=None, grouped_id=None, reply_to=None,
+        sender=None,
     ):
         self.id = id
         self.grouped_id = grouped_id
         self.sender_id = sender_id
+        # Telethon attaches the resolved sender entity (User) best-effort; None when uncached.
+        self.sender = sender
         self.message = text
         self.text = text
         self.out = out

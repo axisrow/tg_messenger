@@ -22,6 +22,7 @@ from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
 from tg_messenger.core.auth import LoginError, LoginSession, delivery_hint
 from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
+from tg_messenger.core.models import format_author
 from tg_messenger.core.search import can_send_in
 
 logger = logging.getLogger(__name__)
@@ -103,8 +104,11 @@ def _make_real_client(session_name: str):
     return client_from_env(session_name=session_name)
 
 
-def _message_label(message) -> str:
-    return f"[{message.id}] {message.text or '<media>'}"
+def _message_label(message, *, show_author: bool = False) -> str:
+    base = f"[{message.id}] {message.text or '<media>'}"
+    # #108: in groups/supergroups, an incoming message gets an author line ABOVE the text.
+    # First line so it becomes part of MessageBubble._base_text (survives translation/reactions).
+    return f"{format_author(message)}\n{base}" if show_author else base
 
 
 class ProfileItem(ListItem):
@@ -445,6 +449,11 @@ class MessengerTUI(App):
         # so the in-app picker, not a CLI menu, resolves the profile. None = library path.
         self._deps_factory = deps_factory
         self._current: int | None = None
+        # #108 (Codex review): the open dialog's kind, captured at selection time while its <li>
+        # is guaranteed in _all_dialogs. _all_dialogs is replaced with the current tab's subset on
+        # a tab switch, so re-querying _dialog_kind for a live message could drop the author line
+        # if the user switched tabs after opening the group — read this stable value instead.
+        self._current_kind: str | None = None
         self._tab = "all"
         self._started = False  # gates tab events until _startup finished
         self._all_dialogs: list = []  # full loaded list; search filters it locally
@@ -755,6 +764,9 @@ class MessengerTUI(App):
         if isinstance(item, DialogItem):
             self._save_current_compose_state()
             self._current = item.dialog_id
+            # #108: capture the kind now, while this dialog's <li> is in _all_dialogs — a later
+            # tab switch can drop it from the list, but the open chat keeps showing author lines.
+            self._current_kind = self._dialog_kind(item.dialog_id)
             self._restore_compose_state(item.dialog_id)
             self._apply_composer_writable(item.dialog_id)
             self._clear_suggestion()
@@ -787,7 +799,9 @@ class MessengerTUI(App):
         bubbles = []
         self._bubble_index.clear()
         for m in messages:
-            bubble = MessageBubble(_message_label(m), m.out, message_id=m.id, dialog_id=dialog_id)
+            show_author = (not m.out) and self._kind_for_rendering(dialog_id) == "group"
+            bubble = MessageBubble(_message_label(m, show_author=show_author), m.out,
+                                   message_id=m.id, dialog_id=dialog_id)
             if m.translated_text:
                 bubble.show_translation(m.translated_text)
             self._bubble_index[m.id] = bubble
@@ -1184,7 +1198,9 @@ class MessengerTUI(App):
                 await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=True)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    bubble = MessageBubble(_message_label(ev.message), out=False,
+                    show_author = self._kind_for_rendering(ev.dialog_id) == "group"
+                    bubble = MessageBubble(_message_label(ev.message, show_author=show_author),
+                                           out=False,
                                            message_id=ev.message.id, dialog_id=ev.dialog_id)
                     self._bubble_index[ev.message.id] = bubble
                     await pane.mount(bubble)
@@ -1268,6 +1284,20 @@ class MessengerTUI(App):
 
     def _is_dm_dialog(self, dialog_id: int) -> bool:
         return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
+
+    def _dialog_kind(self, dialog_id: int) -> str | None:
+        # #108: kind from the already-loaded list (no network) — author lines show only in groups.
+        return next((d.kind for d in self._all_dialogs if d.id == dialog_id), None)
+
+    def _kind_for_rendering(self, dialog_id: int) -> str | None:
+        # #108 (Codex review): the kind to drive the author-line decision for a rendered message.
+        # For the OPEN dialog prefer the kind captured at selection time (_current_kind) — it
+        # stays correct after a tab switch drops the dialog from _all_dialogs. Fall back to a
+        # fresh list lookup when it wasn't captured (dialog still in the list) or for a non-open
+        # dialog; the captured value wins only when present.
+        if dialog_id == self._current and self._current_kind is not None:
+            return self._current_kind
+        return self._dialog_kind(dialog_id)
 
     def _dialog_title(self, dialog_id: int) -> str | None:
         # #105: best-effort title from the already-loaded dialog list (no network — flood

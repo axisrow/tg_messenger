@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any
 
 from tg_messenger.core.client import is_channel_or_megagroup_id
-from tg_messenger.core.models import MediaRef, Message, MessagesDeletedEvent
+from tg_messenger.core.models import MediaRef, Message, MessagesDeletedEvent, User
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,11 @@ MESSAGE_STORE_MIGRATIONS = [
     " dialog_id INTEGER PRIMARY KEY,"
     " low_id INTEGER NOT NULL,"
     " high_id INTEGER NOT NULL)",
+    # #108: author enrichment, so a store-backed group history (the default serve/tui path)
+    # shows 'userid @username First Last', not just the bare id. Nullable, backward-compatible.
+    "ALTER TABLE messages ADD COLUMN sender_username TEXT",
+    "ALTER TABLE messages ADD COLUMN sender_first_name TEXT",
+    "ALTER TABLE messages ADD COLUMN sender_last_name TEXT",
 ]
 MESSAGE_STORE_PEER_STATE_MAX = 1000
 
@@ -329,7 +334,7 @@ class MessageStore:
         low_id, high_id = int(row[0]), int(row[1])
         rows = await self._storage.fetchall(
             "SELECT dialog_id, id, sender_id, out, date, text, media, reply_to_id, "
-            "is_forward, translated_text "
+            "is_forward, translated_text, sender_username, sender_first_name, sender_last_name "
             "FROM messages WHERE dialog_id = ? AND id >= ? AND id <= ? ORDER BY id DESC LIMIT ?",
             (int(peer), low_id, high_id, int(limit)),
         )
@@ -358,14 +363,25 @@ class MessageStore:
             if preserve_translation
             else "translated_text = excluded.translated_text, translated_lang = excluded.translated_lang"
         )
+        s = message.sender
         await self._storage.execute(
             "INSERT INTO messages (dialog_id, id, sender_id, out, date, text, media, "
-            "reply_to_id, is_forward, translated_text, translated_lang) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "reply_to_id, is_forward, translated_text, translated_lang, "
+            "sender_username, sender_first_name, sender_last_name) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(dialog_id, id) DO UPDATE SET "
             "sender_id = excluded.sender_id, out = excluded.out, date = excluded.date, "
             "text = excluded.text, media = excluded.media, reply_to_id = excluded.reply_to_id, "
-            f"is_forward = excluded.is_forward, {update_translation}",
+            # #108 (Codex review): preserve a resolved author across a later sender=None
+            # re-upsert. raw.sender is best-effort — a cold-session/evicted re-sync of the same
+            # message can arrive with sender=None, and an unconditional overwrite would NULL the
+            # stored "@username First Last" back to a bare id. COALESCE keeps the existing value
+            # when the incoming one is NULL (mirrors the translated_text preserve pattern above);
+            # a genuinely changed author (non-NULL incoming) still writes through.
+            "is_forward = excluded.is_forward, "
+            "sender_username = COALESCE(excluded.sender_username, messages.sender_username), "
+            "sender_first_name = COALESCE(excluded.sender_first_name, messages.sender_first_name), "
+            f"sender_last_name = COALESCE(excluded.sender_last_name, messages.sender_last_name), {update_translation}",
             (
                 int(message.dialog_id),
                 int(message.id),
@@ -378,12 +394,22 @@ class MessageStore:
                 1 if message.is_forward else 0,
                 text,
                 lang,
+                s.username if s is not None else None,
+                s.first_name if s is not None else None,
+                s.last_name if s is not None else None,
             ),
         )
 
     @staticmethod
     def _row_to_message(row: tuple[Any, ...]) -> Message:
         media = MediaRef.model_validate_json(row[6]) if row[6] is not None else None
+        # #108: reconstruct the author when any sender field was persisted; sender_id is always
+        # available, so a row with no username/name still yields a User carrying the id.
+        username, first_name, last_name = row[10], row[11], row[12]
+        sender = None
+        if username is not None or first_name is not None or last_name is not None:
+            sender = User(id=int(row[2]), username=username,
+                          first_name=first_name, last_name=last_name)
         return Message(
             dialog_id=int(row[0]),
             id=int(row[1]),
@@ -395,19 +421,27 @@ class MessageStore:
             reply_to_id=int(row[7]) if row[7] is not None else None,
             is_forward=bool(row[8]),
             translated_text=row[9],
+            sender=sender,
         )
 
 
 async def upsert_message_for_translation(storage, message: Message) -> None:
     """Ensure a live message row exists before caching translation metadata."""
     media = message.media.model_dump_json() if message.media is not None else None
+    s = message.sender
     await storage.execute(
         "INSERT INTO messages (dialog_id, id, sender_id, out, date, text, media, "
-        "reply_to_id, is_forward) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "reply_to_id, is_forward, sender_username, sender_first_name, sender_last_name) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(dialog_id, id) DO UPDATE SET "
         "sender_id = excluded.sender_id, out = excluded.out, date = excluded.date, "
         "text = excluded.text, media = excluded.media, reply_to_id = excluded.reply_to_id, "
+        # #108 (Codex review): COALESCE so a sender=None translation upsert never NULLs a
+        # previously-resolved author (mirrors _upsert_message; raw.sender is best-effort).
         "is_forward = excluded.is_forward, "
+        "sender_username = COALESCE(excluded.sender_username, messages.sender_username), "
+        "sender_first_name = COALESCE(excluded.sender_first_name, messages.sender_first_name), "
+        "sender_last_name = COALESCE(excluded.sender_last_name, messages.sender_last_name), "
         "translated_text = CASE WHEN messages.text IS excluded.text THEN messages.translated_text ELSE NULL END, "
         "translated_lang = CASE WHEN messages.text IS excluded.text THEN messages.translated_lang ELSE NULL END",
         (
@@ -420,6 +454,9 @@ async def upsert_message_for_translation(storage, message: Message) -> None:
             media,
             int(message.reply_to_id) if message.reply_to_id is not None else None,
             1 if message.is_forward else 0,
+            s.username if s is not None else None,
+            s.first_name if s is not None else None,
+            s.last_name if s is not None else None,
         ),
     )
 

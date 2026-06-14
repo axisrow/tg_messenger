@@ -57,6 +57,9 @@ class Message(BaseModel):
     reply_to_id: int | None = None  # id of the message this one replies to, if any
     is_forward: bool = False  # True if this message was forwarded from elsewhere
     translated_text: str | None = None
+    # #108: best-effort author (from raw.sender — free when cached). UIs show it above the
+    # text only in groups/supergroups for incoming messages; None when not resolved.
+    sender: User | None = None
 
 
 class IncomingEvent(BaseModel):
@@ -119,3 +122,19 @@ def message_line(m: Message) -> str:
     """One-line text rendering shared by text UIs: '← [id] text' (→ for own messages)."""
     who = "→" if m.out else "←"
     return f"{who} [{m.id}] {m.text or '<media>'}"
+
+
+def format_author(m: Message) -> str:
+    """#108: the author line for a group/supergroup incoming message —
+    'userid @username First Last', empty fields skipped, sender_id always present.
+    Falls back to the bare sender_id when no sender object was resolved. The DECISION
+    to show this (group kind + incoming) lives in the UI; this only formats."""
+    parts = [str(m.sender_id)]
+    s = m.sender
+    if s is not None:
+        if s.username:
+            parts.append(f"@{s.username}")
+        name = " ".join(p for p in (s.first_name, s.last_name) if p)
+        if name:
+            parts.append(name)
+    return " ".join(parts)

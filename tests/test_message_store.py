@@ -9,7 +9,7 @@ from tg_messenger.core.message_store import (
     MessageStore,
     register_message_store_migrations,
 )
-from tg_messenger.core.models import Message, MessagesDeletedEvent
+from tg_messenger.core.models import Message, MessagesDeletedEvent, User
 from tg_messenger.core.storage import Storage
 
 
@@ -144,6 +144,69 @@ async def test_message_store_first_load_then_cooldown_serves_db(tmp_path):
     assert [m.id for m in second] == [1, 2, 3]
     assert [m.id for m in third] == [1, 2, 3, 4]
     assert client.calls == [(7, 0, 50), (7, 3, 50), (7, 0, 50)]
+
+
+class SenderStoreClient(StoreClient):
+    """A group history whose messages carry a resolved author."""
+
+    def __init__(self):
+        super().__init__()
+        self.messages = [
+            Message(id=2, dialog_id=-100200, sender_id=9, out=False, text="m2",
+                    date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    sender=User(id=9, username="bob", first_name="Bob", last_name="Lee")),
+            Message(id=1, dialog_id=-100200, sender_id=5, out=False, text="m1",
+                    date=datetime(2024, 1, 1, tzinfo=timezone.utc)),  # no sender resolved
+        ]
+
+
+async def test_message_store_round_trips_sender(tmp_path):
+    # #108 (Codex review): the store-backed path (default serve/tui) must preserve the author,
+    # so a group history shows 'userid @username First Last', not just the bare id.
+    store = MessageStore(client=SenderStoreClient(), storage=await _storage(tmp_path))
+    try:
+        await store.history(-100200, limit=50)  # first load → persisted to SQLite
+        # second read is served from the DB (within cooldown) — sender must survive the round trip
+        items = await store.history(-100200, limit=50)
+    finally:
+        await store.close()
+    by_id = {m.id: m for m in items}
+    assert by_id[2].sender is not None
+    assert (by_id[2].sender.username, by_id[2].sender.first_name, by_id[2].sender.last_name) \
+        == ("bob", "Bob", "Lee")
+    assert by_id[2].sender.id == 9
+    assert by_id[1].sender is None  # no enrichment persisted → reconstructed as None
+    assert by_id[1].sender_id == 5  # bare id still present
+
+
+async def test_message_store_preserves_author_on_sender_none_reupsert(tmp_path):
+    # #108 (Codex review): raw.sender is best-effort — a later live ingest / history re-sync of
+    # the SAME message can arrive with sender=None (cold session / evicted entity). The upsert
+    # must NOT NULL a previously-resolved author back to a bare id (COALESCE preserve, mirroring
+    # the translation-preserve pattern). Drive it through the public ingest() path.
+    storage = await _storage(tmp_path)
+    store = MessageStore(client=StoreClient(), storage=storage)
+    enriched = Message(
+        id=21, dialog_id=-100200, sender_id=9, out=False, text="hi",
+        date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        sender=User(id=9, username="bob", first_name="Bob", last_name="Lee"),
+    )
+    try:
+        await store.ingest(enriched)
+        # the same (dialog_id, id) re-ingested WITHOUT a resolved sender — must not erase author
+        bare = Message(
+            id=21, dialog_id=-100200, sender_id=9, out=False, text="hi",
+            date=datetime(2024, 1, 1, tzinfo=timezone.utc), sender=None,
+        )
+        await store.ingest(bare)
+        rows = await storage.fetchall(
+            "SELECT sender_username, sender_first_name, sender_last_name "
+            "FROM messages WHERE dialog_id = ? AND id = ?",
+            (-100200, 21),
+        )
+    finally:
+        await store.close()
+    assert rows == [("bob", "Bob", "Lee")]  # author survived the sender=None re-upsert
 
 
 async def test_message_store_resets_window_on_possible_gap(tmp_path):
