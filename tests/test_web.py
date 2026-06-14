@@ -1778,6 +1778,15 @@ async def test_index_after_request_clears_submitted_dialog_not_active_dialog(cli
     assert "if (submittedDialogId === activeDialogId)" in r.text
 
 
+async def test_index_shares_reply_clear_helper(client_app):
+    # #89: the success-path reply-clear is one helper reused by the send (afterRequest) and
+    # media (attach) paths — guard against the two callers drifting apart again.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "function clearReplyIfConsumed(" in r.text  # the shared helper exists
+    assert r.text.count("clearReplyIfConsumed(") >= 3  # 1 definition + >=2 call sites
+
+
 async def test_suggest_endpoint_does_not_escape_draft(suggest_app):
     ac, suggester = suggest_app
     suggester.draft = "you & me"

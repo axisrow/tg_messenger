@@ -746,6 +746,55 @@ async def test_tui_react_forbidden_restores_command():
         assert composer.value == "/react 1 👍"  # typed command back in the composer
 
 
+async def test_tui_optimistic_clear_and_restore_draft_units():
+    # #89: pin the centralized helpers directly. _optimistic_clear wipes draft + all
+    # pending-outbound fields + the composer; _restore_draft puts text back only into an
+    # EMPTY composer (non-clobber guard) while always updating the stored draft; None is a
+    # no-op; a non-current dialog updates state but never touches the composer.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+
+        # seed a draft + pending outbound, then optimistically clear
+        state = app._compose_state_for(7)
+        state.draft = "hi"
+        state.source_text = "orig"
+        state.outbound_token = "tok"
+        state.original_confirm_text = "orig"
+        composer.value = "hi"
+        app._optimistic_clear(7, composer)
+        assert state.draft == ""
+        assert state.source_text is None
+        assert state.outbound_token is None
+        assert state.original_confirm_text is None
+        assert composer.value == ""
+
+        # restore into an empty composer
+        app._restore_draft(7, "hi")
+        assert app._compose_state_for(7).draft == "hi"
+        assert composer.value == "hi"
+
+        # non-clobber: a draft typed meanwhile is preserved, but state.draft still updates
+        composer.value = "typed meanwhile"
+        app._restore_draft(7, "hi")
+        assert composer.value == "typed meanwhile"  # composer untouched
+        assert app._compose_state_for(7).draft == "hi"  # state still set
+
+        # None is a no-op (media/reaction with no captured command)
+        app._compose_state_for(7).draft = "keep"
+        app._restore_draft(7, None)
+        assert app._compose_state_for(7).draft == "keep"
+
+        # restore to a non-current dialog: state set, composer untouched
+        composer.value = "current"
+        app._restore_draft(99, "other")
+        assert app._compose_state_for(99).draft == "other"
+        assert composer.value == "current"
+
+
 async def test_tui_bad_react_command_notifies_and_does_not_send_text():
     stub = TuiStubClient()
     app = MessengerTUI(client=stub)
