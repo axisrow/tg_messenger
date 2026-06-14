@@ -1870,6 +1870,20 @@ def test_message_div_has_react_button():
     )
     assert 'data-react="42"' in html
     assert "react-btn" in html
+    # #95: the bubble stamps its own dialog id so a per-message action targets the
+    # source dialog, not the (possibly switched) global #dialog_id.
+    assert 'data-dialog="7"' in html
+
+
+async def test_reaction_routes_to_path_dialog_not_global(client_app):
+    # #95: the /reaction route takes its target dialog from the URL path (the bubble's
+    # own dialog), so a reaction always lands on the chat the message belongs to — even
+    # if the user has since switched dialogs. The response fragment and echo bucket key
+    # follow the path dialog too.
+    ac, stub = client_app
+    r = await ac.post("/dialogs/7/reaction", data={"message_id": "5", "emoticon": "🔥"})
+    assert r.status_code == 200, r.text
+    assert stub.reactions == [(7, 5, "🔥")]
 
 
 # --- циклы 131-132: web-мастер логина Telegram (/tg-login) ---
