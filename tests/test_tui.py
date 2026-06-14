@@ -2342,6 +2342,64 @@ async def test_up_on_non_first_dialog_scrolls_list_not_tabs():
         assert lv.index == 0  # поднялись на первый
 
 
+# --- #114: unified focus navigation (Tab / Shift+Tab cycle panels; accept_suggestion preserved) ---
+
+
+async def test_tui_tab_cycles_focus_forward_through_panels():
+    # #114: with no pending suggestion, Tab falls through to forward focus cycling. From the
+    # search box the next focusable panel in DOM order is the tabs strip.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#search", Input).focus()
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.focused is app.query_one(Tabs)  # search → tabs
+
+
+async def test_tui_shift_tab_cycles_focus_backward():
+    # #114: Shift+Tab cycles focus backward (mirror of Tab). From the dialog list the prior
+    # focusable panel is the tabs strip.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#dialogs", ListView).focus()
+        await pilot.pause()
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        assert app.focused is app.query_one(Tabs)  # dialogs → (back) tabs
+
+
+async def test_tui_tab_accepts_pending_suggestion_not_focus():
+    # #114: when a suggestion is pending, Tab accepts it into the composer instead of cycling focus.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        app._pending_suggestion = "draft reply"
+        app.query_one("#suggestion", Static).update("💡 Tab: draft reply")
+        app.query_one("#composer", Input).focus()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.query_one("#composer", Input).value == "draft reply"
+        assert app._pending_suggestion is None
+        assert app.focused is app.query_one("#composer", Input)
+
+
+async def test_tui_tab_falls_through_when_no_suggestion():
+    # #114: with no pending suggestion, Tab must MOVE focus (the accept-fallthrough), not stay put.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.focus()
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app.focused is not search  # focus advanced
+
+
 class TwoDmClient(TuiStubClient):
     async def dialogs(self, dm_only=True):
         self.dialogs_calls += 1
