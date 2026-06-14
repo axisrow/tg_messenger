@@ -1913,6 +1913,39 @@ async def test_index_has_reaction_controls(client_app):
     assert "reaction-palette" in r.text  # the preset palette plumbing
 
 
+async def test_index_has_cross_dialog_reaction_toast(client_app):
+    # #97: a reaction landing in a dialog the user navigated away from confirms via a
+    # lightweight toast (the echo bubble is suppressed cross-dialog, #95/#96). Guard the
+    # toast element, the helpers, and both message forms (titled + neutral fallback).
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert 'id="reaction-toast"' in r.text  # the toast element exists
+    assert "function showToast(" in r.text  # the toast helper
+    assert "function dialogTitleById(" in r.text  # the exact-title resolver
+    # the resolver reads the verbatim data-title attribute, never the rendered text
+    # (Codex review of #103 — no more over-trimming of " @"/trailing-digit titles)
+    assert "li.dataset.title" in r.text
+    assert "Реакция в " in r.text  # the titled message form
+    assert "Реакция отправлена " in r.text  # the neutral fallback form
+
+
+def test_dialog_li_emits_exact_data_title():
+    # #103 (Codex review): the cross-dialog reaction toast resolves the title from the <li>'s
+    # verbatim data-title attribute, not by parsing rendered text. _dialog_li must therefore
+    # emit the FULL, escaped title — including the " @" and trailing digits that the old
+    # textContent parser over-trimmed (Release 2026 → "Release", Team @ Ops → "Team", ...).
+    from tg_messenger.web.app import _dialog_li
+
+    for title in ("Release 2026", "Team @ Ops", "Support @bot 2"):
+        li = _dialog_li(Dialog(id=42, title=title, kind="group"))
+        assert 'data-dialog="42"' in li
+        assert f'data-title="{title}"' in li  # exact, untruncated
+
+    # data-title is HTML-escaped (XSS-safe), like the rendered title
+    li = _dialog_li(Dialog(id=7, title='A<b>"&', kind="group"))
+    assert 'data-title="A&lt;b&gt;&quot;&amp;"' in li
+
+
 def test_message_div_has_react_button():
     # #86: every server-rendered bubble carries a per-message react button keyed by id.
     from tg_messenger.web.app import _message_div
