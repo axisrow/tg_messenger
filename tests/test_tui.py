@@ -9,13 +9,15 @@ from textual.widgets import Input, ListView, Static, Tabs
 from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.models import Dialog, IncomingEvent, Message, OutgoingEvent, ReactionEvent
 from tg_messenger.tui.app import (
+    REACTION_PRESETS,
     DialogItem,
+    EmojiPickerScreen,
     MessageBubble,
     MessengerTUI,
     ProfileItem,
+    VariantItem,
     parse_lang_command,
     parse_media_command,
-    parse_reaction_command,
 )
 
 
@@ -47,22 +49,6 @@ def test_parse_media_non_at_is_none():
 def test_parse_media_empty_after_at_is_none():
     assert parse_media_command("@") is None
     assert parse_media_command("@   ") is None
-
-
-def test_parse_reaction_command():
-    assert parse_reaction_command("/react 10 👍") == (10, "👍")
-
-
-def test_parse_reaction_command_non_command_is_none():
-    assert parse_reaction_command("hello") is None
-    assert parse_reaction_command("/reactivity is important") is None
-
-
-def test_parse_reaction_command_rejects_bad_shape():
-    with pytest.raises(ValueError):
-        parse_reaction_command("/react bad 👍")
-    with pytest.raises(ValueError):
-        parse_reaction_command("/react 10")
 
 
 class TuiStubClient:
@@ -380,17 +366,26 @@ async def test_tui_submit_in_readonly_channel_does_not_send():
 
 
 async def test_tui_react_in_readonly_channel_sends():
-    # #86: reactions are NOT gated by posting permission — /react must go through in a
-    # read-only channel even though plain text is still refused by the can_send guard.
+    # #93/#86: reactions are NOT gated by posting permission — the "r" hotkey must go
+    # through in a read-only channel even though the text composer is disabled.
     stub = TuiStubClient()
     stub.channel_can_send = False
     app = MessengerTUI(client=stub)
+
+    async def pick(screen):
+        assert isinstance(screen, EmojiPickerScreen)
+        return "👍"
+
+    app.push_screen_wait = pick  # type: ignore[method-assign]
     async with app.run_test() as pilot:
         await pilot.pause()
         app._current = -100300  # a read-only channel
-        composer = app.query_one("#composer", Input)
-        await app.on_input_submitted(Input.Submitted(composer, "/react 1 👍"))
+        await app._show_history(-100300)  # mounts a bubble with message_id=1
         await pilot.pause()
+        bubble = list(app.query(MessageBubble))[0]
+        bubble.focus()
+        await pilot.press("r")
+        await _pause_until(pilot, lambda: bool(stub.reactions))
         assert stub.reactions == [(-100300, 1, "👍")]  # the reaction went out
         assert stub.sent == []  # ...and no text was sent
 
@@ -728,41 +723,83 @@ async def test_tui_send_failure_notifies_instead_of_crashing(caplog):
     assert errors and errors[0].exc_info is not None
 
 
-async def test_tui_react_command_calls_client():
+async def test_tui_react_hotkey_sends_reaction():
+    # #93: focus a message bubble, press "r", pick an emoji → the reaction is sent.
     stub = TuiStubClient()
     app = MessengerTUI(client=stub)
+
+    async def pick(screen):
+        return "👍"
+
+    app.push_screen_wait = pick  # type: ignore[method-assign]
     async with app.run_test() as pilot:
         await pilot.pause()
         app._current = 7
-        composer = app.query_one("#composer", Input)
-        await app.on_input_submitted(Input.Submitted(composer, "/react 1 👍"))
+        await app._show_history(7)  # the stub history yields a Message(id=1)
         await pilot.pause()
-        bubbles = list(app.query(MessageBubble))
+        bubble = list(app.query(MessageBubble))[0]
+        assert bubble.message_id == 1
+        bubble.focus()
+        await pilot.press("r")
+        await _pause_until(pilot, lambda: bool(stub.reactions))
     assert stub.reactions == [(7, 1, "👍")]
-    assert stub.sent == []
-    assert [str(b.render()) for b in bubbles] == ["reaction [1]: 👍"]
-    assert all("out" in b.classes for b in bubbles)
 
 
-async def test_tui_react_forbidden_restores_command():
-    # Same optimistic-clear data-loss class as text/media: on_input_submitted clears the
-    # composer before the worker; a rejected /react must restore the typed command.
+async def test_tui_react_picker_cancel_sends_nothing():
+    # #93: dismissing the picker (Escape → None) sends no reaction.
     stub = TuiStubClient()
-
-    async def forbidden(peer, message_id, emoticon):
-        raise SendForbiddenError("ChatWriteForbiddenError")
-
-    stub.send_reaction = forbidden
     app = MessengerTUI(client=stub)
+
+    async def cancel(screen):
+        return None
+
+    app.push_screen_wait = cancel  # type: ignore[method-assign]
     async with app.run_test() as pilot:
         await pilot.pause()
         app._current = 7
-        composer = app.query_one("#composer", Input)
-        await app.on_input_submitted(Input.Submitted(composer, "/react 1 👍"))
+        await app._show_history(7)
         await pilot.pause()
-        assert stub.reactions == []  # nothing reacted
-        assert app._compose_state_for(7).draft == "/react 1 👍"  # command restored
-        assert composer.value == "/react 1 👍"  # typed command back in the composer
+        bubble = list(app.query(MessageBubble))[0]
+        bubble.focus()
+        await pilot.press("r")
+        await pilot.pause()
+    assert stub.reactions == []
+
+
+async def test_tui_react_hotkey_on_reaction_bubble_is_noop():
+    # #93: a reaction-echo bubble has message_id=None — "r" must not open the picker.
+    stub = SentReactionEchoClient()
+    app = MessengerTUI(client=stub)
+    picked = []
+
+    async def pick(screen):
+        picked.append(True)
+        return "👍"
+
+    app.push_screen_wait = pick  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._send_reaction(7, 1, "👍")  # mounts a message_id=None echo bubble
+        await pilot.pause()
+        bubble = list(app.query(MessageBubble))[0]
+        assert bubble.message_id is None
+        bubble.focus()
+        await pilot.press("r")
+        await pilot.pause()
+    assert picked == []  # the picker never opened
+
+
+async def test_emoji_picker_lists_presets():
+    # #93: the picker offers exactly the 4 web-parity presets.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(EmojiPickerScreen())
+        await pilot.pause()
+        items = list(app.screen.query(VariantItem))
+        assert [it.value for it in items] == REACTION_PRESETS == ["👍", "❤️", "🔥", "😂"]
 
 
 async def test_tui_optimistic_clear_and_restore_draft_units():
@@ -802,7 +839,7 @@ async def test_tui_optimistic_clear_and_restore_draft_units():
         assert composer.value == "typed meanwhile"  # composer untouched
         assert app._compose_state_for(7).draft == "hi"  # state still set
 
-        # None is a no-op (media/reaction with no captured command)
+        # None is a no-op (media with no captured command)
         app._compose_state_for(7).draft = "keep"
         app._restore_draft(7, None)
         assert app._compose_state_for(7).draft == "keep"
@@ -814,20 +851,28 @@ async def test_tui_optimistic_clear_and_restore_draft_units():
         assert composer.value == "current"
 
 
-async def test_tui_bad_react_command_notifies_and_does_not_send_text():
-    stub = TuiStubClient()
-    app = MessengerTUI(client=stub)
-    notifications = []
-    app.notify = lambda message, **kw: notifications.append((message, kw))  # type: ignore[method-assign]
-    async with app.run_test() as pilot:
+async def test_tui_arrow_keys_move_focus_between_bubbles():
+    # #93: up/down move the selection between message bubbles; clamp at the ends.
+    app = MessengerTUI(client=LongHistoryClient())
+    async with app.run_test(size=(80, 20)) as pilot:
         await pilot.pause()
         app._current = 7
-        composer = app.query_one("#composer", Input)
-        await app.on_input_submitted(Input.Submitted(composer, "/react bad 👍"))
+        await app._show_history(7)
         await pilot.pause()
-    assert stub.reactions == []
-    assert stub.sent == []
-    assert notifications
+        bubbles = list(app.query(MessageBubble))
+        assert len(bubbles) >= 2
+        bubbles[0].focus()
+        await pilot.pause()
+        assert app.focused is bubbles[0]
+        await pilot.press("down")
+        await pilot.pause()
+        assert app.focused is bubbles[1]
+        await pilot.press("up")
+        await pilot.pause()
+        assert app.focused is bubbles[0]
+        await pilot.press("up")  # at the top edge: clamp, stay put
+        await pilot.pause()
+        assert app.focused is bubbles[0]
 
 
 async def test_tui_listener_failure_logged_app_stays_alive(caplog):

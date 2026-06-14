@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 # shown before a draft in the suggestion strip; Tab accepts it into the composer
 SUGGEST_PREFIX = "💡 Tab: "
 ORIGINAL_SENTINEL = "__tg_messenger_original__"
+# #93: the per-message reaction presets — the same four as the web palette (chat.html).
+REACTION_PRESETS = ["👍", "❤️", "🔥", "😂"]
 # #73: the outbound prepare timeout now lives in OutboundSendCoordinator.
 
 
@@ -69,21 +71,6 @@ def parse_media_command(text: str) -> tuple[str, str | None] | None:
     remainder = _strip_first_token(rest)
     caption = remainder.strip() or None
     return path, caption
-
-
-def parse_reaction_command(text: str) -> tuple[int, str] | None:
-    """Parse ``/react MESSAGE_ID EMOTICON`` from the composer."""
-    parts = text.split(maxsplit=2)
-    if not parts or parts[0] != "/react":
-        return None
-    if len(parts) != 3:
-        raise ValueError("usage: /react MESSAGE_ID EMOTICON")
-    if not parts[1].isdigit():
-        raise ValueError("message id must be a positive integer")
-    emoticon = parts[2].strip()
-    if not emoticon:
-        raise ValueError("reaction cannot be empty")
-    return int(parts[1]), emoticon
 
 
 def parse_lang_command(text: str) -> tuple[str, str | None] | None:
@@ -297,12 +284,46 @@ class DialogItem(ListItem):
 
 
 class MessageBubble(Static):
-    def __init__(self, text: str, out: bool):
+    # #93: focusable so arrow keys select a message and "r" reacts on it — replacing the
+    # /react composer command (the TUI has no mouse-click-on-message like the web).
+    can_focus = True
+    BINDINGS = [
+        Binding("up", "focus_prev_bubble", "Prev message", show=False),
+        Binding("down", "focus_next_bubble", "Next message", show=False),
+        Binding("r", "react", "React", show=False),
+    ]
+
+    def __init__(self, text: str, out: bool, message_id: int | None = None):
         self._base_text = text
+        # the message this bubble can be reacted to; None for reaction-echo bubbles,
+        # which are not themselves reaction targets.
+        self.message_id = message_id
         super().__init__(text, classes="out" if out else "in", markup=False)
 
     def show_translation(self, text: str) -> None:
         self.update(f"{self._base_text}\n↳ {text}")
+
+    def action_focus_prev_bubble(self) -> None:
+        self._focus_sibling(-1)
+
+    def action_focus_next_bubble(self) -> None:
+        self._focus_sibling(+1)
+
+    def _focus_sibling(self, delta: int) -> None:
+        if self.parent is None:
+            return
+        siblings = [w for w in self.parent.children if isinstance(w, MessageBubble)]
+        idx = siblings.index(self)
+        target = idx + delta
+        if 0 <= target < len(siblings):  # clamp at the ends — don't escape the pane
+            siblings[target].focus()
+
+    def action_react(self) -> None:
+        if self.message_id is None or self.app._current is None:
+            return  # reaction-echo bubble, or no dialog open — nothing to react to
+        self.app.run_worker(
+            self.app._react_from_bubble(self.app._current, self.message_id)
+        )
 
 
 class VariantItem(ListItem):
@@ -339,6 +360,33 @@ class VariantPickScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class EmojiPickerScreen(ModalScreen[str | None]):
+    """Pick one of the 4 reaction presets for the focused message (#93).
+
+    Mirrors VariantPickScreen and the web palette (REACTION_PRESETS). Returns the chosen
+    emoticon, or None if dismissed with Escape.
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="emoji-box"):
+            yield Label("React:")
+            yield ListView(*(VariantItem(e, e) for e in REACTION_PRESETS), id="emojis")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#emojis", ListView)
+        lv.focus()
+        if len(lv) > 0:
+            lv.index = 0
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item = event.item
+        if isinstance(item, VariantItem):
+            self.dismiss(item.value)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
 class MessengerTUI(App):
     # priority: quitting must work even while focus sits in the composer Input.
     # Tab accepts a pending reply suggestion (priority so the Input doesn't eat it
@@ -352,6 +400,7 @@ class MessengerTUI(App):
     #sidebar { width: 32; border-right: solid $primary; }
     #messages { overflow-y: auto; }
     #messages MessageBubble { width: 100%; text-wrap: wrap; text-overflow: fold; }
+    #messages MessageBubble:focus { background: $boost; }
     .out { color: $accent; text-align: right; }
     .in { color: $text; }
     #suggestion { dock: bottom; color: $text-muted; height: auto; }
@@ -712,7 +761,7 @@ class MessengerTUI(App):
         bubbles = []
         self._bubble_index.clear()
         for m in messages:
-            bubble = MessageBubble(_message_label(m), m.out)
+            bubble = MessageBubble(_message_label(m), m.out, message_id=m.id)
             if m.translated_text:
                 bubble.show_translation(m.translated_text)
             self._bubble_index[m.id] = bubble
@@ -798,27 +847,8 @@ class MessengerTUI(App):
         dialog_id = self._current
         state = self._compose_state_for(dialog_id)
         state.draft = text
-        # #86: reactions are NOT gated by posting permission — parse /react and dispatch it
-        # BEFORE the can_send guard so a read-only chat can still react. A rights rejection is
-        # handled inside _send_reaction (notify + restore the typed command). The per-message
-        # reaction hotkey UI is deferred to a sub-issue (the TUI has no message-selection
-        # mechanism yet); the /react composer command stays for now.
-        try:
-            reaction = parse_reaction_command(text)
-        except ValueError as exc:
-            logger.warning("bad reaction command in dialog %s: %s", dialog_id, exc)
-            self.notify(str(exc), severity="error")
-            return
-        if reaction is not None:
-            message_id, emoticon = reaction
-            self._optimistic_clear(dialog_id, event.input)
-            self.run_worker(
-                self._send_reaction(dialog_id, message_id, emoticon, source_text=text),
-                exclusive=False,
-            )
-            return
-        # The posting-permission gate applies to everything that is NOT a reaction
-        # (text / lang / media / outbound).
+        # #93: reactions are placed via the per-message "r" hotkey (EmojiPickerScreen), not a
+        # composer command — the composer is for text/media/lang/outbound only.
         if not self._dialog_can_send(dialog_id):
             # belt-and-suspenders with the disabled composer (cache may be momentarily stale)
             self.notify(READ_ONLY_MESSAGE, severity="warning")
@@ -1009,7 +1039,7 @@ class MessengerTUI(App):
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            bubble = MessageBubble(_message_label(msg), out=True)
+            bubble = MessageBubble(_message_label(msg), out=True, message_id=msg.id)
             if msg.translated_text:
                 bubble.show_translation(msg.translated_text)
             self._bubble_index[msg.id] = bubble
@@ -1038,17 +1068,25 @@ class MessengerTUI(App):
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            bubble = MessageBubble(_message_label(msg), out=True)
+            bubble = MessageBubble(_message_label(msg), out=True, message_id=msg.id)
             self._bubble_index[msg.id] = bubble
             await pane.mount(bubble)
             self._scroll_messages_to_end(pane)
 
+    async def _react_from_bubble(self, peer: int, message_id: int) -> None:
+        # #93: the "r" hotkey path — open the 4-emoji picker, then send. No composer text
+        # is involved, so _send_reaction is called with source_text=None (restore no-ops).
+        emoticon = await self.push_screen_wait(EmojiPickerScreen())
+        if emoticon is None:
+            return  # picker dismissed (Escape) — nothing sent
+        await self._send_reaction(peer, message_id, emoticon)
+
     async def _send_reaction(
         self, peer: int, message_id: int, emoticon: str, source_text: str | None = None,
     ) -> None:
-        # source_text is the original "/react ..." command, cleared optimistically in
-        # on_input_submitted — _restore_draft puts it back on failure (#89). Reactions are
-        # NOT gated by posting permission, so no _apply_composer_writable here (unlike text/media).
+        # source_text is unused by the "r" hotkey path (always None — nothing in the composer
+        # to restore); kept for signature stability. Reactions are NOT gated by posting
+        # permission, so no _apply_composer_writable here (unlike text/media).
         try:
             await self._client.send_reaction(peer, message_id, emoticon)
         except SendForbiddenError as exc:
@@ -1066,7 +1104,10 @@ class MessengerTUI(App):
         self._remember_sent_reaction(peer, message_id, emoticon)
         if peer == self._current:
             pane = self.query_one("#messages", Vertical)
-            await pane.mount(MessageBubble(f"reaction [{message_id}]: {emoticon}", out=True))
+            # message_id=None: a reaction-echo bubble is not itself a reaction target (#93)
+            await pane.mount(
+                MessageBubble(f"reaction [{message_id}]: {emoticon}", out=True, message_id=None)
+            )
             self._scroll_messages_to_end(pane)
 
     async def _drain_incoming(self) -> None:
@@ -1075,7 +1116,8 @@ class MessengerTUI(App):
                 await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=True)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    bubble = MessageBubble(_message_label(ev.message), out=False)
+                    bubble = MessageBubble(_message_label(ev.message), out=False,
+                                           message_id=ev.message.id)
                     self._bubble_index[ev.message.id] = bubble
                     await pane.mount(bubble)
                     if ev.message.translated_text:
@@ -1111,7 +1153,8 @@ class MessengerTUI(App):
                 await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=False)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    bubble = MessageBubble(_message_label(ev.message), out=True)
+                    bubble = MessageBubble(_message_label(ev.message), out=True,
+                                           message_id=ev.message.id)
                     self._bubble_index[ev.message.id] = bubble
                     await pane.mount(bubble)
                     if ev.message.translated_text:
@@ -1136,7 +1179,7 @@ class MessengerTUI(App):
                     continue  # our own optimistic bubble already shows it
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    await pane.mount(MessageBubble(_reaction_label(ev), out=False))
+                    await pane.mount(MessageBubble(_reaction_label(ev), out=False, message_id=None))
                     self._scroll_messages_to_end(pane)
         except Exception:
             logger.exception("reaction listener failed")
