@@ -392,13 +392,14 @@ def test_react_command_calls_client(runner):
 
 def test_send_to_readonly_channel_refused(runner):
     # The CLI does no pre-flight dialog fetch (F-cli-preflight); a read-only chat is
-    # refused by the core SendForbiddenError seam at send time, mapped to a clean message.
+    # refused by the core SendForbiddenError seam at send time. #92: the surfaced text is
+    # Telegram's specific reason (the SendForbiddenError message), not a fixed line.
     r, stub = runner
-    stub.send_text_raises = SendForbiddenError("ChatWriteForbiddenError")
+    stub.send_text_raises = SendForbiddenError("You can't write in this chat")
     # `--` separates options from a negative DIALOG_ID (a marked channel id)
     result = r.invoke(cli_main.cli, ["send", "--", "-100123", "hello"])
     assert result.exit_code != 0
-    assert "read-only" in result.output
+    assert "You can't write in this chat" in result.output
 
 
 def test_send_does_not_fetch_dialogs(runner):
@@ -431,12 +432,24 @@ def test_send_to_writable_channel_allowed(runner):
 
 def test_send_maps_send_forbidden_error(runner):
     # TOCTOU net: Telegram rejected at send time → clean message, no raw traceback.
+    # #92: the surfaced text is Telegram's specific reason, not a fixed read-only line.
     r, stub = runner
-    stub.send_text_raises = SendForbiddenError("ChatWriteForbiddenError")
+    stub.send_text_raises = SendForbiddenError("You can't write in this chat")
     result = r.invoke(cli_main.cli, ["send", "7", "hi"])
     assert result.exit_code != 0
-    assert "read-only" in result.output
+    assert "You can't write in this chat" in result.output
     assert "Traceback" not in result.output  # clean message, no raw traceback
+
+
+def test_send_surfaces_raw_forbidden_text(runner):
+    # #92: a non-read-only 403 (e.g. privacy) shows its real cause, not "read-only".
+    r, stub = runner
+    stub.send_text_raises = SendForbiddenError(
+        "The user's privacy settings do not allow you to do this"
+    )
+    result = r.invoke(cli_main.cli, ["send", "7", "hi"])
+    assert result.exit_code != 0
+    assert "privacy settings do not allow" in result.output
 
 
 # --- цикл 80: reply/forward/edit/delete/read команды ---
@@ -611,13 +624,16 @@ def test_chat_react_command_does_not_send_text(runner):
 
 def test_chat_send_forbidden_warns_and_keeps_session(runner):
     # F3: a SendForbiddenError on send must NOT crash the REPL — warn and continue.
+    # #92: the warning is Telegram's specific reason, not a fixed read-only line.
     r, stub = runner
     stub.listen_interrupt = False
-    stub.send_text_raises = SendForbiddenError("ChatWriteForbiddenError")
+    stub.send_text_raises = SendForbiddenError(
+        "A premium account is required to execute this action"
+    )
     # two lines then EOF: if the first send killed the session, the second wouldn't run
     result = r.invoke(cli_main.cli, ["chat", "7"], input="first\nsecond\n")
     assert result.exit_code == 0, result.output
-    assert "read-only" in result.output.lower() or "нельзя" in result.output
+    assert "premium account is required" in result.output
     assert stub.connected is False  # clean shutdown on EOF, not a crash
 
 
