@@ -1032,16 +1032,13 @@ async def _outbound_dialog(client, dialog_id: int):
 
 
 async def _readonly_error(client, dialog_id: int) -> HTMLResponse | None:
-    """Pre-flight read-only guard: a clean 403 fragment when the dialog can't be
-    posted to, else None. Reads the (cached) dialog list — no extra network call when
-    warm; an unknown dialog or a lookup failure stays permissive (the core
-    SendForbiddenError handler is the authoritative net, also covering a stale cache).
+    """Pre-flight read-only guard: a clean 403 fragment when the dialog can't be posted
+    to, else None. Delegates to the single capability resolver (#90, ``can_post_to``),
+    which reads the cached dialog list (no network when warm) and stays permissive on an
+    unknown dialog or a lookup failure — the core SendForbiddenError handler is the
+    authoritative net, also covering a stale cache.
     """
-    try:
-        dialog = await _outbound_dialog(client, dialog_id)
-    except DialogLookupError:
-        return None
-    if dialog is not None and not getattr(dialog, "can_send", True):
+    if not await client.can_post_to(dialog_id):
         return _error_response(READ_ONLY_MESSAGE, 403)
     return None
 

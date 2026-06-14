@@ -71,6 +71,16 @@ class WebStubClient:
             raise self.send_reaction_raises
         self.reactions.append((peer, message_id, emoticon))
 
+    async def can_post_to(self, dialog_id):
+        # mirrors StandaloneTelegramClient.can_post_to (#90): cached-list resolve,
+        # permissive on a dialogs() failure
+        from tg_messenger.core.search import can_send_in
+        try:
+            dialogs = await self.dialogs(dm_only=False)
+        except Exception:
+            return True
+        return can_send_in(dialogs, dialog_id)
+
     async def search_messages(self, peer, query, limit=20):
         self.searched.append((peer, query))
         return [Message(id=5, dialog_id=peer, sender_id=peer, out=False, text="found-it",
@@ -647,6 +657,20 @@ async def test_send_maps_send_forbidden_error_to_403():
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
             r = await ac.post("/send", data={"dialog_id": "7", "text": "hi"})
     assert r.status_code == 403
+
+
+async def test_send_permissive_when_dialog_lookup_fails():
+    # #90: can_post_to is fail-safe — if the dialog list is unavailable, the send is NOT
+    # blocked (the core SendForbiddenError net is the authoritative guard). The preflight
+    # must never turn a transient cache miss into a refusal.
+    stub = FailingDialogsClient()
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/send", data={"dialog_id": "7", "text": "hi"})
+    assert r.status_code == 200, r.text
+    assert stub.sent == [(7, "hi", None)]
 
 
 async def test_media_upload_unlink_failure_does_not_mask_response(monkeypatch, caplog):
