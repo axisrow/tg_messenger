@@ -652,19 +652,50 @@ class MessengerTUI(App):
                         logger.warning("TUI login succeeded but session save failed", exc_info=True)
             await self._load_dialogs()
             if self._store is not None:
+                # #112: store.connect() is a pre-startup await DURING which a tab switch can land
+                # (on_tabs_tab_activated only sets _tab, gated). The initial snapshot rendered above
+                # is for _loaded_tab; if the user switches to a different SOURCE (archive <-> the
+                # rest) while connect is pending, that stale population would sit under the loading
+                # spinner. Keep #dialogs empty + loading across the connect await so NO stale source
+                # is ever shown in this window; the reconcile below repopulates under the active tab
+                # once startup finishes. (clear() makes no network call, so the same-source
+                # no-refetch contract holds.)
+                lv = self.query_one("#dialogs", ListView)
+                await lv.clear()
+                lv.loading = True
                 await self._store.connect()
                 self.run_worker(self._run_store(), group="message-store", exclusive=False)
+                # repopulate under whatever tab is active now (it may have changed during connect)
+                if self._tab != self._loaded_tab and (self._tab == "archive") != (
+                    self._loaded_tab == "archive"
+                ):
+                    # cross-source switch: re-fetch under the active source (worker clears loading)
+                    self.run_worker(self._reload_dialogs(), group="dialogs", exclusive=True)
+                    self._started = True
+                    self.run_worker(self._drain_incoming(), exclusive=False)
+                    self.run_worker(self._drain_outgoing(), exclusive=False)
+                    self.run_worker(self._drain_reactions(), exclusive=False)
+                    return
+                # same source: re-project the already-fetched snapshot, then clear loading
+                await self._render_dialogs()
+                lv.loading = False
+                self._started = True
+                self.run_worker(self._drain_incoming(), exclusive=False)
+                self.run_worker(self._drain_outgoing(), exclusive=False)
+                self.run_worker(self._drain_reactions(), exclusive=False)
+                return
         except Exception as exc:
             logger.exception("TUI startup failed")
             self.exit(return_code=1, message=f"Startup failed: {exc}")
             return
+        # no store: the dialogs already loaded; clear loading and reconcile a pending switch once.
         self.query_one("#dialogs", ListView).loading = False
         self._started = True
         # #110 (Codex 4th pass): a tab switch during ANY pre-startup await (connect / login /
-        # _load_dialogs / store.connect) only set _tab — on_tabs_tab_activated returns under the
-        # _started gate and schedules no reload. Now that the gate is open, reconcile once: if the
-        # active tab's source differs from what the initial snapshot was loaded under, reload it;
-        # otherwise just re-project (same source, different tab — e.g. all→groups).
+        # _load_dialogs) only set _tab — on_tabs_tab_activated returns under the _started gate and
+        # schedules no reload. Now that the gate is open, reconcile once: if the active tab's source
+        # differs from what the initial snapshot was loaded under, reload it; otherwise just
+        # re-project (same source, different tab — e.g. all→groups).
         if self._tab != self._loaded_tab:
             if (self._tab == "archive") != (self._loaded_tab == "archive"):
                 self.run_worker(self._reload_dialogs(), group="dialogs", exclusive=True)

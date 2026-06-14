@@ -1423,6 +1423,31 @@ async def test_tui_pre_startup_switch_during_store_connect_reconciles_tab():
     assert app.return_code == 0
 
 
+async def test_tui_archive_switch_during_store_connect_never_shows_non_archived():
+    # #112: while store.connect() is still pending (post-load, pre-_started), a switch to Archive
+    # must NEVER expose the non-archived snapshot under the loading spinner. PR #111's reconcile
+    # fixes the FINAL state; this asserts the in-flight window too — no non-archive id is rendered
+    # while connect is pending, then the final state is the archived set.
+    stub = TuiStubClient()
+    store = SlowConnectStore()
+    app = MessengerTUI(client=stub, store=store)
+    non_archive_ids = {7, 8, -100200, -100300, 9}
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(store.connect_entered.wait(), 5)  # dialogs loaded; stuck in store.connect
+        app._tab = "archive"  # switch lands in the connect window
+        # while connect is still pending, the list must not show any non-archived ids
+        for _ in range(5):
+            await pilot.pause()
+            assert set(_listed_ids(app)).isdisjoint(non_archive_ids)
+            assert app._started is False
+        store.release.set()
+        await _pause_until(pilot, lambda: app._started)
+        await _pause_until(pilot, lambda: _listed_ids(app) == [10, -100400])
+        assert _listed_ids(app) == [10, -100400]
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
 async def test_tui_pre_startup_switch_to_same_source_tab_reconciles_projection():
     # #110 (Codex 4th pass): a same-source switch (all→groups) during store.connect must re-project
     # without a refetch when startup finishes.
