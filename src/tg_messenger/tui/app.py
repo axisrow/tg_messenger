@@ -13,6 +13,7 @@ import shlex
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -108,7 +109,36 @@ def _message_label(message, *, show_author: bool = False) -> str:
     base = f"[{message.id}] {message.text or '<media>'}"
     # #108: in groups/supergroups, an incoming message gets an author line ABOVE the text.
     # First line so it becomes part of MessageBubble._base_text (survives translation/reactions).
+    # #113: the author/body string CONTENT is unchanged (parity with web/CLI format_author and the
+    # [id] prefix the owner keeps); MessageBubble re-splits this and dims the author/[id] via Rich
+    # spans, so str(bubble.render()) stays byte-identical to this label.
     return f"{format_author(message)}\n{base}" if show_author else base
+
+
+def _split_author_body(text: str) -> tuple[str | None, str]:
+    """Split a MessageBubble label into (author_line, body).
+
+    The author line, when present (#108), is the first line and the body begins with the
+    ``[id]`` prefix — so an author is recognised only when a newline is followed by ``[``.
+    Returns ``(None, text)`` for a plain body (DMs, own/echo bubbles, media).
+    """
+    head, sep, tail = text.partition("\n[")
+    if sep:
+        return head, "[" + tail
+    return None, text
+
+
+def _split_id_prefix(body: str) -> tuple[str, str]:
+    """Split a body into its ``[id] `` prefix and the rest, for dimming the id (#113).
+
+    Returns ``("[id] ", rest)`` when the body opens with a ``[...] `` head, else ``("", body)``
+    so non-prefixed bodies (e.g. media echoes) pass through unstyled.
+    """
+    if body.startswith("["):
+        close = body.find("] ")
+        if close != -1:
+            return body[: close + 2], body[close + 2 :]
+    return "", body
 
 
 class ProfileItem(ListItem):
@@ -272,9 +302,16 @@ class DialogListView(ListView):
 
 class DialogItem(ListItem):
     def __init__(self, dialog_id: int, title: str, unread: int = 0, kind: str = "dm"):
-        # markup=False: titles/messages are untrusted text, [brackets] must render literally
-        badge = f" ({unread})" if unread else ""
-        super().__init__(Static(f"{dialog_id} — {title}{badge}", markup=False))
+        # #113: title-first for readability — the human-readable title leads, the unread badge
+        # is prominent, and the raw id is subdued (dim) and trailing. Built as a Rich Text so the
+        # untrusted title still renders literally ([brackets] never markup-parsed) while only the
+        # id segment carries a style — markup=False stays required.
+        t = Text()
+        t.append(title)
+        if unread:
+            t.append(f"  ({unread})")
+        t.append(f"  #{dialog_id}", style="dim")
+        super().__init__(Static(t, markup=False))
         self.dialog_id = dialog_id
         self.kind = kind
 
@@ -292,26 +329,43 @@ class MessageBubble(Static):
     def __init__(self, text: str, out: bool, message_id: int | None = None,
                  dialog_id: int | None = None):
         self._base_text = text
+        # #113: split the combined label into author line + body so each can be dimmed via Rich
+        # spans without re-enabling markup. The string CONTENT is unchanged, so str(render())
+        # stays byte-identical (content-equality tests survive); only styling is added.
+        self._author, self._body = _split_author_body(text)
         # the message this bubble can be reacted to; None for non-target bubbles.
         self.message_id = message_id
         # #102: the SOURCE dialog of this bubble (web #96 parity, data-dialog) — a reaction
         # targets it, not the globally-current dialog, so action_react is self-contained.
         self.dialog_id = dialog_id
-        # #106: translation + reactions are SEPARATE state composed by _render(), so neither
+        # #106: translation + reactions are SEPARATE state composed by _build(), so neither
         # clobbers the other regardless of arrival order (both rewrite the whole widget text).
         self._translation: str | None = None
         self._reactions: list[str] = []  # ordered by arrival; the "👍 ❤️ 🔥" line
-        super().__init__(text, classes="out" if out else "in", markup=False)
+        super().__init__(self._build(), classes="out" if out else "in", markup=False)
+
+    def _build(self) -> Text:
+        # #113: build the bubble as a Rich Text — author line dim, the "[id] " prefix dim, the
+        # message body literal (untrusted, never markup-parsed). Translation/reactions append as
+        # extra lines exactly as before. NOT named _render — Widget._render is reserved.
+        t = Text()
+        if self._author is not None:
+            t.append(self._author, style="dim")
+            t.append("\n")
+        prefix, rest = _split_id_prefix(self._body)
+        if prefix:
+            t.append(prefix, style="dim")
+        t.append(rest)
+        if self._translation is not None:
+            t.append("\n")
+            t.append(f"↳ {self._translation}")
+        if self._reactions:
+            t.append("\n")
+            t.append(" ".join(self._reactions))
+        return t
 
     def _recompose_text(self) -> None:
-        # NOT named _render — Textual's Widget._render is a reserved rendering hook; shadowing
-        # it breaks the widget. This just recomposes our own multi-line text via update().
-        parts = [self._base_text]
-        if self._translation is not None:
-            parts.append(f"↳ {self._translation}")
-        if self._reactions:
-            parts.append(" ".join(self._reactions))
-        self.update("\n".join(parts))
+        self.update(self._build())
 
     def show_translation(self, text: str) -> None:
         self._translation = text
@@ -428,10 +482,20 @@ class MessengerTUI(App):
     #sidebar { width: 32; max-width: 50%; border-right: solid $primary; }
     #chat { width: 1fr; min-width: 16; }
     #messages { overflow-y: auto; }
-    #messages MessageBubble { width: 100%; text-wrap: wrap; text-overflow: fold; }
-    #messages MessageBubble:focus { background: $boost; }
-    .out { color: $accent; text-align: right; }
-    .in { color: $text; }
+    /* #113: each message is a framed, shrink-wrapped card with vertical separation so a group
+       feed is no longer a wall of text. width:auto + max-width gives in/out asymmetry; margin
+       (integer — % does not parse in textual 8.x) separates consecutive bubbles. */
+    #messages MessageBubble {
+        width: auto; max-width: 80%; height: auto;
+        margin: 1 1; padding: 0 1;
+        border: round $panel;
+        text-wrap: wrap; text-overflow: fold;
+    }
+    #messages MessageBubble:focus { background: $boost; border: round $accent; }
+    /* incoming vs outgoing: distinct border + side offset, not color alone. Scoped under
+       #messages MessageBubble so they out-specify the base margin rule above (id+type+class). */
+    #messages MessageBubble.out { border: round $accent; margin: 1 1 1 20; }
+    #messages MessageBubble.in { border: round $panel; margin: 1 20 1 1; }
     #suggestion { color: $text-muted; height: auto; }
     #composer { dock: bottom; }
     """
