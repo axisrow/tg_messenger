@@ -189,15 +189,6 @@ def _message_div(m) -> str:
     )
 
 
-def _reaction_emoticon(emoticon: str | None) -> str:
-    return emoticon if emoticon is not None else "<custom>"
-
-
-def _reaction_div(message_id: int, emoticon: str | None) -> str:
-    body = f"reacted [{message_id}]: {escape(_reaction_emoticon(emoticon))}"
-    return f'<div class="msg reaction">{body}</div>'
-
-
 def _error_response(text: str, status_code: int) -> HTMLResponse:
     """The one escaped error-fragment shape every route returns."""
     return HTMLResponse(f'<div class="error">{escape(text)}</div>', status_code=status_code)
@@ -792,7 +783,10 @@ def build_app(
         await client.send_reaction(dialog_id, msg_id, emoticon)
         sent_reactions = _sent_bucket(request.app.state.sent_reactions_by_client, web_client_id)
         _remember_sent_reaction(sent_reactions, dialog_id, msg_id, emoticon)
-        return HTMLResponse(_reaction_div(msg_id, emoticon))
+        # #106: no body — the optimistic attach happens client-side (attachReaction in
+        # chat.html), the same code path the SSE reaction frame uses, so a reaction always
+        # renders UNDER its target message instead of as a separate bubble.
+        return HTMLResponse("", status_code=204)
 
     @app.post("/dialogs/{dialog_id}/media", response_class=HTMLResponse)
     async def upload_media(

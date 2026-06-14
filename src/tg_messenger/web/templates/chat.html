@@ -19,7 +19,8 @@
     .msg { max-width: 60%; margin: 4px 0; padding: 8px 12px; border-radius: 12px; }
     .msg.in { background: #eee; }
     .msg.out { background: #cfe9ff; margin-left: auto; }
-    .msg.reaction { background: #fff7d6; color: #6b5700; font-size: 13px; }
+    /* #106: reactions attach UNDER their message as one accumulating line, not a separate bubble */
+    .reactions { margin-top: 4px; font-size: 15px; }
     .translation { margin-top: 4px; color: #555; font-size: 13px; }
     .reply-btn, .react-btn { margin-left: 6px; border: none; background: transparent; cursor: pointer; font-size: 12px; }
     .reaction-palette { display: inline-flex; gap: 4px; margin-left: 6px; }
@@ -115,9 +116,8 @@
         const data = JSON.parse(ev.data);
         const div = document.createElement('div');
         if (data.type === 'reaction') {
-          div.className = 'msg reaction';
-          div.textContent = 'reaction [' + data.message_id + ']: ' + (data.emoticon || '<custom>');
-          document.getElementById('messages').appendChild(div);
+          // #106: attach under the reacted message (other people's reactions included), not a bubble
+          attachReaction(data.message_id, data.emoticon);
           return;
         }
         if (data.type === 'translation') {
@@ -213,6 +213,22 @@
         reactionToastTimer = null;
       }, 3000);
     }
+    // #106: attach a reaction UNDER its target message as one accumulating line (👍 ❤️ 🔥),
+    // mirroring how the translation frame appends a line under the message. Shared by the SSE
+    // reaction branch (other people's reactions) and the optimistic POST path (our own).
+    // Silently no-op when the target isn't in the visible history. Dedup so the same emoji
+    // isn't shown twice (our-own optimistic + live echo, or a re-add).
+    function attachReaction(messageId, emoticon) {
+      const msg = document.querySelector('.msg[data-id="' + CSS.escape(String(messageId)) + '"]');
+      if (!msg) return;
+      const label = emoticon || '<custom>';
+      let line = msg.querySelector('.reactions');
+      if (!line) { line = document.createElement('div'); line.className = 'reactions'; msg.appendChild(line); }
+      const shown = line.textContent ? line.textContent.split(' ') : [];
+      if (shown.includes(label)) return;
+      shown.push(label);
+      line.textContent = shown.join(' ');
+    }
     async function postReaction(messageId, emoticon, dialogId) {
       // #95: react to the dialog the clicked BUBBLE belongs to (dialogId), not the global
       // #dialog_id — which may already point to another chat if a switch is in flight while
@@ -228,19 +244,21 @@
         method: 'POST',
         body: fd
       });
-      const html = await resp.text();
       if (resp.ok) {
+        // #106: the server returns 204 (no body); the optimistic attach is client-side via the
+        // same attachReaction path the SSE frame uses, so the reaction lands UNDER its message.
         if (document.getElementById('dialog_id').value === dialogId) {
-          document.getElementById('messages').insertAdjacentHTML('beforeend', html);
+          attachReaction(messageId, emoticon);
         } else {
-          // #97: the reaction landed in a dialog the user has navigated away from. The echo
-          // bubble is (correctly, #95/#96) suppressed to avoid cross-dialog contamination, so
+          // #97: the reaction landed in a dialog the user has navigated away from. The in-pane
+          // attach is (correctly, #95/#96) suppressed to avoid cross-dialog contamination, so
           // confirm with a lightweight toast instead. Title is best-effort — neutral fallback.
           const title = dialogTitleById(dialogId);
           showToast(title ? ('Реакция в ' + title + ' ' + emoticon)
                           : ('Реакция отправлена ' + emoticon));
         }
       } else {
+        const html = await resp.text();
         const doc = new DOMParser().parseFromString(html, 'text/html');
         document.getElementById('suggest-error').textContent =
           (doc.body.textContent || '').trim() || 'Reaction failed.';
