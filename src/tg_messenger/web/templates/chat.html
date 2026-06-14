@@ -139,13 +139,11 @@
         div.dataset.id = data.id;
         div.dataset.dialog = id;  // #95: bind the bubble to this stream's dialog (race-safe)
         // #108: author line above the text for an INCOMING message in a group/supergroup.
-        // Kind is read from the active dialog's <li data-kind> (set by _dialog_li) — no
-        // server round-trip. textContent keeps user-controlled author fields XSS-safe.
-        const liKind = (() => {
-          const li = document.querySelector('#dialogs li[data-dialog="' + CSS.escape(String(id)) + '"]');
-          return li ? li.dataset.kind : null;
-        })();
-        if (!data.out && liKind === 'group') {
+        // The group flag comes from the SSE frame (server resolved it once from the cached
+        // dialog list, Codex review) — NOT from the #dialogs sidebar, which a tab switch /
+        // search can replace while this stream stays live. textContent keeps the user-controlled
+        // author fields XSS-safe.
+        if (!data.out && data.is_group) {
           const author = document.createElement('div');
           author.className = 'author';
           author.textContent = authorLine(data.sender_id, data.sender);

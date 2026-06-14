@@ -179,6 +179,36 @@ async def test_message_store_round_trips_sender(tmp_path):
     assert by_id[1].sender_id == 5  # bare id still present
 
 
+async def test_message_store_preserves_author_on_sender_none_reupsert(tmp_path):
+    # #108 (Codex review): raw.sender is best-effort — a later live ingest / history re-sync of
+    # the SAME message can arrive with sender=None (cold session / evicted entity). The upsert
+    # must NOT NULL a previously-resolved author back to a bare id (COALESCE preserve, mirroring
+    # the translation-preserve pattern). Drive it through the public ingest() path.
+    storage = await _storage(tmp_path)
+    store = MessageStore(client=StoreClient(), storage=storage)
+    enriched = Message(
+        id=21, dialog_id=-100200, sender_id=9, out=False, text="hi",
+        date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        sender=User(id=9, username="bob", first_name="Bob", last_name="Lee"),
+    )
+    try:
+        await store.ingest(enriched)
+        # the same (dialog_id, id) re-ingested WITHOUT a resolved sender — must not erase author
+        bare = Message(
+            id=21, dialog_id=-100200, sender_id=9, out=False, text="hi",
+            date=datetime(2024, 1, 1, tzinfo=timezone.utc), sender=None,
+        )
+        await store.ingest(bare)
+        rows = await storage.fetchall(
+            "SELECT sender_username, sender_first_name, sender_last_name "
+            "FROM messages WHERE dialog_id = ? AND id = ?",
+            (-100200, 21),
+        )
+    finally:
+        await store.close()
+    assert rows == [("bob", "Bob", "Lee")]  # author survived the sender=None re-upsert
+
+
 async def test_message_store_resets_window_on_possible_gap(tmp_path):
     t = {"now": 0.0}
     client = StoreClient()

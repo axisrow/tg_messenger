@@ -299,6 +299,11 @@ async def sse_event_stream(
     """
     sent_ids = sent_ids if sent_ids is not None else OrderedDict()
     sent_reactions = sent_reactions if sent_reactions is not None else OrderedDict()
+    # #108 (Codex review): resolve the dialog kind ONCE from the #8 cached dialog list (network-
+    # free, no get_entity) — the stream's dialog_id is fixed, so the author-line decision is
+    # carried in each frame instead of re-derived client-side from the mutable #dialogs sidebar
+    # (a tab switch / search replaces those <li>s while this stream stays live → author dropped).
+    is_group = (await _dialog_kind(client, dialog_id)) == "group"
     # Merge incoming, outgoing and reaction streams by racing their __anext__
     # coroutines. The iterators are created here, before the first await, so an
     # EventBus subscription is live by the time anything is published.
@@ -371,12 +376,13 @@ async def sse_event_stream(
                 out = kind == "outgoing"
                 if out and (ev.dialog_id, ev.message.id) in sent_ids:
                     continue  # our own optimistic bubble already shows it
-                # #108: carry the author so the client can render the author line for a group
-                # incoming message (it reads dialog kind from the active <li data-kind>).
+                # #108: carry the author AND the group flag so the client renders the author line
+                # without re-deriving kind from the mutable #dialogs sidebar (resolved once above).
                 payload = {
                     "id": ev.message.id,
                     "text": ev.message.text,
                     "out": out,
+                    "is_group": is_group,
                     "sender_id": ev.message.sender_id,
                     "sender": ev.message.sender.model_dump() if ev.message.sender else None,
                 }

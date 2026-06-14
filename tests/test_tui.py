@@ -1300,6 +1300,28 @@ async def test_tui_group_incoming_shows_full_author_line():
     assert [str(b.render()) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
 
 
+async def test_tui_group_author_survives_tab_switch_dropping_dialog_from_list():
+    # #108 (Codex review): the author line must keep rendering for the OPEN group after a tab
+    # switch removed that group from _all_dialogs (the snapshot is the current tab's subset). The
+    # kind captured at selection time (_current_kind) drives it, not a fresh _all_dialogs lookup.
+    stub = GroupSenderEventClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # open the group the way on_list_view_selected does: current id + kind captured while present
+        app._current = -100200
+        app._current_kind = "group"
+        # a tab switch reloads _all_dialogs with another tab's subset — the group is now ABSENT,
+        # so a fresh _dialog_kind(-100200) would return None and drop the author line
+        app._all_dialogs = [d for d in app._all_dialogs if d.id != -100200]
+        assert app._dialog_kind(-100200) is None  # confirm the group really left the list
+        stub.fire.set()
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+    # the author line is still rendered, driven by the captured _current_kind
+    assert [str(b.render()) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
+
+
 async def test_tui_dm_incoming_has_no_author_line():
     # #108: in a DM the author is obvious — no author line even for incoming.
     stub = GroupSenderEventClient()  # reuse, but open a DM dialog instead

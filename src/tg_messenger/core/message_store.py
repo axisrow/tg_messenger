@@ -372,9 +372,16 @@ class MessageStore:
             "ON CONFLICT(dialog_id, id) DO UPDATE SET "
             "sender_id = excluded.sender_id, out = excluded.out, date = excluded.date, "
             "text = excluded.text, media = excluded.media, reply_to_id = excluded.reply_to_id, "
-            "is_forward = excluded.is_forward, sender_username = excluded.sender_username, "
-            "sender_first_name = excluded.sender_first_name, "
-            f"sender_last_name = excluded.sender_last_name, {update_translation}",
+            # #108 (Codex review): preserve a resolved author across a later sender=None
+            # re-upsert. raw.sender is best-effort — a cold-session/evicted re-sync of the same
+            # message can arrive with sender=None, and an unconditional overwrite would NULL the
+            # stored "@username First Last" back to a bare id. COALESCE keeps the existing value
+            # when the incoming one is NULL (mirrors the translated_text preserve pattern above);
+            # a genuinely changed author (non-NULL incoming) still writes through.
+            "is_forward = excluded.is_forward, "
+            "sender_username = COALESCE(excluded.sender_username, messages.sender_username), "
+            "sender_first_name = COALESCE(excluded.sender_first_name, messages.sender_first_name), "
+            f"sender_last_name = COALESCE(excluded.sender_last_name, messages.sender_last_name), {update_translation}",
             (
                 int(message.dialog_id),
                 int(message.id),
@@ -429,8 +436,12 @@ async def upsert_message_for_translation(storage, message: Message) -> None:
         "ON CONFLICT(dialog_id, id) DO UPDATE SET "
         "sender_id = excluded.sender_id, out = excluded.out, date = excluded.date, "
         "text = excluded.text, media = excluded.media, reply_to_id = excluded.reply_to_id, "
-        "is_forward = excluded.is_forward, sender_username = excluded.sender_username, "
-        "sender_first_name = excluded.sender_first_name, sender_last_name = excluded.sender_last_name, "
+        # #108 (Codex review): COALESCE so a sender=None translation upsert never NULLs a
+        # previously-resolved author (mirrors _upsert_message; raw.sender is best-effort).
+        "is_forward = excluded.is_forward, "
+        "sender_username = COALESCE(excluded.sender_username, messages.sender_username), "
+        "sender_first_name = COALESCE(excluded.sender_first_name, messages.sender_first_name), "
+        "sender_last_name = COALESCE(excluded.sender_last_name, messages.sender_last_name), "
         "translated_text = CASE WHEN messages.text IS excluded.text THEN messages.translated_text ELSE NULL END, "
         "translated_lang = CASE WHEN messages.text IS excluded.text THEN messages.translated_lang ELSE NULL END",
         (

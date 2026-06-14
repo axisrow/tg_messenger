@@ -898,8 +898,8 @@ async def test_stream_yields_group_frame():
     frame = await asyncio.wait_for(task, timeout=2)
     import json
     payload = json.loads(frame.removeprefix("data: ").strip())
-    assert payload == {"id": 11, "text": "в группе", "out": False,
-                       "sender_id": 9, "sender": None}  # #108: sender в фрейме
+    assert payload == {"id": 11, "text": "в группе", "out": False, "is_group": True,
+                       "sender_id": 9, "sender": None}  # #108: sender + group flag в фрейме
     await gen.aclose()
 
 
@@ -923,8 +923,8 @@ async def test_stream_yields_outgoing_frame_for_own_message_from_another_device(
 
     frame = await asyncio.wait_for(task, timeout=2)
     payload = json.loads(frame.removeprefix("data: ").strip())
-    assert payload == {"id": 42, "text": "с телефона", "out": True,
-                       "sender_id": 1, "sender": None}  # #108
+    assert payload == {"id": 42, "text": "с телефона", "out": True, "is_group": False,
+                       "sender_id": 1, "sender": None}  # #108 (dialog 7 = DM)
     await gen.aclose()
 
 
@@ -1101,8 +1101,8 @@ async def test_stream_skips_outgoing_echo_of_messages_we_sent():
     frame = await asyncio.wait_for(task, timeout=2)
     payload = json.loads(frame.removeprefix("data: ").strip())
     # эхо (id=42) пропущено, пришло следующее своё сообщение (id=43)
-    assert payload == {"id": 43, "text": "новое", "out": True,
-                       "sender_id": 1, "sender": None}  # #108
+    assert payload == {"id": 43, "text": "новое", "out": True, "is_group": False,
+                       "sender_id": 1, "sender": None}  # #108 (dialog 7 = DM)
     await gen.aclose()
 
 
@@ -1128,8 +1128,8 @@ async def test_stream_does_not_skip_same_message_id_from_other_dialog():
 
     frame = await asyncio.wait_for(task, timeout=2)
     payload = json.loads(frame.removeprefix("data: ").strip())
-    assert payload == {"id": 42, "text": "same id", "out": True,
-                       "sender_id": 1, "sender": None}  # #108
+    assert payload == {"id": 42, "text": "same id", "out": True, "is_group": False,
+                       "sender_id": 1, "sender": None}  # #108 (dialog 7 = DM)
     await gen.aclose()
 
 
@@ -1160,8 +1160,8 @@ async def test_stream_does_not_skip_message_sent_by_other_web_client():
 
         frame = await asyncio.wait_for(task, timeout=2)
         payload = json.loads(frame.removeprefix("data: ").strip())
-        assert payload == {"id": 2, "text": "from a", "out": True,
-                           "sender_id": 1, "sender": None}  # #108
+        assert payload == {"id": 2, "text": "from a", "out": True, "is_group": False,
+                           "sender_id": 1, "sender": None}  # #108 (dialog 7 = DM)
         await gen.aclose()
 
 
@@ -2045,9 +2045,13 @@ async def test_index_has_author_line_plumbing(client_app):
     ac, _ = client_app
     r = await ac.get("/")
     assert "function authorLine(" in r.text  # the JS formatter mirrors format_author
-    assert "li.dataset.kind" in r.text  # kind read from the active dialog <li>
     assert "author.textContent = authorLine(" in r.text  # XSS-safe via textContent
     assert "class=\"author\"" in r.text or "'author'" in r.text
+    # #108 (Codex review): the live author decision comes from the SSE frame's is_group flag,
+    # NOT a #dialogs <li data-kind> lookup — a tab switch/search can replace those <li>s while
+    # the stream stays live, which would drop the author line.
+    assert "data.is_group" in r.text  # the SSE-carried group flag drives the author line
+    assert "li.dataset.kind" not in r.text  # the mutable-sidebar lookup is gone
 
 
 async def test_reaction_routes_to_path_dialog_not_global(client_app):
