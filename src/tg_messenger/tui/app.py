@@ -293,11 +293,15 @@ class MessageBubble(Static):
         Binding("r", "react", "React", show=False),
     ]
 
-    def __init__(self, text: str, out: bool, message_id: int | None = None):
+    def __init__(self, text: str, out: bool, message_id: int | None = None,
+                 dialog_id: int | None = None):
         self._base_text = text
         # the message this bubble can be reacted to; None for reaction-echo bubbles,
         # which are not themselves reaction targets.
         self.message_id = message_id
+        # #102: the SOURCE dialog of this bubble (web #96 parity, data-dialog) — a reaction
+        # targets it, not the globally-current dialog, so action_react is self-contained.
+        self.dialog_id = dialog_id
         super().__init__(text, classes="out" if out else "in", markup=False)
 
     def show_translation(self, text: str) -> None:
@@ -319,10 +323,12 @@ class MessageBubble(Static):
             siblings[target].focus()
 
     def action_react(self) -> None:
-        if self.message_id is None or self.app._current is None:
-            return  # reaction-echo bubble, or no dialog open — nothing to react to
+        # #102: react on the bubble's OWN source dialog, not the globally-current one —
+        # parity with web #96 and self-contained (no app-global read).
+        if self.message_id is None or self.dialog_id is None:
+            return  # reaction-echo bubble, or no source dialog — nothing to react to
         self.app.run_worker(
-            self.app._react_from_bubble(self.app._current, self.message_id)
+            self.app._react_from_bubble(self.dialog_id, self.message_id)
         )
 
 
@@ -761,7 +767,7 @@ class MessengerTUI(App):
         bubbles = []
         self._bubble_index.clear()
         for m in messages:
-            bubble = MessageBubble(_message_label(m), m.out, message_id=m.id)
+            bubble = MessageBubble(_message_label(m), m.out, message_id=m.id, dialog_id=dialog_id)
             if m.translated_text:
                 bubble.show_translation(m.translated_text)
             self._bubble_index[m.id] = bubble
@@ -1039,7 +1045,7 @@ class MessengerTUI(App):
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            bubble = MessageBubble(_message_label(msg), out=True, message_id=msg.id)
+            bubble = MessageBubble(_message_label(msg), out=True, message_id=msg.id, dialog_id=peer)
             if msg.translated_text:
                 bubble.show_translation(msg.translated_text)
             self._bubble_index[msg.id] = bubble
@@ -1068,7 +1074,7 @@ class MessengerTUI(App):
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            bubble = MessageBubble(_message_label(msg), out=True, message_id=msg.id)
+            bubble = MessageBubble(_message_label(msg), out=True, message_id=msg.id, dialog_id=peer)
             self._bubble_index[msg.id] = bubble
             await pane.mount(bubble)
             self._scroll_messages_to_end(pane)
@@ -1106,7 +1112,8 @@ class MessengerTUI(App):
             pane = self.query_one("#messages", Vertical)
             # message_id=None: a reaction-echo bubble is not itself a reaction target (#93)
             await pane.mount(
-                MessageBubble(f"reaction [{message_id}]: {emoticon}", out=True, message_id=None)
+                MessageBubble(f"reaction [{message_id}]: {emoticon}", out=True,
+                              message_id=None, dialog_id=peer)
             )
             self._scroll_messages_to_end(pane)
 
@@ -1117,7 +1124,7 @@ class MessengerTUI(App):
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
                     bubble = MessageBubble(_message_label(ev.message), out=False,
-                                           message_id=ev.message.id)
+                                           message_id=ev.message.id, dialog_id=ev.dialog_id)
                     self._bubble_index[ev.message.id] = bubble
                     await pane.mount(bubble)
                     if ev.message.translated_text:
@@ -1154,7 +1161,7 @@ class MessengerTUI(App):
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
                     bubble = MessageBubble(_message_label(ev.message), out=True,
-                                           message_id=ev.message.id)
+                                           message_id=ev.message.id, dialog_id=ev.dialog_id)
                     self._bubble_index[ev.message.id] = bubble
                     await pane.mount(bubble)
                     if ev.message.translated_text:
@@ -1179,7 +1186,8 @@ class MessengerTUI(App):
                     continue  # our own optimistic bubble already shows it
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    await pane.mount(MessageBubble(_reaction_label(ev), out=False, message_id=None))
+                    await pane.mount(MessageBubble(_reaction_label(ev), out=False,
+                                                  message_id=None, dialog_id=ev.dialog_id))
                     self._scroll_messages_to_end(pane)
         except Exception:
             logger.exception("reaction listener failed")

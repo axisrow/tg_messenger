@@ -745,6 +745,30 @@ async def test_tui_react_hotkey_sends_reaction():
     assert stub.reactions == [(7, 1, "👍")]
 
 
+async def test_tui_react_targets_bubble_dialog_not_current():
+    # #102: a reaction targets the bubble's OWN source dialog (web #96 parity), not the
+    # globally-current dialog — even if _current has since moved to another chat.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+
+    async def pick(screen):
+        return "👍"
+
+    app.push_screen_wait = pick  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)  # bubble gets dialog_id=7
+        await pilot.pause()
+        bubble = list(app.query(MessageBubble))[0]
+        assert bubble.dialog_id == 7 and bubble.message_id == 1
+        app._current = -100300  # navigate away — the global current is now a DIFFERENT dialog
+        bubble.focus()
+        await pilot.press("r")
+        await _pause_until(pilot, lambda: bool(stub.reactions))
+    assert stub.reactions == [(7, 1, "👍")]  # reaction went to the bubble's dialog, not -100300
+
+
 async def test_tui_react_picker_cancel_sends_nothing():
     # #93: dismissing the picker (Escape → None) sends no reaction.
     stub = TuiStubClient()
