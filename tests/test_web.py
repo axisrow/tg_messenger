@@ -23,6 +23,7 @@ class WebStubClient:
         self.read_acks = []
         self.channel_can_send = True  # flip to False to simulate a read-only channel
         self.send_text_raises = None  # set to an exception to exercise the TOCTOU net
+        self.send_reaction_raises = None  # set to an exception for the reaction TOCTOU net
 
     async def connect(self):
         pass
@@ -66,6 +67,8 @@ class WebStubClient:
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
     async def send_reaction(self, peer, message_id, emoticon):
+        if self.send_reaction_raises is not None:
+            raise self.send_reaction_raises
         self.reactions.append((peer, message_id, emoticon))
 
     async def search_messages(self, peer, query, limit=20):
@@ -576,7 +579,9 @@ async def test_send_to_readonly_channel_returns_403():
     assert stub.sent == []
 
 
-async def test_reaction_in_readonly_channel_returns_403():
+async def test_reaction_in_readonly_channel_succeeds():
+    # #86: reactions are NOT gated by posting permission — a read-only broadcast channel
+    # can still be reacted to. The composer is disabled for text, but reacting goes through.
     stub = WebStubClient()
     stub.channel_can_send = False
     app = build_app(client=stub)
@@ -585,8 +590,24 @@ async def test_reaction_in_readonly_channel_returns_403():
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
             r = await ac.post("/dialogs/-100123/reaction",
                               data={"message_id": "5", "emoticon": "👍"})
+    assert r.status_code == 200, r.text
+    assert stub.reactions == [(-100123, 5, "👍")]
+
+
+async def test_reaction_maps_send_forbidden_error_to_403():
+    # #86: with no pre-flight, a channel that truly forbids reacting surfaces via the
+    # global SendForbiddenError handler as a clean 403 — never a 500.
+    from tg_messenger.core.client import SendForbiddenError
+
+    stub = WebStubClient()
+    stub.send_reaction_raises = SendForbiddenError("ChatWriteForbiddenError")
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/dialogs/7/reaction",
+                              data={"message_id": "1", "emoticon": "👍"})
     assert r.status_code == 403
-    assert stub.reactions == []
 
 
 async def test_media_in_readonly_channel_returns_403_without_temp_file(monkeypatch):
@@ -1830,11 +1851,25 @@ async def test_index_has_suggest_button(suggest_app):
 
 
 async def test_index_has_reaction_controls(client_app):
+    # #86: the composer-overloading standalone reaction form is gone; reactions are now
+    # per-message buttons with a small preset palette (the JS plumbing must be present).
     ac, _ = client_app
     r = await ac.get("/")
-    assert 'id="reaction-form"' in r.text
-    assert 'name="message_id"' in r.text
-    assert 'name="emoticon"' in r.text
+    assert 'id="reaction-form"' not in r.text  # the standalone form was removed
+    assert "react-btn" in r.text  # per-message react button class is referenced
+    assert "reaction-palette" in r.text  # the preset palette plumbing
+
+
+def test_message_div_has_react_button():
+    # #86: every server-rendered bubble carries a per-message react button keyed by id.
+    from tg_messenger.web.app import _message_div
+
+    html = _message_div(
+        Message(id=42, dialog_id=7, sender_id=7, out=False, text="hi",
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    )
+    assert 'data-react="42"' in html
+    assert "react-btn" in html
 
 
 # --- циклы 131-132: web-мастер логина Telegram (/tg-login) ---
