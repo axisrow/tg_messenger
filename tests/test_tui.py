@@ -1232,6 +1232,51 @@ async def test_tui_unread_tab_drops_dialog_that_became_read_on_live_message():
         assert _listed_ids(app) == [-100200]
 
 
+class ReadToUnreadClient(TuiStubClient):
+    """A live message arrives for a NON-open, initially-read dialog (id=7)."""
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        dms = [
+            Dialog(id=7, title="Ann", username="ann", unread=0, is_contact=True),
+            Dialog(id=8, title="Stranger", username="stranger", unread=3, is_contact=False),
+        ]
+        if dm_only:
+            return dms
+        return dms
+
+    async def listen_all(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield IncomingEvent(
+            dialog_id=7,
+            message=Message(id=22, dialog_id=7, sender_id=7, out=False, text="fresh", date=date),
+        )
+        await asyncio.Event().wait()
+
+
+async def test_tui_unread_tab_surfaces_dialog_that_became_unread_on_live_message():
+    # #110 (Codex re-review): a live message for a NON-open, initially-read dialog must SURFACE on
+    # the open "Непрочитанные" tab without a reload — the live touch updates the full snapshot, and
+    # the tab projection re-includes it.
+    stub = ReadToUnreadClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).active = "unread"
+        await pilot.pause()
+        assert _listed_ids(app) == [8]  # only Stranger is unread at load time (Ann is read)
+        app._current = 8  # a DIFFERENT dialog is open, so the message for 7 increments its unread
+        stub.fire.set()
+        await pilot.pause()
+        # Ann (7) just became unread → it must appear on the unread tab live
+        assert set(_listed_ids(app)) == {7, 8}
+
+
 async def test_tui_archive_tab_lists_archived_dialogs():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
@@ -1284,6 +1329,25 @@ async def test_tui_tab_activation_before_startup_is_safe():
         await pilot.pause()
         assert stub.dialogs_calls == 0  # клиент ещё не готов — запроса не было
         assert app.return_code is None  # и приложение живо
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
+async def test_tui_tab_switch_clears_search_even_before_startup():
+    # #110 (Codex re-review): a tab switch during a slow connect must still clear #search, so when
+    # startup finishes it does not render the picked tab with a stale query (the pre-startup path).
+    stub = TuiStubClient()
+    connect_entered = asyncio.Event()
+    stub.connect = hangs_forever(connect_entered)
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(connect_entered.wait(), 5)
+        await pilot.pause()
+        app.query_one("#search", Input).value = "zzz"  # user typed during the slow connect
+        app.query_one(Tabs).active = "groups"
+        await pilot.pause()
+        assert app.query_one("#search", Input).value == ""  # cleared even though _started is False
+        assert stub.dialogs_calls == 0  # still no network — the worker is gated by _started
         await pilot.press("ctrl+c")
     assert app.return_code == 0
 

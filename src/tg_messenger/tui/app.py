@@ -453,14 +453,16 @@ class MessengerTUI(App):
         # so the in-app picker, not a CLI menu, resolves the profile. None = library path.
         self._deps_factory = deps_factory
         self._current: int | None = None
-        # #108 (Codex review): the open dialog's kind, captured at selection time while its <li>
-        # is guaranteed in _all_dialogs. _all_dialogs is replaced with the current tab's subset on
-        # a tab switch, so re-querying _dialog_kind for a live message could drop the author line
-        # if the user switched tabs after opening the group — read this stable value instead.
+        # #108 (Codex review): the open dialog's kind, captured at selection time as a stable value
+        # for the author-line decision (read by _kind_for_rendering). Since #110 _all_dialogs is the
+        # full snapshot (a dialog no longer drops out on a tab switch), but keeping the captured kind
+        # is still the cheapest correct source and harmless.
         self._current_kind: str | None = None
         self._tab = "all"
         self._started = False  # gates tab events until _startup finished
-        self._all_dialogs: list = []  # full loaded list; search filters it locally
+        # #110: the FULL source snapshot (every non-archived dialog, or the archived set on the
+        # archive tab) — NOT a tab subset. _render_dialogs projects it via _filter_by_tab + search.
+        self._all_dialogs: list = []
         self._suggester = suggester
         self._store = store
         self._translator = translator
@@ -677,11 +679,12 @@ class MessengerTUI(App):
             logger.exception("message store task failed")
 
     def _filter_by_tab(self, dialogs: list) -> list:
-        """Tab-specific subset of an already-fetched, non-archived dialog list (#110 bug #4).
+        """Project the full dialog snapshot down to the active tab (#110 bug #4).
 
-        Pure (no network). Shared by _load_dialogs (initial fetch) AND _render_dialogs, so a
-        dialog whose unread was zeroed by a live message no longer lingers on the 'unread' tab.
-        'all'/'archive' are already the correct set (archive uses a separate endpoint).
+        Pure (no network). The ONLY place the tab subset is computed — applied in _render_dialogs
+        on every redraw over the full _all_dialogs snapshot, so a live touch that flips a dialog
+        read<->unread surfaces/drops it on the 'unread' tab without a reload. 'all' and 'archive'
+        pass through unchanged (archive's snapshot already is the archived set).
         """
         if self._tab == "contacts":
             return [d for d in dialogs if d.kind == "dm" and d.is_contact is True]
@@ -695,20 +698,23 @@ class MessengerTUI(App):
         return dialogs
 
     async def _load_dialogs(self) -> None:
+        # #110 (Codex re-review): _all_dialogs holds the FULL source snapshot (every non-archived
+        # dialog, or the archived set on the archive tab) — NOT the tab projection. _render_dialogs
+        # projects it through _filter_by_tab, so a live touch that flips a dialog read<->unread is
+        # reflected on the unread tab without a reload (the dialog stays in the snapshot either way).
         if self._tab == "archive":
             archived_dialogs = getattr(self._client, "archived_dialogs", None)
             items = [] if archived_dialogs is None else await archived_dialogs()
         else:
-            all_dialogs = [dialog for dialog in await self._client.dialogs(dm_only=False) if not dialog.archived]
-            items = self._filter_by_tab(all_dialogs)
-        self._all_dialogs = list(items)  # keep the full list for local search
+            items = [dialog for dialog in await self._client.dialogs(dm_only=False) if not dialog.archived]
+        self._all_dialogs = list(items)  # full source snapshot; _render_dialogs applies the tab filter
         await self._render_dialogs()
 
     async def _render_dialogs(self) -> None:
-        """Redraw the dialog list from the cached full list, applying the search filter.
+        """Redraw the dialog list: project the full snapshot to the tab, then the search filter.
 
-        Local and network-free: filtering happens over ``self._all_dialogs`` (already
-        fetched), never re-querying the client.
+        Local and network-free: ``_filter_by_tab`` + ``filter_dialogs`` run over the already-fetched
+        ``self._all_dialogs`` snapshot, never re-querying the client.
         """
         from tg_messenger.core.search import filter_dialogs
 
@@ -717,8 +723,8 @@ class MessengerTUI(App):
         selected_id = None
         if isinstance(lv.highlighted_child, DialogItem):
             selected_id = lv.highlighted_child.dialog_id
-        # #110: re-apply the tab filter so a live unread→0 touch drops the dialog from "unread"
-        # (idempotent for every other tab — _all_dialogs is already the tab's subset).
+        # #110: project the full snapshot to the active tab here, so a live touch flipping a dialog
+        # unread<->read drops/surfaces it on the "unread" tab without a reload.
         filtered = list(filter_dialogs(self._filter_by_tab(self._all_dialogs), query))
         await lv.clear()
         for d in filtered:
@@ -753,11 +759,13 @@ class MessengerTUI(App):
         # (NOT named _ready: Textual's App already has a _ready coroutine.)
         # Network goes through a worker: awaiting here would stall the message pump.
         self._tab = event.tab.id or "all"
+        # #110 (Codex re-review): clear a stale search filter BEFORE the _started guard — it needs
+        # no network, and a tab switch during a slow connect would otherwise render the picked tab
+        # with the old query still applied (the same empty-tab failure on the pre-startup path).
+        # #search exists from compose(); resetting an already-empty value is a no-op.
+        self.query_one("#search", Input).value = ""
         if not self._started:
             return
-        # #110: a stale search filter must not leak onto the new tab (it would make a tab
-        # with no match look empty). Resetting an already-empty value is a no-op.
-        self.query_one("#search", Input).value = ""
         self.run_worker(self._reload_dialogs(), group="dialogs", exclusive=True)
 
     async def _reload_dialogs(self) -> None:
