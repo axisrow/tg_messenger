@@ -679,8 +679,9 @@ def build_app(
     @app.exception_handler(SendForbiddenError)
     async def send_forbidden(request: Request, exc: SendForbiddenError):
         # TOCTOU net: the can_send flag (cached) said OK but Telegram rejected on rights.
+        # Surface Telegram's specific reason (already cleaned in core, #92), not a fixed line.
         logger.warning("send rejected (rights): %s %s", request.url.path, exc)
-        return _error_response(READ_ONLY_MESSAGE, 403)
+        return _error_response(str(exc), 403)
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception):

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
@@ -69,12 +70,15 @@ class MessageDeleteValidationError(ValueError):
 
 class SendForbiddenError(ValueError):
     """Raised by the send wrappers when Telegram rejects a write on a rights basis
-    (read-only channel, banned/restricted member, admin required).
+    (read-only channel, banned/restricted member, admin required, premium-only,
+    privacy settings).
 
-    A ``ValueError`` subclass so the UIs map ONE error type to a clean "you can't
-    post here" message — mirroring ``MessageDeleteValidationError``. The ``can_send``
-    dialog flag pre-disables the composer; this is the authoritative TOCTOU net when
-    the (cached) flag is stale. Slow-mode is NOT folded in here — it's transient.
+    A ``ValueError`` subclass carrying the CLEAN Telegram reason (its ``(caused by
+    ...)`` trailer stripped by ``_forbidden_message``) so each UI can surface the
+    SPECIFIC cause at send time instead of a fixed generic line — mirroring
+    ``MessageDeleteValidationError``. The ``can_send`` dialog flag pre-disables the
+    composer; this is the authoritative TOCTOU net when the (cached) flag is stale.
+    Slow-mode is NOT folded in here — it's transient.
     """
 
 
@@ -101,6 +105,21 @@ _SEND_FORBIDDEN_BADREQUEST = (
     VoiceMessagesForbiddenError,
 )
 _SEND_FORBIDDEN_ERRORS = (ForbiddenError, *_SEND_FORBIDDEN_BADREQUEST)
+
+# Telethon appends a technical " (caused by <ReqType>)" trailer to its rights errors
+# (e.g. "You can't write in this chat (caused by NoneType)"). It's noise, not meaning —
+# strip it so SendForbiddenError carries the clean human sentence Telegram gave (#92).
+_CAUSED_BY_SUFFIX = re.compile(r"\s*\(caused by [^)]*\)\s*$")
+
+
+def _forbidden_message(exc: BaseException) -> str:
+    """Clean human text for a rights rejection: Telethon's ``str(exc)`` with the
+    technical ``(caused by ...)`` trailer stripped. Falls back to READ_ONLY_MESSAGE if
+    the cleaned text is empty, so every UI site can surface it verbatim and never show a
+    blank error.
+    """
+    cleaned = _CAUSED_BY_SUFFIX.sub("", str(exc)).strip()
+    return cleaned or READ_ONLY_MESSAGE
 
 
 def is_channel_or_megagroup_id(peer: int) -> bool:
@@ -464,7 +483,7 @@ class StandaloneTelegramClient:
                 operation="send_text",
             )
         except _SEND_FORBIDDEN_ERRORS as exc:
-            raise SendForbiddenError(str(exc)) from exc
+            raise SendForbiddenError(_forbidden_message(exc)) from exc
         self._invalidate_history(peer)  # the new message must show on reopen
         return self._to_message(msg, dialog_id=int(peer))
 
@@ -676,7 +695,7 @@ class StandaloneTelegramClient:
                 operation="send_media",
             )
         except _SEND_FORBIDDEN_ERRORS as exc:
-            raise SendForbiddenError(str(exc)) from exc
+            raise SendForbiddenError(_forbidden_message(exc)) from exc
         self._invalidate_history(peer)
         return self._to_message(msg, dialog_id=int(peer))
 
@@ -694,7 +713,7 @@ class StandaloneTelegramClient:
                 operation="send_reaction",
             )
         except _SEND_FORBIDDEN_ERRORS as exc:
-            raise SendForbiddenError(str(exc)) from exc
+            raise SendForbiddenError(_forbidden_message(exc)) from exc
 
     def typing(self, peer: int):
         """Async context manager: show the 'typing…' chat action while the body runs.

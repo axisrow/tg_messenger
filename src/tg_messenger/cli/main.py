@@ -392,10 +392,9 @@ def _run(coro, session: str = "default"):
     except MessageDeleteValidationError as exc:
         raise click.ClickException(str(exc)) from exc
     except SendForbiddenError as exc:
+        # surface Telegram's specific reason (already cleaned in core, #92), not a fixed line
         logger.warning("send rejected (rights): %s", exc)
-        raise click.ClickException(
-            "This chat is read-only — you don't have permission to post here."
-        ) from exc
+        raise click.ClickException(str(exc)) from exc
     except UnauthorizedError as exc:
         # session missing or revoked mid-command
         raise click.ClickException(_login_hint(session)) from exc
@@ -1238,9 +1237,12 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                 keeps running instead of the whole session exiting (F3)."""
                 try:
                     return await coro
-                except SendForbiddenError:
-                    logger.warning("send rejected (rights) in chat REPL (dialog %s)", dialog_id)
-                    click.echo("Сюда писать нельзя — чат только для чтения.", err=True)
+                except SendForbiddenError as exc:
+                    # surface Telegram's specific reason (#92); keep the REPL alive (F3)
+                    logger.warning(
+                        "send rejected (rights) in chat REPL (dialog %s): %s", dialog_id, exc
+                    )
+                    click.echo(str(exc), err=True)
                     return None
 
             # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();

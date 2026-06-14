@@ -77,6 +77,13 @@ def test_web_has_global_send_forbidden_handler():
     assert "@app.exception_handler(SendForbiddenError)" in _WEB_APP
 
 
+def test_client_cleans_forbidden_caused_by_suffix():
+    # #92: the send seam surfaces Telegram's clean reason — guard the (caused by ...) strip
+    # so a future refactor can't silently drop it and re-expose the technical trailer.
+    assert "_forbidden_message" in _CLIENT, "send seam must surface the cleaned Telegram reason"
+    assert "caused by" in _CLIENT, "the (caused by ...) trailer strip must stay wired"
+
+
 def test_capability_resolution_goes_through_the_shared_helper():
     # #90: POST-capability is resolved by ONE rule (search.can_send_in) — web via the
     # client method can_post_to, TUI via the pure helper over its loaded list. Guard

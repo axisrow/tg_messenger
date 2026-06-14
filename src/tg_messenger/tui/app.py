@@ -991,10 +991,11 @@ class MessengerTUI(App):
             self.notify("Выбор перевода истёк — выберите вариант заново", severity="warning")
             self._restore_draft(peer, text)
             return
-        except SendForbiddenError:
-            # TOCTOU net: composer was enabled but Telegram rejected the write on rights
-            logger.warning("send rejected (rights) (dialog %s)", peer)
-            self.notify(READ_ONLY_MESSAGE, severity="warning")
+        except SendForbiddenError as exc:
+            # TOCTOU net: composer was enabled but Telegram rejected the write on rights.
+            # Surface the specific reason (#92), not a fixed line.
+            logger.warning("send rejected (rights) (dialog %s): %s", peer, exc)
+            self.notify(str(exc), severity="warning")
             self._restore_draft(peer, text)
             self._apply_composer_writable(peer)  # reflect the now-known read-only state
             return
@@ -1022,9 +1023,9 @@ class MessengerTUI(App):
         # in on_input_submitted — _restore_draft puts it back on failure (#89).
         try:
             msg = await self._client.send_media(peer, path, caption=caption)
-        except SendForbiddenError:
-            logger.warning("send media rejected (rights) (dialog %s)", peer)
-            self.notify(READ_ONLY_MESSAGE, severity="warning")
+        except SendForbiddenError as exc:
+            logger.warning("send media rejected (rights) (dialog %s): %s", peer, exc)
+            self.notify(str(exc), severity="warning")
             self._restore_draft(peer, source_text)
             self._apply_composer_writable(peer)  # reflect the now-known read-only state
             return
@@ -1050,9 +1051,11 @@ class MessengerTUI(App):
         # NOT gated by posting permission, so no _apply_composer_writable here (unlike text/media).
         try:
             await self._client.send_reaction(peer, message_id, emoticon)
-        except SendForbiddenError:
-            logger.warning("reaction rejected (rights) (dialog %s, message %s)", peer, message_id)
-            self.notify(READ_ONLY_MESSAGE, severity="warning")
+        except SendForbiddenError as exc:
+            logger.warning(
+                "reaction rejected (rights) (dialog %s, message %s): %s", peer, message_id, exc
+            )
+            self.notify(str(exc), severity="warning")
             self._restore_draft(peer, source_text)
             return
         except Exception as exc:

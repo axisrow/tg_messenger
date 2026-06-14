@@ -650,13 +650,33 @@ async def test_send_maps_send_forbidden_error_to_403():
     from tg_messenger.core.client import SendForbiddenError
 
     stub = WebStubClient()
-    stub.send_text_raises = SendForbiddenError("ChatWriteForbiddenError")
+    stub.send_text_raises = SendForbiddenError("You can't write in this chat")
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
             r = await ac.post("/send", data={"dialog_id": "7", "text": "hi"})
     assert r.status_code == 403
+    # #92: the body carries Telegram's specific reason (HTML-escaped), not a fixed line
+    assert "write in this chat" in r.text
+
+
+async def test_send_forbidden_surfaces_raw_text_in_403_body():
+    # #92: a non-read-only 403 (e.g. privacy) shows its real cause. Dialog 7 is a writable
+    # DM → clears the can_post_to pre-flight → reaches the global SendForbiddenError handler.
+    from tg_messenger.core.client import SendForbiddenError
+
+    stub = WebStubClient()
+    stub.send_text_raises = SendForbiddenError(
+        "The user's privacy settings do not allow you to do this"
+    )
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/send", data={"dialog_id": "7", "text": "hi"})
+    assert r.status_code == 403
+    assert "privacy settings do not allow" in r.text
 
 
 async def test_send_permissive_when_dialog_lookup_fails():

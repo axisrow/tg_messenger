@@ -421,6 +421,25 @@ async def test_tui_send_forbidden_restores_draft():
         assert composer.value == "hello"  # typed text back in the composer
 
 
+async def test_tui_send_forbidden_notifies_raw_text():
+    # #92: the notify shows Telegram's specific reason, not the fixed read-only line.
+    stub = TuiStubClient()
+
+    async def forbidden(peer, text):
+        raise SendForbiddenError("A premium account is required to execute this action")
+
+    stub.send_text = forbidden
+    app = MessengerTUI(client=stub)
+    notifications = []
+    app.notify = lambda message, **kw: notifications.append((message, kw))  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._send_text(7, "hi")
+        await pilot.pause()
+    assert any("premium account is required" in m for m, _ in notifications)
+
+
 async def test_tui_send_media_forbidden_restores_command(tmp_path):
     # Same regression as text, but for the @file media path: on_input_submitted clears the
     # composer before _send_media; a rights rejection must restore the original command.

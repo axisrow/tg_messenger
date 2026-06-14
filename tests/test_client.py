@@ -20,11 +20,13 @@ from tests.conftest import (
 )
 from tg_messenger.core import client as client_module
 from tg_messenger.core.client import (
+    READ_ONLY_MESSAGE,
     MessageDeleteValidationError,
     SendForbiddenError,
     StandaloneTelegramClient,
     _dialog_kind,
     _entity_can_send,
+    _forbidden_message,
 )
 from tg_messenger.core.models import (
     ChatActionEvent,
@@ -379,6 +381,65 @@ async def test_unrelated_badrequest_is_not_classified(fake_client):
     fake_client.send_message_raises = MessageEmptyError(request=None)
     with pytest.raises(MessageEmptyError):
         await client.send_text(-100123, "")
+
+
+# --- #92: surface the real Telegram reason (clean text), not a fixed line ---
+
+
+def test_forbidden_message_strips_caused_by_suffix():
+    assert (
+        _forbidden_message(ValueError("You can't write in this chat (caused by NoneType)"))
+        == "You can't write in this chat"
+    )
+    assert (
+        _forbidden_message(
+            ValueError("A premium account is required to execute this action (caused by Foo)")
+        )
+        == "A premium account is required to execute this action"
+    )
+
+
+def test_forbidden_message_falls_back_to_read_only_on_empty():
+    assert _forbidden_message(ValueError("")) == READ_ONLY_MESSAGE
+    assert _forbidden_message(ValueError("(caused by NoneType)")) == READ_ONLY_MESSAGE
+
+
+async def test_send_text_forbidden_carries_clean_message(fake_client):
+    # the raise site cleans Telethon's "(caused by ...)" trailer so the UI shows a
+    # human sentence, not the technical artifact.
+    from telethon.errors import ChatWriteForbiddenError
+
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.send_message_raises = ChatWriteForbiddenError(request=None)
+    with pytest.raises(SendForbiddenError) as ei:
+        await client.send_text(-100123, "nope")
+    assert "(caused by" not in str(ei.value)
+    assert "write in this chat" in str(ei.value)
+
+
+async def test_send_media_forbidden_carries_clean_message(fake_client, tmp_path):
+    from telethon.errors import ChatSendMediaForbiddenError
+
+    media = tmp_path / "p.jpg"
+    media.write_bytes(b"x")
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.send_file_raises = ChatSendMediaForbiddenError(request=None)
+    with pytest.raises(SendForbiddenError) as ei:
+        await client.send_media(-100123, str(media))
+    assert "(caused by" not in str(ei.value)
+
+
+async def test_send_reaction_forbidden_carries_clean_message(fake_client):
+    from telethon.errors import ChatWriteForbiddenError
+
+    client = _build(fake_client)
+    await client.connect()
+    fake_client.call_raises = ChatWriteForbiddenError(request=None)
+    with pytest.raises(SendForbiddenError) as ei:
+        await client.send_reaction(-100123, 5, "👍")
+    assert "(caused by" not in str(ei.value)
 
 
 async def test_send_text_floodwait_still_retries(fake_client, monkeypatch):
