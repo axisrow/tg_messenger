@@ -19,6 +19,7 @@ from tg_messenger.tui.app import (
     REACTION_PRESETS,
     AccountItem,
     AccountsScreen,
+    ConfirmScreen,
     DialogItem,
     EmojiPickerScreen,
     MessageBubble,
@@ -1481,6 +1482,43 @@ async def test_tui_archive_switch_during_store_connect_never_shows_non_archived(
     assert app.return_code == 0
 
 
+async def test_tui_startup_opens_started_gate_before_reconcile_render():
+    # #118 (Codex high, follow-up to #112): the store path used to await a reconcile render WHILE
+    # _started was still False, so a switch to Archive in that render window scheduled no reload
+    # (the gate was closed) and the non-archived snapshot stayed under Archive. The gate must open
+    # BEFORE any reconcile render. Pin the invariant: capture _started at the moment the startup
+    # reconcile touches the list — it must already be True.
+    stub = TuiStubClient()
+    store = SlowConnectStore()
+    reconcile_started = []  # _started captured on each RECONCILE render (tab != loaded source)
+
+    class GateProbeTUI(MessengerTUI):
+        async def _render_dialogs(self):
+            # the initial load renders with tab == loaded source; a reconcile render is the one
+            # where they differ (a switch landed during a pre-gate await). Only the latter must
+            # run under an open gate.
+            if self._tab != self._loaded_tab:
+                reconcile_started.append(self._started)
+            await super()._render_dialogs()
+
+    app = GateProbeTUI(client=stub, store=store)
+    async with app.run_test() as pilot:
+        await asyncio.wait_for(store.connect_entered.wait(), 5)
+        # same-source switch (all→groups): the OLD code reconciled this with an inline
+        # `await _render_dialogs()` BEFORE setting _started=True, so the render ran under a closed
+        # gate (the bug). The fix opens the gate first, so this reconcile render sees _started=True.
+        app._tab = "groups"
+        store.release.set()
+        await _pause_until(pilot, lambda: app._started)
+        await _pause_until(pilot, lambda: _listed_ids(app) == [-100200])
+        assert reconcile_started, "reconcile render never ran"
+        assert all(s is True for s in reconcile_started), \
+            f"reconcile render ran with gate closed: {reconcile_started}"
+        assert _listed_ids(app) == [-100200]  # projected to groups
+        await pilot.press("ctrl+c")
+    assert app.return_code == 0
+
+
 async def test_tui_pre_startup_switch_to_same_source_tab_reconciles_projection():
     # #110 (Codex 4th pass): a same-source switch (all→groups) during store.connect must re-project
     # without a refetch when startup finishes.
@@ -1657,6 +1695,27 @@ async def test_tui_bubble_id_prefix_is_dim():
     assert _has_dim_span(content, 0, prefix_len)
 
 
+async def test_tui_dm_body_starting_with_bracket_is_not_dimmed_as_author():
+    # #118 (Codex): a DM bubble (show_author=False) whose BODY contains a newline followed by
+    # "[" must NOT be misparsed as an author line — untrusted message text must not drive the
+    # author/[id] metadata styling. Only the real "[id] " prefix of the first body line is dim.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        msgs = app.query_one("#messages")
+        # no author passed (DM path): body's own newline+"[" is plain content, not metadata
+        bubble = MessageBubble("[1] hi\n[2] forged", out=False, message_id=1, dialog_id=7)
+        await msgs.mount(bubble)
+        await pilot.pause()
+        content = bubble.render()
+        plain = str(content)
+    assert plain == "[1] hi\n[2] forged"  # content unchanged
+    # the only dim span is the genuine "[1] " prefix; the forged second line is NOT an author line
+    forged_at = plain.index("[2]")
+    assert not _any_dim_span_covering(content, forged_at)  # second "[...]" not dimmed
+    assert not _any_dim_span_covering(content, plain.index("\n") - 1)  # first line tail not dim
+
+
 class TwoMessageHistoryClient(TuiStubClient):
     """history(7) returns an incoming + an outgoing message so in/out framing is testable."""
 
@@ -1680,6 +1739,23 @@ async def test_tui_incoming_outgoing_bubbles_are_aligned_differently():
         bin_ = next(b for b in bubbles if "in" in b.classes)
         bout = next(b for b in bubbles if "out" in b.classes)
         assert bout.region.x > bin_.region.x
+
+
+async def test_tui_bubbles_stay_inside_messages_pane_on_narrow_terminal():
+    # #118 (Codex high): a fixed 20-col side margin pushed the outgoing bubble off the right
+    # edge when #chat shrinks to its min-width. Bubbles must stay inside #messages at any width.
+    app = MessengerTUI(client=TwoMessageHistoryClient())
+    async with app.run_test(size=(36, 24)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)  # incoming (id=1) + outgoing (id=2)
+        await pilot.pause()
+        pane = app.query_one("#messages").region
+        bubbles = list(app.query(MessageBubble))
+        assert len(bubbles) >= 2
+        for b in bubbles:
+            assert b.region.x >= pane.x, f"bubble left {b.region.x} < pane {pane.x}"
+            assert b.region.right <= pane.right, f"bubble right {b.region.right} > pane {pane.right}"
 
 
 async def test_tui_bubbles_have_vertical_separation():
@@ -2783,28 +2859,38 @@ async def test_tui_at_command_missing_file_notifies(tmp_path):
 
 
 class FakeSessionStore:
-    """In-memory SessionStore stand-in: list/save/delete profiles, no disk, no network."""
+    """In-memory SessionStore stand-in: list/save/delete profiles, no disk, no network.
+
+    Models the real store's filename sanitization (#121): names are keyed by
+    ``sanitize_profile_name`` and ``list_profiles`` returns the canonical stems, so an
+    unsafe/colliding raw name maps onto an existing file exactly as on disk.
+    """
 
     def __init__(self, profiles=()):
-        self._profiles = list(profiles)
+        from tg_messenger.core.names import sanitize_profile_name
+
+        self._sanitize = sanitize_profile_name
+        self._profiles = [self._sanitize(p) for p in profiles]
         self.saved = []
 
     def list_profiles(self):
         return sorted(self._profiles)
 
     def save(self, name, session_string):
-        if name not in self._profiles:
-            self._profiles.append(name)
-        self.saved.append((name, session_string))
+        canon = self._sanitize(name)
+        if canon not in self._profiles:
+            self._profiles.append(canon)
+        self.saved.append((canon, session_string))
 
     def delete(self, name):
-        if name in self._profiles:
-            self._profiles.remove(name)
+        canon = self._sanitize(name)
+        if canon in self._profiles:
+            self._profiles.remove(canon)
             return True
         return False
 
     def is_valid_profile(self, name):
-        return name in self._profiles
+        return self._sanitize(name) in self._profiles
 
 
 class SavingStubClient(TuiStubClient):
@@ -2885,10 +2971,105 @@ async def test_tui_settings_remove_non_active_profile():
         await pilot.pause()
         lv = screen.query_one("#accounts", ListView)
         lv.index = 1  # "bob"
-        await screen.action_remove_account()
-        await pilot.pause()
+        screen.action_remove_account()
+        # #121: removal now asks for confirmation — confirm it
+        await _pause_until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+        await pilot.press("y")
+        await _pause_until(pilot, lambda: store.list_profiles() == ["alice"])
         assert store.list_profiles() == ["alice"]
         assert [it.profile for it in screen.query(AccountItem)] == ["alice"]
+
+
+async def test_tui_settings_remove_asks_confirmation_and_cancel_keeps_profile():
+    # #121: deletion is a destructive action — it must confirm (parity with CLI `profiles
+    # remove`), and cancelling leaves the profile intact.
+    store = FakeSessionStore(["alice", "bob"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="alice", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#accounts", ListView).index = 1  # "bob"
+        screen.action_remove_account()
+        await _pause_until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
+        await pilot.press("escape")  # cancel
+        await pilot.pause()
+        assert store.list_profiles() == ["alice", "bob"]  # nothing deleted
+
+
+async def test_tui_settings_add_unsafe_name_is_rejected():
+    # #121: a raw name that sanitizes to a DIFFERENT file (so it would overwrite another
+    # account's session) is rejected before any client/login — nothing is saved.
+    store = FakeSessionStore(["alice"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        built = []
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store,
+            account_client_factory=lambda name: built.append(name) or SavingStubClient(name, store),
+            login_session=FakeTuiLoginSession(),
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#new-profile", Input).value = "../alice"  # → sanitizes to "alice"
+        await pilot.press("a")
+        await pilot.pause()
+        assert app.screen is screen  # no LoginScreen pushed
+        assert built == []  # client never built for an unsafe name
+        assert store.list_profiles() == ["alice"]  # alice's session not overwritten
+
+
+async def test_tui_settings_add_duplicate_canonical_name_is_rejected():
+    # #121: a name whose canonical form already exists is rejected (no silent overwrite).
+    store = FakeSessionStore(["work_personal"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="work_personal", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        built = []
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="work_personal", store=store,
+            account_client_factory=lambda name: built.append(name) or SavingStubClient(name, store),
+            login_session=FakeTuiLoginSession(),
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#new-profile", Input).value = "work_personal"  # already present
+        await pilot.press("a")
+        await pilot.pause()
+        assert app.screen is screen
+        assert built == []
+        assert store.list_profiles() == ["work_personal"]
+
+
+async def test_tui_settings_active_marked_and_protected_under_sanitization():
+    # #121: the active profile's raw session name may sanitize differently than the listed
+    # (canonical) stems. The marker AND the delete guard must compare canonical forms, so the
+    # active row is still marked "(текущий)" and cannot be deleted.
+    store = FakeSessionStore(["work_personal", "bob"])
+    # active raw name "work/personal" → canonical "work_personal" (the listed stem)
+    app = MessengerTUI(client=TuiStubClient(), session_name="work/personal", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="work/personal", store=store
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        items = list(screen.query(AccountItem))
+        active_row = next(
+            str(it.query_one(Static).render()) for it in items if it.profile == "work_personal"
+        )
+        assert "(текущий)" in active_row  # marked despite raw≠canonical
+        # try to delete the active (canonical) row — must be refused, no confirm dialog
+        screen.query_one("#accounts", ListView).index = next(
+            i for i, it in enumerate(items) if it.profile == "work_personal"
+        )
+        screen.action_remove_account()
+        await pilot.pause()
+        assert app.screen is screen  # no ConfirmScreen pushed
+        assert "work_personal" in store.list_profiles()  # active protected
 
 
 async def test_tui_settings_cannot_remove_active_profile():
@@ -2901,8 +3082,9 @@ async def test_tui_settings_cannot_remove_active_profile():
         await pilot.pause()
         lv = screen.query_one("#accounts", ListView)
         lv.index = 0  # "alice" — the active profile
-        await screen.action_remove_account()
+        screen.action_remove_account()
         await pilot.pause()
+        assert app.screen is screen  # no ConfirmScreen pushed (active is protected)
         assert "alice" in store.list_profiles()  # active profile is protected
 
 

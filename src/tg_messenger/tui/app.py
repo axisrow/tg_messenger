@@ -29,6 +29,7 @@ from tg_messenger.core.auth import (
 )
 from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
 from tg_messenger.core.models import format_author
+from tg_messenger.core.names import is_safe_profile_name, sanitize_profile_name
 from tg_messenger.core.search import can_send_in
 
 logger = logging.getLogger(__name__)
@@ -110,27 +111,19 @@ def _make_real_client(session_name: str):
     return client_from_env(session_name=session_name)
 
 
-def _message_label(message, *, show_author: bool = False) -> str:
-    base = f"[{message.id}] {message.text or '<media>'}"
-    # #108: in groups/supergroups, an incoming message gets an author line ABOVE the text.
-    # First line so it becomes part of MessageBubble._base_text (survives translation/reactions).
-    # #113: the author/body string CONTENT is unchanged (parity with web/CLI format_author and the
-    # [id] prefix the owner keeps); MessageBubble re-splits this and dims the author/[id] via Rich
-    # spans, so str(bubble.render()) stays byte-identical to this label.
-    return f"{format_author(message)}\n{base}" if show_author else base
+def _message_body(message) -> str:
+    """The bubble body for a message: the ``[id] text`` line (or ``<media>``)."""
+    return f"[{message.id}] {message.text or '<media>'}"
 
 
-def _split_author_body(text: str) -> tuple[str | None, str]:
-    """Split a MessageBubble label into (author_line, body).
+def _message_author_line(message, *, show_author: bool) -> str | None:
+    """The group author line (#108) when the caller asks for it, else ``None``.
 
-    The author line, when present (#108), is the first line and the body begins with the
-    ``[id]`` prefix — so an author is recognised only when a newline is followed by ``[``.
-    Returns ``(None, text)`` for a plain body (DMs, own/echo bubbles, media).
+    #118: author is now passed to MessageBubble as a SEPARATE field rather than glued onto the
+    body and re-parsed — so untrusted message text (a body that happens to contain ``\\n[``)
+    can never be misread as an author line. Content (``format_author``) is unchanged.
     """
-    head, sep, tail = text.partition("\n[")
-    if sep:
-        return head, "[" + tail
-    return None, text
+    return format_author(message) if show_author else None
 
 
 def _split_id_prefix(body: str) -> tuple[str, str]:
@@ -337,13 +330,14 @@ class MessageBubble(Static):
         Binding("r", "react", "React", show=False),
     ]
 
-    def __init__(self, text: str, out: bool, message_id: int | None = None,
-                 dialog_id: int | None = None):
-        self._base_text = text
-        # #113: split the combined label into author line + body so each can be dimmed via Rich
-        # spans without re-enabling markup. The string CONTENT is unchanged, so str(render())
-        # stays byte-identical (content-equality tests survive); only styling is added.
-        self._author, self._body = _split_author_body(text)
+    def __init__(self, body: str, out: bool, message_id: int | None = None,
+                 dialog_id: int | None = None, *, author: str | None = None):
+        # #118: author is a SEPARATE field set only by the caller when it knows the message gets
+        # an author line (group, incoming) — NOT re-parsed from the body. So untrusted body text
+        # that happens to contain "\n[" is never misread as author/[id] metadata. The rendered
+        # CONTENT (author line + "\n" + body) is byte-identical to before (#113 parity).
+        self._author = author
+        self._body = body
         # the message this bubble can be reacted to; None for non-target bubbles.
         self.message_id = message_id
         # #102: the SOURCE dialog of this bubble (web #96 parity, data-dialog) — a reaction
@@ -398,13 +392,19 @@ class MessageBubble(Static):
         self._focus_sibling(+1)
 
     def _focus_sibling(self, delta: int) -> None:
-        if self.parent is None:
+        # #118: bubbles now sit inside a per-message BubbleRow wrapper, so they are no longer
+        # direct siblings of each other. Walk all bubbles in DOM (= visual) order via the screen
+        # query and step to the neighbour; clamp at the ends so focus never escapes the pane.
+        if self.screen is None:
             return
-        siblings = [w for w in self.parent.children if isinstance(w, MessageBubble)]
-        idx = siblings.index(self)
+        bubbles = list(self.screen.query(MessageBubble))
+        try:
+            idx = bubbles.index(self)
+        except ValueError:
+            return
         target = idx + delta
-        if 0 <= target < len(siblings):  # clamp at the ends — don't escape the pane
-            siblings[target].focus()
+        if 0 <= target < len(bubbles):
+            bubbles[target].focus()
 
     def action_react(self) -> None:
         # #102: react on the bubble's OWN source dialog, not the globally-current one —
@@ -414,6 +414,23 @@ class MessageBubble(Static):
         self.app.run_worker(
             self.app._react_from_bubble(self.dialog_id, self.message_id)
         )
+
+
+class BubbleRow(Horizontal):
+    """A full-width row that aligns its single MessageBubble left (incoming) or right (outgoing).
+
+    #118: the in/out offset is a proportional alignment of the bubble inside this row, not a fixed
+    side margin — so the bubble stays inside the message pane at any terminal width. The CSS class
+    (``in``/``out``) mirrors the bubble's so the row aligns to the correct side.
+    """
+
+    def __init__(self, bubble: "MessageBubble"):
+        super().__init__(bubble, classes="out" if bubble.has_class("out") else "in")
+
+
+def _wrap_bubble(bubble: "MessageBubble") -> BubbleRow:
+    """Wrap a bubble in its alignment row (the unit mounted into ``#messages``)."""
+    return BubbleRow(bubble)
 
 
 class VariantItem(ListItem):
@@ -483,6 +500,43 @@ class EmojiPickerScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class ConfirmScreen(ModalScreen[bool]):
+    """A small yes/no confirmation card (#121): dismisses True (y / Enter) or False (n / Esc).
+
+    Reused for destructive account actions so a single keypress can't delete a saved session —
+    parity with the CLI ``profiles remove`` confirmation.
+    """
+
+    DEFAULT_CSS = (
+        "ConfirmScreen { align: center middle; } "
+        "#confirm-box { width: 60%; max-width: 64; height: auto; "
+        "padding: 1 2; border: round $warning; background: $surface; }"
+    )
+
+    BINDINGS = [
+        Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
+        Binding("y", "confirm", "Yes", show=False),
+        Binding("enter", "confirm", "Yes", show=False),
+        Binding("n", "cancel", "No", show=False),
+        Binding("escape", "cancel", "No", show=False),
+    ]
+
+    def __init__(self, prompt: str):
+        super().__init__()
+        self._prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-box"):
+            yield Label(self._prompt, id="confirm-prompt")
+            yield Label("y — да · n / Esc — нет", id="confirm-help")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class AccountItem(ListItem):
     """One saved account profile in the settings screen; the active one is marked."""
 
@@ -518,8 +572,12 @@ class AccountsScreen(ModalScreen[None]):
     def __init__(self, *, profiles, active, store, account_client_factory=None,
                  login_session=None):
         super().__init__()
+        # #121: profiles from list_profiles() are already canonical (sanitized stems); the active
+        # name comes from the raw session_name, so canonicalize it ONCE here. Marker + delete guard
+        # then compare canonical-to-canonical, so an active raw name that sanitizes differently
+        # (e.g. "work/personal" → "work_personal") is still recognised and protected.
         self._profiles = list(profiles)
-        self._active = active
+        self._active = sanitize_profile_name(active)
         self._store = store
         # test seams: build the new-profile client / skip the network login flow
         self._account_client_factory = account_client_factory or _make_real_client
@@ -543,10 +601,25 @@ class AccountsScreen(ModalScreen[None]):
         if not name:
             self.query_one("#new-profile", Input).focus()
             return
+        # #121: reject a name that isn't already its own filename-safe form (it would silently
+        # collapse onto a DIFFERENT session file and overwrite another account), or whose canonical
+        # form already exists. Checked BEFORE building a client — no network on a bad name.
+        if not is_safe_profile_name(name):
+            self.notify(
+                f"Недопустимое имя профиля: {name} (только латиница, цифры, _.-)",
+                severity="error",
+            )
+            self.query_one("#new-profile", Input).focus()
+            return
+        if name in self._store.list_profiles():
+            self.notify(f"Профиль уже существует: {name}", severity="error")
+            self.query_one("#new-profile", Input).focus()
+            return
         self.run_worker(self._add_account(name), exclusive=True)
 
     async def _add_account(self, name: str) -> None:
         # build + connect a client for the NEW profile, then run the existing login wizard.
+        # name is already validated as safe + unique by action_add_account.
         client = None
         try:
             if self._login_session is not None:  # test seam: skip the real client/network
@@ -578,13 +651,30 @@ class AccountsScreen(ModalScreen[None]):
         self.query_one("#new-profile", Input).value = ""
         self.notify(f"Профиль добавлен: {name}")
 
-    async def action_remove_account(self) -> None:
+    def action_remove_account(self) -> None:
         lv = self.query_one("#accounts", ListView)
         item = lv.highlighted_child
+        # #121: both sides are canonical (item.profile from list_profiles, self._active sanitized
+        # in __init__), so the active profile is recognised even when its raw name differs.
         if not isinstance(item, AccountItem) or item.profile == self._active:
             return  # never remove the active profile
-        self._store.delete(item.profile)
+        # #121: destructive — confirm before deleting a saved session (parity with CLI).
+        self.run_worker(self._confirm_remove(item.profile), exclusive=True)
+
+    async def _confirm_remove(self, profile: str) -> None:
+        ok = await self.app.push_screen_wait(
+            ConfirmScreen(f"Удалить профиль «{profile}»?")
+        )
+        if not ok:
+            return
+        try:
+            self._store.delete(profile)
+        except Exception:
+            logger.exception("settings: remove account failed")
+            self.notify(f"Не удалось удалить профиль: {profile}", severity="error")
+            return
         await self._refresh(self._store.list_profiles())
+        self.notify(f"Профиль удалён: {profile}")
 
     async def _refresh(self, profiles) -> None:
         self._profiles = list(profiles)
@@ -619,9 +709,14 @@ class MessengerTUI(App):
     #sidebar { width: 32; max-width: 50%; border-right: solid $primary; }
     #chat { width: 1fr; min-width: 16; }
     #messages { overflow-y: auto; }
-    /* #113: each message is a framed, shrink-wrapped card with vertical separation so a group
-       feed is no longer a wall of text. width:auto + max-width gives in/out asymmetry; margin
-       (integer — % does not parse in textual 8.x) separates consecutive bubbles. */
+    /* #113/#118: each message is a framed, shrink-wrapped card. The in/out asymmetry is now a
+       PROPORTIONAL alignment of the bubble inside a full-width BubbleRow (align-horizontal),
+       NOT a fixed side margin — a fixed 20-col margin pushed the bubble off the right edge once
+       #chat shrank to its 16-col min-width (Codex #118). The bubble caps at max-width 80% so it
+       always stays inside the pane at any width; the row carries the vertical separation. */
+    #messages BubbleRow { width: 1fr; height: auto; }
+    #messages BubbleRow.out { align-horizontal: right; }
+    #messages BubbleRow.in { align-horizontal: left; }
     #messages MessageBubble {
         width: auto; max-width: 80%; height: auto;
         margin: 1 1; padding: 0 1;
@@ -629,10 +724,9 @@ class MessengerTUI(App):
         text-wrap: wrap; text-overflow: fold;
     }
     #messages MessageBubble:focus { background: $boost; border: round $accent; }
-    /* incoming vs outgoing: distinct border + side offset, not color alone. Scoped under
-       #messages MessageBubble so they out-specify the base margin rule above (id+type+class). */
-    #messages MessageBubble.out { border: round $accent; margin: 1 1 1 20; }
-    #messages MessageBubble.in { border: round $panel; margin: 1 20 1 1; }
+    /* incoming vs outgoing: distinct border (the side offset is the BubbleRow alignment above). */
+    #messages MessageBubble.out { border: round $accent; }
+    #messages MessageBubble.in { border: round $panel; }
     #suggestion { color: $text-muted; height: auto; }
     #composer { dock: bottom; }
     /* #116: shared modal card — a centered, bordered, width-capped box (was full-width, top-left,
@@ -876,53 +970,52 @@ class MessengerTUI(App):
                 # is for _loaded_tab; if the user switches to a different SOURCE (archive <-> the
                 # rest) while connect is pending, that stale population would sit under the loading
                 # spinner. Keep #dialogs empty + loading across the connect await so NO stale source
-                # is ever shown in this window; the reconcile below repopulates under the active tab
-                # once startup finishes. (clear() makes no network call, so the same-source
+                # is ever shown in this window; the shared reconcile below repopulates under the
+                # active tab once the gate opens. (clear() makes no network call, so the same-source
                 # no-refetch contract holds.)
                 lv = self.query_one("#dialogs", ListView)
                 await lv.clear()
                 lv.loading = True
                 await self._store.connect()
                 self.run_worker(self._run_store(), group="message-store", exclusive=False)
-                # repopulate under whatever tab is active now (it may have changed during connect)
-                if self._tab != self._loaded_tab and (self._tab == "archive") != (
-                    self._loaded_tab == "archive"
-                ):
-                    # cross-source switch: re-fetch under the active source (worker clears loading)
-                    self.run_worker(self._reload_dialogs(), group="dialogs", exclusive=True)
-                    self._started = True
-                    self.run_worker(self._drain_incoming(), exclusive=False)
-                    self.run_worker(self._drain_outgoing(), exclusive=False)
-                    self.run_worker(self._drain_reactions(), exclusive=False)
-                    return
-                # same source: re-project the already-fetched snapshot, then clear loading
-                await self._render_dialogs()
-                lv.loading = False
-                self._started = True
-                self.run_worker(self._drain_incoming(), exclusive=False)
-                self.run_worker(self._drain_outgoing(), exclusive=False)
-                self.run_worker(self._drain_reactions(), exclusive=False)
-                return
         except Exception as exc:
             logger.exception("TUI startup failed")
             self.exit(return_code=1, message=f"Startup failed: {exc}")
             return
-        # no store: the dialogs already loaded; clear loading and reconcile a pending switch once.
-        self.query_one("#dialogs", ListView).loading = False
+        # #118 (Codex high): open the _started gate BEFORE the reconcile render — the ONE shared
+        # tail for both the store and no-store paths. Previously the store path awaited a render
+        # while the gate was still closed, so a switch to Archive landing in that render window
+        # scheduled no reload and the non-archived snapshot stayed under Archive. With the gate
+        # open first, _reconcile_after_startup reads the active tab synchronously (no await before
+        # that read) and any switch arriving later flows through on_tabs_tab_activated as a reload.
         self._started = True
-        # #110 (Codex 4th pass): a tab switch during ANY pre-startup await (connect / login /
-        # _load_dialogs) only set _tab — on_tabs_tab_activated returns under the _started gate and
-        # schedules no reload. Now that the gate is open, reconcile once: if the active tab's source
-        # differs from what the initial snapshot was loaded under, reload it; otherwise just
-        # re-project (same source, different tab — e.g. all→groups).
-        if self._tab != self._loaded_tab:
-            if (self._tab == "archive") != (self._loaded_tab == "archive"):
-                self.run_worker(self._reload_dialogs(), group="dialogs", exclusive=True)
-            else:
-                await self._render_dialogs()
+        await self._reconcile_after_startup()
         self.run_worker(self._drain_incoming(), exclusive=False)
         self.run_worker(self._drain_outgoing(), exclusive=False)
         self.run_worker(self._drain_reactions(), exclusive=False)
+
+    async def _reconcile_after_startup(self) -> None:
+        """Reconcile the dialog list to the tab active right now, then clear the spinner (#118).
+
+        Called once, AFTER _started=True, so the active-source decision is read under the open
+        gate with no preceding await — a tab switch arriving after this read reaches
+        on_tabs_tab_activated (which is no longer gated) and schedules its own reload, instead of
+        being silently dropped into a render window. A cross-source switch re-fetches via a worker
+        (never an inline awaited render that could paint the stale source); a same-source switch
+        (e.g. all→groups) just re-projects the already-fetched snapshot — no refetch.
+        """
+        lv = self.query_one("#dialogs", ListView)
+        if self._tab != self._loaded_tab and (self._tab == "archive") != (
+            self._loaded_tab == "archive"
+        ):
+            # cross-source: the worker clears loading after fetching under the active source
+            self.run_worker(self._reload_dialogs(), group="dialogs", exclusive=True)
+            return
+        # Re-render unconditionally: the store path cleared #dialogs across store.connect(), so the
+        # list must be repopulated even when the active tab is unchanged (same source, possibly a
+        # different projection than the initial load). No refetch — _render_dialogs is network-free.
+        await self._render_dialogs()
+        lv.loading = False
 
     async def on_unmount(self) -> None:
         if self._client is not None:
@@ -1088,13 +1181,14 @@ class MessengerTUI(App):
         self._bubble_index.clear()
         for m in messages:
             show_author = (not m.out) and self._kind_for_rendering(dialog_id) == "group"
-            bubble = MessageBubble(_message_label(m, show_author=show_author), m.out,
-                                   message_id=m.id, dialog_id=dialog_id)
+            bubble = MessageBubble(_message_body(m), m.out,
+                                   message_id=m.id, dialog_id=dialog_id,
+                                   author=_message_author_line(m, show_author=show_author))
             if m.translated_text:
                 bubble.show_translation(m.translated_text)
             self._bubble_index[m.id] = bubble
             bubbles.append(bubble)
-        await pane.mount(*bubbles)
+        await pane.mount(*(_wrap_bubble(b) for b in bubbles))  # #118: align via wrapper row
         # #106: apply any reactions that arrived while this history was loading.
         self._drain_pending_reactions(dialog_id)
         self._scroll_messages_to_end(pane)
@@ -1405,11 +1499,11 @@ class MessengerTUI(App):
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            bubble = MessageBubble(_message_label(msg), out=True, message_id=msg.id, dialog_id=peer)
+            bubble = MessageBubble(_message_body(msg), out=True, message_id=msg.id, dialog_id=peer)
             if msg.translated_text:
                 bubble.show_translation(msg.translated_text)
             self._bubble_index[msg.id] = bubble
-            await pane.mount(bubble)
+            await pane.mount(_wrap_bubble(bubble))
             self._scroll_messages_to_end(pane)
 
     async def _send_media(
@@ -1434,9 +1528,9 @@ class MessengerTUI(App):
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            bubble = MessageBubble(_message_label(msg), out=True, message_id=msg.id, dialog_id=peer)
+            bubble = MessageBubble(_message_body(msg), out=True, message_id=msg.id, dialog_id=peer)
             self._bubble_index[msg.id] = bubble
-            await pane.mount(bubble)
+            await pane.mount(_wrap_bubble(bubble))
             self._scroll_messages_to_end(pane)
 
     async def _react_from_bubble(self, peer: int, message_id: int) -> None:
@@ -1487,11 +1581,12 @@ class MessengerTUI(App):
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
                     show_author = self._kind_for_rendering(ev.dialog_id) == "group"
-                    bubble = MessageBubble(_message_label(ev.message, show_author=show_author),
+                    bubble = MessageBubble(_message_body(ev.message),
                                            out=False,
-                                           message_id=ev.message.id, dialog_id=ev.dialog_id)
+                                           message_id=ev.message.id, dialog_id=ev.dialog_id,
+                                           author=_message_author_line(ev.message, show_author=show_author))
                     self._bubble_index[ev.message.id] = bubble
-                    await pane.mount(bubble)
+                    await pane.mount(_wrap_bubble(bubble))
                     if ev.message.translated_text:
                         bubble.show_translation(ev.message.translated_text)
                     elif self._translator is not None:
@@ -1525,10 +1620,10 @@ class MessengerTUI(App):
                 await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=False)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    bubble = MessageBubble(_message_label(ev.message), out=True,
+                    bubble = MessageBubble(_message_body(ev.message), out=True,
                                            message_id=ev.message.id, dialog_id=ev.dialog_id)
                     self._bubble_index[ev.message.id] = bubble
-                    await pane.mount(bubble)
+                    await pane.mount(_wrap_bubble(bubble))
                     if ev.message.translated_text:
                         bubble.show_translation(ev.message.translated_text)
                     elif self._translator is not None:
