@@ -50,6 +50,7 @@ from tg_messenger.core.models import (
     User,
 )
 from tg_messenger.core.ratelimit import TokenBucket
+from tg_messenger.core.search import can_send_in
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +337,25 @@ class StandaloneTelegramClient:
             _DIALOGS_CACHE_KEY, lambda: self._fetch_dialogs(archived=False)
         )
         return [d for d in full if d.kind != "dm"]
+
+    async def can_post_to(self, dialog_id: int) -> bool:
+        """Whether our account may POST to ``dialog_id``, read from the cached dialog
+        list (rides the #8 TTL cache — zero network when warm). The single capability
+        resolver every UI shares (#90). Fail-safe: an unknown dialog OR a ``dialogs()``
+        failure returns True (writable), so a transient cache miss never wrongly locks a
+        chat — the core ``SendForbiddenError`` net is the authoritative guard at send time.
+
+        POST only — reactions are not gated (#86) and must never call this.
+        """
+        try:
+            dialogs = await self.dialogs(dm_only=False)
+        except Exception:
+            logger.warning(
+                "can_post_to: dialog lookup failed for %s — permissive", dialog_id,
+                exc_info=True,
+            )
+            return True
+        return can_send_in(dialogs, dialog_id)
 
     async def _fetch_dialogs(self, *, archived: bool = False) -> list[Dialog]:
         raw = await run_with_flood_wait_retry(

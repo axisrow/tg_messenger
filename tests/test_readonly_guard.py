@@ -14,6 +14,8 @@ _SRC = Path(__file__).resolve().parent.parent / "src" / "tg_messenger"
 _CLIENT = (_SRC / "core" / "client.py").read_text(encoding="utf-8")
 _MODELS = (_SRC / "core" / "models.py").read_text(encoding="utf-8")
 _WEB_APP = (_SRC / "web" / "app.py").read_text(encoding="utf-8")
+_TUI_APP = (_SRC / "tui" / "app.py").read_text(encoding="utf-8")
+_SEARCH = (_SRC / "core" / "search.py").read_text(encoding="utf-8")
 
 # Classification is CATEGORY-based (#88): every HTTP-403 ForbiddenError is caught by the
 # base class (so a NEW *ForbiddenError is covered with no source change), plus an explicit
@@ -73,3 +75,14 @@ def test_web_has_global_send_forbidden_handler():
     # The authoritative net the removed /reaction pre-flight relies on: a forbidden
     # reaction surfaces here as a clean 403, never a 500.
     assert "@app.exception_handler(SendForbiddenError)" in _WEB_APP
+
+
+def test_capability_resolution_goes_through_the_shared_helper():
+    # #90: POST-capability is resolved by ONE rule (search.can_send_in) — web via the
+    # client method can_post_to, TUI via the pure helper over its loaded list. Guard
+    # against a UI re-introducing its own ad-hoc "for d in dialogs if d.id ==" lookup.
+    assert "def can_send_in(" in _SEARCH, "the shared POST-capability rule lives in core/search.py"
+    assert "async def can_post_to(" in _CLIENT, "the client exposes the cached-list resolver"
+    assert "can_send_in(" in _CLIENT, "can_post_to must delegate to the shared rule"
+    assert "await client.can_post_to(" in _WEB_APP, "web must resolve via can_post_to"
+    assert "can_send_in(self._all_dialogs" in _TUI_APP, "TUI must resolve via the shared rule"

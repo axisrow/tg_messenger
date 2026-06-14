@@ -37,3 +37,16 @@ def filter_dialogs(dialogs: list[Dialog], query: str) -> list[Dialog]:
     if not q:
         return dialogs
     return [d for d in dialogs if _matches(d, q)]
+
+
+def can_send_in(dialogs: list[Dialog], dialog_id: int) -> bool:
+    """Whether OUR account may POST in ``dialog_id``, resolved over an already-fetched
+    dialog list (the #8 read cache) — pure, network-free. The ONE lookup rule shared by
+    every UI (#90): an unknown dialog is fail-safe writable (True), matching
+    ``_entity_can_send`` and the core ``SendForbiddenError`` net that catches a real
+    rejection at send time.
+
+    POST capability only. Reactions are a SEPARATE capability (#86) and never call this —
+    a read-only chat can still react; a true rejection surfaces as SendForbiddenError.
+    """
+    return next((d.can_send for d in dialogs if d.id == dialog_id), True)

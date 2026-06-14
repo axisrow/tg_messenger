@@ -22,6 +22,7 @@ from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
 from tg_messenger.core.auth import LoginError, LoginSession, delivery_hint
 from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
+from tg_messenger.core.search import can_send_in
 
 logger = logging.getLogger(__name__)
 
@@ -1156,10 +1157,9 @@ class MessengerTUI(App):
         return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
 
     def _dialog_can_send(self, dialog_id: int) -> bool:
-        # default True for an unknown dialog (fail-safe writable, matches core)
-        return next(
-            (d.can_send for d in self._all_dialogs if d.id == dialog_id), True
-        )
+        # #90: the one shared POST-capability rule over the already-loaded dialog list
+        # (unknown dialog → fail-safe writable, matches core).
+        return can_send_in(self._all_dialogs, dialog_id)
 
     def _apply_composer_writable(self, dialog_id: int) -> None:
         """Disable the composer in a read-only chat (mirrors the real Telegram client)."""

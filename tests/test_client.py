@@ -254,6 +254,42 @@ async def test_dialogs_populates_can_send(fake_client):
     }
 
 
+async def test_can_post_to_resolves_from_cached_dialogs(fake_client):
+    # #90: the single capability resolver — reads the cached dialog list, no recompute.
+    fake_client.dialogs = [
+        FakeDialog(FakeUser(id=7, first_name="Ann"), name="Ann"),
+        FakeDialog(FakeChannel(id=123, title="News", broadcast=True), name="News"),
+    ]
+    client = _build(fake_client)
+    await client.connect()
+    assert await client.can_post_to(7) is True            # writable DM
+    assert await client.can_post_to(-100123) is False     # read-only broadcast
+    assert await client.can_post_to(999) is True          # unknown → fail-safe writable
+
+
+async def test_can_post_to_uses_the_cache_no_second_fetch(fake_client):
+    # warm-cache call must not hit the network a second time (rides the #8 TTL cache)
+    fake_client.dialogs = [FakeDialog(FakeUser(id=7, first_name="Ann"), name="Ann")]
+    client = _build(fake_client)
+    await client.connect()
+    await client.dialogs(dm_only=False)  # warm the cache
+    before = fake_client.iter_dialogs_calls
+    assert await client.can_post_to(7) is True
+    assert fake_client.iter_dialogs_calls == before  # no extra fetch
+
+
+async def test_can_post_to_permissive_on_lookup_failure(fake_client):
+    # a dialogs() failure must not lock the chat — return True; SendForbiddenError is the net
+    client = _build(fake_client)
+    await client.connect()
+
+    async def boom(dm_only=False):
+        raise RuntimeError("dialogs unavailable")
+
+    client.dialogs = boom  # type: ignore[method-assign]
+    assert await client.can_post_to(-100123) is True
+
+
 _RIGHTS_ERROR_NAMES = [
     "ChatAdminRequiredError",
     "ChatWriteForbiddenError",
