@@ -170,8 +170,13 @@ def _message_div(m) -> str:
         f'<button type="button" class="reply-btn" data-reply="{m.id}" '
         f'title="Reply">↩</button>'
     )
+    # #86: a per-message reaction trigger; chat.html toggles a small preset palette under it.
+    react_btn = (
+        f'<button type="button" class="react-btn" data-react="{m.id}" '
+        f'title="React">🙂</button>'
+    )
     return (
-        f'<div class="msg {cls}" data-id="{m.id}">{body}{reply_btn}{translation}</div>'
+        f'<div class="msg {cls}" data-id="{m.id}">{body}{reply_btn}{react_btn}{translation}</div>'
     )
 
 
@@ -771,10 +776,9 @@ def build_app(
             return _error_response("Reaction cannot be empty.", 400)
         msg_id = int(message_id)
         client = request.app.state.client
-        # NB: this gate reuses the posting permission (can_send) — reactions are really a
-        # separate capability; the reaction-vs-post split is tracked in #86.
-        if (readonly := await _readonly_error(client, dialog_id)) is not None:
-            return readonly
+        # #86: reactions are NOT gated by posting permission (can_send) — a read-only chat
+        # can still react. No pre-flight; a true rights rejection surfaces via the global
+        # SendForbiddenError handler as a clean 403 (matching the CLI's react command).
         await client.send_reaction(dialog_id, msg_id, emoticon)
         sent_reactions = _sent_bucket(request.app.state.sent_reactions_by_client, web_client_id)
         _remember_sent_reaction(sent_reactions, dialog_id, msg_id, emoticon)

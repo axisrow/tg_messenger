@@ -13,6 +13,7 @@ from pathlib import Path
 _SRC = Path(__file__).resolve().parent.parent / "src" / "tg_messenger"
 _CLIENT = (_SRC / "core" / "client.py").read_text(encoding="utf-8")
 _MODELS = (_SRC / "core" / "models.py").read_text(encoding="utf-8")
+_WEB_APP = (_SRC / "web" / "app.py").read_text(encoding="utf-8")
 
 # Classification is CATEGORY-based (#88): every HTTP-403 ForbiddenError is caught by the
 # base class (so a NEW *ForbiddenError is covered with no source change), plus an explicit
@@ -52,3 +53,23 @@ def test_client_defines_send_forbidden_error():
 
 def test_dialog_model_exposes_can_send():
     assert "can_send" in _MODELS, "Dialog must carry can_send for the UIs to gate the composer"
+
+
+def test_web_reaction_route_does_not_preflight_can_send():
+    # #86: reactions must NOT be re-gated by posting permission. The /reaction route
+    # attempts send_reaction directly; a true rights rejection is netted by the global
+    # SendForbiddenError handler. Slice the source between the reaction route decorator
+    # and the next route (/media) and assert the can_send pre-flight is absent there.
+    start = _WEB_APP.index('"/dialogs/{dialog_id}/reaction"')
+    rest = _WEB_APP[start:]
+    end = rest.index('@app.post("/dialogs/{dialog_id}/media"')
+    reaction_route = rest[:end]
+    assert "_readonly_error" not in reaction_route, (
+        "/reaction must not pre-flight can_send — reactions are not gated by posting permission"
+    )
+
+
+def test_web_has_global_send_forbidden_handler():
+    # The authoritative net the removed /reaction pre-flight relies on: a forbidden
+    # reaction surfaces here as a clean 403, never a 500.
+    assert "@app.exception_handler(SendForbiddenError)" in _WEB_APP

@@ -21,11 +21,11 @@
     .msg.out { background: #cfe9ff; margin-left: auto; }
     .msg.reaction { background: #fff7d6; color: #6b5700; font-size: 13px; }
     .translation { margin-top: 4px; color: #555; font-size: 13px; }
+    .reply-btn, .react-btn { margin-left: 6px; border: none; background: transparent; cursor: pointer; font-size: 12px; }
+    .reaction-palette { display: inline-flex; gap: 4px; margin-left: 6px; }
+    .reaction-palette button { border: 1px solid #ccc; border-radius: 8px; background: #fff; cursor: pointer; padding: 0 4px; }
     #composer { display: flex; border-top: 1px solid #ccc; padding: 8px; }
     #composer input { flex: 1; padding: 8px; }
-    #reaction-form { display: flex; gap: 6px; border-top: 1px solid #eee; padding: 8px; }
-    #reaction-form input[name="message_id"] { width: 90px; }
-    #reaction-form input[name="emoticon"] { width: 70px; }
     #suggest-error { color: #b00020; padding: 0 8px; align-self: center; font-size: 12px; }
     #variant-panel { border-top: 1px solid #ddd; padding: 8px; display: none; }
     .variant-card { display: block; width: 100%; text-align: left; margin: 4px 0; padding: 8px; }
@@ -67,11 +67,6 @@
         <input type="file" id="attach-file" style="display:none">
       </label>
       <span id="suggest-error" role="status"></span>
-    </form>
-    <form id="reaction-form">
-      <input type="text" name="message_id" placeholder="Message id" inputmode="numeric" autocomplete="off">
-      <input type="text" name="emoticon" placeholder="👍" autocomplete="off">
-      <button type="submit">React</button>
     </form>
   </main>
   <script>
@@ -129,6 +124,15 @@
         div.className = data.out ? 'msg out' : 'msg in';
         div.dataset.id = data.id;
         div.textContent = '[' + data.id + '] ' + (data.text || '<media>');
+        // #86: live-arriving bubbles get the same per-message react button as server-rendered
+        // ones (built via DOM API so the message text stays safely set via textContent).
+        const reactBtn = document.createElement('button');
+        reactBtn.type = 'button';
+        reactBtn.className = 'react-btn';
+        reactBtn.dataset.react = data.id;
+        reactBtn.title = 'React';
+        reactBtn.textContent = '🙂';
+        div.appendChild(reactBtn);
         document.getElementById('messages').appendChild(div);
       };
     });
@@ -169,12 +173,17 @@
       }
       e.target.value = '';
     });
-    // React by message id. Message ids are rendered in each bubble as [id].
-    document.getElementById('reaction-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
+    // #86: per-message reactions. Each bubble carries a 🙂 react-btn; clicking it toggles a
+    // small preset palette, and picking an emoji POSTs to /reaction for that message. React
+    // buttons stay live even in a read-only chat (the text composer is disabled, reactions
+    // are not). Errors surface inline (no browser dialog) — reactions are best-effort.
+    const REACTION_PRESETS = ['👍', '❤️', '🔥', '😂'];
+    async function postReaction(messageId, emoticon) {
       const id = document.getElementById('dialog_id').value;
       if (!id) return;
-      const fd = new FormData(e.target);
+      const fd = new FormData();
+      fd.append('message_id', messageId);
+      fd.append('emoticon', emoticon);
       fd.append('web_client_id', webClientId);
       const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/reaction', {
         method: 'POST',
@@ -183,10 +192,39 @@
       const html = await resp.text();
       if (resp.ok) {
         document.getElementById('messages').insertAdjacentHTML('beforeend', html);
-        e.target.reset();
       } else {
-        alert(html.replace(/<[^>]+>/g, '').trim() || 'Reaction failed');
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        document.getElementById('suggest-error').textContent =
+          (doc.body.textContent || '').trim() || 'Reaction failed.';
       }
+    }
+    function closeReactionPalettes() {
+      document.querySelectorAll('.reaction-palette').forEach(p => p.remove());
+    }
+    document.getElementById('messages').addEventListener('click', (e) => {
+      const reactBtn = e.target.closest('.react-btn');
+      if (reactBtn) {
+        const bubble = reactBtn.closest('.msg');
+        const existing = bubble ? bubble.querySelector('.reaction-palette') : null;
+        closeReactionPalettes();
+        if (existing) return;  // a second click on the same button toggles the palette off
+        const palette = document.createElement('span');
+        palette.className = 'reaction-palette';
+        REACTION_PRESETS.forEach((emoji) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = emoji;
+          b.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            closeReactionPalettes();
+            postReaction(reactBtn.dataset.react, emoji);
+          });
+          palette.appendChild(b);
+        });
+        reactBtn.insertAdjacentElement('afterend', palette);
+        return;
+      }
+      if (!e.target.closest('.reaction-palette')) closeReactionPalettes();  // click elsewhere closes it
     });
     // Suggest: fetch a draft for the open dialog and drop it into the composer.
     document.getElementById('suggest-btn').addEventListener('click', async () => {
@@ -256,6 +294,8 @@
       const attachFile = document.getElementById('attach-file');
       if (suggestBtn) suggestBtn.disabled = ro;
       if (attachFile) attachFile.disabled = ro;
+      // #86: react buttons are intentionally NOT disabled here — reactions are allowed in a
+      // read-only chat even though posting text/media is not.
     }
 
     function blankComposeState(dialogId) {

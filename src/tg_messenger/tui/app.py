@@ -767,14 +767,13 @@ class MessengerTUI(App):
             return
         text = event.value
         dialog_id = self._current
-        if not self._dialog_can_send(dialog_id):
-            # belt-and-suspenders with the disabled composer (cache may be momentarily stale)
-            # NB: this also blocks /react in a read-only chat — reactions are a separate
-            # capability from posting; the reaction-vs-post split is tracked in #86.
-            self.notify(READ_ONLY_MESSAGE, severity="warning")
-            return
         state = self._compose_state_for(dialog_id)
         state.draft = text
+        # #86: reactions are NOT gated by posting permission — parse /react and dispatch it
+        # BEFORE the can_send guard so a read-only chat can still react. A rights rejection is
+        # handled inside _send_reaction (notify + restore the typed command). The per-message
+        # reaction hotkey UI is deferred to a sub-issue (the TUI has no message-selection
+        # mechanism yet); the /react composer command stays for now.
         try:
             reaction = parse_reaction_command(text)
         except ValueError as exc:
@@ -790,6 +789,12 @@ class MessengerTUI(App):
                 self._send_reaction(dialog_id, message_id, emoticon, source_text=text),
                 exclusive=False,
             )
+            return
+        # The posting-permission gate applies to everything that is NOT a reaction
+        # (text / lang / media / outbound).
+        if not self._dialog_can_send(dialog_id):
+            # belt-and-suspenders with the disabled composer (cache may be momentarily stale)
+            self.notify(READ_ONLY_MESSAGE, severity="warning")
             return
         try:
             lang_command = parse_lang_command(text)

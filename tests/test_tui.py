@@ -379,6 +379,22 @@ async def test_tui_submit_in_readonly_channel_does_not_send():
         assert stub.sent == []  # the guard refused before any send worker
 
 
+async def test_tui_react_in_readonly_channel_sends():
+    # #86: reactions are NOT gated by posting permission — /react must go through in a
+    # read-only channel even though plain text is still refused by the can_send guard.
+    stub = TuiStubClient()
+    stub.channel_can_send = False
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = -100300  # a read-only channel
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "/react 1 👍"))
+        await pilot.pause()
+        assert stub.reactions == [(-100300, 1, "👍")]  # the reaction went out
+        assert stub.sent == []  # ...and no text was sent
+
+
 async def test_tui_send_forbidden_restores_draft():
     # Regression: composer is enabled (can_send=True / stale), but Telegram rejects the
     # write on rights at send time. on_input_submitted clears the composer optimistically
