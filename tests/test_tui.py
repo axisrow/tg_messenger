@@ -267,14 +267,14 @@ async def test_tui_mounts_and_lists_dialogs():
 
 
 async def test_tui_dialog_item_shows_id():
-    # цикл 63: DialogItem рендерит "id — title", id виден пользователю
+    # #113: title-first — the human-readable title leads, the id is subdued and trailing (#id).
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
         await pilot.pause()
         item = list(app.query(DialogItem))[0]
-        # Static внутри DialogItem рендерит "7 — Ann [/x" литерально
-        rendered = str(item.query_one(Static).render())
-        assert rendered.startswith("7 — ")
+        rendered = str(item.query_one(Static).render())  # "Ann [/x  #7" literally
+        assert rendered.startswith("Ann")
+        assert "#7" in rendered  # id still visible to the user, just subdued
 
 
 class UnreadClient(TuiStubClient):
@@ -299,7 +299,8 @@ async def test_tui_no_unread_marker_when_zero():
         await pilot.pause()
         item = list(app.query(DialogItem))[0]
         rendered = str(item.query_one(Static).render())
-        assert "(" not in rendered.split("—", 1)[1]  # no "(N)" badge after the title
+        assert "(" not in rendered  # no "(N)" badge when unread==0
+        assert "#7" in rendered  # id still present
 
 
 async def test_tui_selecting_dialog_marks_read():
@@ -1567,6 +1568,127 @@ async def test_tui_dm_incoming_has_no_author_line():
     assert any(str(b.render()).startswith("[1] ") for b in bubbles)
 
 
+# --- #113: presentation redesign (dim author/[id], title-first dialog item, framing) ---
+
+def _has_dim_span(content, start: int, end: int) -> bool:
+    """True if a span covering [start, end) carries a dim style (textual Content.spans)."""
+    spans = getattr(content, "spans", None) or []
+    for sp in spans:
+        if sp.start == start and sp.end == end and getattr(sp.style, "dim", False):
+            return True
+    return False
+
+
+def _any_dim_span_covering(content, index: int) -> bool:
+    spans = getattr(content, "spans", None) or []
+    return any(sp.start <= index < sp.end and getattr(sp.style, "dim", False) for sp in spans)
+
+
+async def test_tui_dialog_item_id_is_dim_and_trailing():
+    # #113: title leads (prominent), the raw id is subdued (dim) and trailing.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        content = list(app.query(DialogItem))[0].query_one(Static).render()
+        plain = str(content)
+        assert plain.startswith("Ann")  # title first
+        assert plain.rstrip().endswith("#7")  # id trailing
+        assert _any_dim_span_covering(content, plain.index("#7"))  # id rendered dim
+
+
+async def test_tui_bubble_author_line_is_dim():
+    # #113: the group author line keeps its content but is dimmed (spans), not removed.
+    stub = GroupSenderEventClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = -100200
+        stub.fire.set()
+        await pilot.pause()
+        content = list(app.query(MessageBubble))[0].render()
+    assert str(content) == "9 @bob Bob Lee\n[21] привет"  # content parity (no behavior change)
+    assert _has_dim_span(content, 0, len("9 @bob Bob Lee"))  # author line dimmed
+
+
+async def test_tui_bubble_id_prefix_is_dim():
+    # #113: the "[id] " prefix is subdued (dim span) while the body stays literal.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        content = list(app.query(MessageBubble))[0].render()
+    plain = str(content)
+    assert plain.startswith("[1] ")  # content unchanged
+    prefix_len = plain.index("] ") + 2  # length of "[1] "
+    assert _has_dim_span(content, 0, prefix_len)
+
+
+class TwoMessageHistoryClient(TuiStubClient):
+    """history(7) returns an incoming + an outgoing message so in/out framing is testable."""
+
+    async def history(self, peer, limit=50, offset_id=0):
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        return [
+            Message(id=1, dialog_id=peer, sender_id=peer, out=False, text="hi there", date=date),
+            Message(id=2, dialog_id=peer, sender_id=1, out=True, text="hello back", date=date),
+        ]
+
+
+async def test_tui_incoming_outgoing_bubbles_are_aligned_differently():
+    # #113: in/out distinction beyond color — the out bubble is offset further right.
+    app = MessengerTUI(client=TwoMessageHistoryClient())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)  # incoming (id=1) + outgoing (id=2)
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+        bin_ = next(b for b in bubbles if "in" in b.classes)
+        bout = next(b for b in bubbles if "out" in b.classes)
+        assert bout.region.x > bin_.region.x
+
+
+async def test_tui_bubbles_have_vertical_separation():
+    # #113: consecutive bubbles are visually separated (margin + border), not run together.
+    app = MessengerTUI(client=TwoMessageHistoryClient())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+        assert len(bubbles) >= 2
+        assert bubbles[1].region.y > bubbles[0].region.y + 1  # clear gap between bubbles
+
+
+async def test_tui_bubble_brackets_render_literally_after_styling():
+    # #113 regression: untrusted body with markup-looking text must never be parsed.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one("#messages", Vertical)
+        bubble = MessageBubble("[1] [b]not bold[/b]", out=False, message_id=1, dialog_id=7)
+        await pane.mount(bubble)
+        await pilot.pause()
+        assert "[b]not bold[/b]" in str(bubble.render())
+
+
+async def test_tui_translation_and_reactions_keep_content_after_styling():
+    # #113: translation + reactions still compose under the new Text builder (content parity).
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one("#messages", Vertical)
+        bubble = MessageBubble("[1] hi", out=False, message_id=1, dialog_id=7)
+        await pane.mount(bubble)
+        bubble.show_translation("привет")
+        bubble.add_reaction("👍")
+        await pilot.pause()
+        assert str(bubble.render()) == "[1] hi\n↳ привет\n👍"
+
+
 class IncomingDialogListClient(TuiStubClient):
     """listen_all emits one new DM after the initial dialog snapshot was rendered."""
 
@@ -1638,7 +1760,7 @@ async def test_tui_incoming_updates_dialog_list_without_network_reload():
         stub.fire.set()
         await pilot.pause()
         rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
-    assert rendered == ["8 — Bob (1)", "7 — Ann", "-100200 — Devs"]
+    assert rendered == ["Bob  (1)  #8", "Ann  #7", "Devs  #-100200"]
     assert stub.dialogs_calls == calls_before
 
 
@@ -1672,7 +1794,7 @@ async def test_tui_open_dialog_live_message_stays_read_and_marks_new_id():
         await pilot.pause()
         rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
         bubbles = [str(b.render()) for b in app.query(MessageBubble)]
-    assert rendered == ["8 — Bob", "7 — Ann", "-100200 — Devs"]
+    assert rendered == ["Bob  #8", "Ann  #7", "Devs  #-100200"]
     assert bubbles == ["[22] fresh"]
     assert stub.read_acks == [(8, 22)]
 
@@ -1755,7 +1877,7 @@ async def test_tui_outgoing_updates_dialog_list_without_unread_increment():
         stub.fire.set()
         await pilot.pause()
         rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
-    assert rendered == ["8 — Bob", "7 — Ann", "-100200 — Devs"]
+    assert rendered == ["Bob  #8", "Ann  #7", "Devs  #-100200"]
     assert stub.dialogs_calls == calls_before
 
 
@@ -1769,7 +1891,7 @@ async def test_tui_local_send_updates_dialog_list_without_waiting_for_echo():
         await app._send_text(8, "from composer")
         await pilot.pause()
         rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
-    assert rendered == ["8 — Bob", "7 — Ann", "-100200 — Devs"]
+    assert rendered == ["Bob  #8", "Ann  #7", "Devs  #-100200"]
     assert stub.dialogs_calls == calls_before
 
 
@@ -1920,17 +2042,25 @@ async def test_tui_reaction_accumulates_distinct_emoji_and_dedups():
 
 async def test_tui_reaction_and_translation_coexist_either_order():
     # #106: translation and reactions are separate bubble state — neither clobbers the other.
-    bubble = MessageBubble("[1] hi", out=False, message_id=1, dialog_id=7)
-    bubble.show_translation("привет")
-    bubble.add_reaction("👍")
-    first = str(bubble.render())
-    assert "↳ привет" in first and "👍" in first and "[1] hi" in first
+    # #113: bubbles render a Rich Text, whose render() resolves through the app theme, so mount
+    # them in a running app (the only context they ever render in) before asserting.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one("#messages", Vertical)
+        bubble = MessageBubble("[1] hi", out=False, message_id=1, dialog_id=7)
+        await pane.mount(bubble)
+        bubble.show_translation("привет")
+        bubble.add_reaction("👍")
+        first = str(bubble.render())
+        assert "↳ привет" in first and "👍" in first and "[1] hi" in first
 
-    bubble2 = MessageBubble("[2] yo", out=False, message_id=2, dialog_id=7)
-    bubble2.add_reaction("🔥")
-    bubble2.show_translation("здарова")  # reverse order
-    second = str(bubble2.render())
-    assert "↳ здарова" in second and "🔥" in second and "[2] yo" in second
+        bubble2 = MessageBubble("[2] yo", out=False, message_id=2, dialog_id=7)
+        await pane.mount(bubble2)
+        bubble2.add_reaction("🔥")
+        bubble2.show_translation("здарова")  # reverse order
+        second = str(bubble2.render())
+        assert "↳ здарова" in second and "🔥" in second and "[2] yo" in second
 
 
 async def test_tui_reaction_for_unknown_message_is_silently_ignored():
