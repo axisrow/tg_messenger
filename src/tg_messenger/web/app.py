@@ -113,9 +113,14 @@ def _dialog_li(d) -> str:
     # data-can-send drives the composer enable/disable on the client (zero round-trip):
     # chat.html reads li.dataset.canSend when a dialog opens
     can_send = "1" if getattr(d, "can_send", True) else "0"
+    # data-dialog / data-title are the exact, unparsed id+title for the cross-dialog reaction
+    # toast (#97): the client matches on data-dialog and reads data-title instead of slicing the
+    # rendered <li> text, so a title containing " @" or trailing digits can no longer be
+    # over-trimmed (Codex review of #103).
     return (
         f'<li hx-get="/dialogs/{d.id}/messages" hx-target="#messages" '
-        f'data-kind="{d.kind}" data-can-send="{can_send}">'
+        f'data-dialog="{d.id}" data-kind="{d.kind}" data-can-send="{can_send}" '
+        f'data-title="{escape(d.title)}">'
         f"{d.id} — {escape(d.title)}{uname}{unread}</li>"
     )
 
