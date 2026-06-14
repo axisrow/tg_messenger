@@ -795,9 +795,9 @@ async def test_tui_react_picker_cancel_sends_nothing():
     assert stub.reactions == []
 
 
-async def test_tui_react_hotkey_on_reaction_bubble_is_noop():
-    # #93: a reaction-echo bubble has message_id=None — "r" must not open the picker.
-    stub = SentReactionEchoClient()
+async def test_tui_react_hotkey_on_non_target_bubble_is_noop():
+    # #93: a bubble with message_id=None is not a reaction target — "r" must not open the picker.
+    stub = TuiStubClient()
     app = MessengerTUI(client=stub)
     picked = []
 
@@ -809,9 +809,10 @@ async def test_tui_react_hotkey_on_reaction_bubble_is_noop():
     async with app.run_test() as pilot:
         await pilot.pause()
         app._current = 7
-        await app._send_reaction(7, 1, "👍")  # mounts a message_id=None echo bubble
+        pane = app.query_one("#messages", Vertical)
+        bubble = MessageBubble("system notice", out=False, message_id=None, dialog_id=7)
+        await pane.mount(bubble)
         await pilot.pause()
-        bubble = list(app.query(MessageBubble))[0]
         assert bubble.message_id is None
         bubble.focus()
         await pilot.press("r")
@@ -1505,23 +1506,36 @@ class ReactionEventClient(TuiStubClient):
         super().__init__()
         self.fire = asyncio.Event()
 
+    async def history(self, peer, limit=50, offset_id=0):
+        # message id 11 exists so the reaction targeting it can attach (id 10 does not)
+        return [Message(id=11, dialog_id=peer, sender_id=peer, out=False, text="hi",
+                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))]
+
     async def listen_reactions(self):
         await self.fire.wait()
-        yield ReactionEvent(dialog_id=9, message_id=10, emoticon="❤️")
-        yield ReactionEvent(dialog_id=7, message_id=11, emoticon=None)
+        yield ReactionEvent(dialog_id=9, message_id=10, emoticon="❤️")  # other dialog → ignored
+        yield ReactionEvent(dialog_id=7, message_id=11, emoticon=None)  # custom → "<custom>"
         await asyncio.Event().wait()
 
 
-async def test_tui_reaction_event_appends_bubble_for_open_dialog_only():
+async def test_tui_reaction_attaches_under_message_for_open_dialog_only():
+    # #106: an incoming (other people's) reaction attaches UNDER its target message — no
+    # separate bubble — and only for a message in the open dialog's loaded history.
     stub = ReactionEventClient()
     app = MessengerTUI(client=stub)
     async with app.run_test() as pilot:
         await pilot.pause()
         app._current = 7
+        await app._show_history(7)  # bubble id=11 enters _bubble_index
+        await pilot.pause()
         stub.fire.set()
         await pilot.pause()
-        bubbles = [str(b.render()) for b in app.query(MessageBubble)]
-        assert bubbles == ["reaction [11]: <custom>"]
+        bubbles = list(app.query(MessageBubble))
+        # still exactly ONE bubble (the message) — the reaction did not spawn its own
+        assert len(bubbles) == 1
+        rendered = str(bubbles[0].render())
+        assert rendered.startswith("[11] hi")
+        assert rendered.endswith("<custom>")  # custom/premium reaction label, attached under
 
 
 class SentReactionEchoClient(TuiStubClient):
@@ -1536,17 +1550,164 @@ class SentReactionEchoClient(TuiStubClient):
 
 
 async def test_tui_sent_reaction_echo_is_not_duplicated():
+    # #106: our own optimistic reaction attaches under the message; the live echo for the
+    # same (dialog, message, emoji) is deduped (_sent_reactions) so 👍 is shown once.
     stub = SentReactionEchoClient()
     app = MessengerTUI(client=stub)
     async with app.run_test() as pilot:
         await pilot.pause()
         app._current = 7
-        await app._send_reaction(7, 1, "👍")
+        await app._show_history(7)  # bubble id=1 (stub history) enters the index
+        await pilot.pause()
+        await app._send_reaction(7, 1, "👍")  # optimistic attach + remembers sent
+        stub.fire.set()  # live echo for (7,1,"👍") — deduped, must not double-attach
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+    # one bubble (the message), reaction line shows a single 👍, not 👍 👍
+    assert len(bubbles) == 1
+    rendered = str(bubbles[0].render())
+    assert rendered.count("👍") == 1
+    assert rendered.startswith("[1] ")
+
+
+async def test_tui_reaction_accumulates_distinct_emoji_and_dedups():
+    # #106: multiple distinct reactions accumulate on one line; a repeat is not added twice.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)  # bubble id=1
+        await pilot.pause()
+        app._apply_reaction(7, 1, "👍")
+        app._apply_reaction(7, 1, "❤️")
+        app._apply_reaction(7, 1, "👍")  # duplicate — ignored
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+    assert len(bubbles) == 1
+    rendered = str(bubbles[0].render())
+    assert rendered.endswith("👍 ❤️")
+    assert rendered.count("👍") == 1
+
+
+async def test_tui_reaction_and_translation_coexist_either_order():
+    # #106: translation and reactions are separate bubble state — neither clobbers the other.
+    bubble = MessageBubble("[1] hi", out=False, message_id=1, dialog_id=7)
+    bubble.show_translation("привет")
+    bubble.add_reaction("👍")
+    first = str(bubble.render())
+    assert "↳ привет" in first and "👍" in first and "[1] hi" in first
+
+    bubble2 = MessageBubble("[2] yo", out=False, message_id=2, dialog_id=7)
+    bubble2.add_reaction("🔥")
+    bubble2.show_translation("здарова")  # reverse order
+    second = str(bubble2.render())
+    assert "↳ здарова" in second and "🔥" in second and "[2] yo" in second
+
+
+async def test_tui_reaction_for_unknown_message_is_silently_ignored():
+    # #106: a reaction whose message isn't in the loaded history attaches nowhere and
+    # spawns no bubble — no exception (mirrors the translation no-op).
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)  # only message id=1 exists
+        await pilot.pause()
+        app._apply_reaction(7, 999, "👍")  # unknown id
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+    assert len(bubbles) == 1  # still just the one message, no reaction bubble
+    assert "👍" not in str(bubbles[0].render())
+
+
+class ChannelReactionClient(TuiStubClient):
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def history(self, peer, limit=50, offset_id=0):
+        # a channel post (marked negative dialog id) — message id 50 in the loaded history
+        return [Message(id=50, dialog_id=peer, sender_id=peer, out=False, text="post",
+                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))]
+
+    async def listen_reactions(self):
+        await self.fire.wait()
+        yield ReactionEvent(dialog_id=-100300, message_id=50, emoticon="🔥")
+        await asyncio.Event().wait()
+
+
+async def test_tui_reaction_attaches_in_channel():
+    # #106: reactions attach under messages in channels too (marked negative dialog id) —
+    # not just DMs. Same path for bots/groups since nothing filters by dialog kind.
+    stub = ChannelReactionClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = -100300
+        await app._show_history(-100300)  # bubble id=50
+        await pilot.pause()
         stub.fire.set()
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
-    assert [str(b.render()) for b in bubbles] == ["reaction [1]: 👍"]
-    assert all("out" in b.classes for b in bubbles)
+    assert len(bubbles) == 1
+    assert str(bubbles[0].render()).endswith("🔥")
+
+
+async def test_tui_reaction_during_history_load_is_buffered_and_replayed():
+    # #106 (Codex review): a reaction for the open dialog that arrives while its history is
+    # still loading (the bubble doesn't exist yet) must not be dropped — it is buffered and
+    # replayed once _show_history mounts the bubbles.
+    stub = TuiStubClient()  # history returns message id=1
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        # reaction arrives BEFORE history is loaded: index empty → buffered, not lost
+        app._apply_reaction(7, 1, "👍")
+        assert app._pending_reactions.get(7) == [(1, "👍")]
+        await app._show_history(7)  # mounts bubble id=1, then replays the buffer
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+    assert len(bubbles) == 1
+    assert str(bubbles[0].render()).endswith("👍")
+    assert app._pending_reactions.get(7) is None  # buffer drained, not left dangling
+
+
+async def test_tui_buffered_reaction_for_other_dialog_is_not_kept():
+    # #106: a reaction for a dialog other than the open one is never buffered (it would never
+    # be replayed) — it is silently ignored, like an out-of-snapshot message.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        app._apply_reaction(9, 1, "👍")  # different dialog
+        assert app._pending_reactions == {}
+
+
+async def test_tui_reaction_not_attached_to_same_id_bubble_of_other_dialog():
+    # #106 (Codex review, defense-in-depth): _bubble_index is keyed by bare message_id, which
+    # is not unique across dialogs. If a stale bubble from a DIFFERENT dialog somehow sits in the
+    # index under a colliding id, a reaction for the current dialog must NOT attach to it — the
+    # bubble's own source dialog is verified before attaching. (The synchronous index clear +
+    # exclusive history worker make this unreachable in practice; this guards the invariant.)
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        pane = app.query_one("#messages", Vertical)
+        # a bubble whose SOURCE dialog is 9 (not the open dialog 7), indexed under id 1
+        stale = MessageBubble("[1] from dialog 9", out=False, message_id=1, dialog_id=9)
+        await pane.mount(stale)
+        app._bubble_index[1] = stale
+        app._apply_reaction(7, 1, "👍")  # current dialog 7, colliding id 1
+        await pilot.pause()
+        rendered = str(stale.render())
+    assert "👍" not in rendered  # the reaction did not land under the other dialog's bubble
+    assert app._pending_reactions == {}  # nor was it buffered (the bubble existed, just mismatched)
 
 
 async def test_tui_group_incoming_does_not_trigger_suggester():

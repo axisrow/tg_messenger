@@ -479,9 +479,11 @@ async def test_send_without_dialog_returns_400(client_app):
 async def test_reaction_endpoint_calls_client(client_app):
     ac, stub = client_app
     r = await ac.post("/dialogs/7/reaction", data={"message_id": "10", "emoticon": "👍"})
-    assert r.status_code == 200, r.text
+    # #106: no body — the optimistic attach-under-message happens client-side (attachReaction),
+    # the same path the SSE frame uses, so a reaction never renders as a separate bubble.
+    assert r.status_code == 204, r.text
+    assert r.text == ""
     assert stub.reactions == [(7, 10, "👍")]
-    assert "reacted" in r.text.lower()
 
 
 async def test_reaction_endpoint_rejects_bad_message_id(client_app):
@@ -600,7 +602,7 @@ async def test_reaction_in_readonly_channel_succeeds():
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
             r = await ac.post("/dialogs/-100123/reaction",
                               data={"message_id": "5", "emoticon": "👍"})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 204, r.text  # #106: 204, attach is client-side
     assert stub.reactions == [(-100123, 5, "👍")]
 
 
@@ -1173,7 +1175,7 @@ async def test_stream_skips_reaction_echo_sent_by_same_web_client():
                 data={"message_id": "51", "emoticon": "👍", "web_client_id": "a"},
             )
 
-        assert r.status_code == 200
+        assert r.status_code == 204  # #106: 204, attach is client-side
         assert stub.reactions == [(7, 51, "👍")]
 
         gen = sse_event_stream(
@@ -1209,7 +1211,7 @@ async def test_stream_does_not_skip_reaction_sent_by_other_web_client():
                 data={"message_id": "51", "emoticon": "👍", "web_client_id": "a"},
             )
 
-        assert r.status_code == 200
+        assert r.status_code == 204  # #106: 204, attach is client-side
 
         gen = sse_event_stream(
             stub,
@@ -1913,6 +1915,28 @@ async def test_index_has_reaction_controls(client_app):
     assert "reaction-palette" in r.text  # the preset palette plumbing
 
 
+async def test_index_attaches_reaction_under_message(client_app):
+    # #106: reactions render UNDER their target message (accumulating line), never as a
+    # separate bubble. Inline chat.html JS has no unit harness → grep-guard the plumbing.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "function attachReaction(" in r.text  # the shared attach-under-message helper
+    assert "attachReaction(id, data.message_id" in r.text  # SSE frame passes the stream dialog
+    assert "attachReaction(dialogId, messageId, emoticon)" in r.text  # optimistic POST path
+    assert "className = 'reactions'" in r.text  # the accumulating line container
+    assert ".reactions {" in r.text  # its CSS rule
+    assert "msg reaction" not in r.text  # the old separate-bubble class is gone
+    # #95/#96 race-safety: attach must match BOTH the source dialog AND the message id, since
+    # message ids aren't unique across dialogs and a frame can arrive mid-dialog-switch.
+    assert "[data-dialog=" in r.text and "[data-id=" in r.text
+    # #106 (Codex review): a reaction frame arriving before the #messages swap settles must be
+    # buffered and replayed, not dropped (mirrors the TUI _pending_reactions buffer). Guard the
+    # plumbing: the per-dialog pending map, and the htmx:afterSettle drain on #messages.
+    assert "pendingReactions" in r.text  # the per-dialog buffer for the swap race
+    assert "function drainPendingReactions(" in r.text  # replays buffered reactions after mount
+    assert "addEventListener('htmx:afterSettle'" in r.text  # drains once #messages has swapped in
+
+
 async def test_index_has_cross_dialog_reaction_toast(client_app):
     # #97: a reaction landing in a dialog the user navigated away from confirms via a
     # lightweight toast (the echo bubble is suppressed cross-dialog, #95/#96). Guard the
@@ -1964,11 +1988,10 @@ def test_message_div_has_react_button():
 async def test_reaction_routes_to_path_dialog_not_global(client_app):
     # #95: the /reaction route takes its target dialog from the URL path (the bubble's
     # own dialog), so a reaction always lands on the chat the message belongs to — even
-    # if the user has since switched dialogs. The response fragment and echo bucket key
-    # follow the path dialog too.
+    # if the user has since switched dialogs. The echo bucket key follows the path dialog too.
     ac, stub = client_app
     r = await ac.post("/dialogs/7/reaction", data={"message_id": "5", "emoticon": "🔥"})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 204, r.text  # #106: 204, attach is client-side
     assert stub.reactions == [(7, 5, "🔥")]
 
 

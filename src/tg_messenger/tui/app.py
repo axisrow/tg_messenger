@@ -107,14 +107,6 @@ def _message_label(message) -> str:
     return f"[{message.id}] {message.text or '<media>'}"
 
 
-def _reaction_emoticon(emoticon: str | None) -> str:
-    return emoticon if emoticon is not None else "<custom>"
-
-
-def _reaction_label(event) -> str:
-    return f"reaction [{event.message_id}]: {_reaction_emoticon(event.emoticon)}"
-
-
 class ProfileItem(ListItem):
     """One selectable account profile on the startup screen."""
 
@@ -296,16 +288,39 @@ class MessageBubble(Static):
     def __init__(self, text: str, out: bool, message_id: int | None = None,
                  dialog_id: int | None = None):
         self._base_text = text
-        # the message this bubble can be reacted to; None for reaction-echo bubbles,
-        # which are not themselves reaction targets.
+        # the message this bubble can be reacted to; None for non-target bubbles.
         self.message_id = message_id
         # #102: the SOURCE dialog of this bubble (web #96 parity, data-dialog) — a reaction
         # targets it, not the globally-current dialog, so action_react is self-contained.
         self.dialog_id = dialog_id
+        # #106: translation + reactions are SEPARATE state composed by _render(), so neither
+        # clobbers the other regardless of arrival order (both rewrite the whole widget text).
+        self._translation: str | None = None
+        self._reactions: list[str] = []  # ordered by arrival; the "👍 ❤️ 🔥" line
         super().__init__(text, classes="out" if out else "in", markup=False)
 
+    def _recompose_text(self) -> None:
+        # NOT named _render — Textual's Widget._render is a reserved rendering hook; shadowing
+        # it breaks the widget. This just recomposes our own multi-line text via update().
+        parts = [self._base_text]
+        if self._translation is not None:
+            parts.append(f"↳ {self._translation}")
+        if self._reactions:
+            parts.append(" ".join(self._reactions))
+        self.update("\n".join(parts))
+
     def show_translation(self, text: str) -> None:
-        self.update(f"{self._base_text}\n↳ {text}")
+        self._translation = text
+        self._recompose_text()
+
+    def add_reaction(self, emoticon: str | None) -> None:
+        # #106: accumulate reactions on one line under the message; custom/premium → "<custom>".
+        # Dedup so the same emoji isn't shown twice (a re-add or our-own + live echo).
+        label = emoticon if emoticon is not None else "<custom>"
+        if label in self._reactions:
+            return
+        self._reactions.append(label)
+        self._recompose_text()
 
     def action_focus_prev_bubble(self) -> None:
         self._focus_sibling(-1)
@@ -450,6 +465,10 @@ class MessengerTUI(App):
         # (dialog_id, message_id, emoticon) keys we reacted with from this composer.
         # Telegram echoes the update via listen_reactions(); skip the local echo only.
         self._sent_reactions: OrderedDict[tuple[int, int, str | None], bool] = OrderedDict()
+        # #106: reactions for the current dialog that arrived while its history was still
+        # loading (the bubble didn't exist yet) — replayed once _show_history mounts bubbles,
+        # so a reaction in that window isn't lost. Keyed by dialog_id; bounded per dialog.
+        self._pending_reactions: dict[int, list[tuple[int, str | None]]] = {}
 
     def _build_coordinator(self) -> OutboundSendCoordinator:
         return OutboundSendCoordinator(outbound=self._outbound, store=self._store)
@@ -740,6 +759,7 @@ class MessengerTUI(App):
             self._apply_composer_writable(item.dialog_id)
             self._clear_suggestion()
             self._bubble_index.clear()
+            self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
             # exclusive group: selecting another dialog cancels a still-loading history
             self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
 
@@ -773,6 +793,8 @@ class MessengerTUI(App):
             self._bubble_index[m.id] = bubble
             bubbles.append(bubble)
         await pane.mount(*bubbles)
+        # #106: apply any reactions that arrived while this history was loading.
+        self._drain_pending_reactions(dialog_id)
         self._scroll_messages_to_end(pane)
         if self._translator is not None:
             self.run_worker(
@@ -928,6 +950,42 @@ class MessengerTUI(App):
         self._sent_reactions.move_to_end(key)
         while len(self._sent_reactions) > 200:  # bounded, like watch.py's caches
             self._sent_reactions.popitem(last=False)
+
+    def _apply_reaction(self, dialog_id: int, message_id: int, emoticon: str | None) -> None:
+        # #106: attach the reaction UNDER its target message (the translation pattern), not as
+        # a separate bubble.
+        bubble = self._bubble_index.get(message_id)
+        # Defense-in-depth (Codex review): _bubble_index is keyed by bare message_id, which is
+        # not unique across dialogs. on_list_view_selected clears the index synchronously and the
+        # history worker is exclusive, so a stale bubble from a prior dialog should never remain —
+        # but verify the bubble's own SOURCE dialog matches before attaching, so a colliding id
+        # can never render under the wrong chat's message even if that invariant is ever broken.
+        if bubble is not None:
+            if bubble.dialog_id == dialog_id:
+                bubble.add_reaction(emoticon)
+            # else: a same-id bubble from a different dialog (the invariant says this can't
+            # happen — see above) — drop rather than mis-attach or buffer indefinitely.
+            return
+        # Target not in the index. Two cases: (a) for the OPEN dialog whose history is still
+        # loading — the bubble will exist in a moment, so buffer and replay after _show_history
+        # mounts (Codex review: don't drop a live reaction in that window); (b) any other case
+        # (a different dialog, or a message scrolled out of the loaded snapshot) — silently
+        # ignore, mirroring how translations no-op.
+        if dialog_id != self._current:
+            return
+        pending = self._pending_reactions.setdefault(dialog_id, [])
+        pending.append((message_id, emoticon))
+        while len(pending) > 100:  # bounded, like the other in-memory caches
+            pending.pop(0)
+
+    def _drain_pending_reactions(self, dialog_id: int) -> None:
+        # #106: replay reactions buffered while this dialog's history was loading. Apply onto
+        # the freshly-mounted bubbles (a missing target now means it really isn't in the
+        # snapshot → dropped, not re-buffered, so this can't loop).
+        for message_id, emoticon in self._pending_reactions.pop(dialog_id, []):
+            bubble = self._bubble_index.get(message_id)
+            if bubble is not None:
+                bubble.add_reaction(emoticon)
 
     async def _apply_lang_command(self, dialog_id: int, command: tuple[str, str | None]) -> None:
         if self._outbound is None:
@@ -1109,13 +1167,8 @@ class MessengerTUI(App):
             return
         self._remember_sent_reaction(peer, message_id, emoticon)
         if peer == self._current:
-            pane = self.query_one("#messages", Vertical)
-            # message_id=None: a reaction-echo bubble is not itself a reaction target (#93)
-            await pane.mount(
-                MessageBubble(f"reaction [{message_id}]: {emoticon}", out=True,
-                              message_id=None, dialog_id=peer)
-            )
-            self._scroll_messages_to_end(pane)
+            # #106: attach under the reacted message instead of a separate bubble.
+            self._apply_reaction(peer, message_id, emoticon)
         else:
             # #105: the reaction landed in a dialog the user has navigated away from — the
             # in-pane echo bubble would contaminate the wrong chat, so confirm with a transient
@@ -1191,12 +1244,10 @@ class MessengerTUI(App):
                 key = (ev.dialog_id, ev.message_id, ev.emoticon)
                 if key in self._sent_reactions:
                     self._sent_reactions.pop(key, None)
-                    continue  # our own optimistic bubble already shows it
+                    continue  # our own optimistic reaction is already shown under the message
                 if ev.dialog_id == self._current:
-                    pane = self.query_one("#messages", Vertical)
-                    await pane.mount(MessageBubble(_reaction_label(ev), out=False,
-                                                  message_id=None, dialog_id=ev.dialog_id))
-                    self._scroll_messages_to_end(pane)
+                    # #106: other people's reactions attach under the reacted message too.
+                    self._apply_reaction(ev.dialog_id, ev.message_id, ev.emoticon)
         except Exception:
             logger.exception("reaction listener failed")
             self.notify("Reaction listener failed — see log.", severity="error")
