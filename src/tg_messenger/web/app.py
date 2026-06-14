@@ -175,8 +175,12 @@ def _message_div(m) -> str:
         f'<button type="button" class="react-btn" data-react="{m.id}" '
         f'title="React">🙂</button>'
     )
+    # #95: stamp the bubble's own dialog id so a per-message action (react/reply) targets
+    # the source dialog, not the global #dialog_id — which updates synchronously on a switch
+    # while these bubbles are still briefly live in the DOM (HTMX swaps #messages async).
     return (
-        f'<div class="msg {cls}" data-id="{m.id}">{body}{reply_btn}{react_btn}{translation}</div>'
+        f'<div class="msg {cls}" data-id="{m.id}" data-dialog="{m.dialog_id}">'
+        f"{body}{reply_btn}{react_btn}{translation}</div>"
     )
 
 

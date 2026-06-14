@@ -123,6 +123,7 @@
         // our own messages (sent from another device) render on the right
         div.className = data.out ? 'msg out' : 'msg in';
         div.dataset.id = data.id;
+        div.dataset.dialog = id;  // #95: bind the bubble to this stream's dialog (race-safe)
         div.textContent = '[' + data.id + '] ' + (data.text || '<media>');
         // #86: live-arriving bubbles get the same per-message react button as server-rendered
         // ones (built via DOM API so the message text stays safely set via textContent).
@@ -178,20 +179,26 @@
     // buttons stay live even in a read-only chat (the text composer is disabled, reactions
     // are not). Errors surface inline (no browser dialog) — reactions are best-effort.
     const REACTION_PRESETS = ['👍', '❤️', '🔥', '😂'];
-    async function postReaction(messageId, emoticon) {
-      const id = document.getElementById('dialog_id').value;
-      if (!id) return;
+    async function postReaction(messageId, emoticon, dialogId) {
+      // #95: react to the dialog the clicked BUBBLE belongs to (dialogId), not the global
+      // #dialog_id — which may already point to another chat if a switch is in flight while
+      // a stale bubble is still live in the DOM. The append-echo is guarded like the attach
+      // path: only show the response fragment if the user is still on that dialog.
+      if (!dialogId) dialogId = document.getElementById('dialog_id').value;  // fallback
+      if (!dialogId) return;
       const fd = new FormData();
       fd.append('message_id', messageId);
       fd.append('emoticon', emoticon);
       fd.append('web_client_id', webClientId);
-      const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/reaction', {
+      const resp = await fetch('/dialogs/' + encodeURIComponent(dialogId) + '/reaction', {
         method: 'POST',
         body: fd
       });
       const html = await resp.text();
       if (resp.ok) {
-        document.getElementById('messages').insertAdjacentHTML('beforeend', html);
+        if (document.getElementById('dialog_id').value === dialogId) {
+          document.getElementById('messages').insertAdjacentHTML('beforeend', html);
+        }
       } else {
         const doc = new DOMParser().parseFromString(html, 'text/html');
         document.getElementById('suggest-error').textContent =
@@ -208,6 +215,8 @@
         const existing = bubble ? bubble.querySelector('.reaction-palette') : null;
         closeReactionPalettes();
         if (existing) return;  // a second click on the same button toggles the palette off
+        // #95: the reaction targets the bubble's OWN dialog, captured here at palette time.
+        const bubbleDialog = bubble ? bubble.dataset.dialog : '';
         const palette = document.createElement('span');
         palette.className = 'reaction-palette';
         REACTION_PRESETS.forEach((emoji) => {
@@ -217,7 +226,7 @@
           b.addEventListener('click', (ev) => {
             ev.stopPropagation();
             closeReactionPalettes();
-            postReaction(reactBtn.dataset.react, emoji);
+            postReaction(reactBtn.dataset.react, emoji, bubbleDialog);
           });
           palette.appendChild(b);
         });
@@ -271,6 +280,12 @@
     document.getElementById('messages').addEventListener('click', (e) => {
       const btn = e.target.closest('.reply-btn');
       if (!btn) return;
+      // #95 defense-in-depth: reply targets the composer (which sends to the active dialog),
+      // so ignore a click on a stale bubble belonging to a different dialog — otherwise the
+      // banner would set a reply_to that doesn't exist in the now-active chat.
+      const bubble = btn.closest('.msg');
+      const bubbleDialog = bubble ? bubble.dataset.dialog : '';
+      if (bubbleDialog && bubbleDialog !== document.getElementById('dialog_id').value) return;
       setReply(btn.dataset.reply);
     });
     document.getElementById('reply-cancel').addEventListener('click', clearReply);
