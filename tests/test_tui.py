@@ -755,8 +755,10 @@ async def test_tui_react_targets_bubble_dialog_not_current():
         return "👍"
 
     app.push_screen_wait = pick  # type: ignore[method-assign]
+    notifications: list[str] = []
     async with app.run_test() as pilot:
         await pilot.pause()
+        app.notify = lambda message, **kw: notifications.append(message)  # type: ignore[method-assign]
         app._current = 7
         await app._show_history(7)  # bubble gets dialog_id=7
         await pilot.pause()
@@ -767,6 +769,9 @@ async def test_tui_react_targets_bubble_dialog_not_current():
         await pilot.press("r")
         await _pause_until(pilot, lambda: bool(stub.reactions))
     assert stub.reactions == [(7, 1, "👍")]  # reaction went to the bubble's dialog, not -100300
+    # #105: cross-dialog reaction confirms via a toast (the in-pane echo is suppressed since
+    # peer != _current), with the source dialog's title — parity with web #103/#97.
+    assert notifications == ["Реакция в Ann [/x 👍"]
 
 
 async def test_tui_react_picker_cancel_sends_nothing():

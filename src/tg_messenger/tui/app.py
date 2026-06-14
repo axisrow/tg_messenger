@@ -1116,6 +1116,14 @@ class MessengerTUI(App):
                               message_id=None, dialog_id=peer)
             )
             self._scroll_messages_to_end(pane)
+        else:
+            # #105: the reaction landed in a dialog the user has navigated away from — the
+            # in-pane echo bubble would contaminate the wrong chat, so confirm with a transient
+            # toast instead (parity with web #103/#97). Title is best-effort — neutral fallback.
+            title = self._dialog_title(peer)
+            self.notify(
+                f"Реакция в {title} {emoticon}" if title else f"Реакция отправлена {emoticon}"
+            )
 
     async def _drain_incoming(self) -> None:
         try:
@@ -1209,6 +1217,12 @@ class MessengerTUI(App):
 
     def _is_dm_dialog(self, dialog_id: int) -> bool:
         return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
+
+    def _dialog_title(self, dialog_id: int) -> str | None:
+        # #105: best-effort title from the already-loaded dialog list (no network — flood
+        # discipline), for the cross-dialog reaction toast. None → the caller falls back to a
+        # neutral confirmation. Mirrors web dialogTitleById (#103).
+        return next((d.title for d in self._all_dialogs if d.id == dialog_id), None)
 
     def _dialog_can_send(self, dialog_id: int) -> bool:
         # #90: the one shared POST-capability rule over the already-loaded dialog list
