@@ -126,6 +126,9 @@ class ProfileScreen(ModalScreen[str]):
     returns its name to the caller (which then builds the client for it).
     """
 
+    # #116: center the modal card (the box geometry is shaped by App.CSS #profile-box).
+    DEFAULT_CSS = "ProfileScreen { align: center middle; }"
+
     def __init__(self, profiles: list[str]):
         super().__init__()
         self._profiles = profiles
@@ -156,6 +159,9 @@ class LoginScreen(ModalScreen[bool]):
     with ``True`` once the session reaches ``done``; the app then continues its
     normal startup (loads dialogs). Phone numbers and codes are never logged.
     """
+
+    # #116: center the modal card (the box geometry is shaped by App.CSS #login-box).
+    DEFAULT_CSS = "LoginScreen { align: center middle; }"
 
     BINDINGS = [
         # Ctrl+C must quit cleanly even mid-login (priority: focus sits in Input)
@@ -358,6 +364,9 @@ class VariantItem(ListItem):
 
 
 class VariantPickScreen(ModalScreen[str | None]):
+    # #116: center the modal card (the box geometry is shaped by App.CSS #variant-box).
+    DEFAULT_CSS = "VariantPickScreen { align: center middle; }"
+
     def __init__(self, variants: list[str], draft: str):
         super().__init__()
         self._variants = variants
@@ -391,6 +400,9 @@ class EmojiPickerScreen(ModalScreen[str | None]):
     Mirrors VariantPickScreen and the web palette (REACTION_PRESETS). Returns the chosen
     emoticon, or None if dismissed with Escape.
     """
+
+    # #116: center the modal card (the box geometry is shaped by App.CSS #emoji-box).
+    DEFAULT_CSS = "EmojiPickerScreen { align: center middle; }"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="emoji-box"):
@@ -434,6 +446,19 @@ class MessengerTUI(App):
     .in { color: $text; }
     #suggestion { color: $text-muted; height: auto; }
     #composer { dock: bottom; }
+    /* #116: shared modal card — a centered, bordered, width-capped box (was full-width, top-left,
+       unframed). Centering (align: center middle) lives on each ModalScreen's DEFAULT_CSS so it is
+       not affected by App.CSS-vs-screen scoping; these rules only shape the box. */
+    #profile-box, #login-box, #variant-box, #emoji-box {
+        width: 60%;
+        max-width: 64;
+        height: auto;
+        max-height: 80%;
+        padding: 1 2;
+        border: round $primary;
+        background: $surface;
+    }
+    #login-title { text-style: bold; }
     """
 
     def __init__(self, *, client=None, session_name: str = "default",

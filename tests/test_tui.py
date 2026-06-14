@@ -849,6 +849,36 @@ async def test_emoji_picker_lists_presets():
         assert [it.value for it in items] == REACTION_PRESETS == ["👍", "❤️", "🔥", "😂"]
 
 
+async def test_tui_login_modal_is_centered_and_bordered():
+    # #116: the login modal is a centered, bordered card — not a full-width, top-left raw box.
+    from tg_messenger.tui.app import LoginScreen
+
+    stub = TuiStubClient()
+    stub.authorized = False
+    app = MessengerTUI(client=stub, login_session=FakeTuiLoginSession())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _pause_until(pilot, lambda: isinstance(app.screen, LoginScreen))
+        box = app.screen.query_one("#login-box")
+        assert box.region.x > 0  # not flush-left (centered horizontally)
+        assert box.region.y > 0  # not flush-top (centered vertically)
+        assert box.region.width < app.size.width  # width-capped, not full width
+        assert box.styles.border.top[0] != ""  # a border edge is set
+
+
+async def test_tui_emoji_modal_is_centered_and_bordered():
+    # #116: the emoji picker is a centered, bordered card too.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        app.push_screen(EmojiPickerScreen())
+        await pilot.pause()
+        box = app.screen.query_one("#emoji-box")
+        assert box.region.x > 0
+        assert box.region.width < app.size.width
+        assert box.styles.border.top[0] != ""
+
+
 async def test_tui_optimistic_clear_and_restore_draft_units():
     # #89: pin the centralized helpers directly. _optimistic_clear wipes draft + all
     # pending-outbound fields + the composer; _restore_draft puts text back only into an
