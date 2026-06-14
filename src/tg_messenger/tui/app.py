@@ -418,7 +418,13 @@ class MessengerTUI(App):
     # for focus traversal); the binding is a no-op when there's nothing to accept.
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", priority=True),
+        # #114: Tab accepts a pending suggestion, else falls through to forward focus cycling
+        # (search → tabs → dialogs → message bubbles → composer, the DOM order). Shift+Tab cycles
+        # backward — Textual's Screen already binds it to focus_previous; declaring it on the app
+        # makes the symmetric scheme explicit. Arrows navigate within a panel and hand off at the
+        # edges (up-at-top-of-dialogs → tabs, down/enter on tabs → dialogs, up/down between bubbles).
         Binding("tab", "accept_suggestion", "Accept suggestion", priority=True, show=False),
+        Binding("shift+tab", "focus_previous", "Back", show=False),
     ]
 
     CSS = """
@@ -1374,9 +1380,10 @@ class MessengerTUI(App):
         self.query_one("#suggestion", Static).update(f"{SUGGEST_PREFIX}{draft}" if draft else "")
 
     def action_accept_suggestion(self) -> None:
-        """Tab — move a pending suggestion into the composer (else fall through)."""
+        """Tab: accept a pending suggestion into the composer, else fall through to forward
+        focus cycling (#114 — the unified scheme; Shift+Tab cycles backward)."""
         if not self._pending_suggestion:
-            # nothing to accept: hand Tab back to normal focus traversal
+            # nothing to accept: hand Tab back to normal forward focus traversal
             self.screen.focus_next()
             return
         composer = self.query_one("#composer", Input)
