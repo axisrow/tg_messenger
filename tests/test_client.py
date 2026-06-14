@@ -1546,6 +1546,23 @@ async def test_to_message_reply_to_id_none_when_absent():
     assert msg.reply_to_id is None
 
 
+async def test_to_message_maps_sender_from_raw():
+    # #108: the author is mapped from the (already-cached) raw.sender — no network call.
+    raw = FakeMessage(id=1, sender_id=9, text="hi",
+                      sender=FakeUser(id=9, first_name="Bob", last_name="Lee", username="bob"))
+    msg = StandaloneTelegramClient._to_message(raw, dialog_id=-100200)
+    assert msg.sender is not None
+    assert (msg.sender.id, msg.sender.username) == (9, "bob")
+    assert (msg.sender.first_name, msg.sender.last_name) == ("Bob", "Lee")
+
+
+async def test_to_message_sender_none_when_absent():
+    raw = FakeMessage(id=1, sender_id=9, text="hi")  # no .sender attached
+    msg = StandaloneTelegramClient._to_message(raw, dialog_id=-100200)
+    assert msg.sender is None
+    assert msg.sender_id == 9  # the bare id is still present
+
+
 async def test_send_text_reply_invalidates_history(fake_client):
     _seed_dm(fake_client)
     client = _build(fake_client)

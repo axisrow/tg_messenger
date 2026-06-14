@@ -7,7 +7,14 @@ from textual.containers import Vertical
 from textual.widgets import Input, ListView, Static, Tabs
 
 from tg_messenger.core.client import SendForbiddenError
-from tg_messenger.core.models import Dialog, IncomingEvent, Message, OutgoingEvent, ReactionEvent
+from tg_messenger.core.models import (
+    Dialog,
+    IncomingEvent,
+    Message,
+    OutgoingEvent,
+    ReactionEvent,
+    User,
+)
 from tg_messenger.tui.app import (
     REACTION_PRESETS,
     DialogItem,
@@ -1259,8 +1266,53 @@ async def test_tui_group_incoming_appends_bubble_for_open_group_only():
         stub.fire.set()
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
-        # ЛС-событие не дорисовано (чужой диалог), групповое — да
-        assert [str(b.render()) for b in bubbles] == ["[21] из группы"]
+        # ЛС-событие не дорисовано (чужой диалог), групповое — да.
+        # #108: в группе у входящего сверху строка автора (sender=None → голый userid).
+        assert [str(b.render()) for b in bubbles] == ["9\n[21] из группы"]
+
+
+class GroupSenderEventClient(TuiStubClient):
+    """Групповое событие с полным sender (имя/фамилия/username)."""
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def listen_all(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        yield IncomingEvent(dialog_id=-100200, message=Message(
+            id=21, dialog_id=-100200, sender_id=9, out=False, text="привет",
+            date=date, sender=User(id=9, username="bob", first_name="Bob", last_name="Lee")))
+        await asyncio.Event().wait()
+
+
+async def test_tui_group_incoming_shows_full_author_line():
+    # #108: userid @username First Last above the text in a group.
+    stub = GroupSenderEventClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = -100200
+        stub.fire.set()
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+    assert [str(b.render()) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
+
+
+async def test_tui_dm_incoming_has_no_author_line():
+    # #108: in a DM the author is obvious — no author line even for incoming.
+    stub = GroupSenderEventClient()  # reuse, but open a DM dialog instead
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7  # DM
+        # fire a DM event by reusing _show_history (stub history returns a DM message id=1)
+        await app._show_history(7)
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+    assert all("\n[" not in str(b.render()) for b in bubbles)  # no author line prefix
+    assert any(str(b.render()).startswith("[1] ") for b in bubbles)
 
 
 class IncomingDialogListClient(TuiStubClient):

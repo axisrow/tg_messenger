@@ -965,6 +965,9 @@ class StandaloneTelegramClient:
             media=media,
             reply_to_id=int(reply_to_id) if reply_to_id is not None else None,
             is_forward=getattr(raw, "forward", None) is not None,
+            # #108: best-effort author from raw.sender (free — already cached; no get_entity).
+            # _to_user(None) → None, so absent sender just leaves it unset.
+            sender=StandaloneTelegramClient._to_user(getattr(raw, "sender", None)),
         )
 
 

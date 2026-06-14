@@ -22,6 +22,7 @@ from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
 from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
 from tg_messenger.core.auth import LoginError, LoginSession, delivery_hint
 from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
+from tg_messenger.core.models import format_author
 from tg_messenger.core.search import can_send_in
 
 logger = logging.getLogger(__name__)
@@ -103,8 +104,11 @@ def _make_real_client(session_name: str):
     return client_from_env(session_name=session_name)
 
 
-def _message_label(message) -> str:
-    return f"[{message.id}] {message.text or '<media>'}"
+def _message_label(message, *, show_author: bool = False) -> str:
+    base = f"[{message.id}] {message.text or '<media>'}"
+    # #108: in groups/supergroups, an incoming message gets an author line ABOVE the text.
+    # First line so it becomes part of MessageBubble._base_text (survives translation/reactions).
+    return f"{format_author(message)}\n{base}" if show_author else base
 
 
 class ProfileItem(ListItem):
@@ -787,7 +791,9 @@ class MessengerTUI(App):
         bubbles = []
         self._bubble_index.clear()
         for m in messages:
-            bubble = MessageBubble(_message_label(m), m.out, message_id=m.id, dialog_id=dialog_id)
+            show_author = (not m.out) and self._dialog_kind(dialog_id) == "group"
+            bubble = MessageBubble(_message_label(m, show_author=show_author), m.out,
+                                   message_id=m.id, dialog_id=dialog_id)
             if m.translated_text:
                 bubble.show_translation(m.translated_text)
             self._bubble_index[m.id] = bubble
@@ -1184,7 +1190,9 @@ class MessengerTUI(App):
                 await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=True)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    bubble = MessageBubble(_message_label(ev.message), out=False,
+                    show_author = self._dialog_kind(ev.dialog_id) == "group"
+                    bubble = MessageBubble(_message_label(ev.message, show_author=show_author),
+                                           out=False,
                                            message_id=ev.message.id, dialog_id=ev.dialog_id)
                     self._bubble_index[ev.message.id] = bubble
                     await pane.mount(bubble)
@@ -1268,6 +1276,10 @@ class MessengerTUI(App):
 
     def _is_dm_dialog(self, dialog_id: int) -> bool:
         return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
+
+    def _dialog_kind(self, dialog_id: int) -> str | None:
+        # #108: kind from the already-loaded list (no network) — author lines show only in groups.
+        return next((d.kind for d in self._all_dialogs if d.id == dialog_id), None)
 
     def _dialog_title(self, dialog_id: int) -> str | None:
         # #105: best-effort title from the already-loaded dialog list (no network — flood
