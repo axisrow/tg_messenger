@@ -1655,6 +1655,38 @@ async def test_tui_reaction_attaches_in_channel():
     assert str(bubbles[0].render()).endswith("🔥")
 
 
+async def test_tui_reaction_during_history_load_is_buffered_and_replayed():
+    # #106 (Codex review): a reaction for the open dialog that arrives while its history is
+    # still loading (the bubble doesn't exist yet) must not be dropped — it is buffered and
+    # replayed once _show_history mounts the bubbles.
+    stub = TuiStubClient()  # history returns message id=1
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        # reaction arrives BEFORE history is loaded: index empty → buffered, not lost
+        app._apply_reaction(7, 1, "👍")
+        assert app._pending_reactions.get(7) == [(1, "👍")]
+        await app._show_history(7)  # mounts bubble id=1, then replays the buffer
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+    assert len(bubbles) == 1
+    assert str(bubbles[0].render()).endswith("👍")
+    assert app._pending_reactions.get(7) is None  # buffer drained, not left dangling
+
+
+async def test_tui_buffered_reaction_for_other_dialog_is_not_kept():
+    # #106: a reaction for a dialog other than the open one is never buffered (it would never
+    # be replayed) — it is silently ignored, like an out-of-snapshot message.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        app._apply_reaction(9, 1, "👍")  # different dialog
+        assert app._pending_reactions == {}
+
+
 async def test_tui_group_incoming_does_not_trigger_suggester():
     class RecordingSuggester:
         def __init__(self):

@@ -116,8 +116,10 @@
         const data = JSON.parse(ev.data);
         const div = document.createElement('div');
         if (data.type === 'reaction') {
-          // #106: attach under the reacted message (other people's reactions included), not a bubble
-          attachReaction(data.message_id, data.emoticon);
+          // #106: attach under the reacted message (other people's reactions included), not a
+          // bubble. `id` is THIS stream's dialog — pass it so a frame can't land under a same-id
+          // bubble of a previously-open dialog still lingering in the DOM (#95/#96 race).
+          attachReaction(id, data.message_id, data.emoticon);
           return;
         }
         if (data.type === 'translation') {
@@ -218,8 +220,14 @@
     // reaction branch (other people's reactions) and the optimistic POST path (our own).
     // Silently no-op when the target isn't in the visible history. Dedup so the same emoji
     // isn't shown twice (our-own optimistic + live echo, or a re-add).
-    function attachReaction(messageId, emoticon) {
-      const msg = document.querySelector('.msg[data-id="' + CSS.escape(String(messageId)) + '"]');
+    // Matches BOTH data-dialog AND data-id (#95/#96): Telegram message ids are not unique
+    // across dialogs, and a reaction frame for the newly-selected dialog can arrive while the
+    // old dialog's bubbles are still in the DOM (SSE reconnects before HTMX swaps #messages).
+    // Requiring the source dialog to match keeps it from landing under an unrelated old bubble.
+    function attachReaction(dialogId, messageId, emoticon) {
+      const msg = document.querySelector(
+        '.msg[data-dialog="' + CSS.escape(String(dialogId)) + '"]' +
+        '[data-id="' + CSS.escape(String(messageId)) + '"]');
       if (!msg) return;
       const label = emoticon || '<custom>';
       let line = msg.querySelector('.reactions');
@@ -248,7 +256,7 @@
         // #106: the server returns 204 (no body); the optimistic attach is client-side via the
         // same attachReaction path the SSE frame uses, so the reaction lands UNDER its message.
         if (document.getElementById('dialog_id').value === dialogId) {
-          attachReaction(messageId, emoticon);
+          attachReaction(dialogId, messageId, emoticon);
         } else {
           // #97: the reaction landed in a dialog the user has navigated away from. The in-pane
           // attach is (correctly, #95/#96) suppressed to avoid cross-dialog contamination, so

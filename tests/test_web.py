@@ -1921,11 +1921,14 @@ async def test_index_attaches_reaction_under_message(client_app):
     ac, _ = client_app
     r = await ac.get("/")
     assert "function attachReaction(" in r.text  # the shared attach-under-message helper
-    assert "attachReaction(data.message_id" in r.text  # SSE reaction frame uses it
-    assert "attachReaction(messageId, emoticon)" in r.text  # optimistic POST path uses it
+    assert "attachReaction(id, data.message_id" in r.text  # SSE frame passes the stream dialog
+    assert "attachReaction(dialogId, messageId, emoticon)" in r.text  # optimistic POST path
     assert "className = 'reactions'" in r.text  # the accumulating line container
     assert ".reactions {" in r.text  # its CSS rule
     assert "msg reaction" not in r.text  # the old separate-bubble class is gone
+    # #95/#96 race-safety: attach must match BOTH the source dialog AND the message id, since
+    # message ids aren't unique across dialogs and a frame can arrive mid-dialog-switch.
+    assert "[data-dialog=" in r.text and "[data-id=" in r.text
 
 
 async def test_index_has_cross_dialog_reaction_toast(client_app):

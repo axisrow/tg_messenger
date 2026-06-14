@@ -465,6 +465,10 @@ class MessengerTUI(App):
         # (dialog_id, message_id, emoticon) keys we reacted with from this composer.
         # Telegram echoes the update via listen_reactions(); skip the local echo only.
         self._sent_reactions: OrderedDict[tuple[int, int, str | None], bool] = OrderedDict()
+        # #106: reactions for the current dialog that arrived while its history was still
+        # loading (the bubble didn't exist yet) — replayed once _show_history mounts bubbles,
+        # so a reaction in that window isn't lost. Keyed by dialog_id; bounded per dialog.
+        self._pending_reactions: dict[int, list[tuple[int, str | None]]] = {}
 
     def _build_coordinator(self) -> OutboundSendCoordinator:
         return OutboundSendCoordinator(outbound=self._outbound, store=self._store)
@@ -755,6 +759,7 @@ class MessengerTUI(App):
             self._apply_composer_writable(item.dialog_id)
             self._clear_suggestion()
             self._bubble_index.clear()
+            self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
             # exclusive group: selecting another dialog cancels a still-loading history
             self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
 
@@ -788,6 +793,8 @@ class MessengerTUI(App):
             self._bubble_index[m.id] = bubble
             bubbles.append(bubble)
         await pane.mount(*bubbles)
+        # #106: apply any reactions that arrived while this history was loading.
+        self._drain_pending_reactions(dialog_id)
         self._scroll_messages_to_end(pane)
         if self._translator is not None:
             self.run_worker(
@@ -946,12 +953,31 @@ class MessengerTUI(App):
 
     def _apply_reaction(self, dialog_id: int, message_id: int, emoticon: str | None) -> None:
         # #106: attach the reaction UNDER its target message (the translation pattern), not as
-        # a separate bubble. Silently ignore when the message isn't in the loaded history —
-        # _bubble_index is cleared on dialog switch / reload, mirroring how translations no-op.
+        # a separate bubble.
         bubble = self._bubble_index.get(message_id)
-        if bubble is None:
+        if bubble is not None:
+            bubble.add_reaction(emoticon)
             return
-        bubble.add_reaction(emoticon)
+        # Target not in the index. Two cases: (a) for the OPEN dialog whose history is still
+        # loading — the bubble will exist in a moment, so buffer and replay after _show_history
+        # mounts (Codex review: don't drop a live reaction in that window); (b) any other case
+        # (a different dialog, or a message scrolled out of the loaded snapshot) — silently
+        # ignore, mirroring how translations no-op.
+        if dialog_id != self._current:
+            return
+        pending = self._pending_reactions.setdefault(dialog_id, [])
+        pending.append((message_id, emoticon))
+        while len(pending) > 100:  # bounded, like the other in-memory caches
+            pending.pop(0)
+
+    def _drain_pending_reactions(self, dialog_id: int) -> None:
+        # #106: replay reactions buffered while this dialog's history was loading. Apply onto
+        # the freshly-mounted bubbles (a missing target now means it really isn't in the
+        # snapshot → dropped, not re-buffered, so this can't loop).
+        for message_id, emoticon in self._pending_reactions.pop(dialog_id, []):
+            bubble = self._bubble_index.get(message_id)
+            if bubble is not None:
+                bubble.add_reaction(emoticon)
 
     async def _apply_lang_command(self, dialog_id: int, command: tuple[str, str | None]) -> None:
         if self._outbound is None:
