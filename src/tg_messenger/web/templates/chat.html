@@ -29,6 +29,15 @@
     #suggest-error { color: #b00020; padding: 0 8px; align-self: center; font-size: 12px; }
     #variant-panel { border-top: 1px solid #ddd; padding: 8px; display: none; }
     .variant-card { display: block; width: 100%; text-align: left; margin: 4px 0; padding: 8px; }
+    /* #97: transient confirmation for a reaction that landed in a dialog the user left */
+    #reaction-toast {
+      position: fixed; right: 16px; bottom: 16px; max-width: 280px; padding: 8px 12px;
+      background: #323232; color: #fff; border-radius: 6px; font-size: 13px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+      opacity: 0; transform: translateY(8px); transition: opacity 0.2s, transform 0.2s;
+      pointer-events: none; z-index: 1000;
+    }
+    #reaction-toast.show { opacity: 1; transform: translateY(0); }
   </style>
 </head>
 <body>
@@ -50,6 +59,7 @@
   </aside>
   <main id="chat">
     <div id="messages"></div>
+    <div id="reaction-toast" role="status" aria-live="polite"></div>
     <div id="lang-settings" hx-get="/settings/lang" hx-trigger="load" hx-swap="innerHTML"></div>
     <div id="variant-panel" role="status"></div>
     <div id="reply-banner" style="display:none; padding: 4px 8px; font-size: 12px; color: #555; border-top: 1px solid #eee;">
@@ -177,6 +187,38 @@
     // buttons stay live even in a read-only chat (the text composer is disabled, reactions
     // are not). Errors surface inline (no browser dialog) — reactions are best-effort.
     const REACTION_PRESETS = ['👍', '❤️', '🔥', '😂'];
+    // #97: best-effort title for the cross-dialog reaction toast. Reads the dialog-list <li>
+    // whose leading token is dialogId, extracting the title from "{id} — {title}{ @user}{ N}".
+    // Returns null when the chat isn't in the current list DOM (tab switched / search filtered)
+    // — the caller then shows a neutral toast rather than "undefined".
+    function dialogTitleById(dialogId) {
+      for (const li of document.querySelectorAll('#dialogs li')) {
+        const text = li.textContent.trim();
+        if (text.split(' ')[0] !== String(dialogId)) continue;
+        const sep = ' — ';
+        const idx = text.indexOf(sep);
+        let rest = idx === -1 ? text : text.slice(idx + sep.length);
+        const at = rest.indexOf(' @');
+        if (at !== -1) rest = rest.slice(0, at);  // drop a trailing " @username"
+        rest = rest.replace(/\s+\d+$/, '').trim();  // drop a trailing unread count
+        return rest || null;
+      }
+      return null;
+    }
+    // #97: transient bottom-right toast, distinct from the red #suggest-error composer line.
+    // Re-arms its own timer so a burst of cross-dialog reactions doesn't flicker.
+    let reactionToastTimer = null;
+    function showToast(text) {
+      const toast = document.getElementById('reaction-toast');
+      if (!toast) return;
+      toast.textContent = text;
+      toast.classList.add('show');
+      if (reactionToastTimer) clearTimeout(reactionToastTimer);
+      reactionToastTimer = setTimeout(() => {
+        toast.classList.remove('show');
+        reactionToastTimer = null;
+      }, 3000);
+    }
     async function postReaction(messageId, emoticon, dialogId) {
       // #95: react to the dialog the clicked BUBBLE belongs to (dialogId), not the global
       // #dialog_id — which may already point to another chat if a switch is in flight while
@@ -196,6 +238,13 @@
       if (resp.ok) {
         if (document.getElementById('dialog_id').value === dialogId) {
           document.getElementById('messages').insertAdjacentHTML('beforeend', html);
+        } else {
+          // #97: the reaction landed in a dialog the user has navigated away from. The echo
+          // bubble is (correctly, #95/#96) suppressed to avoid cross-dialog contamination, so
+          // confirm with a lightweight toast instead. Title is best-effort — neutral fallback.
+          const title = dialogTitleById(dialogId);
+          showToast(title ? ('Реакция в ' + title + ' ' + emoticon)
+                          : ('Реакция отправлена ' + emoticon));
         }
       } else {
         const doc = new DOMParser().parseFromString(html, 'text/html');
