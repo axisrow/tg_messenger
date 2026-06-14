@@ -955,8 +955,16 @@ class MessengerTUI(App):
         # #106: attach the reaction UNDER its target message (the translation pattern), not as
         # a separate bubble.
         bubble = self._bubble_index.get(message_id)
+        # Defense-in-depth (Codex review): _bubble_index is keyed by bare message_id, which is
+        # not unique across dialogs. on_list_view_selected clears the index synchronously and the
+        # history worker is exclusive, so a stale bubble from a prior dialog should never remain —
+        # but verify the bubble's own SOURCE dialog matches before attaching, so a colliding id
+        # can never render under the wrong chat's message even if that invariant is ever broken.
         if bubble is not None:
-            bubble.add_reaction(emoticon)
+            if bubble.dialog_id == dialog_id:
+                bubble.add_reaction(emoticon)
+            # else: a same-id bubble from a different dialog (the invariant says this can't
+            # happen — see above) — drop rather than mis-attach or buffer indefinitely.
             return
         # Target not in the index. Two cases: (a) for the OPEN dialog whose history is still
         # loading — the bubble will exist in a moment, so buffer and replay after _show_history

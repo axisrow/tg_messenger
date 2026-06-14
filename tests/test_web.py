@@ -1929,6 +1929,12 @@ async def test_index_attaches_reaction_under_message(client_app):
     # #95/#96 race-safety: attach must match BOTH the source dialog AND the message id, since
     # message ids aren't unique across dialogs and a frame can arrive mid-dialog-switch.
     assert "[data-dialog=" in r.text and "[data-id=" in r.text
+    # #106 (Codex review): a reaction frame arriving before the #messages swap settles must be
+    # buffered and replayed, not dropped (mirrors the TUI _pending_reactions buffer). Guard the
+    # plumbing: the per-dialog pending map, and the htmx:afterSettle drain on #messages.
+    assert "pendingReactions" in r.text  # the per-dialog buffer for the swap race
+    assert "function drainPendingReactions(" in r.text  # replays buffered reactions after mount
+    assert "addEventListener('htmx:afterSettle'" in r.text  # drains once #messages has swapped in
 
 
 async def test_index_has_cross_dialog_reaction_toast(client_app):
