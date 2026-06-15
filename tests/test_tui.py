@@ -4064,6 +4064,9 @@ async def test_tui_settings_fields_have_persistent_border_titles():
         await pilot.pause()
         target = screen.query_one("#target-lang", Input)
         lang_list = screen.query_one("#lang-list", Input)
+        # the caption must be styled legible (accent + bold), not the default grey blurred border
+        assert target.styles.border_title_color is not None
+        assert "bold" in str(target.styles.border_title_style)
         # target-lang has a fixed caption; type a value and confirm the caption persists
         assert str(target.border_title) == "Язык перевода"
         target.value = "ru"

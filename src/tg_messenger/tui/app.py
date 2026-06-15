@@ -821,7 +821,12 @@ class AccountsScreen(ModalScreen[None]):
         "#accounts-box { width: 60%; max-width: 64; height: auto; max-height: 80%; "
         "padding: 1 2; border: round $primary; background: $surface; } "
         "#translate-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
-        "#translate-section RadioSet { height: auto; }"
+        "#translate-section RadioSet { height: auto; } "
+        # the field captions live in border_title, which inherits the (grey, blurred) border colour
+        # and is nearly unreadable by default — give the translation inputs a visible border + a
+        # bold accent caption so the labels stay legible whether the field is focused or not.
+        "#target-lang, #lang-list { border: round $primary; "
+        "border-title-color: $accent; border-title-style: bold; }"
     )
 
     BINDINGS = [
