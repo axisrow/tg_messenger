@@ -40,6 +40,22 @@ ORIGINAL_SENTINEL = "__tg_messenger_original__"
 # #93: the per-message reaction presets — the same four as the web palette (chat.html).
 REACTION_PRESETS = ["👍", "❤️", "🔥", "😂"]
 # #73: the outbound prepare timeout now lives in OutboundSendCoordinator.
+# #124: the key-help overlay text (HelpScreen, opened with ? / F1). Russian, to match the UI.
+HELP_TEXT = """Навигация (стрелки):
+  ↑ / ↓     цепочка фокуса: Поиск → Вкладки → Диалоги → Сообщения → Поле ввода
+  ← / →     войти в диалог (→ из списка) · выйти (← на пустом поле); на вкладках — смена вкладки
+  Пробел    к концу/началу списка (диалоги и сообщения)
+  Enter     открыть диалог · отправить сообщение
+
+Действия:
+  Tab       принять подсказку ответа (иначе — вперёд по фокусу)
+  Shift+Tab назад по фокусу
+  r / x     реакция на выбранном сообщении
+  Ctrl+S    настройки аккаунтов
+  /lang     язык перевода в текущем диалоге (команда в поле ввода)
+  ? / F1    эта справка
+  Esc       очистить поиск · закрыть окно
+  Ctrl+C    выход"""
 
 
 @dataclass
@@ -273,10 +289,16 @@ class SidebarTabs(Tabs):
 
     BINDINGS = [
         Binding("down,enter", "focus_dialogs", "Dialogs", show=False),
+        # #124-r2: Up returns to the search box — the symmetric counterpart to Down/Enter, so the
+        # whole sidebar (search ↔ tabs ↔ dialogs) is reachable with arrows alone.
+        Binding("up", "focus_search", "Search", show=False),
     ]
 
     def action_focus_dialogs(self) -> None:
         self.screen.query_one("#dialogs", ListView).focus()
+
+    def action_focus_search(self) -> None:
+        self.screen.query_one("#search", Input).focus()
 
 
 class DialogListView(ListView):
@@ -291,6 +313,13 @@ class DialogListView(ListView):
 
     BINDINGS = [
         Binding("up", "cursor_up_or_tabs", "Up", show=False),
+        # #124: Down at the LAST dialog hands off into the chat pane so the vertical chain
+        # (dialogs → messages → composer) is seamless with arrows alone — was a dead clamp.
+        Binding("down", "cursor_down_or_messages", "Down", show=False),
+        # #124-r2: Right opens the highlighted dialog and drops the cursor into the composer
+        # (horizontal "enter the chat"); Space jumps to the last/first item (toggle).
+        Binding("right", "open_dialog", "Open", show=False),
+        Binding("space", "jump_edge", "Top/bottom", show=False),
     ]
 
     def on_focus(self) -> None:
@@ -302,6 +331,135 @@ class DialogListView(ListView):
             self.screen.focus_previous()  # the tabs are the prior focusable
         else:
             self.action_cursor_up()
+
+    def action_cursor_down_or_messages(self) -> None:
+        # At the last item (or an empty/None selection on a populated list), Down leaves the
+        # sidebar for the chat pane: the first message bubble if any, else the composer. Anywhere
+        # else, Down scrolls the list as usual (ListView's cursor_down). Mirror of cursor_up_or_tabs.
+        if len(self) == 0 or (self.index is not None and self.index >= len(self) - 1):
+            # #124: cursor-only movement highlights without opening (only Selected sets _current),
+            # so the highlighted dialog can differ from the open chat. Commit the highlighted dialog
+            # BEFORE entering the chat pane, else a reply would silently go to the previously-open
+            # dialog — a wrong-recipient send. Mirrors action_open_dialog's synchronous open.
+            item = self.highlighted_child
+            switching = isinstance(item, DialogItem) and item.dialog_id != self.app._current
+            if switching:
+                # #124: open SYNCHRONOUSLY (not action_select_cursor, which only posts Selected and
+                # leaves _current stale until the pump drains it). _current is committed here, before
+                # the composer is focused below, so a same-tick Enter/queued paste can never send to
+                # the previously-open dialog (Codex wrong-recipient finding).
+                self.app._open_dialog(item.dialog_id)
+            # #124: same read-only guard as action_open_dialog (the Right path). A read-only chat
+            # disables the composer asynchronously; _focus_first_bubble_or_composer would land on it
+            # (no bubbles yet — history loads in a worker) and focus would be lost into nothing.
+            # Keep focus on the dialog list there so arrow navigation stays alive.
+            if isinstance(item, DialogItem) and not self.app._dialog_can_send(item.dialog_id):
+                return
+            if switching:
+                # #124: _open_dialog above committed _current synchronously, but the history RENDER
+                # still happens in a worker (_show_history removes and re-mounts bubbles). The bubbles
+                # mounted RIGHT NOW still belong to the previously-open chat, so focusing one would
+                # land on a STALE bubble during the load window. Because MessageBubble.action_react
+                # acts on the bubble's OWN dialog/message id, a fast r/x there would react on the
+                # previous conversation — a wrong-conversation action. Land on the composer instead:
+                # the Right path's safe target, which _show_history never removes. Once the new
+                # history renders, the user can walk up into the (now correct) bubbles.
+                self.screen.query_one("#composer", Input).focus()
+            else:
+                # Same open dialog (no switch): the mounted bubbles are already the current chat's,
+                # so entering the first bubble is safe.
+                _focus_first_bubble_or_composer(self.screen)
+        else:
+            self.action_cursor_down()
+
+    def action_open_dialog(self) -> None:
+        # Right = open the highlighted dialog, then focus the composer so the user can reply at once.
+        # No-op on an empty list / no selection.
+        if self.index is None or len(self) == 0:
+            return
+        item = self.highlighted_child
+        # #124: open SYNCHRONOUSLY (not action_select_cursor, which only posts ListView.Selected and
+        # leaves _current stale until the pump drains it). _current is committed here, BEFORE the
+        # composer is focused, so a same-tick Enter / queued paste can never send to the previously-
+        # open dialog — the wrong-recipient send window (Codex finding). _open_dialog still kicks
+        # the history render in a worker, independent of focus.
+        if isinstance(item, DialogItem):
+            self.app._open_dialog(item.dialog_id)
+        # #124: a read-only chat disables the composer (via _apply_composer_writable, inside
+        # _open_dialog). Focusing a soon-to-be-disabled composer would leave focus on nothing
+        # (Textual releases focus from a disabled widget). Keep focus on the list there so arrow
+        # navigation stays alive; only dive into the composer when the chat is writable.
+        if isinstance(item, DialogItem) and not self.app._dialog_can_send(item.dialog_id):
+            return
+        self.screen.query_one("#composer", Input).focus()
+
+    def action_jump_edge(self) -> None:
+        # Space = toggle between the last and the first item (the same edge-jump used in the
+        # message pane). On the last item → first; anywhere else → last. Empty list → no-op.
+        if len(self) == 0:
+            return
+        self.index = 0 if (self.index is not None and self.index >= len(self) - 1) else len(self) - 1
+
+
+class SearchInput(Input):
+    """The sidebar search box. Down hands focus to the tab strip (the next link in the
+    vertical chain); Up is the top of the chain (no-op). Left/Right/Home/End stay with Input
+    for cursor movement, so typing a query is unaffected (#124)."""
+
+    BINDINGS = [
+        Binding("down", "focus_tabs", "Tabs", show=False),
+    ]
+
+    def action_focus_tabs(self) -> None:
+        self.screen.query_one("#tabs", Tabs).focus()
+
+
+class ComposerInput(Input):
+    """The message composer. Up leaves the composer for the chat history — the last message
+    bubble if any, else the dialog list. Down is the bottom of the chain (no-op). Left/Right/
+    Home/End stay with Input for cursor movement, so typing/editing is unaffected (#124)."""
+
+    BINDINGS = [
+        Binding("up", "focus_messages", "Messages", show=False),
+        # #124-r2: Left on an EMPTY composer leaves the chat (back to the dialog list); with text,
+        # Left is the normal cursor move (Input's action_cursor_left) so editing isn't broken.
+        Binding("left", "cursor_left_or_dialogs", "Dialogs", show=False),
+    ]
+
+    def action_focus_messages(self) -> None:
+        # #124 (Codex cycle-2): only the current dialog's bubbles are navigable — Up from the
+        # composer must never land on a stale previous-dialog bubble that lingers during the async
+        # history render (a fast r/x there would react on the previous conversation).
+        bubbles = _navigable_bubbles(self.screen)
+        if bubbles:
+            bubbles[-1].focus()
+        else:
+            self.screen.query_one("#dialogs", ListView).focus()
+
+    def action_cursor_left_or_dialogs(self) -> None:
+        if self.value == "":
+            self.screen.query_one("#dialogs", ListView).focus()  # empty field → exit the chat
+        else:
+            self.action_cursor_left()  # normal in-field cursor move
+
+
+def _navigable_bubbles(screen) -> list["MessageBubble"]:
+    # #124 (Codex cycle-2): a dialog SWITCH commits _current synchronously but the history RENDER
+    # is async (_show_history removes the old rows in a worker), so bubbles of the PREVIOUS dialog
+    # linger in the DOM during the load window. Reacting on one (r/x) acts on the bubble's OWN
+    # dialog_id → a wrong-conversation outbound action. Navigation must therefore only ever land on
+    # bubbles belonging to the now-current dialog; stale ones are unreachable until they're removed.
+    current = getattr(screen.app, "_current", None)
+    return [b for b in screen.query(MessageBubble) if b.dialog_id == current]
+
+
+def _focus_first_bubble_or_composer(screen) -> None:
+    """Enter the chat pane from the dialog list: the first current-dialog bubble, else the composer."""
+    bubbles = _navigable_bubbles(screen)
+    if bubbles:
+        bubbles[0].focus()
+    else:
+        screen.query_one("#composer", Input).focus()
 
 
 class DialogItem(ListItem):
@@ -327,7 +485,11 @@ class MessageBubble(Static):
     BINDINGS = [
         Binding("up", "focus_prev_bubble", "Prev message", show=False),
         Binding("down", "focus_next_bubble", "Next message", show=False),
-        Binding("r", "react", "React", show=False),
+        # #124-r2: "x" is a synonym for "r" (both open the reaction picker); Space jumps to the
+        # last/first message (toggle) — the same edge-jump as the dialog list. Space is NOT a
+        # reaction key (Static binds nothing to it by default, so it's free for navigation).
+        Binding("r,x", "react", "React", show=False),
+        Binding("space", "jump_edge", "Top/bottom", show=False),
     ]
 
     def __init__(self, body: str, out: bool, message_id: int | None = None,
@@ -394,17 +556,40 @@ class MessageBubble(Static):
     def _focus_sibling(self, delta: int) -> None:
         # #118: bubbles now sit inside a per-message BubbleRow wrapper, so they are no longer
         # direct siblings of each other. Walk all bubbles in DOM (= visual) order via the screen
-        # query and step to the neighbour; clamp at the ends so focus never escapes the pane.
+        # query and step to the neighbour. #124: at the ends, hand focus OFF rather than clamp so
+        # the vertical chain is seamless — Up at the first bubble returns to the dialog list, Down
+        # at the last bubble drops into the composer.
         if self.screen is None:
             return
-        bubbles = list(self.screen.query(MessageBubble))
+        # #124 (Codex cycle-2): step only among the CURRENT dialog's bubbles — never across a stale
+        # previous-dialog bubble lingering during the async history render.
+        bubbles = _navigable_bubbles(self.screen)
         try:
             idx = bubbles.index(self)
         except ValueError:
+            # self is a stale bubble (different dialog) or unmounted — leave the chat pane rather
+            # than stepping onto another stale bubble. Up → dialogs, Down → composer.
+            (self.screen.query_one("#dialogs", ListView) if delta < 0
+             else self.screen.query_one("#composer", Input)).focus()
             return
         target = idx + delta
         if 0 <= target < len(bubbles):
             bubbles[target].focus()
+        elif target < 0:
+            self.screen.query_one("#dialogs", ListView).focus()  # up past the top → dialog list
+        else:
+            self.screen.query_one("#composer", Input).focus()  # down past the bottom → composer
+
+    def action_jump_edge(self) -> None:
+        # #124-r2: Space = toggle between the last and the first message (the same edge-jump as the
+        # dialog list). On the last bubble → first; anywhere else → last. No-op if alone/unmounted.
+        if self.screen is None:
+            return
+        # #124 (Codex cycle-2): jump only within the CURRENT dialog's bubbles, never onto a stale one.
+        bubbles = _navigable_bubbles(self.screen)
+        if not bubbles or self not in bubbles:
+            return
+        (bubbles[0] if self is bubbles[-1] else bubbles[-1]).focus()
 
     def action_react(self) -> None:
         # #102: react on the bubble's OWN source dialog, not the globally-current one —
@@ -443,6 +628,12 @@ class VariantPickScreen(ModalScreen[str | None]):
     # #116: center the modal card (the box geometry is shaped by App.CSS #variant-box).
     DEFAULT_CSS = "VariantPickScreen { align: center middle; }"
 
+    # #124: Escape must CONSUME the event (a Binding, not a key_escape method) so it cancels only
+    # this modal — a method handler lets Escape bubble to the app and silently clears the search.
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
     def __init__(self, variants: list[str], draft: str):
         super().__init__()
         self._variants = variants
@@ -466,7 +657,7 @@ class VariantPickScreen(ModalScreen[str | None]):
         if isinstance(item, VariantItem):
             self.dismiss(item.value)
 
-    def key_escape(self) -> None:
+    def action_cancel(self) -> None:
         self.dismiss(None)
 
 
@@ -479,6 +670,12 @@ class EmojiPickerScreen(ModalScreen[str | None]):
 
     # #116: center the modal card (the box geometry is shaped by App.CSS #emoji-box).
     DEFAULT_CSS = "EmojiPickerScreen { align: center middle; }"
+
+    # #124: Escape as a Binding (consumes the event) — see VariantPickScreen: a key_escape method
+    # would let Escape bubble to the app and clear the search filter while only closing this picker.
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="emoji-box"):
@@ -496,7 +693,34 @@ class EmojiPickerScreen(ModalScreen[str | None]):
         if isinstance(item, VariantItem):
             self.dismiss(item.value)
 
-    def key_escape(self) -> None:
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class HelpScreen(ModalScreen[None]):
+    """The key-help overlay (#124): a centered card listing navigation + hotkeys.
+
+    Opened/closed by ? or F1 (toggle, via the app's action_toggle_help) and dismissed by
+    Escape too. f1/escape are non-printable so they fire from the modal's own BINDINGS even
+    though no Input is focused here; ? works because the modal holds no text field.
+    """
+
+    # #116-parity: center the modal card (the box geometry is shaped by App.CSS #help-box).
+    DEFAULT_CSS = "HelpScreen { align: center middle; }"
+
+    BINDINGS = [
+        Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
+        Binding("escape", "dismiss", "Close", show=False),
+        Binding("f1", "dismiss", "Close", show=False),
+        Binding("question_mark", "dismiss", "Close", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-box"):
+            yield Label("Горячие клавиши", id="help-title")
+            yield Static(HELP_TEXT, id="help-body", markup=False)
+
+    def action_dismiss(self) -> None:  # type: ignore[override]
         self.dismiss(None)
 
 
@@ -700,6 +924,15 @@ class MessengerTUI(App):
         # #115: open account settings (add/list/remove a profile). priority so it works from
         # inside the composer Input.
         Binding("ctrl+s", "open_settings", "Settings", priority=True),
+        # #124: the key-help overlay (toggle). F1 is non-printable so a priority binding fires
+        # even from inside an Input; "?" is printable and so is filtered out while an Input is
+        # focused — it works everywhere ELSE (tabs/dialogs/a bubble). Documented: ? outside text
+        # inputs, F1 anywhere.
+        Binding("f1", "toggle_help", "Help", priority=True, show=True),
+        Binding("question_mark", "toggle_help", "Help", show=True),
+        # #124: Escape clears a non-empty search filter (a small, predictable global). NOT priority,
+        # so any open modal's own Escape still wins (the modal binding chain truncates above the app).
+        Binding("escape", "clear_search", "Clear search", show=False),
     ]
 
     CSS = """
@@ -708,6 +941,13 @@ class MessengerTUI(App):
        so the default 32 width is unchanged. */
     #sidebar { width: 32; max-width: 50%; border-right: solid $primary; }
     #chat { width: 1fr; min-width: 16; }
+    /* #124: focus indicator — the pane holding focus gets an accent border so "where am I" is
+       always visible. :focus-within styles a container while any descendant (search/tabs/list/
+       bubble/composer) is focused. Keeps the sidebar's existing right border; the chat's left
+       accent is purely additive (it had none) and visually balances the sidebar. The exact
+       focused bubble still gets its own #messages MessageBubble:focus accent below. */
+    #sidebar:focus-within { border-right: solid $accent; }
+    #chat:focus-within { border-left: solid $accent; }
     #messages { overflow-y: auto; }
     /* #113/#118: each message is a framed, shrink-wrapped card. The in/out asymmetry is now a
        PROPORTIONAL alignment of the bubble inside a full-width BubbleRow (align-horizontal),
@@ -723,16 +963,25 @@ class MessengerTUI(App):
         border: round $panel;
         text-wrap: wrap; text-overflow: fold;
     }
-    #messages MessageBubble:focus { background: $boost; border: round $accent; }
     /* incoming vs outgoing: distinct border (the side offset is the BubbleRow alignment above). */
     #messages MessageBubble.out { border: round $accent; }
     #messages MessageBubble.in { border: round $panel; }
+    /* #124-r3: the focused message is INVERTED (bg/fg swapped) — the same scheme Textual uses for
+       list/table selection, so it's clearly visible (the old $boost wash was nearly invisible).
+       Placed AFTER .out/.in on purpose: :focus and .out have equal specificity (1,1,1), so source
+       ORDER decides the tie — :focus must come last to win on outgoing bubbles too. */
+    #messages MessageBubble:focus {
+        background: $block-cursor-background;
+        color: $block-cursor-foreground;
+        text-style: $block-cursor-text-style;
+        border: round $accent;
+    }
     #suggestion { color: $text-muted; height: auto; }
     #composer { dock: bottom; }
     /* #116: shared modal card — a centered, bordered, width-capped box (was full-width, top-left,
        unframed). Centering (align: center middle) lives on each ModalScreen's DEFAULT_CSS so it is
        not affected by App.CSS-vs-screen scoping; these rules only shape the box. */
-    #profile-box, #login-box, #variant-box, #emoji-box {
+    #profile-box, #login-box, #variant-box, #emoji-box, #help-box {
         width: 60%;
         max-width: 64;
         height: auto;
@@ -742,6 +991,7 @@ class MessengerTUI(App):
         background: $surface;
     }
     #login-title { text-style: bold; }
+    #help-title { text-style: bold; }
     """
 
     def __init__(self, *, client=None, session_name: str = "default",
@@ -885,7 +1135,7 @@ class MessengerTUI(App):
     def compose(self) -> ComposeResult:
         with Horizontal():
             with Vertical(id="sidebar"):
-                yield Input(placeholder="Поиск…", id="search")
+                yield SearchInput(placeholder="Поиск…", id="search")
                 yield SidebarTabs(
                     Tab("Все", id="all"),
                     Tab("Контакты", id="contacts"),
@@ -901,7 +1151,7 @@ class MessengerTUI(App):
             with Vertical(id="chat"):
                 yield Vertical(id="messages")
                 yield Static("", id="suggestion", markup=False)
-                yield Input(placeholder="Message…", id="composer")
+                yield ComposerInput(placeholder="Message…", id="composer")
 
     async def on_mount(self) -> None:
         # Textual's real App.run() installs asyncio.eager_task_factory (py3.12+),
@@ -1143,18 +1393,28 @@ class MessengerTUI(App):
     async def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, DialogItem):
-            self._save_current_compose_state()
-            self._current = item.dialog_id
-            # #108: capture the kind now, while this dialog's <li> is in _all_dialogs — a later
-            # tab switch can drop it from the list, but the open chat keeps showing author lines.
-            self._current_kind = self._dialog_kind(item.dialog_id)
-            self._restore_compose_state(item.dialog_id)
-            self._apply_composer_writable(item.dialog_id)
-            self._clear_suggestion()
-            self._bubble_index.clear()
-            self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
-            # exclusive group: selecting another dialog cancels a still-loading history
-            self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
+            self._open_dialog(item.dialog_id)
+
+    def _open_dialog(self, dialog_id: int) -> None:
+        # #124: the SYNCHRONOUS open — sets _current and all per-dialog state, then kicks the
+        # history worker. Called both from on_list_view_selected (mouse/Enter selection, via the
+        # posted ListView.Selected) AND directly from the arrow handoff paths (Down/Right). The
+        # keyboard paths MUST commit synchronously: action_select_cursor only POSTS Selected, so
+        # if the composer is focused before the pump drains it, a fast Enter/queued paste would
+        # snapshot the stale _current and send to the previously-open dialog — a wrong-recipient
+        # send (Codex finding). Setting _current here, before focus moves, closes that window.
+        self._save_current_compose_state()
+        self._current = dialog_id
+        # #108: capture the kind now, while this dialog's <li> is in _all_dialogs — a later
+        # tab switch can drop it from the list, but the open chat keeps showing author lines.
+        self._current_kind = self._dialog_kind(dialog_id)
+        self._restore_compose_state(dialog_id)
+        self._apply_composer_writable(dialog_id)
+        self._clear_suggestion()
+        self._bubble_index.clear()
+        self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
+        # exclusive group: selecting another dialog cancels a still-loading history
+        self.run_worker(self._show_history(dialog_id), group="history", exclusive=True)
 
     async def _mark_read(self, dialog_id: int, max_id: int) -> None:
         try:
@@ -1733,6 +1993,33 @@ class MessengerTUI(App):
     def _clear_suggestion(self) -> None:
         self._pending_suggestion = None
         self.query_one("#suggestion", Static).update("")
+
+    def action_toggle_help(self) -> None:
+        """? / F1 — toggle the key-help overlay (#124).
+
+        The SAME key opens and closes it: if HelpScreen is already on top, pop it; else push it.
+        (HelpScreen also binds ?/F1/Escape to dismiss, so pressing them while it's open closes it
+        via its own bindings — the isinstance guard here covers the app-side path defensively.)
+        """
+        if isinstance(self.screen, HelpScreen):
+            self.pop_screen()
+        elif isinstance(self.screen, ModalScreen):
+            # #124 cleanup: F1 is a priority binding, so it fires even over another open modal
+            # (login, emoji picker, account settings…). Don't stack HelpScreen on top of it — the
+            # underlying modal owns the screen; do nothing rather than bury it under help.
+            return
+        else:
+            self.push_screen(HelpScreen())
+
+    def action_clear_search(self) -> None:
+        """Escape — clear a non-empty search filter and re-render (a small, predictable global).
+
+        A no-op when the search box is already empty, so Escape stays unsurprising elsewhere.
+        """
+        search = self.query_one("#search", Input)
+        if not search.value:
+            return
+        search.value = ""  # triggers on_input_changed → _render_dialogs
 
     def action_open_settings(self) -> None:
         """Ctrl+S — open account settings (add/list/remove a profile, #115)."""
