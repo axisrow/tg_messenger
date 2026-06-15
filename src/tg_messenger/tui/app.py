@@ -19,7 +19,18 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
+from textual.widgets import (
+    Footer,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    RadioButton,
+    RadioSet,
+    Static,
+    Tab,
+    Tabs,
+)
 
 from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
 from tg_messenger.core.auth import (
@@ -29,6 +40,7 @@ from tg_messenger.core.auth import (
     session_store_from_env,
 )
 from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
+from tg_messenger.core.languages import parse_lang_codes, validate_supported_lang_code
 from tg_messenger.core.models import format_author
 from tg_messenger.core.names import is_safe_profile_name, sanitize_profile_name
 from tg_messenger.core.search import can_send_in
@@ -52,8 +64,8 @@ HELP_TEXT = """Навигация (стрелки):
   Tab       принять подсказку ответа (иначе — вперёд по фокусу)
   Shift+Tab назад по фокусу
   r / x     реакция на выбранном сообщении
-  Ctrl+S    настройки аккаунтов
-  /lang     язык перевода в текущем диалоге (команда в поле ввода)
+  Ctrl+S    настройки: аккаунты + перевод входящих (режим и языки)
+  /lang     язык перевода ИСХОДЯЩИХ в текущем диалоге (команда в поле ввода)
   ? / F1    эта справка
   Esc       очистить поиск · закрыть окно
   Ctrl+C    выход"""
@@ -807,7 +819,9 @@ class AccountsScreen(ModalScreen[None]):
     DEFAULT_CSS = (
         "AccountsScreen { align: center middle; } "
         "#accounts-box { width: 60%; max-width: 64; height: auto; max-height: 80%; "
-        "padding: 1 2; border: round $primary; background: $surface; }"
+        "padding: 1 2; border: round $primary; background: $surface; } "
+        "#translate-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
+        "#translate-section RadioSet { height: auto; }"
     )
 
     BINDINGS = [
@@ -817,8 +831,16 @@ class AccountsScreen(ModalScreen[None]):
         Binding("d", "remove_account", "Remove", show=False),
     ]
 
+    # Inbound-translation modes, in display order. The id is the stored TranslateMode literal.
+    _TRANSLATE_MODE_LABELS = (
+        ("off", "Выкл — не переводить"),
+        ("all_unknown", "Всё незнакомое (кроме моих языков)"),
+        ("skip_known", "Кроме знакомых (список ниже)"),
+        ("only_unknown", "Только указанные (список ниже)"),
+    )
+
     def __init__(self, *, profiles, active, store, account_client_factory=None,
-                 login_session=None):
+                 login_session=None, translator=None):
         super().__init__()
         # #121: profiles from list_profiles() are already canonical (sanitized stems); the active
         # name comes from the raw session_name, so canonicalize it ONCE here. Marker + delete guard
@@ -830,6 +852,13 @@ class AccountsScreen(ModalScreen[None]):
         # test seams: build the new-profile client / skip the network login flow
         self._account_client_factory = account_client_factory or _make_real_client
         self._login_session = login_session
+        # inbound-translation settings live on the injected Translator (it owns the Storage). None
+        # means the [agent] extra / translate model isn't configured — the section is then hidden.
+        self._translator = translator
+        # the mode last loaded-from / saved-to storage. RadioSet.Changed is delivered async (after
+        # the worker that set it returns), so a sync "loading" flag can't gate it; instead we save
+        # only when the pressed mode actually DIFFERS from this, which the programmatic load never does.
+        self._applied_mode: str | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="accounts-box"):
@@ -840,6 +869,112 @@ class AccountsScreen(ModalScreen[None]):
             )
             yield Label("a — добавить · d — удалить · Esc — закрыть", id="accounts-help")
             yield Input(placeholder="Имя нового профиля", id="new-profile")
+            # inbound-translation settings — only when a Translator is wired ([agent] extra +
+            # translate model configured). Values are loaded in on_mount (async, can't read in compose).
+            if self._translator is not None:
+                with Vertical(id="translate-section"):
+                    yield Label("Перевод входящих", id="translate-title")
+                    with RadioSet(id="translate-mode"):
+                        for mode_id, label in self._TRANSLATE_MODE_LABELS:
+                            yield RadioButton(label, id=f"mode-{mode_id}")
+                    yield Input(placeholder="Язык перевода (напр. ru)", id="target-lang")
+                    yield Input(
+                        placeholder="Список языков через запятую (напр. ru, en)",
+                        id="lang-list",
+                    )
+                    yield Label("Enter в поле — сохранить", id="translate-help")
+
+    def on_mount(self) -> None:
+        if self._translator is not None:
+            self.run_worker(self._load_translate_settings(), exclusive=False)
+
+    async def _load_translate_settings(self) -> None:
+        if self._translator is None:
+            return
+        try:
+            settings = await self._translator.get_settings()
+        except Exception:
+            logger.exception("settings: failed to load translation settings")
+            return
+        # select the stored mode in the RadioSet; record it so the resulting (async) RadioSet.Changed
+        # is recognised as the load echo, not a user change, and doesn't auto-save.
+        mode = settings.get("mode") or "off"
+        self._applied_mode = mode
+        try:
+            self.query_one(f"#mode-{mode}", RadioButton).value = True
+        except Exception:
+            logger.warning("settings: unknown stored translate mode %r", mode)
+        self.query_one("#target-lang", Input).value = settings.get("target") or ""
+        # show the list relevant to the mode (known for skip_known, unknown for only_unknown)
+        codes = settings.get("unknown") if mode == "only_unknown" else settings.get("known")
+        self.query_one("#lang-list", Input).value = ", ".join(codes or [])
+        self._sync_list_label(mode)
+
+    def _selected_mode(self) -> str:
+        """The currently-pressed translate-mode RadioButton id → its TranslateMode literal."""
+        pressed = self.query_one("#translate-mode", RadioSet).pressed_button
+        if pressed is not None and pressed.id and pressed.id.startswith("mode-"):
+            return pressed.id[len("mode-"):]
+        return "off"
+
+    def _sync_list_label(self, mode: str) -> None:
+        """Relabel the language-list field for the mode; disable it when no list applies."""
+        field = self.query_one("#lang-list", Input)
+        if mode == "only_unknown":
+            field.disabled = False
+            field.placeholder = "Переводить ТОЛЬКО эти языки (напр. en, ja)"
+        elif mode in ("skip_known", "all_unknown"):
+            field.disabled = False
+            field.placeholder = "Мои языки — НЕ переводить (напр. ru, en)"
+        else:  # off
+            field.disabled = True
+            field.placeholder = "—"
+
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        if event.radio_set.id != "translate-mode":
+            return
+        mode = self._selected_mode()
+        self._sync_list_label(mode)
+        # ignore the echo of the programmatic selection done while loading — only a genuine user
+        # mode change (differs from what's stored/applied) should persist.
+        if mode == self._applied_mode:
+            return
+        self.run_worker(self._save_translate_settings(), exclusive=True)
+
+    async def _save_translate_settings(self) -> None:
+        if self._translator is None:
+            return
+        mode = self._selected_mode()
+        target = self.query_one("#target-lang", Input).value.strip()
+        raw_list = self.query_one("#lang-list", Input).value
+        try:
+            codes = parse_lang_codes(raw_list)
+            target_code = validate_supported_lang_code(target) if target else None
+        except ValueError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        # the list field feeds known_langs in every mode except only_unknown (where it's the
+        # whitelist). Pass both so a later mode switch finds the right list already stored.
+        known = [] if mode == "only_unknown" else codes
+        unknown = codes if mode == "only_unknown" else None
+        try:
+            await self._translator.set_settings(
+                mode=mode, target=target_code, known=known, unknown=unknown
+            )
+        except ValueError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        except Exception:
+            logger.exception("settings: failed to save translation settings")
+            self.notify("Не удалось сохранить настройки перевода", severity="error")
+            return
+        self._applied_mode = mode
+        self.notify("Настройки перевода сохранены")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Enter in a translation field saves; the profile-name field keeps its add-account flow.
+        if event.input.id in ("target-lang", "lang-list"):
+            self.run_worker(self._save_translate_settings(), exclusive=True)
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -947,13 +1082,19 @@ class MessengerTUI(App):
         Binding("shift+tab", "focus_previous", "Back", show=False),
         # #115: open account settings (add/list/remove a profile). priority so it works from
         # inside the composer Input.
-        Binding("ctrl+s", "open_settings", "Settings", priority=True),
+        Binding("ctrl+s", "open_settings", "Настройки", priority=True),
         # #124: the key-help overlay (toggle). F1 is non-printable so a priority binding fires
         # even from inside an Input; "?" is printable and so is filtered out while an Input is
         # focused — it works everywhere ELSE (tabs/dialogs/a bubble). Documented: ? outside text
         # inputs, F1 anywhere.
-        Binding("f1", "toggle_help", "Help", priority=True, show=True),
-        Binding("question_mark", "toggle_help", "Help", show=True),
+        # The Footer shows ONE help hint. It must be F1, not "?": the Footer only renders bindings
+        # active in the CURRENT focus context, and "?" (printable, non-priority) is filtered out
+        # while the search Input has focus on startup — so a "?"-hint would be invisible exactly
+        # when the user first looks (the original complaint). F1 is priority, stays active inside an
+        # Input, and so is always shown. "?" keeps working everywhere outside a text input but is
+        # hidden to avoid a duplicate "Справка" entry.
+        Binding("f1", "toggle_help", "Справка", priority=True, show=True),
+        Binding("question_mark", "toggle_help", "Справка", show=False),
         # #124: Escape clears a non-empty search filter (a small, predictable global). NOT priority,
         # so any open modal's own Escape still wins (the modal binding chain truncates above the app).
         Binding("escape", "clear_search", "Clear search", show=False),
@@ -1181,6 +1322,9 @@ class MessengerTUI(App):
                 yield Vertical(id="messages")
                 yield Static("", id="suggestion", markup=False)
                 yield ComposerInput(placeholder="Message…", id="composer")
+        # #124-followup: the Footer surfaces the show=True bindings (Справка, Настройки, Выход) —
+        # without it the key hints exist but are invisible (the reported "не вижу настроек/?").
+        yield Footer()
 
     async def on_mount(self) -> None:
         # Textual's real App.run() installs asyncio.eager_task_factory (py3.12+),
@@ -2044,7 +2188,7 @@ class MessengerTUI(App):
         search.value = ""  # triggers on_input_changed → _render_dialogs
 
     def action_open_settings(self) -> None:
-        """Ctrl+S — open account settings (add/list/remove a profile, #115)."""
+        """Ctrl+S — account settings (#115) + inbound-translation settings when a Translator is wired."""
         store = self._session_store or session_store_from_env()
         self.push_screen(
             AccountsScreen(
@@ -2052,5 +2196,6 @@ class MessengerTUI(App):
                 active=self._session_name,
                 store=store,
                 account_client_factory=self._account_client_factory,
+                translator=self._translator,
             )
         )
