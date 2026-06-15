@@ -825,7 +825,7 @@ class AccountsScreen(ModalScreen[None]):
         # the field captions live in border_title, which inherits the (grey, blurred) border colour
         # and is nearly unreadable by default — give the translation inputs a visible border + a
         # bold accent caption so the labels stay legible whether the field is focused or not.
-        "#target-lang, #lang-list { border: round $primary; "
+        "#target-lang, #known-langs, #unknown-langs { border: round $primary; "
         "border-title-color: $accent; border-title-style: bold; }"
     )
 
@@ -882,14 +882,18 @@ class AccountsScreen(ModalScreen[None]):
                     with RadioSet(id="translate-mode"):
                         for mode_id, label in self._TRANSLATE_MODE_LABELS:
                             yield RadioButton(label, id=f"mode-{mode_id}")
-                    # border_title is a PERSISTENT label drawn on the input's frame — unlike the
-                    # placeholder it stays visible once a value is typed, so the user can always tell
-                    # which field is which (the reported issue). #lang-list's title is mode-dependent
-                    # and (re)set in _sync_list_label.
+                    # THREE explicit fields, each with a PERSISTENT border_title caption (visible on
+                    # the frame even with a value typed — a placeholder vanishes on input). The two
+                    # language lists are always shown so nothing silently changes meaning by mode.
                     target = Input(placeholder="напр. ru", id="target-lang")
-                    target.border_title = "Язык перевода"
+                    target.border_title = "Язык перевода (пусто = выкл)"
                     yield target
-                    yield Input(placeholder="напр. ru, en", id="lang-list")
+                    known = Input(placeholder="напр. ru, en", id="known-langs")
+                    known.border_title = "Мои языки (не переводить)"
+                    yield known
+                    unknown = Input(placeholder="напр. en, ja", id="unknown-langs")
+                    unknown.border_title = "Переводить только эти"
+                    yield unknown
                     yield Label("Enter в поле — сохранить", id="translate-help")
 
     def on_mount(self) -> None:
@@ -912,11 +916,10 @@ class AccountsScreen(ModalScreen[None]):
             self.query_one(f"#mode-{mode}", RadioButton).value = True
         except Exception:
             logger.warning("settings: unknown stored translate mode %r", mode)
+        # three independent fields → three independent settings (no per-mode branching)
         self.query_one("#target-lang", Input).value = settings.get("target") or ""
-        # show the list relevant to the mode (known for skip_known, unknown for only_unknown)
-        codes = settings.get("unknown") if mode == "only_unknown" else settings.get("known")
-        self.query_one("#lang-list", Input).value = ", ".join(codes or [])
-        self._sync_list_label(mode)
+        self.query_one("#known-langs", Input).value = ", ".join(settings.get("known") or [])
+        self.query_one("#unknown-langs", Input).value = ", ".join(settings.get("unknown") or [])
 
     def _selected_mode(self) -> str:
         """The currently-pressed translate-mode RadioButton id → its TranslateMode literal."""
@@ -925,29 +928,10 @@ class AccountsScreen(ModalScreen[None]):
             return pressed.id[len("mode-"):]
         return "off"
 
-    def _sync_list_label(self, mode: str) -> None:
-        """Relabel the language-list field for the mode.
-
-        The label is the input's ``border_title`` — a PERSISTENT caption on the frame that, unlike
-        the placeholder, stays visible after a value is typed (the reported issue). The field is
-        NEVER disabled: a disabled widget drops out of Textual's focus_chain, which made Tab skip
-        the last field in the "off" mode ("циклит без последнего"). In "off" the list is simply
-        unused (ignored on save) but stays Tab-reachable.
-        """
-        field = self.query_one("#lang-list", Input)
-        field.disabled = False
-        if mode == "only_unknown":
-            field.border_title = "Переводить только эти"
-        elif mode in ("skip_known", "all_unknown"):
-            field.border_title = "Мои языки (не переводить)"
-        else:  # off
-            field.border_title = "Языки (в режиме «Выкл» не используются)"
-
     def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
         if event.radio_set.id != "translate-mode":
             return
         mode = self._selected_mode()
-        self._sync_list_label(mode)
         # ignore the echo of the programmatic selection done while loading — only a genuine user
         # mode change (differs from what's stored/applied) should persist.
         if mode == self._applied_mode:
@@ -959,17 +943,15 @@ class AccountsScreen(ModalScreen[None]):
             return
         mode = self._selected_mode()
         target = self.query_one("#target-lang", Input).value.strip()
-        raw_list = self.query_one("#lang-list", Input).value
         try:
-            codes = parse_lang_codes(raw_list)
+            # three independent fields → persist all three every save (no per-mode branching),
+            # so editing one field never clobbers another
             target_code = validate_supported_lang_code(target) if target else None
+            known = parse_lang_codes(self.query_one("#known-langs", Input).value)
+            unknown = parse_lang_codes(self.query_one("#unknown-langs", Input).value)
         except ValueError as exc:
             self.notify(str(exc), severity="error")
             return
-        # the list field feeds known_langs in every mode except only_unknown (where it's the
-        # whitelist). Pass both so a later mode switch finds the right list already stored.
-        known = [] if mode == "only_unknown" else codes
-        unknown = codes if mode == "only_unknown" else None
         try:
             await self._translator.set_settings(
                 mode=mode, target=target_code, known=known, unknown=unknown
@@ -986,7 +968,7 @@ class AccountsScreen(ModalScreen[None]):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # Enter in a translation field saves; the profile-name field keeps its add-account flow.
-        if event.input.id in ("target-lang", "lang-list"):
+        if event.input.id in ("target-lang", "known-langs", "unknown-langs"):
             self.run_worker(self._save_translate_settings(), exclusive=True)
 
     def action_close(self) -> None:

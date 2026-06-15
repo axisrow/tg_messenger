@@ -3964,7 +3964,7 @@ async def test_tui_footer_is_present_and_shows_help_and_settings():
 
 async def test_tui_settings_shows_translate_section_when_translator_wired():
     store = FakeSessionStore(["alice"])
-    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": []})
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": ["ja"]})
     app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -3974,10 +3974,11 @@ async def test_tui_settings_shows_translate_section_when_translator_wired():
         app.push_screen(screen)
         await pilot.pause()
         assert screen.query("#translate-section")
-        # stored mode selected, target + list prefilled
+        # stored mode selected; each of the three fields prefilled from its own setting
         assert screen.query_one("#mode-skip_known").value is True
         assert screen.query_one("#target-lang", Input).value == "ru"
-        assert screen.query_one("#lang-list", Input).value == "ru, en"
+        assert screen.query_one("#known-langs", Input).value == "ru, en"
+        assert screen.query_one("#unknown-langs", Input).value == "ja"
 
 
 async def test_tui_settings_hides_translate_section_without_translator():
@@ -3991,9 +3992,10 @@ async def test_tui_settings_hides_translate_section_without_translator():
         assert not screen.query("#translate-section")
 
 
-async def test_tui_settings_saves_translate_settings_on_submit():
+async def test_tui_settings_saves_all_three_fields_independently():
+    # the three fields each write their own setting — editing one never clobbers another
     store = FakeSessionStore(["alice"])
-    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": []})
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": ["ja"]})
     app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -4003,10 +4005,11 @@ async def test_tui_settings_saves_translate_settings_on_submit():
         app.push_screen(screen)
         await pilot.pause()
         screen.query_one("#target-lang", Input).value = "ru"
-        screen.query_one("#lang-list", Input).value = "ru, en"
+        screen.query_one("#known-langs", Input).value = "ru, en"
+        screen.query_one("#unknown-langs", Input).value = "ja, ko"
         await screen._save_translate_settings()
         assert translator.saved[-1] == {
-            "mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": None,
+            "mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": ["ja", "ko"],
         }
 
 
@@ -4021,15 +4024,14 @@ async def test_tui_settings_rejects_bad_lang_code_without_saving():
         )
         app.push_screen(screen)
         await pilot.pause()
-        screen.query_one("#lang-list", Input).value = "ru, fr"  # fr unsupported
+        screen.query_one("#known-langs", Input).value = "ru, fr"  # fr unsupported
         await screen._save_translate_settings()
         assert translator.saved == []  # nothing persisted on a bad code
 
 
-async def test_tui_settings_lang_list_stays_tab_reachable_in_every_mode():
-    # regression: in mode "off" the lang-list field was `disabled`, which drops it out of
-    # Textual's focus_chain — Tab cycled past it ("циклит без последнего"). It must stay
-    # focus-reachable (and never disabled) in EVERY mode.
+async def test_tui_settings_all_three_fields_tab_reachable_in_every_mode():
+    # regression (#133): a disabled field drops out of Textual's focus_chain. None of the three
+    # translation fields may ever be disabled — Tab must reach each of them in every mode.
     store = FakeSessionStore(["alice"])
     translator = StubTranslator({"mode": "all_unknown", "target": "ru", "known": ["ru"], "unknown": []})
     app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
@@ -4043,15 +4045,16 @@ async def test_tui_settings_lang_list_stays_tab_reachable_in_every_mode():
         for mode in ("off", "all_unknown", "skip_known", "only_unknown"):
             screen.query_one(f"#mode-{mode}").value = True
             await pilot.pause()
-            field = screen.query_one("#lang-list", Input)
             chain_ids = [getattr(w, "id", None) for w in screen.focus_chain]
-            assert field.disabled is False, f"lang-list disabled in mode {mode}"
-            assert "lang-list" in chain_ids, f"lang-list not Tab-reachable in mode {mode}"
+            for fid in ("target-lang", "known-langs", "unknown-langs"):
+                field = screen.query_one(f"#{fid}", Input)
+                assert field.disabled is False, f"{fid} disabled in mode {mode}"
+                assert fid in chain_ids, f"{fid} not Tab-reachable in mode {mode}"
 
 
 async def test_tui_settings_fields_have_persistent_border_titles():
-    # the fields must carry a PERSISTENT border_title caption (visible even with a value typed),
-    # not just a placeholder that vanishes on input — the reported "can't tell which field is which".
+    # each field carries a PERSISTENT, fixed border_title caption (visible even with a value typed),
+    # not a placeholder that vanishes on input — the reported "can't tell which field is which".
     store = FakeSessionStore(["alice"])
     translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": []})
     app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
@@ -4062,24 +4065,19 @@ async def test_tui_settings_fields_have_persistent_border_titles():
         )
         app.push_screen(screen)
         await pilot.pause()
+        captions = {
+            "target-lang": "Язык перевода (пусто = выкл)",
+            "known-langs": "Мои языки (не переводить)",
+            "unknown-langs": "Переводить только эти",
+        }
+        for fid, caption in captions.items():
+            field = screen.query_one(f"#{fid}", Input)
+            # styled legible (accent + bold), not the default grey blurred border
+            assert field.styles.border_title_color is not None
+            assert "bold" in str(field.styles.border_title_style)
+            assert str(field.border_title) == caption
+        # caption survives a typed value (the core of the fix)
         target = screen.query_one("#target-lang", Input)
-        lang_list = screen.query_one("#lang-list", Input)
-        # the caption must be styled legible (accent + bold), not the default grey blurred border
-        assert target.styles.border_title_color is not None
-        assert "bold" in str(target.styles.border_title_style)
-        # target-lang has a fixed caption; type a value and confirm the caption persists
-        assert str(target.border_title) == "Язык перевода"
         target.value = "ru"
         await pilot.pause()
-        assert str(target.border_title) == "Язык перевода"  # caption survives a typed value
-        # lang-list caption is mode-dependent and present in every mode
-        expected = {
-            "off": "Языки (в режиме «Выкл» не используются)",
-            "all_unknown": "Мои языки (не переводить)",
-            "skip_known": "Мои языки (не переводить)",
-            "only_unknown": "Переводить только эти",
-        }
-        for mode, caption in expected.items():
-            screen.query_one(f"#mode-{mode}").value = True
-            await pilot.pause()
-            assert str(lang_list.border_title) == caption, f"wrong caption in mode {mode}"
+        assert str(target.border_title) == "Язык перевода (пусто = выкл)"
