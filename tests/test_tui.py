@@ -816,6 +816,47 @@ async def test_tui_react_picker_cancel_sends_nothing():
     assert stub.reactions == []
 
 
+async def test_emoji_picker_escape_does_not_clear_search():
+    # #124 regression: the app binds Escape → clear_search. The emoji picker must CONSUME its own
+    # Escape (a Binding, not a key_escape method) so cancelling the picker doesn't also bubble up
+    # and silently wipe the user's active search filter.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.value = "abc"
+        await pilot.pause()
+        app.push_screen(EmojiPickerScreen())
+        await pilot.pause()
+        assert isinstance(app.screen, EmojiPickerScreen)
+        await pilot.press("escape")  # cancel the picker
+        await pilot.pause()
+        assert not isinstance(app.screen, EmojiPickerScreen)  # picker closed
+        assert search.value == "abc"  # ...but the search filter survived
+
+
+async def test_variant_picker_escape_does_not_clear_search():
+    # #124 regression (twin of the emoji picker): Escape on the translation-variant picker cancels
+    # only the modal, leaving an active search filter intact.
+    from tg_messenger.tui.app import VariantPickScreen
+
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.value = "abc"
+        await pilot.pause()
+        app.push_screen(VariantPickScreen(["hola"], "hello"))
+        await pilot.pause()
+        assert isinstance(app.screen, VariantPickScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, VariantPickScreen)
+        assert search.value == "abc"
+
+
 async def test_tui_react_hotkey_on_non_target_bubble_is_noop():
     # #93: a bubble with message_id=None is not a reaction target — "r" must not open the picker.
     stub = TuiStubClient()
@@ -2512,16 +2553,18 @@ async def test_search_up_is_noop_at_top():
 
 
 async def test_dialogs_down_at_last_hands_off_to_messages():
-    # dialogs (last item) ↓ → the first message bubble (chat pane entry).
+    # dialogs (last item) ↓ → the first message bubble (chat pane entry). The last dialog (id 8) is
+    # also the open one here, so the handoff is a pure focus move into the already-loaded chat.
     app = MessengerTUI(client=LongHistoryClient())
     async with app.run_test(size=(80, 20)) as pilot:
         await pilot.pause()
-        app._current = 7
-        await app._show_history(7)
-        await pilot.pause()
         lv = app.query_one("#dialogs", ListView)
         lv.focus()
-        lv.index = len(lv) - 1  # last dialog
+        lv.index = len(lv) - 1  # last dialog (id 8)
+        await pilot.press("right")  # open it so highlighted == _current (no wrong-recipient switch)
+        await _pause_until(pilot, lambda: bool(list(app.query(MessageBubble))))
+        lv.focus()
+        lv.index = len(lv) - 1
         await pilot.pause()
         await pilot.press("down")
         await pilot.pause()
@@ -2620,17 +2663,20 @@ async def test_composer_down_is_noop_at_bottom():
 
 async def test_full_chain_down_then_up():
     # the whole vertical chain with arrows alone: search → tabs → dialogs → bubble → composer,
-    # then symmetric back up.
+    # then symmetric back up. The LAST dialog is the open one so the Down handoff is a pure focus
+    # move (no wrong-recipient dialog switch — see test_dialogs_down_handoff_commits_*).
     app = MessengerTUI(client=LongHistoryClient())
     async with app.run_test(size=(80, 20)) as pilot:
-        await pilot.pause()
-        app._current = 7
-        await app._show_history(7)
         await pilot.pause()
         search = app.query_one("#search", Input)
         tabs = app.query_one(Tabs)
         dialogs = app.query_one("#dialogs", ListView)
         composer = app.query_one("#composer", Input)
+        # open the LAST dialog so the cursor and the open chat agree
+        dialogs.focus()
+        dialogs.index = len(dialogs) - 1
+        await pilot.press("right")
+        await _pause_until(pilot, lambda: bool(list(app.query(MessageBubble))))
         bubbles = list(app.query(MessageBubble))
 
         search.focus()
@@ -2641,7 +2687,7 @@ async def test_full_chain_down_then_up():
         await pilot.press("down")  # tabs → dialogs
         await pilot.pause()
         assert app.focused is dialogs
-        dialogs.index = len(dialogs) - 1  # go to the last dialog so the next Down hands off
+        dialogs.index = len(dialogs) - 1  # the last dialog (already open) — Down hands off
         await pilot.pause()
         await pilot.press("down")  # dialogs (last) → first bubble
         await pilot.pause()
@@ -2862,6 +2908,82 @@ async def test_bubble_x_opens_reaction_picker():
         await pilot.press("x")
         await _pause_until(pilot, lambda: bool(stub.reactions))
     assert stub.reactions == [(7, 1, "🔥")]
+
+
+async def test_dialogs_down_handoff_commits_highlighted_dialog():
+    # #124 regression (wrong-recipient send): open dialog 7, then arrow the cursor to a DIFFERENT
+    # last dialog WITHOUT selecting it, then Down to hand off into the chat pane. The Down must
+    # commit the highlighted dialog first, so _current is the dialog the cursor sits on — not 7
+    # (the previously-open chat). Otherwise a reply would silently go to the wrong recipient.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = 0  # open dialog 7 (first item on the "Все" tab)
+        await pilot.press("right")
+        await _pause_until(pilot, lambda: app._current == 7)
+        # move the cursor to the last dialog WITHOUT opening it (cursor move = Highlighted only)
+        lv.focus()
+        lv.index = len(lv) - 1
+        await pilot.pause()
+        last_id = lv.highlighted_child.dialog_id
+        assert last_id != 7 and app._current == 7  # diverged before the handoff
+        await pilot.press("down")  # hand off into the chat pane — must commit the highlighted dialog
+        await _pause_until(pilot, lambda: app._current == last_id)
+        assert app._current == last_id  # the handoff opened the highlighted dialog, not the stale one
+
+
+async def test_dialogs_down_handoff_then_send_targets_highlighted_dialog():
+    # #124 regression (the privacy bug end to end): after the Down handoff above, typing a message
+    # and submitting must send to the highlighted dialog, never the previously-open one (7).
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = 0  # open dialog 7
+        await pilot.press("right")
+        await _pause_until(pilot, lambda: app._current == 7)
+        lv.focus()
+        lv.index = len(lv) - 1  # cursor on the last dialog, still showing dialog 7's chat
+        await pilot.pause()
+        last_id = lv.highlighted_child.dialog_id
+        assert last_id != 7
+        await pilot.press("down")  # handoff → opens the highlighted dialog
+        await _pause_until(pilot, lambda: app._current == last_id)
+        composer = app.query_one("#composer", Input)
+        composer.focus()
+        await pilot.press("s", "e", "c", "r", "e", "t", "enter")
+        await stub.wait_sent_count(1)
+    assert stub.sent == [(last_id, "secret", None)]  # sent to the highlighted dialog, not the stale 7
+
+
+async def test_dialogs_right_on_readonly_channel_keeps_focus_alive():
+    # #124 regression: Right on a read-only channel disables the composer (async, via
+    # _apply_composer_writable). Focusing a soon-to-be-disabled composer would leave focus on
+    # nothing (Textual releases focus from a disabled widget) and kill arrow navigation. The Right
+    # handler must keep focus on the dialog list there instead of diving into the dead composer.
+    stub = TuiStubClient()
+    stub.channel_can_send = False
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        # the default "Все" tab already lists the read-only channel (-100300)
+        await _pause_until(pilot, lambda: any(
+            i.dialog_id == -100300 for i in app.query(DialogItem)))
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = next(i for i, it in enumerate(lv.children)
+                        if getattr(it, "dialog_id", None) == -100300)
+        await pilot.pause()
+        await pilot.press("right")  # open the read-only channel
+        await _pause_until(pilot, lambda: app._current == -100300)
+        assert app.query_one("#composer", Input).disabled  # read-only → composer disabled
+        assert app.focused is not None  # focus is NOT lost into nothing
+        assert app.focused is lv  # stays on the dialog list, so arrow navigation still works
 
 
 class TwoDmClient(TuiStubClient):

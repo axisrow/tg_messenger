@@ -337,6 +337,13 @@ class DialogListView(ListView):
         # sidebar for the chat pane: the first message bubble if any, else the composer. Anywhere
         # else, Down scrolls the list as usual (ListView's cursor_down). Mirror of cursor_up_or_tabs.
         if len(self) == 0 or (self.index is not None and self.index >= len(self) - 1):
+            # #124: cursor-only movement highlights without opening (only Selected sets _current),
+            # so the highlighted dialog can differ from the open chat. Commit the highlighted dialog
+            # BEFORE entering the chat pane, else a reply would silently go to the previously-open
+            # dialog — a wrong-recipient send. Mirrors action_open_dialog's Selected → open.
+            item = self.highlighted_child
+            if isinstance(item, DialogItem) and item.dialog_id != self.app._current:
+                self.action_select_cursor()
             _focus_first_bubble_or_composer(self.screen)
         else:
             self.action_cursor_down()
@@ -348,7 +355,14 @@ class DialogListView(ListView):
         # of that load. No-op on an empty list / no selection.
         if self.index is None or len(self) == 0:
             return
+        item = self.highlighted_child
         self.action_select_cursor()
+        # #124: a read-only chat disables the composer (via the async on_list_view_selected →
+        # _apply_composer_writable). Focusing a soon-to-be-disabled composer would leave focus on
+        # nothing (Textual releases focus from a disabled widget). Keep focus on the list there so
+        # arrow navigation stays alive; only dive into the composer when the chat is writable.
+        if isinstance(item, DialogItem) and not self.app._dialog_can_send(item.dialog_id):
+            return
         self.screen.query_one("#composer", Input).focus()
 
     def action_jump_edge(self) -> None:
@@ -566,6 +580,12 @@ class VariantPickScreen(ModalScreen[str | None]):
     # #116: center the modal card (the box geometry is shaped by App.CSS #variant-box).
     DEFAULT_CSS = "VariantPickScreen { align: center middle; }"
 
+    # #124: Escape must CONSUME the event (a Binding, not a key_escape method) so it cancels only
+    # this modal — a method handler lets Escape bubble to the app and silently clears the search.
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
     def __init__(self, variants: list[str], draft: str):
         super().__init__()
         self._variants = variants
@@ -589,7 +609,7 @@ class VariantPickScreen(ModalScreen[str | None]):
         if isinstance(item, VariantItem):
             self.dismiss(item.value)
 
-    def key_escape(self) -> None:
+    def action_cancel(self) -> None:
         self.dismiss(None)
 
 
@@ -602,6 +622,12 @@ class EmojiPickerScreen(ModalScreen[str | None]):
 
     # #116: center the modal card (the box geometry is shaped by App.CSS #emoji-box).
     DEFAULT_CSS = "EmojiPickerScreen { align: center middle; }"
+
+    # #124: Escape as a Binding (consumes the event) — see VariantPickScreen: a key_escape method
+    # would let Escape bubble to the app and clear the search filter while only closing this picker.
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="emoji-box"):
@@ -619,7 +645,7 @@ class EmojiPickerScreen(ModalScreen[str | None]):
         if isinstance(item, VariantItem):
             self.dismiss(item.value)
 
-    def key_escape(self) -> None:
+    def action_cancel(self) -> None:
         self.dismiss(None)
 
 
