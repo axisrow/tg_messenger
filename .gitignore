@@ -9,3 +9,4 @@ uv.lock
 agent.json
 AGENTS.md
 CLAUDE.md
+.claude/
