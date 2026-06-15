@@ -877,11 +877,14 @@ class AccountsScreen(ModalScreen[None]):
                     with RadioSet(id="translate-mode"):
                         for mode_id, label in self._TRANSLATE_MODE_LABELS:
                             yield RadioButton(label, id=f"mode-{mode_id}")
-                    yield Input(placeholder="Язык перевода (напр. ru)", id="target-lang")
-                    yield Input(
-                        placeholder="Список языков через запятую (напр. ru, en)",
-                        id="lang-list",
-                    )
+                    # border_title is a PERSISTENT label drawn on the input's frame — unlike the
+                    # placeholder it stays visible once a value is typed, so the user can always tell
+                    # which field is which (the reported issue). #lang-list's title is mode-dependent
+                    # and (re)set in _sync_list_label.
+                    target = Input(placeholder="напр. ru", id="target-lang")
+                    target.border_title = "Язык перевода"
+                    yield target
+                    yield Input(placeholder="напр. ru, en", id="lang-list")
                     yield Label("Enter в поле — сохранить", id="translate-help")
 
     def on_mount(self) -> None:
@@ -920,18 +923,20 @@ class AccountsScreen(ModalScreen[None]):
     def _sync_list_label(self, mode: str) -> None:
         """Relabel the language-list field for the mode.
 
-        The field is NEVER disabled: a disabled widget drops out of Textual's focus_chain, so a
-        `disabled` here made Tab skip the last field in the "off" mode ("циклит без последнего").
-        In "off" the list is simply unused (ignored on save), but stays Tab-reachable.
+        The label is the input's ``border_title`` — a PERSISTENT caption on the frame that, unlike
+        the placeholder, stays visible after a value is typed (the reported issue). The field is
+        NEVER disabled: a disabled widget drops out of Textual's focus_chain, which made Tab skip
+        the last field in the "off" mode ("циклит без последнего"). In "off" the list is simply
+        unused (ignored on save) but stays Tab-reachable.
         """
         field = self.query_one("#lang-list", Input)
         field.disabled = False
         if mode == "only_unknown":
-            field.placeholder = "Переводить ТОЛЬКО эти языки (напр. en, ja)"
+            field.border_title = "Переводить только эти"
         elif mode in ("skip_known", "all_unknown"):
-            field.placeholder = "Мои языки — НЕ переводить (напр. ru, en)"
+            field.border_title = "Мои языки (не переводить)"
         else:  # off
-            field.placeholder = "(в режиме «Выкл» не используется)"
+            field.border_title = "Языки (в режиме «Выкл» не используются)"
 
     def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
         if event.radio_set.id != "translate-mode":

@@ -4047,3 +4047,36 @@ async def test_tui_settings_lang_list_stays_tab_reachable_in_every_mode():
             chain_ids = [getattr(w, "id", None) for w in screen.focus_chain]
             assert field.disabled is False, f"lang-list disabled in mode {mode}"
             assert "lang-list" in chain_ids, f"lang-list not Tab-reachable in mode {mode}"
+
+
+async def test_tui_settings_fields_have_persistent_border_titles():
+    # the fields must carry a PERSISTENT border_title caption (visible even with a value typed),
+    # not just a placeholder that vanishes on input — the reported "can't tell which field is which".
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": []})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        target = screen.query_one("#target-lang", Input)
+        lang_list = screen.query_one("#lang-list", Input)
+        # target-lang has a fixed caption; type a value and confirm the caption persists
+        assert str(target.border_title) == "Язык перевода"
+        target.value = "ru"
+        await pilot.pause()
+        assert str(target.border_title) == "Язык перевода"  # caption survives a typed value
+        # lang-list caption is mode-dependent and present in every mode
+        expected = {
+            "off": "Языки (в режиме «Выкл» не используются)",
+            "all_unknown": "Мои языки (не переводить)",
+            "skip_known": "Мои языки (не переводить)",
+            "only_unknown": "Переводить только эти",
+        }
+        for mode, caption in expected.items():
+            screen.query_one(f"#mode-{mode}").value = True
+            await pilot.pause()
+            assert str(lang_list.border_title) == caption, f"wrong caption in mode {mode}"
