@@ -3,6 +3,7 @@ import inspect
 from datetime import datetime, timezone
 
 import pytest
+from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Input, ListView, Static, Tabs
 
@@ -26,6 +27,7 @@ from tg_messenger.tui.app import (
     MessengerTUI,
     ProfileItem,
     VariantItem,
+    _terminal_safe_display_text,
     parse_lang_command,
     parse_media_command,
 )
@@ -33,6 +35,19 @@ from tg_messenger.tui.app import (
 
 def test_parse_media_simple():
     assert parse_media_command("@a.jpg") == ("a.jpg", None)
+
+
+def test_tui_terminal_safe_display_text_preserves_text_but_simplifies_problem_glyphs():
+    raw = "⚽️เปิดทุกคู่ 🇩🇪 https://777sportplus.net/register?m_ref=bh"
+    safe = _terminal_safe_display_text(raw)
+
+    assert "https://777sportplus.net/register?m_ref=bh" in safe
+    assert "เปดทกค" in safe
+    assert "⚽" not in safe
+    assert "🇩" not in safe
+    assert "\ufe0f" not in safe
+    assert "\u0e34" not in safe
+    assert "*" in safe
 
 
 def test_parse_media_quoted_path_with_caption():
@@ -278,6 +293,22 @@ async def test_tui_dialog_item_shows_id():
         rendered = str(item.query_one(Static).render())  # "Ann [/x  #7" literally
         assert rendered.startswith("Ann")
         assert "#7" in rendered  # id still visible to the user, just subdued
+
+
+async def test_tui_dialog_item_uses_terminal_safe_title_display():
+    class DialogItemProbe(App):
+        def compose(self) -> ComposeResult:
+            yield ListView(DialogItem(-100200, "7วันปั่นลูกหนัง V4", unread=1, kind="group"))
+
+    app = DialogItemProbe()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        item = app.query_one(DialogItem)
+        rendered = str(item.query_one(Static).render())
+        assert "V4" in rendered
+        assert "#-100200" in rendered
+        assert "\u0e31" not in rendered
+        assert "\u0e48" not in rendered
 
 
 class UnreadClient(TuiStubClient):
@@ -530,6 +561,49 @@ class LongMessageClient(TuiStubClient):
         return [Message(id=1, dialog_id=peer, sender_id=1, out=True, text=text, date=date)]
 
 
+THAI_EMOJI_MESSAGE = "\n".join(
+    [
+        "**⚽️ 777SportsPlus+ ⚽️**",
+        "**🏆บอลโลก 2026 มาแล้ว!🏆**",
+        "**⚽️NEW โปรแกรมฟุตบอล**",
+        "⚽️เปิดทุกคู่ ทุกลีคทั่วโลก ค่ายดังที่คุณวางใจ",
+        "**▶️ UFABET     ▶️ BTI",
+        "▶️ SBOBET     ▶️ WSSPORT**",
+        "🌟**NEW โปรโมชั่น แทงครบ 3-5 บิล",
+        "🌟(รับ FREE BET สูงสุด 100 บาท) ทันที!",
+        "**⚽️กิจกรรมทายผลฟุตบอล มีทุกวัน!",
+        "🚀 เปลี่ยนเพชรเป็นเงินรางวัล ลุ้นได้ทุกวัน!**",
+        "https://777sportplus.net/register?m_ref=bh",
+        "📲 หรือสอบถามเพิ่มเติม: @7sps",
+    ]
+)
+
+
+class ThaiEmojiHistoryClient(TuiStubClient):
+    async def history(self, peer, limit=50, offset_id=0):
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        messages = []
+        for i in range(2770, 2792):
+            score_text = "\n".join(
+                [
+                    "🇩🇪เยอรมนี 7-1 คูราเซา🇨🇼",
+                    f"{i} 🇳🇱เนเธอร์แลนด์ 2-2 ญี่ปุ่น🇯🇵",
+                ]
+            )
+            text = THAI_EMOJI_MESSAGE if i % 4 == 1 else score_text
+            messages.append(
+                Message(
+                    id=i,
+                    dialog_id=peer,
+                    sender_id=8229443682,
+                    out=False,
+                    text=text,
+                    date=date,
+                )
+            )
+        return messages
+
+
 async def test_tui_long_message_bubble_stays_within_message_pane():
     app = MessengerTUI(client=LongMessageClient())
     async with app.run_test(size=(80, 20)) as pilot:
@@ -540,6 +614,47 @@ async def test_tui_long_message_bubble_stays_within_message_pane():
         bubble = list(app.query(MessageBubble))[0]
         assert bubble.size.width <= pane.size.width
         assert "long-message-" in str(bubble.render())
+
+
+async def test_tui_messages_pane_has_no_horizontal_overflow_but_keeps_vertical_scroll():
+    app = MessengerTUI(client=ThaiEmojiHistoryClient())
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        app._current = -100200
+        app._current_kind = "group"
+        await app._show_history(-100200)
+        await pilot.pause()
+        pane = app.query_one("#messages")
+
+        assert pane.max_scroll_x == 0
+        assert pane.show_horizontal_scrollbar is False
+        assert pane.max_scroll_y > 0
+        assert pane.show_vertical_scrollbar is True
+        pane.scroll_end(animate=False, force=True)
+        await pilot.pause()
+        assert pane.scroll_y == pane.max_scroll_y
+        assert pane.scrollbars_space == (0, 0)
+
+
+async def test_tui_thai_emoji_bubbles_keep_right_padding_slack():
+    app = MessengerTUI(client=ThaiEmojiHistoryClient())
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        app._current = -100200
+        app._current_kind = "group"
+        await app._show_history(-100200)
+        await pilot.pause()
+        pane = app.query_one("#messages").region
+        thai_bubble = next(b for b in app.query(MessageBubble) if "777SportsPlus" in str(b.render()))
+        rendered = str(thai_bubble.render())
+
+        assert thai_bubble.region.x >= pane.x
+        assert thai_bubble.region.right <= pane.right
+        assert thai_bubble.styles.padding.left == 1
+        assert thai_bubble.styles.padding.right >= 4
+        assert "https://777sportplus.net/register?m_ref=bh" in rendered
+        assert "⚽" not in rendered
+        assert "\ufe0f" not in rendered
 
 
 async def test_tui_messages_pane_does_not_collapse_on_narrow_terminal():
@@ -1833,7 +1948,7 @@ async def test_tui_translation_and_reactions_keep_content_after_styling():
         bubble.show_translation("привет")
         bubble.add_reaction("👍")
         await pilot.pause()
-        assert str(bubble.render()) == "[1] hi\n↳ привет\n👍"
+        assert str(bubble.render()) == "[1] hi\n↳ привет\n*"
 
 
 class IncomingDialogListClient(TuiStubClient):
@@ -2160,10 +2275,11 @@ async def test_tui_sent_reaction_echo_is_not_duplicated():
         stub.fire.set()  # live echo for (7,1,"👍") — deduped, must not double-attach
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
-    # one bubble (the message), reaction line shows a single 👍, not 👍 👍
+    # one bubble (the message), reaction line shows a single safe reaction marker, not two.
     assert len(bubbles) == 1
     rendered = str(bubbles[0].render())
-    assert rendered.count("👍") == 1
+    assert rendered.count("*") == 1
+    assert "👍" not in rendered
     assert rendered.startswith("[1] ")
 
 
@@ -2183,8 +2299,10 @@ async def test_tui_reaction_accumulates_distinct_emoji_and_dedups():
         bubbles = list(app.query(MessageBubble))
     assert len(bubbles) == 1
     rendered = str(bubbles[0].render())
-    assert rendered.endswith("👍 ❤️")
-    assert rendered.count("👍") == 1
+    assert rendered.endswith("* *")
+    assert rendered.count("*") == 2
+    assert "👍" not in rendered
+    assert "❤️" not in rendered
 
 
 async def test_tui_reaction_and_translation_coexist_either_order():
@@ -2200,14 +2318,14 @@ async def test_tui_reaction_and_translation_coexist_either_order():
         bubble.show_translation("привет")
         bubble.add_reaction("👍")
         first = str(bubble.render())
-        assert "↳ привет" in first and "👍" in first and "[1] hi" in first
+        assert "↳ привет" in first and "*" in first and "👍" not in first and "[1] hi" in first
 
         bubble2 = MessageBubble("[2] yo", out=False, message_id=2, dialog_id=7)
         await pane.mount(bubble2)
         bubble2.add_reaction("🔥")
         bubble2.show_translation("здарова")  # reverse order
         second = str(bubble2.render())
-        assert "↳ здарова" in second and "🔥" in second and "[2] yo" in second
+        assert "↳ здарова" in second and "*" in second and "🔥" not in second and "[2] yo" in second
 
 
 async def test_tui_reaction_for_unknown_message_is_silently_ignored():
@@ -2224,7 +2342,7 @@ async def test_tui_reaction_for_unknown_message_is_silently_ignored():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
     assert len(bubbles) == 1  # still just the one message, no reaction bubble
-    assert "👍" not in str(bubbles[0].render())
+    assert "*" not in str(bubbles[0].render())
 
 
 class ChannelReactionClient(TuiStubClient):
@@ -2257,7 +2375,7 @@ async def test_tui_reaction_attaches_in_channel():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
     assert len(bubbles) == 1
-    assert str(bubbles[0].render()).endswith("🔥")
+    assert str(bubbles[0].render()).endswith("*")
 
 
 async def test_tui_reaction_during_history_load_is_buffered_and_replayed():
@@ -2276,7 +2394,7 @@ async def test_tui_reaction_during_history_load_is_buffered_and_replayed():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
     assert len(bubbles) == 1
-    assert str(bubbles[0].render()).endswith("👍")
+    assert str(bubbles[0].render()).endswith("*")
     assert app._pending_reactions.get(7) is None  # buffer drained, not left dangling
 
 
@@ -2311,7 +2429,7 @@ async def test_tui_reaction_not_attached_to_same_id_bubble_of_other_dialog():
         app._apply_reaction(7, 1, "👍")  # current dialog 7, colliding id 1
         await pilot.pause()
         rendered = str(stale.render())
-    assert "👍" not in rendered  # the reaction did not land under the other dialog's bubble
+    assert "*" not in rendered  # the reaction did not land under the other dialog's bubble
     assert app._pending_reactions == {}  # nor was it buffered (the bubble existed, just mismatched)
 
 

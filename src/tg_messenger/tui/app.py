@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import shlex
+import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -56,6 +57,29 @@ HELP_TEXT = """Навигация (стрелки):
   ? / F1    эта справка
   Esc       очистить поиск · закрыть окно
   Ctrl+C    выход"""
+
+
+def _terminal_safe_display_text(value: str) -> str:
+    """Return a terminal-safe display copy of Telegram-sourced text.
+
+    macOS Terminal and Rich/Textual disagree on a few zero-width Thai marks and emoji glyph
+    widths. Keep the model text untouched, but render a conservative one-cell display form in
+    the TUI so borders and line clearing stay aligned.
+    """
+    safe: list[str] = []
+    for ch in unicodedata.normalize("NFC", value):
+        codepoint = ord(ch)
+        if ch in "\ufe0e\ufe0f\u200d" or unicodedata.category(ch) == "Mn":
+            continue
+        if (
+            0x1F000 <= codepoint <= 0x1FAFF
+            or 0x2600 <= codepoint <= 0x27BF
+            or 0x2B00 <= codepoint <= 0x2BFF
+        ):
+            safe.append("*")
+        else:
+            safe.append(ch)
+    return "".join(safe)
 
 
 @dataclass
@@ -469,7 +493,7 @@ class DialogItem(ListItem):
         # untrusted title still renders literally ([brackets] never markup-parsed) while only the
         # id segment carries a style — markup=False stays required.
         t = Text()
-        t.append(title)
+        t.append(_terminal_safe_display_text(title))
         if unread:
             t.append(f"  ({unread})")
         t.append(f"  #{dialog_id}", style="dim")
@@ -517,18 +541,18 @@ class MessageBubble(Static):
         # extra lines exactly as before. NOT named _render — Widget._render is reserved.
         t = Text()
         if self._author is not None:
-            t.append(self._author, style="dim")
+            t.append(_terminal_safe_display_text(self._author), style="dim")
             t.append("\n")
         prefix, rest = _split_id_prefix(self._body)
         if prefix:
             t.append(prefix, style="dim")
-        t.append(rest)
+        t.append(_terminal_safe_display_text(rest))
         if self._translation is not None:
             t.append("\n")
-            t.append(f"↳ {self._translation}")
+            t.append(f"↳ {_terminal_safe_display_text(self._translation)}")
         if self._reactions:
             t.append("\n")
-            t.append(" ".join(self._reactions))
+            t.append(_terminal_safe_display_text(" ".join(self._reactions)))
         return t
 
     def _recompose_text(self) -> None:
@@ -948,7 +972,12 @@ class MessengerTUI(App):
        focused bubble still gets its own #messages MessageBubble:focus accent below. */
     #sidebar:focus-within { border-right: solid $accent; }
     #chat:focus-within { border-left: solid $accent; }
-    #messages { overflow-y: auto; }
+    #messages {
+        overflow-x: hidden;
+        overflow-y: auto;
+        scrollbar-size-vertical: 0;
+        scrollbar-size-horizontal: 0;
+    }
     /* #113/#118: each message is a framed, shrink-wrapped card. The in/out asymmetry is now a
        PROPORTIONAL alignment of the bubble inside a full-width BubbleRow (align-horizontal),
        NOT a fixed side margin — a fixed 20-col margin pushed the bubble off the right edge once
@@ -959,7 +988,7 @@ class MessengerTUI(App):
     #messages BubbleRow.in { align-horizontal: left; }
     #messages MessageBubble {
         width: auto; max-width: 80%; height: auto;
-        margin: 1 1; padding: 0 1;
+        margin: 1 1; padding: 0 4 0 1;
         border: round $panel;
         text-wrap: wrap; text-overflow: fold;
     }
@@ -1422,6 +1451,21 @@ class MessengerTUI(App):
         except Exception:
             logger.warning("mark_read failed (dialog %s) — continuing", dialog_id, exc_info=True)
 
+    def _message_bubble_for(self, message, dialog_id: int) -> MessageBubble:
+        """Build and index the one TUI bubble representation for a core message."""
+        show_author = (not message.out) and self._kind_for_rendering(dialog_id) == "group"
+        bubble = MessageBubble(
+            _message_body(message),
+            message.out,
+            message_id=message.id,
+            dialog_id=dialog_id,
+            author=_message_author_line(message, show_author=show_author),
+        )
+        if message.translated_text:
+            bubble.show_translation(message.translated_text)
+        self._bubble_index[message.id] = bubble
+        return bubble
+
     async def _show_history(self, dialog_id: int) -> None:
         pane = self.query_one("#messages", Vertical)
         await pane.remove_children()
@@ -1440,14 +1484,7 @@ class MessengerTUI(App):
         bubbles = []
         self._bubble_index.clear()
         for m in messages:
-            show_author = (not m.out) and self._kind_for_rendering(dialog_id) == "group"
-            bubble = MessageBubble(_message_body(m), m.out,
-                                   message_id=m.id, dialog_id=dialog_id,
-                                   author=_message_author_line(m, show_author=show_author))
-            if m.translated_text:
-                bubble.show_translation(m.translated_text)
-            self._bubble_index[m.id] = bubble
-            bubbles.append(bubble)
+            bubbles.append(self._message_bubble_for(m, dialog_id))
         await pane.mount(*(_wrap_bubble(b) for b in bubbles))  # #118: align via wrapper row
         # #106: apply any reactions that arrived while this history was loading.
         self._drain_pending_reactions(dialog_id)
@@ -1759,10 +1796,7 @@ class MessengerTUI(App):
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            bubble = MessageBubble(_message_body(msg), out=True, message_id=msg.id, dialog_id=peer)
-            if msg.translated_text:
-                bubble.show_translation(msg.translated_text)
-            self._bubble_index[msg.id] = bubble
+            bubble = self._message_bubble_for(msg, peer)
             await pane.mount(_wrap_bubble(bubble))
             self._scroll_messages_to_end(pane)
 
@@ -1788,8 +1822,7 @@ class MessengerTUI(App):
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
-            bubble = MessageBubble(_message_body(msg), out=True, message_id=msg.id, dialog_id=peer)
-            self._bubble_index[msg.id] = bubble
+            bubble = self._message_bubble_for(msg, peer)
             await pane.mount(_wrap_bubble(bubble))
             self._scroll_messages_to_end(pane)
 
@@ -1840,16 +1873,9 @@ class MessengerTUI(App):
                 await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=True)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    show_author = self._kind_for_rendering(ev.dialog_id) == "group"
-                    bubble = MessageBubble(_message_body(ev.message),
-                                           out=False,
-                                           message_id=ev.message.id, dialog_id=ev.dialog_id,
-                                           author=_message_author_line(ev.message, show_author=show_author))
-                    self._bubble_index[ev.message.id] = bubble
+                    bubble = self._message_bubble_for(ev.message, ev.dialog_id)
                     await pane.mount(_wrap_bubble(bubble))
-                    if ev.message.translated_text:
-                        bubble.show_translation(ev.message.translated_text)
-                    elif self._translator is not None:
+                    if not ev.message.translated_text and self._translator is not None:
                         self.run_worker(
                             self._translate_bubble(ev.dialog_id, ev.message, bubble),
                             group="translate-live",
@@ -1880,13 +1906,9 @@ class MessengerTUI(App):
                 await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=False)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
-                    bubble = MessageBubble(_message_body(ev.message), out=True,
-                                           message_id=ev.message.id, dialog_id=ev.dialog_id)
-                    self._bubble_index[ev.message.id] = bubble
+                    bubble = self._message_bubble_for(ev.message, ev.dialog_id)
                     await pane.mount(_wrap_bubble(bubble))
-                    if ev.message.translated_text:
-                        bubble.show_translation(ev.message.translated_text)
-                    elif self._translator is not None:
+                    if not ev.message.translated_text and self._translator is not None:
                         self.run_worker(
                             self._translate_bubble(ev.dialog_id, ev.message, bubble),
                             group="translate-live",
