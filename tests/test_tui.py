@@ -2661,11 +2661,22 @@ async def test_composer_down_is_noop_at_bottom():
         assert app.focused is composer
 
 
+class ThreeMessageHistoryClient(TuiStubClient):
+    # a small, fixed history so a full intra-bubble arrow walk is feasible with a few keypresses.
+    async def history(self, peer, limit=50, offset_id=0):
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        return [
+            Message(id=i, dialog_id=peer, sender_id=peer, out=False, text=f"msg {i}", date=date)
+            for i in range(1, 4)
+        ]
+
+
 async def test_full_chain_down_then_up():
-    # the whole vertical chain with arrows alone: search → tabs → dialogs → bubble → composer,
-    # then symmetric back up. The LAST dialog is the open one so the Down handoff is a pure focus
-    # move (no wrong-recipient dialog switch — see test_dialogs_down_handoff_commits_*).
-    app = MessengerTUI(client=LongHistoryClient())
+    # the whole vertical chain with arrows ALONE: search → tabs → dialogs → bubble walk → composer,
+    # then symmetric back up. The intra-bubble steps are real keypresses (not .focus()) so the walk
+    # itself is exercised. The LAST dialog is the open one so the Down handoff is a pure focus move
+    # (no wrong-recipient dialog switch — see test_dialogs_down_handoff_commits_*).
+    app = MessengerTUI(client=ThreeMessageHistoryClient())
     async with app.run_test(size=(80, 20)) as pilot:
         await pilot.pause()
         search = app.query_one("#search", Input)
@@ -2676,7 +2687,7 @@ async def test_full_chain_down_then_up():
         dialogs.focus()
         dialogs.index = len(dialogs) - 1
         await pilot.press("right")
-        await _pause_until(pilot, lambda: bool(list(app.query(MessageBubble))))
+        await _pause_until(pilot, lambda: len(list(app.query(MessageBubble))) == 3)
         bubbles = list(app.query(MessageBubble))
 
         search.focus()
@@ -2692,19 +2703,23 @@ async def test_full_chain_down_then_up():
         await pilot.press("down")  # dialogs (last) → first bubble
         await pilot.pause()
         assert app.focused is bubbles[0]
-        # walk to the last bubble, then down into the composer
-        bubbles[-1].focus()
-        await pilot.pause()
-        await pilot.press("down")
+        # walk DOWN through the bubbles with arrows alone, then into the composer
+        for nxt in bubbles[1:]:
+            await pilot.press("down")
+            await pilot.pause()
+            assert app.focused is nxt
+        await pilot.press("down")  # last bubble → composer
         await pilot.pause()
         assert app.focused is composer
-        # symmetric path back up: composer → last bubble → ... → first bubble → dialogs → tabs
+        # symmetric path back up: composer → last bubble → ...walk up... → first bubble → dialogs → tabs
         await pilot.press("up")
         await pilot.pause()
         assert app.focused is bubbles[-1]
-        bubbles[0].focus()
-        await pilot.pause()
-        await pilot.press("up")
+        for prev in reversed(bubbles[:-1]):
+            await pilot.press("up")
+            await pilot.pause()
+            assert app.focused is prev
+        await pilot.press("up")  # first bubble → dialogs
         await pilot.pause()
         assert app.focused is dialogs
         dialogs.index = 0
