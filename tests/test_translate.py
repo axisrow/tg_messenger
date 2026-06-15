@@ -6,12 +6,23 @@ import pytest
 
 from tg_messenger.agent.translate import (
     Translator,
+    get_known_langs,
+    get_translate_mode,
+    get_unknown_langs,
     get_user_lang,
     needs_translation,
+    resolve_skip_only,
+    set_known_langs,
+    set_translate_mode,
+    set_unknown_langs,
     set_user_lang,
     translate_model_from_env,
 )
-from tg_messenger.core.message_store import MessageStore, register_message_store_migrations
+from tg_messenger.core.message_store import (
+    MessageStore,
+    get_message_translation,
+    register_message_store_migrations,
+)
 from tg_messenger.core.models import Message
 from tg_messenger.core.storage import Storage
 
@@ -101,7 +112,7 @@ async def test_translator_batches_and_caches(tmp_path):
     register_message_store_migrations(storage)
     calls = []
 
-    async def translate_fn(batch, lang):
+    async def translate_fn(batch, lang, skip=(), only=()):
         calls.append((list(batch), lang))
         return {mid: (None if text == "привет" else f"ru:{text}") for mid, text in batch}
 
@@ -125,7 +136,7 @@ async def test_translator_does_not_cache_same_script_text_as_already_translated(
     register_message_store_migrations(storage)
     calls = []
 
-    async def translate_fn(batch, lang):
+    async def translate_fn(batch, lang, skip=(), only=()):
         calls.append((list(batch), lang))
         return {mid: "hello" for mid, _ in batch}
 
@@ -148,7 +159,7 @@ async def test_translator_caches_missing_model_response_ids_as_null(tmp_path):
     register_message_store_migrations(storage)
     calls = []
 
-    async def translate_fn(batch, lang):
+    async def translate_fn(batch, lang, skip=(), only=()):
         calls.append((list(batch), lang))
         return {}
 
@@ -171,7 +182,7 @@ async def test_translator_skips_outgoing_messages(tmp_path):
     register_message_store_migrations(storage)
     calls = []
 
-    async def translate_fn(batch, lang):
+    async def translate_fn(batch, lang, skip=(), only=()):
         calls.append((list(batch), lang))
         return {mid: "ru:own" for mid, _ in batch}
 
@@ -204,7 +215,7 @@ async def test_translator_retranslates_when_source_text_changes(tmp_path):
     register_message_store_migrations(storage)
     calls = []
 
-    async def translate_fn(batch, lang):
+    async def translate_fn(batch, lang, skip=(), only=()):
         calls.append((list(batch), lang))
         return {mid: f"ru:{text}" for mid, text in batch}
 
@@ -227,7 +238,7 @@ async def test_translator_failure_is_logged_and_unraised(tmp_path, caplog):
     storage = Storage(tmp_path / "t.db")
     register_message_store_migrations(storage)
 
-    async def boom(batch, lang):
+    async def boom(batch, lang, skip=(), only=()):
         raise RuntimeError("translator down")
 
     store = MessageStore(client=object(), storage=storage)
@@ -241,3 +252,165 @@ async def test_translator_failure_is_logged_and_unraised(tmp_path, caplog):
 
     assert result[0].translated_text is None
     assert any("translation batch failed" in rec.message for rec in caplog.records)
+
+
+# --- translation mode / known-unknown languages -----------------------------------------
+
+
+async def _connected_store(tmp_path):
+    storage = Storage(tmp_path / "t.db")
+    register_message_store_migrations(storage)
+    store = MessageStore(client=object(), storage=storage)
+    await store.connect()
+    return storage, store
+
+
+async def test_translate_mode_defaults_from_user_lang(tmp_path):
+    storage, store = await _connected_store(tmp_path)
+    try:
+        # no stored mode + no target → off
+        assert await get_translate_mode(storage, {}) == "off"
+        # no stored mode + a target language → all_unknown (back-compat with the old single-lang setup)
+        assert await get_translate_mode(storage, {"TG_USER_LANG": "ru"}) == "all_unknown"
+        await set_translate_mode(storage, "skip_known")
+        assert await get_translate_mode(storage, {}) == "skip_known"
+    finally:
+        await store.close()
+
+
+async def test_off_mode_returns_originals_without_calling_llm(tmp_path):
+    storage, store = await _connected_store(tmp_path)
+    calls = []
+
+    async def translate_fn(batch, lang, skip=(), only=()):
+        calls.append((list(batch), lang, list(skip), list(only)))
+        return {mid: f"x:{text}" for mid, text in batch}
+
+    translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "ru"})
+    try:
+        await set_translate_mode(storage, "off")
+        result = await translator.translate_history(7, [_msg(1, "hello")])
+    finally:
+        await store.close()
+
+    assert result[0].translated_text is None
+    assert calls == []
+
+
+async def test_all_unknown_skips_known_langs_plus_target(tmp_path):
+    storage, store = await _connected_store(tmp_path)
+    seen = {}
+
+    async def translate_fn(batch, lang, skip=(), only=()):
+        seen["skip"] = list(skip)
+        seen["only"] = list(only)
+        return {mid: f"ru:{text}" for mid, text in batch}
+
+    translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "ru"})
+    try:
+        await set_translate_mode(storage, "all_unknown")
+        await set_known_langs(storage, "en")
+        await translator.translate_history(7, [_msg(1, "hallo")])
+    finally:
+        await store.close()
+
+    # all_unknown → skip = known ∪ {target}; no whitelist
+    assert set(seen["skip"]) == {"en", "ru"}
+    assert seen["only"] == []
+
+
+async def test_skip_known_passes_known_list(tmp_path):
+    storage, store = await _connected_store(tmp_path)
+    seen = {}
+
+    async def translate_fn(batch, lang, skip=(), only=()):
+        seen["skip"] = list(skip)
+        seen["only"] = list(only)
+        return {mid: f"ru:{text}" for mid, text in batch}
+
+    translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "ru"})
+    try:
+        await set_translate_mode(storage, "skip_known")
+        await set_known_langs(storage, "ru, en")
+        await translator.translate_history(7, [_msg(1, "hallo")])
+    finally:
+        await store.close()
+
+    assert seen["skip"] == ["ru", "en"]
+    assert seen["only"] == []
+
+
+async def test_only_unknown_passes_whitelist(tmp_path):
+    storage, store = await _connected_store(tmp_path)
+    seen = {}
+
+    async def translate_fn(batch, lang, skip=(), only=()):
+        seen["skip"] = list(skip)
+        seen["only"] = list(only)
+        return {mid: f"ru:{text}" for mid, text in batch}
+
+    translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "ru"})
+    try:
+        await set_translate_mode(storage, "only_unknown")
+        await set_unknown_langs(storage, "ja, ko")
+        await translator.translate_history(7, [_msg(1, "こんにちは")])
+    finally:
+        await store.close()
+
+    assert seen["only"] == ["ja", "ko"]
+    assert seen["skip"] == []
+
+
+async def test_resolve_skip_only_per_mode(tmp_path):
+    storage, store = await _connected_store(tmp_path)
+    try:
+        await set_known_langs(storage, "ru")
+        await set_unknown_langs(storage, "ja")
+        await set_translate_mode(storage, "all_unknown")
+        assert await resolve_skip_only(storage, "en", {}) == (["ru", "en"], [])
+        await set_translate_mode(storage, "skip_known")
+        assert await resolve_skip_only(storage, "en", {}) == (["ru"], [])
+        await set_translate_mode(storage, "only_unknown")
+        assert await resolve_skip_only(storage, "en", {}) == ([], ["ja"])
+    finally:
+        await store.close()
+
+
+async def test_changing_mode_clears_translation_cache(tmp_path):
+    storage, store = await _connected_store(tmp_path)
+    calls = []
+
+    async def translate_fn(batch, lang, skip=(), only=()):
+        calls.append(list(batch))
+        return {mid: f"ru:{text}" for mid, text in batch}
+
+    translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "ru"})
+    try:
+        await set_translate_mode(storage, "all_unknown")
+        first = await translator.translate_history(7, [_msg(1, "hallo")])
+        assert first[0].translated_text == "ru:hallo"
+        # the row is now cached
+        assert await get_message_translation(storage, 7, 1, "ru", source_text="hallo") is not None
+        # changing the mode must invalidate the cache → next read re-calls the LLM
+        await set_known_langs(storage, "en")
+        assert await get_message_translation(storage, 7, 1, "ru", source_text="hallo") is None
+        await translator.translate_history(7, [_msg(1, "hallo")])
+    finally:
+        await store.close()
+
+    assert calls == [[(1, "hallo")], [(1, "hallo")]]
+
+
+async def test_lang_list_setters_validate_and_dedupe(tmp_path):
+    storage, store = await _connected_store(tmp_path)
+    try:
+        await set_known_langs(storage, "ru, en, ru")
+        assert await get_known_langs(storage) == ["ru", "en"]
+        with pytest.raises(ValueError, match="invalid language code"):
+            await set_known_langs(storage, "ru, fr")
+        # the failed write left the previous value intact
+        assert await get_known_langs(storage) == ["ru", "en"]
+        await set_unknown_langs(storage, ["ja", "ja", "ko"])
+        assert await get_unknown_langs(storage) == ["ja", "ko"]
+    finally:
+        await store.close()

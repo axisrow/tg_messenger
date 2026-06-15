@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Input, ListView, Static, Tabs
+from textual.widgets import Footer, Input, ListView, Static, Tabs
 
 from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.models import (
@@ -3922,3 +3922,105 @@ async def test_tui_settings_add_empty_name_is_noop():
         await pilot.pause()
         assert app.screen is screen  # no LoginScreen pushed (still on AccountsScreen)
         assert store.list_profiles() == ["alice"]  # nothing added
+
+
+# --- Footer visibility + inbound-translation settings (#127-followup) --------------------
+
+
+class StubTranslator:
+    """Minimal Translator stand-in for AccountsScreen tests (no Storage, no LLM)."""
+
+    def __init__(self, settings=None):
+        self._settings = settings or {"mode": "off", "target": None, "known": [], "unknown": []}
+        self.saved = []
+
+    async def get_settings(self):
+        return dict(self._settings)
+
+    async def set_settings(self, *, mode, target=None, known=None, unknown=None):
+        self.saved.append({"mode": mode, "target": target, "known": known, "unknown": unknown})
+
+
+async def test_tui_footer_is_present_and_shows_help_and_settings():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # the Footer exists (was missing — the reported "не вижу настроек/?")
+        assert app.query(Footer)
+        # exactly one visible "Справка" binding (no F1/? duplicate) and a "Настройки" binding
+        labels = [b.description for b in app._bindings.shown_keys]
+        assert labels.count("Справка") == 1
+        assert "Настройки" in labels
+        # the Footer only renders bindings ACTIVE in the current focus (search Input on startup).
+        # The help hint must be the F1 binding (priority → active inside an Input); a "?"-only hint
+        # would be filtered out exactly when the user first looks — the original complaint.
+        active = [
+            ab.binding for ab in app.active_bindings.values() if ab.binding.show
+        ]
+        active_help = [b for b in active if b.description == "Справка"]
+        assert len(active_help) == 1 and active_help[0].key == "f1"
+        assert any(b.description == "Настройки" for b in active)
+
+
+async def test_tui_settings_shows_translate_section_when_translator_wired():
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": []})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        assert screen.query("#translate-section")
+        # stored mode selected, target + list prefilled
+        assert screen.query_one("#mode-skip_known").value is True
+        assert screen.query_one("#target-lang", Input).value == "ru"
+        assert screen.query_one("#lang-list", Input).value == "ru, en"
+
+
+async def test_tui_settings_hides_translate_section_without_translator():
+    store = FakeSessionStore(["alice"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="alice", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        assert not screen.query("#translate-section")
+
+
+async def test_tui_settings_saves_translate_settings_on_submit():
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": []})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#target-lang", Input).value = "ru"
+        screen.query_one("#lang-list", Input).value = "ru, en"
+        await screen._save_translate_settings()
+        assert translator.saved[-1] == {
+            "mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": None,
+        }
+
+
+async def test_tui_settings_rejects_bad_lang_code_without_saving():
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": [], "unknown": []})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#lang-list", Input).value = "ru, fr"  # fr unsupported
+        await screen._save_translate_settings()
+        assert translator.saved == []  # nothing persisted on a bad code

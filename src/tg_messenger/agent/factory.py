@@ -76,7 +76,11 @@ VISION_SYSTEM_PROMPT = (
 TRANSLATE_SYSTEM_PROMPT = (
     "Translate Telegram messages into the target language. Return ONLY JSON: "
     "[{\"id\": number, \"translation\": string|null}]. Use null when a message is "
-    "already in the target language or should not be translated."
+    "already in the target language or should not be translated.\n"
+    "Detect each message's source language. If \"only_langs\" is a non-empty list, translate "
+    "ONLY messages whose source language is one of those codes and return null for every other "
+    "message. Otherwise, return null for any message whose source language is in \"skip_langs\". "
+    "Language codes are ISO 639-1 (e.g. ru, en, es)."
 )
 
 OUTBOUND_VARIANTS_SYSTEM_PROMPT = (
@@ -183,9 +187,11 @@ def make_suggest_fn(model) -> Callable:
 def make_translate_fn(model) -> Callable:
     """Batch translator over a plain ainvoke; injected into ``Translator``."""
 
-    async def translate(messages, target_lang: str) -> dict[int, str | None]:
+    async def translate(messages, target_lang: str, skip_langs=(), only_langs=()) -> dict[int, str | None]:
         payload = {
             "target_lang": target_lang,
+            "skip_langs": list(skip_langs),
+            "only_langs": list(only_langs),
             "messages": [{"id": int(mid), "text": text} for mid, text in messages],
         }
         response = await _ainvoke_with_timeout(

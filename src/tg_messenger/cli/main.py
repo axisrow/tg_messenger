@@ -803,12 +803,41 @@ def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> 
 @cli.command()
 @click.argument("code", required=False)
 @click.option("--clear", "clear", is_flag=True, help="Clear the stored language override.")
+@click.option(
+    "--mode",
+    "mode",
+    type=click.Choice(["off", "all_unknown", "skip_known", "only_unknown"]),
+    default=None,
+    help="Inbound translation mode (off / all_unknown / skip_known / only_unknown).",
+)
+@click.option("--known", "known", default=None,
+              help="Comma/space-separated languages you KNOW (not translated).")
+@click.option("--unknown", "unknown", default=None,
+              help="Comma/space-separated languages to translate (only_unknown mode).")
 @click.option("--session", default="default")
 @click.pass_context
-def lang(ctx: click.Context, code: str | None, clear: bool, session: str) -> None:
-    """Show or set the user's target language for cached message translation."""
-    from tg_messenger.agent.translate import USER_LANG_KEY, get_user_lang, set_user_lang
-    from tg_messenger.core.languages import validate_supported_lang_code
+def lang(
+    ctx: click.Context,
+    code: str | None,
+    clear: bool,
+    mode: str | None,
+    known: str | None,
+    unknown: str | None,
+    session: str,
+) -> None:
+    """Show or set inbound translation: target language (CODE), mode, and known/unknown lists."""
+    from tg_messenger.agent.translate import (
+        USER_LANG_KEY,
+        get_known_langs,
+        get_translate_mode,
+        get_unknown_langs,
+        get_user_lang,
+        set_known_langs,
+        set_translate_mode,
+        set_unknown_langs,
+        set_user_lang,
+    )
+    from tg_messenger.core.languages import parse_lang_codes, validate_supported_lang_code
 
     if clear and code is not None:
         raise click.ClickException("CODE and --clear are mutually exclusive")
@@ -818,16 +847,32 @@ def lang(ctx: click.Context, code: str | None, clear: bool, session: str) -> Non
             language_code = validate_supported_lang_code(code)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
+    # parse lists up front so a bad code fails before touching the DB
+    try:
+        known_codes = parse_lang_codes(known) if known is not None else None
+        unknown_codes = parse_lang_codes(unknown) if unknown is not None else None
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     session = _effective_session(ctx, session)
+    mutating = clear or language_code is not None or mode is not None \
+        or known_codes is not None or unknown_codes is not None
 
     async def _do(storage):
         if clear:
             await set_user_lang(storage, None)
+            await set_translate_mode(storage, "off")
             click.echo("language override cleared.")
             return
-        if language_code is not None:
-            await set_user_lang(storage, language_code)
-            click.echo(f"language set to {language_code}.")
+        if mutating:
+            if language_code is not None:
+                await set_user_lang(storage, language_code)
+            if known_codes is not None:
+                await set_known_langs(storage, known_codes)
+            if unknown_codes is not None:
+                await set_unknown_langs(storage, unknown_codes)
+            if mode is not None:
+                await set_translate_mode(storage, mode)
+            click.echo("translation settings updated.")
             return
         stored = await storage.get_value(USER_LANG_KEY)
         effective = await get_user_lang(storage)
@@ -837,7 +882,13 @@ def lang(ctx: click.Context, code: str | None, clear: bool, session: str) -> Non
             source = "env"
         else:
             source = "unset"
+        eff_mode = await get_translate_mode(storage)
+        eff_known = await get_known_langs(storage)
+        eff_unknown = await get_unknown_langs(storage)
         click.echo(f"{effective or 'unset'}\t{source}")
+        click.echo(f"mode\t{eff_mode}")
+        click.echo(f"known\t{', '.join(eff_known) or '-'}")
+        click.echo(f"unknown\t{', '.join(eff_unknown) or '-'}")
 
     _run(_with_storage(session, lambda storage: None, _do), session=session)
 

@@ -782,6 +782,30 @@ def test_lang_rejects_unsupported_code(monkeypatch, tmp_path):
     assert "unset" in show_result.output
 
 
+def test_lang_sets_mode_and_known_list(monkeypatch, tmp_path):
+    from tg_messenger.core.storage import Storage
+
+    def fake_make_storage(profile="default"):
+        return Storage(tmp_path / f"{profile}.db")
+
+    monkeypatch.setattr(cli_main, "make_storage", fake_make_storage)
+    runner = CliRunner()
+
+    set_result = runner.invoke(
+        cli_main.cli, ["lang", "ru", "--mode", "skip_known", "--known", "ru, en"]
+    )
+    show_result = runner.invoke(cli_main.cli, ["lang"])
+    bad_result = runner.invoke(cli_main.cli, ["lang", "--known", "ru, fr"])
+
+    assert set_result.exit_code == 0, set_result.output
+    assert show_result.exit_code == 0, show_result.output
+    assert "mode\tskip_known" in show_result.output
+    assert "known\tru, en" in show_result.output
+    # a bad code in a list fails before any write
+    assert bad_result.exit_code != 0
+    assert "invalid language code" in bad_result.output
+
+
 def test_dialog_lang_rejects_unsupported_code(monkeypatch, tmp_path):
     from tg_messenger.core.storage import Storage
 
