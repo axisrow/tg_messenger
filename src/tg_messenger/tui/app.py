@@ -342,7 +342,8 @@ class DialogListView(ListView):
             # BEFORE entering the chat pane, else a reply would silently go to the previously-open
             # dialog — a wrong-recipient send. Mirrors action_open_dialog's Selected → open.
             item = self.highlighted_child
-            if isinstance(item, DialogItem) and item.dialog_id != self.app._current:
+            switching = isinstance(item, DialogItem) and item.dialog_id != self.app._current
+            if switching:
                 self.action_select_cursor()
             # #124: same read-only guard as action_open_dialog (the Right path). A read-only chat
             # disables the composer asynchronously; _focus_first_bubble_or_composer would land on it
@@ -350,7 +351,21 @@ class DialogListView(ListView):
             # Keep focus on the dialog list there so arrow navigation stays alive.
             if isinstance(item, DialogItem) and not self.app._dialog_can_send(item.dialog_id):
                 return
-            _focus_first_bubble_or_composer(self.screen)
+            if switching:
+                # #124: a dialog SWITCH only posts ListView.Selected — _current and the history
+                # render happen later on the pump / in a worker (on_list_view_selected → _show_history
+                # removes and re-mounts bubbles). The bubbles mounted RIGHT NOW still belong to the
+                # previously-open chat, so focusing one would land on a STALE bubble during the load
+                # window. Because MessageBubble.action_react acts on the bubble's OWN dialog/message
+                # id (not _current), a fast r/x there would react on the previous conversation — a
+                # wrong-conversation action. Land on the composer instead: the Right path's safe
+                # target, which _show_history never removes. Once the new history renders, the user
+                # can walk up into the (now correct) bubbles.
+                self.screen.query_one("#composer", Input).focus()
+            else:
+                # Same open dialog (no switch): the mounted bubbles are already the current chat's,
+                # so entering the first bubble is safe.
+                _focus_first_bubble_or_composer(self.screen)
         else:
             self.action_cursor_down()
 

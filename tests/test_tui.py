@@ -2976,6 +2976,47 @@ async def test_dialogs_down_handoff_then_send_targets_highlighted_dialog():
     assert stub.sent == [(last_id, "secret", None)]  # sent to the highlighted dialog, not the stale 7
 
 
+async def test_dialogs_down_handoff_switch_does_not_focus_stale_bubble():
+    # #124 regression (wrong-conversation action): open dialog 7 (its bubble mounts), then arrow the
+    # cursor to a DIFFERENT writable dialog (8) WITHOUT selecting it and press Down. The switch only
+    # POSTS ListView.Selected — _current and the history render happen later (on_list_view_selected →
+    # _show_history removes and re-mounts bubbles in a worker) — so the bubbles still mounted at the
+    # handoff moment belong to dialog 7. Focusing one would land on a STALE bubble, and
+    # MessageBubble.action_react acts on the bubble's OWN dialog id (not _current), so a fast r/x there
+    # would react on the previous conversation. The handoff must land on the composer, never a stale
+    # dialog-7 bubble — and must stay off stale bubbles once the new history finishes loading.
+    class TwoWritableDmClient(TuiStubClient):
+        async def dialogs(self, dm_only=True):
+            self.dialogs_calls += 1
+            return [
+                Dialog(id=7, title="Ann", username="ann", is_contact=True),
+                Dialog(id=8, title="Bob", username="bob", is_contact=False),
+            ]
+
+    app = MessengerTUI(client=TwoWritableDmClient())
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = 0  # open dialog 7
+        await pilot.press("right")
+        await _pause_until(pilot, lambda: app._current == 7 and bool(list(app.query(MessageBubble))))
+        assert all(b.dialog_id == 7 for b in app.query(MessageBubble))  # mounted bubbles are dialog 7's
+        lv.focus()
+        lv.index = len(lv) - 1  # cursor on the LAST dialog (8), still showing dialog 7's chat
+        await pilot.pause()
+        assert lv.highlighted_child.dialog_id == 8 and app._current == 7  # diverged before the handoff
+        await pilot.press("down")  # hand off into a DIFFERENT dialog
+        focused = app.focused
+        # the instant of the switch must not focus a stale dialog-7 bubble
+        assert not (isinstance(focused, MessageBubble) and focused.dialog_id == 7)
+        assert focused is app.query_one("#composer", Input)  # lands on the safe composer
+        # after the new history renders, focus is still off any stale dialog-7 bubble
+        await _pause_until(pilot, lambda: app._current == 8)
+        focused = app.focused
+        assert not (isinstance(focused, MessageBubble) and focused.dialog_id == 7)
+
+
 async def test_dialogs_right_on_readonly_channel_keeps_focus_alive():
     # #124 regression: Right on a read-only channel disables the composer (async, via
     # _apply_composer_writable). Focusing a soon-to-be-disabled composer would leave focus on
