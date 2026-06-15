@@ -2976,6 +2976,61 @@ async def test_dialogs_down_handoff_then_send_targets_highlighted_dialog():
     assert stub.sent == [(last_id, "secret", None)]  # sent to the highlighted dialog, not the stale 7
 
 
+async def test_dialogs_down_handoff_commits_current_synchronously():
+    # #124 regression (Codex): the Down handoff must commit _current SYNCHRONOUSLY, before focus
+    # moves into the composer — not via a posted ListView.Selected the pump drains later. Otherwise
+    # a same-tick Enter / queued paste in the composer would snapshot the stale _current and send to
+    # the previously-open dialog (a wrong-recipient private send). Assert _current flips the instant
+    # the handoff action runs, with NO intervening pause (the pump never gets a turn).
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = 0
+        await pilot.press("right")
+        await _pause_until(pilot, lambda: app._current == 7)
+        lv.focus()
+        lv.index = len(lv) - 1  # cursor on the last dialog WITHOUT opening it
+        await pilot.pause()
+        last_id = lv.highlighted_child.dialog_id
+        assert last_id != 7 and app._current == 7  # diverged before the handoff
+        lv.action_cursor_down_or_messages()  # the handoff — runs synchronously, no pump turn
+        assert app._current == last_id  # committed IMMEDIATELY, not deferred to the pump
+        # and a submit in the very same window now targets the highlighted dialog
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "secret"))
+        await stub.wait_sent_count(1)
+    assert stub.sent == [(last_id, "secret", None)]  # never the stale 7
+
+
+async def test_dialogs_right_open_commits_current_synchronously():
+    # #124 regression (Codex): the Right-open path has the same race as Down — it focuses the
+    # composer right after action_select_cursor, which only posts Selected. Commit _current
+    # synchronously so a same-tick submit can't leak text to the previously-open dialog.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = 0
+        await pilot.press("right")
+        await _pause_until(pilot, lambda: app._current == 7)
+        lv.focus()
+        lv.index = len(lv) - 1  # cursor on the last dialog WITHOUT opening it
+        await pilot.pause()
+        last_id = lv.highlighted_child.dialog_id
+        assert last_id != 7 and app._current == 7  # diverged before the open
+        lv.action_open_dialog()  # Right — runs synchronously, no pump turn
+        assert app._current == last_id  # committed IMMEDIATELY, not deferred to the pump
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "secret"))
+        await stub.wait_sent_count(1)
+    assert stub.sent == [(last_id, "secret", None)]  # never the stale 7
+
+
 async def test_dialogs_down_handoff_switch_does_not_focus_stale_bubble():
     # #124 regression (wrong-conversation action): open dialog 7 (its bubble mounts), then arrow the
     # cursor to a DIFFERENT writable dialog (8) WITHOUT selecting it and press Down. The switch only

@@ -340,11 +340,15 @@ class DialogListView(ListView):
             # #124: cursor-only movement highlights without opening (only Selected sets _current),
             # so the highlighted dialog can differ from the open chat. Commit the highlighted dialog
             # BEFORE entering the chat pane, else a reply would silently go to the previously-open
-            # dialog — a wrong-recipient send. Mirrors action_open_dialog's Selected → open.
+            # dialog — a wrong-recipient send. Mirrors action_open_dialog's synchronous open.
             item = self.highlighted_child
             switching = isinstance(item, DialogItem) and item.dialog_id != self.app._current
             if switching:
-                self.action_select_cursor()
+                # #124: open SYNCHRONOUSLY (not action_select_cursor, which only posts Selected and
+                # leaves _current stale until the pump drains it). _current is committed here, before
+                # the composer is focused below, so a same-tick Enter/queued paste can never send to
+                # the previously-open dialog (Codex wrong-recipient finding).
+                self.app._open_dialog(item.dialog_id)
             # #124: same read-only guard as action_open_dialog (the Right path). A read-only chat
             # disables the composer asynchronously; _focus_first_bubble_or_composer would land on it
             # (no bubbles yet — history loads in a worker) and focus would be lost into nothing.
@@ -352,15 +356,14 @@ class DialogListView(ListView):
             if isinstance(item, DialogItem) and not self.app._dialog_can_send(item.dialog_id):
                 return
             if switching:
-                # #124: a dialog SWITCH only posts ListView.Selected — _current and the history
-                # render happen later on the pump / in a worker (on_list_view_selected → _show_history
-                # removes and re-mounts bubbles). The bubbles mounted RIGHT NOW still belong to the
-                # previously-open chat, so focusing one would land on a STALE bubble during the load
-                # window. Because MessageBubble.action_react acts on the bubble's OWN dialog/message
-                # id (not _current), a fast r/x there would react on the previous conversation — a
-                # wrong-conversation action. Land on the composer instead: the Right path's safe
-                # target, which _show_history never removes. Once the new history renders, the user
-                # can walk up into the (now correct) bubbles.
+                # #124: _open_dialog above committed _current synchronously, but the history RENDER
+                # still happens in a worker (_show_history removes and re-mounts bubbles). The bubbles
+                # mounted RIGHT NOW still belong to the previously-open chat, so focusing one would
+                # land on a STALE bubble during the load window. Because MessageBubble.action_react
+                # acts on the bubble's OWN dialog/message id, a fast r/x there would react on the
+                # previous conversation — a wrong-conversation action. Land on the composer instead:
+                # the Right path's safe target, which _show_history never removes. Once the new
+                # history renders, the user can walk up into the (now correct) bubbles.
                 self.screen.query_one("#composer", Input).focus()
             else:
                 # Same open dialog (no switch): the mounted bubbles are already the current chat's,
@@ -370,18 +373,22 @@ class DialogListView(ListView):
             self.action_cursor_down()
 
     def action_open_dialog(self) -> None:
-        # Right = open the highlighted dialog, then focus the composer so the user can reply at
-        # once. action_select_cursor posts ListView.Selected → on_list_view_selected does the
-        # actual open (sets _current, loads history in a worker); the composer focus is independent
-        # of that load. No-op on an empty list / no selection.
+        # Right = open the highlighted dialog, then focus the composer so the user can reply at once.
+        # No-op on an empty list / no selection.
         if self.index is None or len(self) == 0:
             return
         item = self.highlighted_child
-        self.action_select_cursor()
-        # #124: a read-only chat disables the composer (via the async on_list_view_selected →
-        # _apply_composer_writable). Focusing a soon-to-be-disabled composer would leave focus on
-        # nothing (Textual releases focus from a disabled widget). Keep focus on the list there so
-        # arrow navigation stays alive; only dive into the composer when the chat is writable.
+        # #124: open SYNCHRONOUSLY (not action_select_cursor, which only posts ListView.Selected and
+        # leaves _current stale until the pump drains it). _current is committed here, BEFORE the
+        # composer is focused, so a same-tick Enter / queued paste can never send to the previously-
+        # open dialog — the wrong-recipient send window (Codex finding). _open_dialog still kicks
+        # the history render in a worker, independent of focus.
+        if isinstance(item, DialogItem):
+            self.app._open_dialog(item.dialog_id)
+        # #124: a read-only chat disables the composer (via _apply_composer_writable, inside
+        # _open_dialog). Focusing a soon-to-be-disabled composer would leave focus on nothing
+        # (Textual releases focus from a disabled widget). Keep focus on the list there so arrow
+        # navigation stays alive; only dive into the composer when the chat is writable.
         if isinstance(item, DialogItem) and not self.app._dialog_can_send(item.dialog_id):
             return
         self.screen.query_one("#composer", Input).focus()
@@ -1366,18 +1373,28 @@ class MessengerTUI(App):
     async def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, DialogItem):
-            self._save_current_compose_state()
-            self._current = item.dialog_id
-            # #108: capture the kind now, while this dialog's <li> is in _all_dialogs — a later
-            # tab switch can drop it from the list, but the open chat keeps showing author lines.
-            self._current_kind = self._dialog_kind(item.dialog_id)
-            self._restore_compose_state(item.dialog_id)
-            self._apply_composer_writable(item.dialog_id)
-            self._clear_suggestion()
-            self._bubble_index.clear()
-            self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
-            # exclusive group: selecting another dialog cancels a still-loading history
-            self.run_worker(self._show_history(item.dialog_id), group="history", exclusive=True)
+            self._open_dialog(item.dialog_id)
+
+    def _open_dialog(self, dialog_id: int) -> None:
+        # #124: the SYNCHRONOUS open — sets _current and all per-dialog state, then kicks the
+        # history worker. Called both from on_list_view_selected (mouse/Enter selection, via the
+        # posted ListView.Selected) AND directly from the arrow handoff paths (Down/Right). The
+        # keyboard paths MUST commit synchronously: action_select_cursor only POSTS Selected, so
+        # if the composer is focused before the pump drains it, a fast Enter/queued paste would
+        # snapshot the stale _current and send to the previously-open dialog — a wrong-recipient
+        # send (Codex finding). Setting _current here, before focus moves, closes that window.
+        self._save_current_compose_state()
+        self._current = dialog_id
+        # #108: capture the kind now, while this dialog's <li> is in _all_dialogs — a later
+        # tab switch can drop it from the list, but the open chat keeps showing author lines.
+        self._current_kind = self._dialog_kind(dialog_id)
+        self._restore_compose_state(dialog_id)
+        self._apply_composer_writable(dialog_id)
+        self._clear_suggestion()
+        self._bubble_index.clear()
+        self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
+        # exclusive group: selecting another dialog cancels a still-loading history
+        self.run_worker(self._show_history(dialog_id), group="history", exclusive=True)
 
     async def _mark_read(self, dialog_id: int, max_id: int) -> None:
         try:
