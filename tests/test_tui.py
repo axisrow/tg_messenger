@@ -2777,6 +2777,23 @@ async def test_question_mark_opens_help_outside_inputs():
         assert not isinstance(app.screen, HelpScreen)
 
 
+async def test_f1_over_another_modal_is_noop():
+    # #124 cleanup: F1 is a priority binding so it fires even over an open modal. It must NOT stack
+    # HelpScreen on top of that modal (which owns the screen) — pressing F1 there is a no-op.
+    from tg_messenger.tui.app import AccountsScreen, HelpScreen
+
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+s")  # open account settings (a different modal)
+        await pilot.pause()
+        assert isinstance(app.screen, AccountsScreen)
+        await pilot.press("f1")  # must not bury the modal under HelpScreen
+        await pilot.pause()
+        assert isinstance(app.screen, AccountsScreen)
+        assert not isinstance(app.screen, HelpScreen)
+
+
 # --- #124: text editing in the Inputs is unaffected by the new up/down bindings ---
 
 

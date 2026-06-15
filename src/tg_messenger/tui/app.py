@@ -2003,6 +2003,11 @@ class MessengerTUI(App):
         """
         if isinstance(self.screen, HelpScreen):
             self.pop_screen()
+        elif isinstance(self.screen, ModalScreen):
+            # #124 cleanup: F1 is a priority binding, so it fires even over another open modal
+            # (login, emoji picker, account settings…). Don't stack HelpScreen on top of it — the
+            # underlying modal owns the screen; do nothing rather than bury it under help.
+            return
         else:
             self.push_screen(HelpScreen())
 
