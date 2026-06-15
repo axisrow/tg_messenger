@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 TranslateFn = Callable[[Sequence[tuple[int, str]], str], Awaitable[Mapping[int, str | None]]]
 
 USER_LANG_KEY = "user_lang"
+TRANSLATE_AUTO_KEY = "translate_auto"
 DEFAULT_BATCH_SIZE = 20
 
 _LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
@@ -76,6 +77,23 @@ def translate_model_from_env(env=None) -> str | None:
     return (source.get("TG_TRANSLATE_MODEL") or source.get("TG_AGENT_MODEL") or "").strip() or None
 
 
+async def get_translate_auto(storage) -> bool | None:
+    """Persisted auto-translate preference, or None when never set (caller falls back to env).
+
+    Stored as a "1"/"0" string under the ``translate_auto`` KV key — the same per-profile
+    SQLite KV that backs ``user_lang``. Returning None (not False) lets the caller keep the
+    env-derived default until the user toggles it once in the UI.
+    """
+    value = await storage.get_value(TRANSLATE_AUTO_KEY)
+    if value is None:
+        return None
+    return str(value).strip().lower() in {"1", "true", "on", "yes"}
+
+
+async def set_translate_auto(storage, enabled: bool) -> None:
+    await storage.set_value(TRANSLATE_AUTO_KEY, "1" if enabled else "0")
+
+
 class Translator:
     def __init__(
         self,
@@ -95,6 +113,13 @@ class Translator:
 
     async def set_target_lang(self, code: str | None) -> None:
         await set_user_lang(self._storage, code)
+
+    async def auto_enabled(self) -> bool | None:
+        """Persisted auto-translate toggle (None = never set; caller keeps the env default)."""
+        return await get_translate_auto(self._storage)
+
+    async def set_auto_enabled(self, enabled: bool) -> None:
+        await set_translate_auto(self._storage, enabled)
 
     async def translate_history(self, dialog_id: int, messages: Sequence[Message]) -> list[Message]:
         target = await self.target_lang()

@@ -53,7 +53,10 @@ HELP_TEXT = """Навигация (стрелки):
   Shift+Tab назад по фокусу
   r / x     реакция на выбранном сообщении
   Ctrl+S    настройки аккаунтов
-  /lang     язык перевода в текущем диалоге (команда в поле ввода)
+  t         вкл/выкл авто-перевод входящих (вне поля ввода)
+  Ctrl+T    перевести текущий чат сейчас
+  /tlang    язык перевода входящих (команда в поле ввода; иначе спросит)
+  /lang     язык перевода исходящих в текущем диалоге (команда в поле ввода)
   ? / F1    эта справка
   Esc       очистить поиск · закрыть окно
   Ctrl+C    выход"""
@@ -130,6 +133,23 @@ def parse_lang_command(text: str) -> tuple[str, str | None] | None:
     value = parts[1].strip().lower()
     if value in {"auto", "on", "off"}:
         return value, None
+    return "set", value
+
+
+def parse_tlang_command(text: str) -> tuple[str, str | None] | None:
+    """`/tlang CODE|off` — set/clear the INBOUND reading language (#126).
+
+    Distinct from /lang (which drives OUTBOUND translation). Returns ("set", code) or
+    ("off", None), or None when the text isn't a /tlang command; raises on a missing argument.
+    """
+    parts = text.split(maxsplit=1)
+    if not parts or parts[0] != "/tlang":
+        return None
+    if len(parts) != 2 or not parts[1].strip():
+        raise ValueError("usage: /tlang CODE|off")
+    value = parts[1].strip().lower()
+    if value == "off":
+        return "off", None
     return "set", value
 
 
@@ -785,6 +805,39 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class ReadLangScreen(ModalScreen[str | None]):
+    """Prompt for the inbound reading language (#126).
+
+    The reading language (``user_lang``) was previously settable only via TG_USER_LANG / the CLI.
+    This modal lets the user set it from the TUI — crucially, it works in read-only channels where
+    the composer (and so the /tlang command) is disabled. Dismisses the entered code, or None on
+    Esc / empty submit. The code is validated by Translator.set_target_lang downstream.
+    """
+
+    DEFAULT_CSS = "ReadLangScreen { align: center middle; }"
+
+    BINDINGS = [
+        Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="readlang-box"):
+            yield Label("Язык перевода входящих", id="readlang-title")
+            yield Input(placeholder="напр. ru, en, de", id="readlang-input")
+            yield Label("Enter — сохранить · Esc — отмена", id="readlang-help")
+
+    def on_mount(self) -> None:
+        self.query_one("#readlang-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        code = event.value.strip()
+        self.dismiss(code or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class AccountItem(ListItem):
     """One saved account profile in the settings screen; the active one is marked."""
 
@@ -957,6 +1010,14 @@ class MessengerTUI(App):
         # #124: Escape clears a non-empty search filter (a small, predictable global). NOT priority,
         # so any open modal's own Escape still wins (the modal binding chain truncates above the app).
         Binding("escape", "clear_search", "Clear search", show=False),
+        # #126: inbound translation. `t` toggles auto-translate; it is PRINTABLE so — like `?` — it
+        # is filtered out while an Input (composer/search) is focused and works everywhere else
+        # (tabs/dialogs/a bubble). Making it priority would steal every literal "t" typed into a
+        # message, so it stays non-priority. Ctrl+T translates the open chat on demand; it is
+        # non-printable, so priority=True lets it fire even from inside the composer or a read-only
+        # channel where the composer is disabled.
+        Binding("t", "toggle_auto_translate", "Авто-перевод", show=True),
+        Binding("ctrl+t", "translate_chat", "Перевести чат", priority=True, show=True),
     ]
 
     CSS = """
@@ -1010,7 +1071,7 @@ class MessengerTUI(App):
     /* #116: shared modal card — a centered, bordered, width-capped box (was full-width, top-left,
        unframed). Centering (align: center middle) lives on each ModalScreen's DEFAULT_CSS so it is
        not affected by App.CSS-vs-screen scoping; these rules only shape the box. */
-    #profile-box, #login-box, #variant-box, #emoji-box, #help-box {
+    #profile-box, #login-box, #variant-box, #emoji-box, #help-box, #readlang-box {
         width: 60%;
         max-width: 64;
         height: auto;
@@ -1021,12 +1082,14 @@ class MessengerTUI(App):
     }
     #login-title { text-style: bold; }
     #help-title { text-style: bold; }
+    #readlang-title { text-style: bold; }
     """
 
     def __init__(self, *, client=None, session_name: str = "default",
                  profiles: list[str] | None = None, client_factory=None, deps_factory=None,
                  suggester=None, login_session=None, store=None, translator=None,
-                 outbound=None, session_store=None, account_client_factory=None):
+                 outbound=None, session_store=None, account_client_factory=None,
+                 auto_translate=False):
         super().__init__()
         self._client = client
         self._session_name = session_name
@@ -1062,12 +1125,22 @@ class MessengerTUI(App):
         self._suggester = suggester
         self._store = store
         self._translator = translator
+        # #126: inbound auto-translate toggle. Default OFF so a fresh session never spends LLM
+        # tokens until the user opts in (key `t` or TG_TRANSLATE_AUTO=on). A per-profile KV
+        # override (translate_auto) is loaded in _startup and wins over this seed value.
+        self._auto_translate = bool(auto_translate)
         self._outbound = outbound
         # #73: one UI-agnostic coordinator owns the outbound flow (prepare/timeout/token/
         # send/source-recording). Rebuilt after a ProfileScreen pick swaps the deps.
         self._coordinator = self._build_coordinator()
         self._compose_states: dict[int, ComposeState] = {}
         self._bubble_index: dict[int, MessageBubble] = {}
+        # #126: the messages currently mounted in the open dialog — the source for on-demand
+        # Ctrl+T translation. Captured in _show_history and appended to as live messages arrive,
+        # cleared on dialog switch so a stale snapshot can't translate the wrong chat.
+        self._current_messages: list = []
+        # #126: re-entrancy guard so a second t/Ctrl+T can't stack a second reading-language modal.
+        self._lang_prompt_open = False
         self._pending_suggestion: str | None = None
         # (dialog_id, message_id) keys we sent from this composer — the same messages echo back on
         # listen_outgoing(); skip them so our optimistic bubble isn't duplicated.
@@ -1216,6 +1289,7 @@ class MessengerTUI(App):
                         self._store = deps.store
                         self._translator = deps.translator
                         self._outbound = deps.outbound
+                        self._auto_translate = deps.auto_translate  # #126: per-profile env default
                         self._coordinator = self._build_coordinator()  # #73: deps swapped
                     else:
                         self._session_name = chosen
@@ -1272,6 +1346,21 @@ class MessengerTUI(App):
         self.run_worker(self._drain_incoming(), exclusive=False)
         self.run_worker(self._drain_outgoing(), exclusive=False)
         self.run_worker(self._drain_reactions(), exclusive=False)
+        # #126: a persisted toggle (set last session via `t`) overrides the env default. Loaded in
+        # a worker — _startup must not await IO (it stalls the pump); harmless if it lands late.
+        if self._translator is not None:
+            self.run_worker(
+                self._load_auto_translate_pref(), group="translate-pref", exclusive=False
+            )
+
+    async def _load_auto_translate_pref(self) -> None:
+        try:
+            stored = await self._translator.auto_enabled()
+        except Exception:
+            logger.exception("loading auto-translate preference failed")
+            return
+        if stored is not None:
+            self._auto_translate = stored
 
     async def _reconcile_after_startup(self) -> None:
         """Reconcile the dialog list to the tab active right now, then clear the spinner (#118).
@@ -1441,6 +1530,7 @@ class MessengerTUI(App):
         self._apply_composer_writable(dialog_id)
         self._clear_suggestion()
         self._bubble_index.clear()
+        self._current_messages = []  # #126: drop the prior chat's Ctrl+T snapshot until reloaded
         self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
         # exclusive group: selecting another dialog cancels a still-loading history
         self.run_worker(self._show_history(dialog_id), group="history", exclusive=True)
@@ -1483,13 +1573,16 @@ class MessengerTUI(App):
         pane.loading = False
         bubbles = []
         self._bubble_index.clear()
+        # #126: snapshot the loaded messages so on-demand Ctrl+T can translate them even when
+        # auto-translate is OFF. Set unconditionally (above the auto gate below).
+        self._current_messages = list(messages)
         for m in messages:
             bubbles.append(self._message_bubble_for(m, dialog_id))
         await pane.mount(*(_wrap_bubble(b) for b in bubbles))  # #118: align via wrapper row
         # #106: apply any reactions that arrived while this history was loading.
         self._drain_pending_reactions(dialog_id)
         self._scroll_messages_to_end(pane)
-        if self._translator is not None:
+        if self._translator is not None and self._auto_translate:
             self.run_worker(
                 self._translate_history_bubbles(dialog_id, messages),
                 group="translate-history",
@@ -1573,6 +1666,20 @@ class MessengerTUI(App):
         if not self._dialog_can_send(dialog_id):
             # belt-and-suspenders with the disabled composer (cache may be momentarily stale)
             self.notify(READ_ONLY_MESSAGE, severity="warning")
+            return
+        try:
+            tlang_command = parse_tlang_command(text)
+        except ValueError as exc:
+            logger.warning("bad tlang command in dialog %s: %s", dialog_id, exc)
+            self.notify(str(exc), severity="error")
+            return
+        if tlang_command is not None:
+            self._optimistic_clear(dialog_id, event.input)
+            self.run_worker(
+                self._apply_tlang_command(tlang_command),
+                group="reading-lang",
+                exclusive=True,
+            )
             return
         try:
             lang_command = parse_lang_command(text)
@@ -1679,6 +1786,29 @@ class MessengerTUI(App):
             bubble = self._bubble_index.get(message_id)
             if bubble is not None:
                 bubble.add_reaction(emoticon)
+
+    async def _apply_tlang_command(self, command: tuple[str, str | None]) -> None:
+        """#126: set/clear the global inbound reading language via Translator.set_target_lang."""
+        if self._translator is None:
+            self.notify("Перевод не настроен (нет TG_TRANSLATE_MODEL).", severity="warning")
+            return
+        action, value = command
+        try:
+            if action == "off":
+                await self._translator.set_target_lang(None)
+            elif action == "set" and value is not None:
+                await self._translator.set_target_lang(value)
+        except ValueError as exc:
+            logger.warning("invalid reading language code: %s", exc)
+            self.notify(str(exc), severity="error")
+            return
+        except Exception:
+            logger.exception("reading language command failed")
+            self.notify("Не удалось сохранить язык перевода.", severity="error")
+            return
+        self.notify(
+            "Перевод входящих отключён." if action == "off" else "Язык перевода сохранён."
+        )
 
     async def _apply_lang_command(self, dialog_id: int, command: tuple[str, str | None]) -> None:
         if self._outbound is None:
@@ -1875,7 +2005,12 @@ class MessengerTUI(App):
                     pane = self.query_one("#messages", Vertical)
                     bubble = self._message_bubble_for(ev.message, ev.dialog_id)
                     await pane.mount(_wrap_bubble(bubble))
-                    if not ev.message.translated_text and self._translator is not None:
+                    self._current_messages.append(ev.message)  # #126: keep Ctrl+T snapshot fresh
+                    if (
+                        not ev.message.translated_text
+                        and self._translator is not None
+                        and self._auto_translate
+                    ):
                         self.run_worker(
                             self._translate_bubble(ev.dialog_id, ev.message, bubble),
                             group="translate-live",
@@ -1908,7 +2043,12 @@ class MessengerTUI(App):
                     pane = self.query_one("#messages", Vertical)
                     bubble = self._message_bubble_for(ev.message, ev.dialog_id)
                     await pane.mount(_wrap_bubble(bubble))
-                    if not ev.message.translated_text and self._translator is not None:
+                    self._current_messages.append(ev.message)  # #126: keep Ctrl+T snapshot fresh
+                    if (
+                        not ev.message.translated_text
+                        and self._translator is not None
+                        and self._auto_translate
+                    ):
                         self.run_worker(
                             self._translate_bubble(ev.dialog_id, ev.message, bubble),
                             group="translate-live",
@@ -2054,3 +2194,77 @@ class MessengerTUI(App):
                 account_client_factory=self._account_client_factory,
             )
         )
+
+    def action_toggle_auto_translate(self) -> None:
+        """`t` — flip inbound auto-translate on/off (#126).
+
+        Persists the choice per-profile (loaded next launch) and, when turning ON with a chat
+        open, immediately translates it (prompting for a reading language first if none is set).
+        """
+        if self._translator is None:
+            self.notify("Перевод не настроен (нет TG_TRANSLATE_MODEL).", severity="warning")
+            return
+        self._auto_translate = not self._auto_translate
+        self.notify(f"Авто-перевод {'включён' if self._auto_translate else 'выключен'}")
+        self.run_worker(
+            self._persist_auto_translate(self._auto_translate),
+            group="translate-pref",
+            exclusive=False,
+        )
+        if self._auto_translate and self._current is not None and self._current_messages:
+            self.run_worker(
+                self._translate_chat_flow(), group="translate-ondemand", exclusive=False
+            )
+
+    def action_translate_chat(self) -> None:
+        """Ctrl+T — translate the open chat now, regardless of the auto-translate toggle (#126)."""
+        if self._translator is None:
+            self.notify("Перевод не настроен (нет TG_TRANSLATE_MODEL).", severity="warning")
+            return
+        if self._current is None or not self._current_messages:
+            self.notify("Нет открытого чата для перевода.", severity="warning")
+            return
+        self.run_worker(
+            self._translate_chat_flow(), group="translate-ondemand", exclusive=False
+        )
+
+    async def _persist_auto_translate(self, enabled: bool) -> None:
+        try:
+            await self._translator.set_auto_enabled(enabled)
+        except Exception:
+            logger.exception("persisting auto-translate preference failed")
+
+    async def _translate_chat_flow(self) -> None:
+        """Ensure a reading language is set (prompt via ReadLangScreen if not), then translate
+        the messages currently shown in the open chat (#126)."""
+        try:
+            target = await self._translator.target_lang()
+        except Exception:
+            logger.exception("reading target language failed")
+            return
+        if not target:
+            if self._lang_prompt_open:
+                return  # another t/Ctrl+T already has the modal open
+            self._lang_prompt_open = True
+            try:
+                code = await self.push_screen_wait(ReadLangScreen())
+            finally:
+                self._lang_prompt_open = False
+            if not code:
+                self.notify("Язык перевода не задан.", severity="warning")
+                return
+            try:
+                await self._translator.set_target_lang(code)
+            except ValueError as exc:
+                self.notify(str(exc), severity="error")
+                return
+            except Exception:
+                logger.exception("saving reading language failed")
+                self.notify("Не удалось сохранить язык перевода.", severity="error")
+                return
+        dialog_id = self._current
+        if dialog_id is None or not self._current_messages:
+            return
+        # _translate_history_bubbles re-checks dialog_id == self._current and looks bubbles up in
+        # _bubble_index, so a dialog switch mid-flight resolves to a harmless no-op.
+        await self._translate_history_bubbles(dialog_id, list(self._current_messages))

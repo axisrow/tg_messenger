@@ -297,6 +297,17 @@ def make_optional_outbound(store, storage):
         return None
 
 
+def translate_auto_from_env(env=None) -> bool:
+    """Default auto-translate state for inbound messages (off — don't burn tokens).
+
+    Unlike TG_OUTBOUND (which defaults on), inbound auto-translation defaults OFF so a
+    fresh setup never spends LLM tokens until the user opts in (key ``t`` or this flag).
+    A per-profile KV override set via the UI wins over this at startup.
+    """
+    source = os.environ if env is None else env
+    return source.get("TG_TRANSLATE_AUTO", "off").strip().lower() in {"1", "true", "on", "yes"}
+
+
 @dataclass
 class TuiDeps:
     """The full dependency set the TUI needs, built for one chosen profile (#52)."""
@@ -307,6 +318,7 @@ class TuiDeps:
     store: object
     translator: object
     outbound: object
+    auto_translate: bool
 
 
 def make_tui_deps(profile: str, *, log_kwargs: dict) -> TuiDeps:
@@ -330,6 +342,7 @@ def make_tui_deps(profile: str, *, log_kwargs: dict) -> TuiDeps:
         store=store,
         translator=translator,
         outbound=outbound,
+        auto_translate=translate_auto_from_env(),
     )
 
 
@@ -2056,6 +2069,7 @@ def tui(ctx: click.Context, session: str) -> None:
         store=deps.store,
         translator=deps.translator,
         outbound=deps.outbound,
+        auto_translate=deps.auto_translate,
     ).run()
 
 

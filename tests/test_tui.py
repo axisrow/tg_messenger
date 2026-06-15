@@ -26,10 +26,12 @@ from tg_messenger.tui.app import (
     MessageBubble,
     MessengerTUI,
     ProfileItem,
+    ReadLangScreen,
     VariantItem,
     _terminal_safe_display_text,
     parse_lang_command,
     parse_media_command,
+    parse_tlang_command,
 )
 
 
@@ -61,6 +63,16 @@ def test_parse_lang_command():
     assert parse_lang_command("hello") is None
     with pytest.raises(ValueError):
         parse_lang_command("/lang")
+
+
+def test_parse_tlang_command():
+    assert parse_tlang_command("/tlang en") == ("set", "en")
+    assert parse_tlang_command("/tlang RU") == ("set", "ru")  # lowercased
+    assert parse_tlang_command("/tlang off") == ("off", None)
+    assert parse_tlang_command("/lang en") is None  # distinct from outbound /lang
+    assert parse_tlang_command("hello") is None
+    with pytest.raises(ValueError):
+        parse_tlang_command("/tlang")
 
 
 def test_parse_media_path_and_caption():
@@ -3583,6 +3595,7 @@ class _FakeDeps:
         self.store = None  # keep None so _startup's store block is a no-op in tests
         self.translator = object()
         self.outbound = object()
+        self.auto_translate = False  # #126: _startup assigns self._auto_translate from this
 
 
 async def test_tui_startup_calls_deps_factory_after_profile_screen():
@@ -3922,3 +3935,269 @@ async def test_tui_settings_add_empty_name_is_noop():
         await pilot.pause()
         assert app.screen is screen  # no LoginScreen pushed (still on AccountsScreen)
         assert store.list_profiles() == ["alice"]  # nothing added
+
+
+# --- #126: inbound translation toggle (t) + on-demand translate (Ctrl+T) -----------------
+
+
+class FakeKVStorage:
+    """Minimal SQLite-KV stand-in recording set_value calls for persistence assertions."""
+
+    def __init__(self, values=None):
+        self.values = dict(values or {})
+        self.sets = []
+
+    async def get_value(self, key):
+        return self.values.get(key)
+
+    async def set_value(self, key, value):
+        self.values[key] = value
+        self.sets.append((key, value))
+
+
+class FakeTranslator:
+    """In-memory Translator double — no LLM. Translates incoming text to f"{text}!{lang}"."""
+
+    def __init__(self, *, target_lang="ru", auto=None, storage=None):
+        self._target = target_lang
+        self._auto = auto
+        self.storage = storage or FakeKVStorage()
+        self.history_calls = []
+        self.set_lang_calls = []
+
+    async def target_lang(self):
+        return self._target
+
+    async def set_target_lang(self, code):
+        self.set_lang_calls.append(code)
+        self._target = code
+
+    async def auto_enabled(self):
+        return self._auto
+
+    async def set_auto_enabled(self, enabled):
+        self._auto = enabled
+        await self.storage.set_value("translate_auto", "1" if enabled else "0")
+
+    async def translate_history(self, dialog_id, messages):
+        self.history_calls.append((dialog_id, list(messages)))
+        if not self._target:
+            return list(messages)
+        out = []
+        for m in messages:
+            if not m.out and m.text:
+                out.append(m.model_copy(update={"translated_text": f"{m.text}!{self._target}"}))
+            else:
+                out.append(m)
+        return out
+
+    async def translate_message(self, message):
+        return (await self.translate_history(message.dialog_id, [message]))[0]
+
+
+def _has_translation(app) -> bool:
+    return any("↳" in str(b.render()) for b in app.query(MessageBubble))
+
+
+async def test_tui_auto_translate_off_by_default_no_translation():
+    tr = FakeTranslator()
+    app = MessengerTUI(client=TuiStubClient(), translator=tr)  # auto_translate defaults False
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._auto_translate is False
+        await app._show_history(7)
+        await pilot.pause()
+        await pilot.pause()
+        assert tr.history_calls == []  # the LLM path was never kicked — no tokens spent
+        assert not _has_translation(app)
+
+
+async def test_tui_toggle_t_flips_notifies_persists():
+    storage = FakeKVStorage()
+    tr = FakeTranslator(storage=storage)
+    app = MessengerTUI(client=TuiStubClient(), translator=tr)
+    notes = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+        app.set_focus(app.query_one("#dialogs", ListView))  # `t` is printable: not in an Input
+        await pilot.press("t")
+        await _pause_until(pilot, lambda: app._auto_translate is True)
+        await _pause_until(pilot, lambda: ("translate_auto", "1") in storage.sets)
+        await pilot.press("t")
+        await _pause_until(pilot, lambda: app._auto_translate is False)
+        await _pause_until(pilot, lambda: ("translate_auto", "0") in storage.sets)
+    assert any("включ" in n for n in notes)
+    assert any("выключ" in n for n in notes)
+
+
+async def test_tui_t_swallowed_in_composer_but_ctrl_t_reaches_handler():
+    tr = FakeTranslator()
+    app = MessengerTUI(client=TuiStubClient(), translator=tr)
+    notes = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7  # writable DM
+        notes.clear()
+        app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+        composer = app.query_one("#composer", Input)
+        composer.disabled = False
+        composer.focus()
+        await pilot.pause()
+        await pilot.press("t")
+        await pilot.pause()
+        assert "t" in composer.value  # printable `t` typed into the Input, not a toggle
+        assert app._auto_translate is False
+        # Ctrl+T is non-printable + priority → reaches the handler even from inside the composer
+        await pilot.press("ctrl+t")
+        await _pause_until(pilot, lambda: any("Нет открытого чата" in n for n in notes))
+
+
+async def test_tui_toggle_on_translates_open_chat():
+    tr = FakeTranslator(target_lang="ru")
+    app = MessengerTUI(client=TuiStubClient(), translator=tr)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        assert not _has_translation(app)  # auto off → nothing yet
+        app.action_toggle_auto_translate()  # turning ON translates the open chat
+        await _pause_until(pilot, lambda: _has_translation(app))
+        assert app._auto_translate is True
+
+
+async def test_tui_ctrl_t_translates_regardless_of_flag():
+    tr = FakeTranslator(target_lang="ru")
+    app = MessengerTUI(client=TuiStubClient(), translator=tr)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _select_dialog(pilot, app, 7)  # loads history; focus ends on composer
+        await _pause_until(pilot, lambda: bool(app.query(MessageBubble)))  # history mounted
+        assert app._auto_translate is False
+        assert not _has_translation(app)
+        await pilot.press("ctrl+t")  # on-demand, ignores the auto flag
+        await _pause_until(pilot, lambda: _has_translation(app))
+        assert tr.history_calls  # the translate path ran despite auto being off
+
+
+async def test_tui_ctrl_t_no_open_chat_notifies():
+    tr = FakeTranslator()
+    app = MessengerTUI(client=TuiStubClient(), translator=tr)
+    notes = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+        await pilot.press("ctrl+t")  # no dialog open
+        await pilot.pause()
+    assert any("Нет открытого чата" in n for n in notes)
+    assert tr.history_calls == []
+
+
+async def test_tui_translate_prompts_for_language_when_unset():
+    tr = FakeTranslator(target_lang=None)  # no reading language configured
+    app = MessengerTUI(client=TuiStubClient(), translator=tr)
+    seen = []
+
+    async def fake_psw(screen):
+        seen.append(type(screen).__name__)
+        return "ru"  # user enters a code in the modal
+
+    app.push_screen_wait = fake_psw  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        await pilot.press("ctrl+t")
+        await _pause_until(pilot, lambda: _has_translation(app))
+    assert "ReadLangScreen" in seen  # prompted instead of silently doing nothing
+    assert tr.set_lang_calls == ["ru"]
+
+
+async def test_tui_translate_not_configured_warns():
+    app = MessengerTUI(client=TuiStubClient(), translator=None)  # agent extra/model absent
+    notes = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+        await pilot.press("ctrl+t")
+        await pilot.pause()
+        app.set_focus(app.query_one("#dialogs", ListView))
+        await pilot.press("t")
+        await pilot.pause()
+    assert sum("Перевод не настроен" in n for n in notes) >= 2
+
+
+async def test_tui_auto_translate_covers_channels():
+    tr = FakeTranslator(target_lang="ru")
+    app = MessengerTUI(client=TuiStubClient(), translator=tr, auto_translate=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = -100300  # a broadcast channel
+        await app._show_history(-100300)
+        await _pause_until(pilot, lambda: _has_translation(app))
+        assert tr.history_calls  # channel messages flow through the same translate path
+
+
+async def test_tui_auto_translate_pref_loaded_at_startup():
+    tr = FakeTranslator(auto=True)  # persisted KV says ON
+    # constructor seed is False (env default) — the persisted pref must win
+    app = MessengerTUI(client=TuiStubClient(), translator=tr, auto_translate=False)
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._auto_translate is True)
+
+
+async def test_tui_live_incoming_translated_when_auto_on():
+    stub = GroupEventClient()
+    tr = FakeTranslator(target_lang="ru")
+    app = MessengerTUI(client=stub, translator=tr, auto_translate=True)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7  # the DM the live event targets
+        stub.fire.set()
+        await _pause_until(pilot, lambda: _has_translation(app))
+
+
+async def test_tui_live_incoming_not_translated_when_auto_off():
+    stub = GroupEventClient()
+    tr = FakeTranslator(target_lang="ru")
+    app = MessengerTUI(client=stub, translator=tr)  # auto off
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        stub.fire.set()
+        await _pause_until(pilot, lambda: bool(app.query(MessageBubble)))  # bubble mounted
+        await pilot.pause()
+        assert not _has_translation(app)  # ...but never translated
+        assert tr.history_calls == []
+
+
+async def test_tui_tlang_command_sets_reading_language():
+    tr = FakeTranslator(target_lang=None)
+    app = MessengerTUI(client=TuiStubClient(), translator=tr)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7  # writable DM — composer commands are allowed
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "/tlang en"))
+        await _pause_until(pilot, lambda: tr.set_lang_calls == ["en"])
+
+
+async def test_tui_read_lang_screen_submit_and_cancel():
+    app = MessengerTUI(client=TuiStubClient())
+    results = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Enter on the input dismisses with the entered code...
+        app.push_screen(ReadLangScreen(), callback=results.append)
+        await pilot.pause()
+        app.screen.query_one("#readlang-input", Input).value = "de"
+        await pilot.press("enter")
+        await _pause_until(pilot, lambda: results == ["de"])
+        # ...and Esc dismisses with None.
+        app.push_screen(ReadLangScreen(), callback=results.append)
+        await pilot.pause()
+        await pilot.press("escape")
+        await _pause_until(pilot, lambda: results == ["de", None])
