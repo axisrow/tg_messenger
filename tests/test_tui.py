@@ -2986,6 +2986,32 @@ async def test_dialogs_right_on_readonly_channel_keeps_focus_alive():
         assert app.focused is lv  # stays on the dialog list, so arrow navigation still works
 
 
+async def test_dialogs_down_handoff_to_readonly_channel_keeps_focus_alive():
+    # #124 regression (cycle 2): the Down handoff must apply the SAME read-only guard as Right.
+    # The read-only channel (-100300) is the LAST dialog here, so Down from it commits the channel,
+    # which disables the composer async — focusing it would lose focus into nothing. Down must keep
+    # focus on the dialog list instead, exactly like the Right path.
+    class ReadOnlyLastClient(TuiStubClient):
+        async def dialogs(self, dm_only=True):
+            self.dialogs_calls += 1
+            # a single read-only channel as the only (hence last) dialog
+            return [Dialog(id=-100300, title="News", kind="channel", can_send=False)]
+
+    app = MessengerTUI(client=ReadOnlyLastClient())
+    async with app.run_test(size=(80, 20)) as pilot:
+        await _pause_until(pilot, lambda: any(
+            i.dialog_id == -100300 for i in app.query(DialogItem)))
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = len(lv) - 1  # the read-only channel is the last (and only) item
+        await pilot.pause()
+        await pilot.press("down")  # handoff into the read-only chat pane
+        await _pause_until(pilot, lambda: app._current == -100300)
+        assert app.query_one("#composer", Input).disabled  # read-only → composer disabled
+        assert app.focused is not None  # focus is NOT lost into nothing
+        assert app.focused is lv  # stays on the dialog list, so arrow navigation still works
+
+
 class TwoDmClient(TuiStubClient):
     async def dialogs(self, dm_only=True):
         self.dialogs_calls += 1

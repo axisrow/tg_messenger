@@ -344,6 +344,12 @@ class DialogListView(ListView):
             item = self.highlighted_child
             if isinstance(item, DialogItem) and item.dialog_id != self.app._current:
                 self.action_select_cursor()
+            # #124: same read-only guard as action_open_dialog (the Right path). A read-only chat
+            # disables the composer asynchronously; _focus_first_bubble_or_composer would land on it
+            # (no bubbles yet — history loads in a worker) and focus would be lost into nothing.
+            # Keep focus on the dialog list there so arrow navigation stays alive.
+            if isinstance(item, DialogItem) and not self.app._dialog_can_send(item.dialog_id):
+                return
             _focus_first_bubble_or_composer(self.screen)
         else:
             self.action_cursor_down()
