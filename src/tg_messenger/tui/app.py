@@ -427,7 +427,10 @@ class ComposerInput(Input):
     ]
 
     def action_focus_messages(self) -> None:
-        bubbles = list(self.screen.query(MessageBubble))
+        # #124 (Codex cycle-2): only the current dialog's bubbles are navigable — Up from the
+        # composer must never land on a stale previous-dialog bubble that lingers during the async
+        # history render (a fast r/x there would react on the previous conversation).
+        bubbles = _navigable_bubbles(self.screen)
         if bubbles:
             bubbles[-1].focus()
         else:
@@ -440,9 +443,19 @@ class ComposerInput(Input):
             self.action_cursor_left()  # normal in-field cursor move
 
 
+def _navigable_bubbles(screen) -> list["MessageBubble"]:
+    # #124 (Codex cycle-2): a dialog SWITCH commits _current synchronously but the history RENDER
+    # is async (_show_history removes the old rows in a worker), so bubbles of the PREVIOUS dialog
+    # linger in the DOM during the load window. Reacting on one (r/x) acts on the bubble's OWN
+    # dialog_id → a wrong-conversation outbound action. Navigation must therefore only ever land on
+    # bubbles belonging to the now-current dialog; stale ones are unreachable until they're removed.
+    current = getattr(screen.app, "_current", None)
+    return [b for b in screen.query(MessageBubble) if b.dialog_id == current]
+
+
 def _focus_first_bubble_or_composer(screen) -> None:
-    """Enter the chat pane from the dialog list: the first message bubble, else the composer."""
-    bubbles = list(screen.query(MessageBubble))
+    """Enter the chat pane from the dialog list: the first current-dialog bubble, else the composer."""
+    bubbles = _navigable_bubbles(screen)
     if bubbles:
         bubbles[0].focus()
     else:
@@ -548,10 +561,16 @@ class MessageBubble(Static):
         # at the last bubble drops into the composer.
         if self.screen is None:
             return
-        bubbles = list(self.screen.query(MessageBubble))
+        # #124 (Codex cycle-2): step only among the CURRENT dialog's bubbles — never across a stale
+        # previous-dialog bubble lingering during the async history render.
+        bubbles = _navigable_bubbles(self.screen)
         try:
             idx = bubbles.index(self)
         except ValueError:
+            # self is a stale bubble (different dialog) or unmounted — leave the chat pane rather
+            # than stepping onto another stale bubble. Up → dialogs, Down → composer.
+            (self.screen.query_one("#dialogs", ListView) if delta < 0
+             else self.screen.query_one("#composer", Input)).focus()
             return
         target = idx + delta
         if 0 <= target < len(bubbles):
@@ -566,8 +585,9 @@ class MessageBubble(Static):
         # dialog list). On the last bubble → first; anywhere else → last. No-op if alone/unmounted.
         if self.screen is None:
             return
-        bubbles = list(self.screen.query(MessageBubble))
-        if not bubbles:
+        # #124 (Codex cycle-2): jump only within the CURRENT dialog's bubbles, never onto a stale one.
+        bubbles = _navigable_bubbles(self.screen)
+        if not bubbles or self not in bubbles:
             return
         (bubbles[0] if self is bubbles[-1] else bubbles[-1]).focus()
 

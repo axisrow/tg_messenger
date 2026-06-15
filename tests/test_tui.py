@@ -3072,6 +3072,44 @@ async def test_dialogs_down_handoff_switch_does_not_focus_stale_bubble():
         assert not (isinstance(focused, MessageBubble) and focused.dialog_id == 7)
 
 
+async def test_composer_up_during_switch_cannot_focus_stale_bubble():
+    # #124 regression (Codex cycle-2, wrong-conversation reaction): the text-send race is closed by
+    # committing _current synchronously, but old MessageBubble nodes linger in the DOM until the
+    # async history worker (_show_history) runs remove_children. In that window pressing Up from the
+    # composer (ComposerInput.action_focus_messages) must NOT re-enter a stale previous-dialog bubble
+    # — else a following r/x would react on the PREVIOUS conversation (MessageBubble.action_react acts
+    # on the bubble's OWN dialog_id). We materialise that exact window deterministically: mount dialog
+    # 7's bubbles, then flip _current to 8 with the bubbles still present (the state between the
+    # synchronous switch and the worker's first remove_children).
+    from tg_messenger.tui.app import _focus_first_bubble_or_composer, _navigable_bubbles
+
+    app = MessengerTUI(client=LongHistoryClient())
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)          # mount dialog 7's bubbles
+        await pilot.pause()
+        stale = list(app.query(MessageBubble))
+        assert stale and all(b.dialog_id == 7 for b in stale)
+        app._current = 8                    # the switch committed _current; bubbles not yet removed
+        # the stale dialog-7 bubbles must be UNREACHABLE by navigation now
+        assert _navigable_bubbles(app.screen) == []
+        # Up from the composer must fall back to the dialog list, never a dialog-7 bubble
+        composer = app.query_one("#composer", Input)
+        composer.action_focus_messages()
+        await pilot.pause()
+        focused = app.focused
+        assert not (isinstance(focused, MessageBubble) and focused.dialog_id == 7)
+        assert focused is app.query_one("#dialogs", ListView)
+        # entering the pane from the dialog list must also skip the stale bubbles (→ composer here,
+        # since dialog 8 has no bubbles mounted yet)
+        _focus_first_bubble_or_composer(app.screen)
+        await pilot.pause()
+        focused = app.focused
+        assert not (isinstance(focused, MessageBubble) and focused.dialog_id == 7)
+        assert focused is composer
+
+
 async def test_dialogs_right_on_readonly_channel_keeps_focus_alive():
     # #124 regression: Right on a read-only channel disables the composer (async, via
     # _apply_composer_writable). Focusing a soon-to-be-disabled composer would leave focus on
