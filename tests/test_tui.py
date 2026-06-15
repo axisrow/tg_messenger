@@ -4066,9 +4066,9 @@ async def test_tui_settings_fields_have_persistent_border_titles():
         app.push_screen(screen)
         await pilot.pause()
         captions = {
-            "target-lang": "Язык перевода (пусто = выкл)",
-            "known-langs": "Мои языки (не переводить)",
-            "unknown-langs": "Переводить только эти",
+            "target-lang": "Мой язык (на что переводить)",
+            "known-langs": "Не переводить",
+            "unknown-langs": "Переводить (пусто = всё переводить)",
         }
         for fid, caption in captions.items():
             field = screen.query_one(f"#{fid}", Input)
@@ -4080,4 +4080,4 @@ async def test_tui_settings_fields_have_persistent_border_titles():
         target = screen.query_one("#target-lang", Input)
         target.value = "ru"
         await pilot.pause()
-        assert str(target.border_title) == "Язык перевода (пусто = выкл)"
+        assert str(target.border_title) == "Мой язык (на что переводить)"

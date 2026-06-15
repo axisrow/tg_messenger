@@ -886,13 +886,13 @@ class AccountsScreen(ModalScreen[None]):
                     # the frame even with a value typed — a placeholder vanishes on input). The two
                     # language lists are always shown so nothing silently changes meaning by mode.
                     target = Input(placeholder="напр. ru", id="target-lang")
-                    target.border_title = "Язык перевода (пусто = выкл)"
+                    target.border_title = "Мой язык (на что переводить)"
                     yield target
                     known = Input(placeholder="напр. ru, en", id="known-langs")
-                    known.border_title = "Мои языки (не переводить)"
+                    known.border_title = "Не переводить"
                     yield known
                     unknown = Input(placeholder="напр. en, ja", id="unknown-langs")
-                    unknown.border_title = "Переводить только эти"
+                    unknown.border_title = "Переводить (пусто = всё переводить)"
                     yield unknown
                     yield Label("Enter в поле — сохранить", id="translate-help")
 
