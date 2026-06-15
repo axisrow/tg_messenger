@@ -4024,3 +4024,26 @@ async def test_tui_settings_rejects_bad_lang_code_without_saving():
         screen.query_one("#lang-list", Input).value = "ru, fr"  # fr unsupported
         await screen._save_translate_settings()
         assert translator.saved == []  # nothing persisted on a bad code
+
+
+async def test_tui_settings_lang_list_stays_tab_reachable_in_every_mode():
+    # regression: in mode "off" the lang-list field was `disabled`, which drops it out of
+    # Textual's focus_chain — Tab cycled past it ("циклит без последнего"). It must stay
+    # focus-reachable (and never disabled) in EVERY mode.
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "all_unknown", "target": "ru", "known": ["ru"], "unknown": []})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        for mode in ("off", "all_unknown", "skip_known", "only_unknown"):
+            screen.query_one(f"#mode-{mode}").value = True
+            await pilot.pause()
+            field = screen.query_one("#lang-list", Input)
+            chain_ids = [getattr(w, "id", None) for w in screen.focus_chain]
+            assert field.disabled is False, f"lang-list disabled in mode {mode}"
+            assert "lang-list" in chain_ids, f"lang-list not Tab-reachable in mode {mode}"

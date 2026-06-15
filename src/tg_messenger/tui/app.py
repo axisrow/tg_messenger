@@ -918,17 +918,20 @@ class AccountsScreen(ModalScreen[None]):
         return "off"
 
     def _sync_list_label(self, mode: str) -> None:
-        """Relabel the language-list field for the mode; disable it when no list applies."""
+        """Relabel the language-list field for the mode.
+
+        The field is NEVER disabled: a disabled widget drops out of Textual's focus_chain, so a
+        `disabled` here made Tab skip the last field in the "off" mode ("циклит без последнего").
+        In "off" the list is simply unused (ignored on save), but stays Tab-reachable.
+        """
         field = self.query_one("#lang-list", Input)
+        field.disabled = False
         if mode == "only_unknown":
-            field.disabled = False
             field.placeholder = "Переводить ТОЛЬКО эти языки (напр. en, ja)"
         elif mode in ("skip_known", "all_unknown"):
-            field.disabled = False
             field.placeholder = "Мои языки — НЕ переводить (напр. ru, en)"
         else:  # off
-            field.disabled = True
-            field.placeholder = "—"
+            field.placeholder = "(в режиме «Выкл» не используется)"
 
     def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
         if event.radio_set.id != "translate-mode":
