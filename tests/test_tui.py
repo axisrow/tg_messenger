@@ -933,7 +933,8 @@ async def test_tui_optimistic_clear_and_restore_draft_units():
 
 
 async def test_tui_arrow_keys_move_focus_between_bubbles():
-    # #93: up/down move the selection between message bubbles; clamp at the ends.
+    # #93/#124: up/down move the selection between message bubbles; at the top edge up hands off
+    # to the dialog list (no longer a clamp — see the dedicated edge tests below).
     app = MessengerTUI(client=LongHistoryClient())
     async with app.run_test(size=(80, 20)) as pilot:
         await pilot.pause()
@@ -949,9 +950,6 @@ async def test_tui_arrow_keys_move_focus_between_bubbles():
         await pilot.pause()
         assert app.focused is bubbles[1]
         await pilot.press("up")
-        await pilot.pause()
-        assert app.focused is bubbles[0]
-        await pilot.press("up")  # at the top edge: clamp, stay put
         await pilot.pause()
         assert app.focused is bubbles[0]
 
@@ -2476,6 +2474,394 @@ async def test_tui_tab_falls_through_when_no_suggestion():
         await pilot.press("tab")
         await pilot.pause()
         assert app.focused is not search  # focus advanced
+
+
+# --- #124: vertical-chain arrow navigation (search ↓ tabs ↓ dialogs ↓ messages ↓ composer) ---
+
+
+class EmptyHistoryClient(TuiStubClient):
+    async def history(self, peer, limit=50, offset_id=0):
+        return []
+
+
+async def test_search_down_focuses_tabs():
+    # search ↓ → tabs (the next link in the chain). Up at search is the top: no-op.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.focus()
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        assert app.focused is app.query_one(Tabs)
+
+
+async def test_search_up_is_noop_at_top():
+    # search is the top of the chain — Up stays on search and leaves the (empty) value alone.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.focus()
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        assert app.focused is search
+        assert search.value == ""
+
+
+async def test_dialogs_down_at_last_hands_off_to_messages():
+    # dialogs (last item) ↓ → the first message bubble (chat pane entry).
+    app = MessengerTUI(client=LongHistoryClient())
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = len(lv) - 1  # last dialog
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+        assert app.focused is bubbles[0]
+
+
+async def test_dialogs_down_at_last_no_bubbles_focuses_composer():
+    # dialogs (last item) ↓ with no messages loaded → the composer (chain never dead-ends).
+    app = MessengerTUI(client=EmptyHistoryClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not list(app.query(MessageBubble))
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = len(lv) - 1
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        assert app.focused is app.query_one("#composer", Input)
+
+
+async def test_bubble_up_at_first_returns_to_dialogs():
+    # first bubble ↑ → back to the dialog list (#124: was a clamp).
+    app = MessengerTUI(client=LongHistoryClient())
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+        bubbles[0].focus()
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        assert app.focused is app.query_one("#dialogs", ListView)
+
+
+async def test_bubble_down_at_last_focuses_composer():
+    # last bubble ↓ → the composer (#124: was a clamp).
+    app = MessengerTUI(client=LongHistoryClient())
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+        bubbles[-1].focus()
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        assert app.focused is app.query_one("#composer", Input)
+
+
+async def test_composer_up_focuses_last_bubble():
+    # composer ↑ → the last message bubble.
+    app = MessengerTUI(client=LongHistoryClient())
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        app.query_one("#composer", Input).focus()
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+        assert app.focused is bubbles[-1]
+
+
+async def test_composer_up_focuses_dialogs_when_no_bubbles():
+    # composer ↑ with no messages → the dialog list (chain never dead-ends).
+    app = MessengerTUI(client=EmptyHistoryClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not list(app.query(MessageBubble))
+        app.query_one("#composer", Input).focus()
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        assert app.focused is app.query_one("#dialogs", ListView)
+
+
+async def test_composer_down_is_noop_at_bottom():
+    # composer is the bottom of the chain — Down stays on the composer.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+        composer.focus()
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        assert app.focused is composer
+
+
+async def test_full_chain_down_then_up():
+    # the whole vertical chain with arrows alone: search → tabs → dialogs → bubble → composer,
+    # then symmetric back up.
+    app = MessengerTUI(client=LongHistoryClient())
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        tabs = app.query_one(Tabs)
+        dialogs = app.query_one("#dialogs", ListView)
+        composer = app.query_one("#composer", Input)
+        bubbles = list(app.query(MessageBubble))
+
+        search.focus()
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        assert app.focused is tabs
+        await pilot.press("down")  # tabs → dialogs
+        await pilot.pause()
+        assert app.focused is dialogs
+        dialogs.index = len(dialogs) - 1  # go to the last dialog so the next Down hands off
+        await pilot.pause()
+        await pilot.press("down")  # dialogs (last) → first bubble
+        await pilot.pause()
+        assert app.focused is bubbles[0]
+        # walk to the last bubble, then down into the composer
+        bubbles[-1].focus()
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        assert app.focused is composer
+        # symmetric path back up: composer → last bubble → ... → first bubble → dialogs → tabs
+        await pilot.press("up")
+        await pilot.pause()
+        assert app.focused is bubbles[-1]
+        bubbles[0].focus()
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        assert app.focused is dialogs
+        dialogs.index = 0
+        await pilot.pause()
+        await pilot.press("up")  # dialogs (first) → tabs
+        await pilot.pause()
+        assert app.focused is tabs
+
+
+# --- #124: the ?/F1 key-help overlay ---
+
+
+async def test_f1_opens_and_closes_help():
+    from tg_messenger.tui.app import HelpScreen
+
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("f1")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpScreen)
+        await pilot.press("f1")  # same key toggles it closed (via the modal's own binding)
+        await pilot.pause()
+        assert not isinstance(app.screen, HelpScreen)
+
+
+async def test_f1_opens_help_from_inside_composer():
+    # F1 is non-printable, so a priority app binding fires even while an Input is focused.
+    from tg_messenger.tui.app import HelpScreen
+
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#composer", Input).focus()
+        await pilot.pause()
+        await pilot.press("f1")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpScreen)
+
+
+async def test_question_mark_opens_help_outside_inputs():
+    # "?" works when focus is NOT on a text input (here: the tab strip).
+    from tg_messenger.tui.app import HelpScreen
+
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).focus()
+        await pilot.pause()
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpScreen)
+        await pilot.press("escape")  # Escape also closes the overlay
+        await pilot.pause()
+        assert not isinstance(app.screen, HelpScreen)
+
+
+# --- #124: text editing in the Inputs is unaffected by the new up/down bindings ---
+
+
+async def test_composer_typing_and_cursor_unaffected():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+        composer.focus()
+        await pilot.pause()
+        await pilot.press("a", "b", "c", "left", "x")
+        await pilot.pause()
+        assert composer.value == "abxc"  # left moved the cursor; up/down bindings didn't interfere
+
+
+async def test_search_typing_filters_and_cursor_unaffected():
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        search = app.query_one("#search", Input)
+        search.focus()
+        await pilot.pause()
+        await pilot.press("A", "n", "left", "n")  # type into the search box
+        await pilot.pause()
+        assert search.value == "Ann"  # left moved the cursor between n's
+        # live filter still works: only the "Ann" DM (id=7) matches the query
+        assert [item.dialog_id for item in app.query(DialogItem)] == [7]
+
+
+# --- #124-r2: tabs↑→search, dialogs →/space, composer ←, bubble space/x ---
+
+
+async def test_tabs_up_focuses_search():
+    # ↑ on the tab strip returns focus to the search box (symmetric to down/enter → dialogs).
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one(Tabs).focus()
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        assert app.focused is app.query_one("#search", Input)
+
+
+async def test_dialogs_right_opens_dialog_and_focuses_composer():
+    # → from the dialog list opens the highlighted dialog and drops the cursor into the composer.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = 0  # first dialog (id=7)
+        await pilot.pause()
+        await pilot.press("right")
+        await pilot.pause()
+        assert app._current == 7
+        assert app.focused is app.query_one("#composer", Input)
+
+
+async def test_dialogs_space_jumps_to_last_then_first():
+    # space toggles the cursor between the last and the first dialog.
+    app = MessengerTUI(client=TwoDmClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        lv = app.query_one("#dialogs", ListView)
+        lv.focus()
+        lv.index = 0
+        await pilot.pause()
+        await pilot.press("space")  # first → last
+        await pilot.pause()
+        assert lv.index == len(lv) - 1
+        await pilot.press("space")  # last → first
+        await pilot.pause()
+        assert lv.index == 0
+
+
+async def test_composer_left_empty_focuses_dialogs():
+    # ← on an EMPTY composer leaves the chat (back to the dialog list).
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+        assert composer.value == ""
+        composer.focus()
+        await pilot.pause()
+        await pilot.press("left")
+        await pilot.pause()
+        assert app.focused is app.query_one("#dialogs", ListView)
+
+
+async def test_composer_left_nonempty_moves_cursor():
+    # ← with text is a normal cursor move — focus stays, value unchanged, cursor steps left.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer", Input)
+        composer.focus()
+        await pilot.pause()
+        await pilot.press("a", "b")  # value "ab", cursor at end (pos 2)
+        await pilot.pause()
+        assert composer.value == "ab" and composer.cursor_position == 2
+        await pilot.press("left")
+        await pilot.pause()
+        assert app.focused is composer  # did NOT leave the composer
+        assert composer.value == "ab" and composer.cursor_position == 1
+
+
+async def test_bubble_space_jumps_to_last_then_first():
+    # space on a message toggles focus between the last and the first bubble.
+    app = MessengerTUI(client=LongHistoryClient())
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        bubbles = list(app.query(MessageBubble))
+        assert len(bubbles) >= 2
+        bubbles[0].focus()
+        await pilot.pause()
+        await pilot.press("space")  # first → last
+        await pilot.pause()
+        assert app.focused is bubbles[-1]
+        await pilot.press("space")  # last → first
+        await pilot.pause()
+        assert app.focused is bubbles[0]
+
+
+async def test_bubble_x_opens_reaction_picker():
+    # "x" is a synonym for "r": focus a bubble, press "x", pick → the reaction is sent.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+
+    async def pick(screen):
+        return "🔥"
+
+    app.push_screen_wait = pick  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        bubble = list(app.query(MessageBubble))[0]
+        bubble.focus()
+        await pilot.press("x")
+        await _pause_until(pilot, lambda: bool(stub.reactions))
+    assert stub.reactions == [(7, 1, "🔥")]
 
 
 class TwoDmClient(TuiStubClient):

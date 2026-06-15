@@ -40,6 +40,22 @@ ORIGINAL_SENTINEL = "__tg_messenger_original__"
 # #93: the per-message reaction presets — the same four as the web palette (chat.html).
 REACTION_PRESETS = ["👍", "❤️", "🔥", "😂"]
 # #73: the outbound prepare timeout now lives in OutboundSendCoordinator.
+# #124: the key-help overlay text (HelpScreen, opened with ? / F1). Russian, to match the UI.
+HELP_TEXT = """Навигация (стрелки):
+  ↑ / ↓     цепочка фокуса: Поиск → Вкладки → Диалоги → Сообщения → Поле ввода
+  ← / →     войти в диалог (→ из списка) · выйти (← на пустом поле); на вкладках — смена вкладки
+  Пробел    к концу/началу списка (диалоги и сообщения)
+  Enter     открыть диалог · отправить сообщение
+
+Действия:
+  Tab       принять подсказку ответа (иначе — вперёд по фокусу)
+  Shift+Tab назад по фокусу
+  r / x     реакция на выбранном сообщении
+  Ctrl+S    настройки аккаунтов
+  /lang     язык перевода в текущем диалоге (команда в поле ввода)
+  ? / F1    эта справка
+  Esc       очистить поиск · закрыть окно
+  Ctrl+C    выход"""
 
 
 @dataclass
@@ -273,10 +289,16 @@ class SidebarTabs(Tabs):
 
     BINDINGS = [
         Binding("down,enter", "focus_dialogs", "Dialogs", show=False),
+        # #124-r2: Up returns to the search box — the symmetric counterpart to Down/Enter, so the
+        # whole sidebar (search ↔ tabs ↔ dialogs) is reachable with arrows alone.
+        Binding("up", "focus_search", "Search", show=False),
     ]
 
     def action_focus_dialogs(self) -> None:
         self.screen.query_one("#dialogs", ListView).focus()
+
+    def action_focus_search(self) -> None:
+        self.screen.query_one("#search", Input).focus()
 
 
 class DialogListView(ListView):
@@ -291,6 +313,13 @@ class DialogListView(ListView):
 
     BINDINGS = [
         Binding("up", "cursor_up_or_tabs", "Up", show=False),
+        # #124: Down at the LAST dialog hands off into the chat pane so the vertical chain
+        # (dialogs → messages → composer) is seamless with arrows alone — was a dead clamp.
+        Binding("down", "cursor_down_or_messages", "Down", show=False),
+        # #124-r2: Right opens the highlighted dialog and drops the cursor into the composer
+        # (horizontal "enter the chat"); Space jumps to the last/first item (toggle).
+        Binding("right", "open_dialog", "Open", show=False),
+        Binding("space", "jump_edge", "Top/bottom", show=False),
     ]
 
     def on_focus(self) -> None:
@@ -302,6 +331,80 @@ class DialogListView(ListView):
             self.screen.focus_previous()  # the tabs are the prior focusable
         else:
             self.action_cursor_up()
+
+    def action_cursor_down_or_messages(self) -> None:
+        # At the last item (or an empty/None selection on a populated list), Down leaves the
+        # sidebar for the chat pane: the first message bubble if any, else the composer. Anywhere
+        # else, Down scrolls the list as usual (ListView's cursor_down). Mirror of cursor_up_or_tabs.
+        if len(self) == 0 or (self.index is not None and self.index >= len(self) - 1):
+            _focus_first_bubble_or_composer(self.screen)
+        else:
+            self.action_cursor_down()
+
+    def action_open_dialog(self) -> None:
+        # Right = open the highlighted dialog, then focus the composer so the user can reply at
+        # once. action_select_cursor posts ListView.Selected → on_list_view_selected does the
+        # actual open (sets _current, loads history in a worker); the composer focus is independent
+        # of that load. No-op on an empty list / no selection.
+        if self.index is None or len(self) == 0:
+            return
+        self.action_select_cursor()
+        self.screen.query_one("#composer", Input).focus()
+
+    def action_jump_edge(self) -> None:
+        # Space = toggle between the last and the first item (the same edge-jump used in the
+        # message pane). On the last item → first; anywhere else → last. Empty list → no-op.
+        if len(self) == 0:
+            return
+        self.index = 0 if (self.index is not None and self.index >= len(self) - 1) else len(self) - 1
+
+
+class SearchInput(Input):
+    """The sidebar search box. Down hands focus to the tab strip (the next link in the
+    vertical chain); Up is the top of the chain (no-op). Left/Right/Home/End stay with Input
+    for cursor movement, so typing a query is unaffected (#124)."""
+
+    BINDINGS = [
+        Binding("down", "focus_tabs", "Tabs", show=False),
+    ]
+
+    def action_focus_tabs(self) -> None:
+        self.screen.query_one("#tabs", Tabs).focus()
+
+
+class ComposerInput(Input):
+    """The message composer. Up leaves the composer for the chat history — the last message
+    bubble if any, else the dialog list. Down is the bottom of the chain (no-op). Left/Right/
+    Home/End stay with Input for cursor movement, so typing/editing is unaffected (#124)."""
+
+    BINDINGS = [
+        Binding("up", "focus_messages", "Messages", show=False),
+        # #124-r2: Left on an EMPTY composer leaves the chat (back to the dialog list); with text,
+        # Left is the normal cursor move (Input's action_cursor_left) so editing isn't broken.
+        Binding("left", "cursor_left_or_dialogs", "Dialogs", show=False),
+    ]
+
+    def action_focus_messages(self) -> None:
+        bubbles = list(self.screen.query(MessageBubble))
+        if bubbles:
+            bubbles[-1].focus()
+        else:
+            self.screen.query_one("#dialogs", ListView).focus()
+
+    def action_cursor_left_or_dialogs(self) -> None:
+        if self.value == "":
+            self.screen.query_one("#dialogs", ListView).focus()  # empty field → exit the chat
+        else:
+            self.action_cursor_left()  # normal in-field cursor move
+
+
+def _focus_first_bubble_or_composer(screen) -> None:
+    """Enter the chat pane from the dialog list: the first message bubble, else the composer."""
+    bubbles = list(screen.query(MessageBubble))
+    if bubbles:
+        bubbles[0].focus()
+    else:
+        screen.query_one("#composer", Input).focus()
 
 
 class DialogItem(ListItem):
@@ -327,7 +430,11 @@ class MessageBubble(Static):
     BINDINGS = [
         Binding("up", "focus_prev_bubble", "Prev message", show=False),
         Binding("down", "focus_next_bubble", "Next message", show=False),
-        Binding("r", "react", "React", show=False),
+        # #124-r2: "x" is a synonym for "r" (both open the reaction picker); Space jumps to the
+        # last/first message (toggle) — the same edge-jump as the dialog list. Space is NOT a
+        # reaction key (Static binds nothing to it by default, so it's free for navigation).
+        Binding("r,x", "react", "React", show=False),
+        Binding("space", "jump_edge", "Top/bottom", show=False),
     ]
 
     def __init__(self, body: str, out: bool, message_id: int | None = None,
@@ -394,7 +501,9 @@ class MessageBubble(Static):
     def _focus_sibling(self, delta: int) -> None:
         # #118: bubbles now sit inside a per-message BubbleRow wrapper, so they are no longer
         # direct siblings of each other. Walk all bubbles in DOM (= visual) order via the screen
-        # query and step to the neighbour; clamp at the ends so focus never escapes the pane.
+        # query and step to the neighbour. #124: at the ends, hand focus OFF rather than clamp so
+        # the vertical chain is seamless — Up at the first bubble returns to the dialog list, Down
+        # at the last bubble drops into the composer.
         if self.screen is None:
             return
         bubbles = list(self.screen.query(MessageBubble))
@@ -405,6 +514,20 @@ class MessageBubble(Static):
         target = idx + delta
         if 0 <= target < len(bubbles):
             bubbles[target].focus()
+        elif target < 0:
+            self.screen.query_one("#dialogs", ListView).focus()  # up past the top → dialog list
+        else:
+            self.screen.query_one("#composer", Input).focus()  # down past the bottom → composer
+
+    def action_jump_edge(self) -> None:
+        # #124-r2: Space = toggle between the last and the first message (the same edge-jump as the
+        # dialog list). On the last bubble → first; anywhere else → last. No-op if alone/unmounted.
+        if self.screen is None:
+            return
+        bubbles = list(self.screen.query(MessageBubble))
+        if not bubbles:
+            return
+        (bubbles[0] if self is bubbles[-1] else bubbles[-1]).focus()
 
     def action_react(self) -> None:
         # #102: react on the bubble's OWN source dialog, not the globally-current one —
@@ -497,6 +620,33 @@ class EmojiPickerScreen(ModalScreen[str | None]):
             self.dismiss(item.value)
 
     def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class HelpScreen(ModalScreen[None]):
+    """The key-help overlay (#124): a centered card listing navigation + hotkeys.
+
+    Opened/closed by ? or F1 (toggle, via the app's action_toggle_help) and dismissed by
+    Escape too. f1/escape are non-printable so they fire from the modal's own BINDINGS even
+    though no Input is focused here; ? works because the modal holds no text field.
+    """
+
+    # #116-parity: center the modal card (the box geometry is shaped by App.CSS #help-box).
+    DEFAULT_CSS = "HelpScreen { align: center middle; }"
+
+    BINDINGS = [
+        Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
+        Binding("escape", "dismiss", "Close", show=False),
+        Binding("f1", "dismiss", "Close", show=False),
+        Binding("question_mark", "dismiss", "Close", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-box"):
+            yield Label("Горячие клавиши", id="help-title")
+            yield Static(HELP_TEXT, id="help-body", markup=False)
+
+    def action_dismiss(self) -> None:  # type: ignore[override]
         self.dismiss(None)
 
 
@@ -700,6 +850,15 @@ class MessengerTUI(App):
         # #115: open account settings (add/list/remove a profile). priority so it works from
         # inside the composer Input.
         Binding("ctrl+s", "open_settings", "Settings", priority=True),
+        # #124: the key-help overlay (toggle). F1 is non-printable so a priority binding fires
+        # even from inside an Input; "?" is printable and so is filtered out while an Input is
+        # focused — it works everywhere ELSE (tabs/dialogs/a bubble). Documented: ? outside text
+        # inputs, F1 anywhere.
+        Binding("f1", "toggle_help", "Help", priority=True, show=True),
+        Binding("question_mark", "toggle_help", "Help", show=True),
+        # #124: Escape clears a non-empty search filter (a small, predictable global). NOT priority,
+        # so any open modal's own Escape still wins (the modal binding chain truncates above the app).
+        Binding("escape", "clear_search", "Clear search", show=False),
     ]
 
     CSS = """
@@ -708,6 +867,13 @@ class MessengerTUI(App):
        so the default 32 width is unchanged. */
     #sidebar { width: 32; max-width: 50%; border-right: solid $primary; }
     #chat { width: 1fr; min-width: 16; }
+    /* #124: focus indicator — the pane holding focus gets an accent border so "where am I" is
+       always visible. :focus-within styles a container while any descendant (search/tabs/list/
+       bubble/composer) is focused. Keeps the sidebar's existing right border; the chat's left
+       accent is purely additive (it had none) and visually balances the sidebar. The exact
+       focused bubble still gets its own #messages MessageBubble:focus accent below. */
+    #sidebar:focus-within { border-right: solid $accent; }
+    #chat:focus-within { border-left: solid $accent; }
     #messages { overflow-y: auto; }
     /* #113/#118: each message is a framed, shrink-wrapped card. The in/out asymmetry is now a
        PROPORTIONAL alignment of the bubble inside a full-width BubbleRow (align-horizontal),
@@ -723,16 +889,25 @@ class MessengerTUI(App):
         border: round $panel;
         text-wrap: wrap; text-overflow: fold;
     }
-    #messages MessageBubble:focus { background: $boost; border: round $accent; }
     /* incoming vs outgoing: distinct border (the side offset is the BubbleRow alignment above). */
     #messages MessageBubble.out { border: round $accent; }
     #messages MessageBubble.in { border: round $panel; }
+    /* #124-r3: the focused message is INVERTED (bg/fg swapped) — the same scheme Textual uses for
+       list/table selection, so it's clearly visible (the old $boost wash was nearly invisible).
+       Placed AFTER .out/.in on purpose: :focus and .out have equal specificity (1,1,1), so source
+       ORDER decides the tie — :focus must come last to win on outgoing bubbles too. */
+    #messages MessageBubble:focus {
+        background: $block-cursor-background;
+        color: $block-cursor-foreground;
+        text-style: $block-cursor-text-style;
+        border: round $accent;
+    }
     #suggestion { color: $text-muted; height: auto; }
     #composer { dock: bottom; }
     /* #116: shared modal card — a centered, bordered, width-capped box (was full-width, top-left,
        unframed). Centering (align: center middle) lives on each ModalScreen's DEFAULT_CSS so it is
        not affected by App.CSS-vs-screen scoping; these rules only shape the box. */
-    #profile-box, #login-box, #variant-box, #emoji-box {
+    #profile-box, #login-box, #variant-box, #emoji-box, #help-box {
         width: 60%;
         max-width: 64;
         height: auto;
@@ -742,6 +917,7 @@ class MessengerTUI(App):
         background: $surface;
     }
     #login-title { text-style: bold; }
+    #help-title { text-style: bold; }
     """
 
     def __init__(self, *, client=None, session_name: str = "default",
@@ -885,7 +1061,7 @@ class MessengerTUI(App):
     def compose(self) -> ComposeResult:
         with Horizontal():
             with Vertical(id="sidebar"):
-                yield Input(placeholder="Поиск…", id="search")
+                yield SearchInput(placeholder="Поиск…", id="search")
                 yield SidebarTabs(
                     Tab("Все", id="all"),
                     Tab("Контакты", id="contacts"),
@@ -901,7 +1077,7 @@ class MessengerTUI(App):
             with Vertical(id="chat"):
                 yield Vertical(id="messages")
                 yield Static("", id="suggestion", markup=False)
-                yield Input(placeholder="Message…", id="composer")
+                yield ComposerInput(placeholder="Message…", id="composer")
 
     async def on_mount(self) -> None:
         # Textual's real App.run() installs asyncio.eager_task_factory (py3.12+),
@@ -1733,6 +1909,28 @@ class MessengerTUI(App):
     def _clear_suggestion(self) -> None:
         self._pending_suggestion = None
         self.query_one("#suggestion", Static).update("")
+
+    def action_toggle_help(self) -> None:
+        """? / F1 — toggle the key-help overlay (#124).
+
+        The SAME key opens and closes it: if HelpScreen is already on top, pop it; else push it.
+        (HelpScreen also binds ?/F1/Escape to dismiss, so pressing them while it's open closes it
+        via its own bindings — the isinstance guard here covers the app-side path defensively.)
+        """
+        if isinstance(self.screen, HelpScreen):
+            self.pop_screen()
+        else:
+            self.push_screen(HelpScreen())
+
+    def action_clear_search(self) -> None:
+        """Escape — clear a non-empty search filter and re-render (a small, predictable global).
+
+        A no-op when the search box is already empty, so Escape stays unsurprising elsewhere.
+        """
+        search = self.query_one("#search", Input)
+        if not search.value:
+            return
+        search.value = ""  # triggers on_input_changed → _render_dialogs
 
     def action_open_settings(self) -> None:
         """Ctrl+S — open account settings (add/list/remove a profile, #115)."""
