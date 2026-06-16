@@ -499,10 +499,10 @@ async def test_cached_method_is_per_model(tmp_path):
     try:
         assert await get_cached_method(storage, "openai:a") is None
         await set_cached_method(storage, "openai:a", "json_schema")
-        await set_cached_method(storage, "openai:b", "json_object")
+        await set_cached_method(storage, "openai:b", "json_mode")
         # each model has its own key → a model swap re-detects
         assert await get_cached_method(storage, "openai:a") == "json_schema"
-        assert await get_cached_method(storage, "openai:b") == "json_object"
+        assert await get_cached_method(storage, "openai:b") == "json_mode"
         assert await get_cached_method(storage, "openai:c") is None
         with pytest.raises(ValueError, match="invalid structured method"):
             await set_cached_method(storage, "openai:a", "nonsense")

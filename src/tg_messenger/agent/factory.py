@@ -256,7 +256,7 @@ async def probe_structured_method(model) -> str:
 
     Sends one tiny json_schema request with a predictable input. If it comes back as a usable
     ``TranslationBatch`` with items, the model supports json_schema; otherwise we fall back to
-    json_object (lenient JSON mode). Result is meant to be cached per model by the caller.
+    json_mode (lenient JSON mode). Result is meant to be cached per model by the caller.
     """
     probe_payload = {
         "target_lang": "en",
@@ -267,14 +267,14 @@ async def probe_structured_method(model) -> str:
     try:
         schema_model = model.with_structured_output(TranslationBatch, method="json_schema")
     except Exception:
-        logger.info("model does not support json_schema structured output; using json_object")
-        return "json_object"
+        logger.info("model does not support json_schema structured output; using json_mode")
+        return "json_mode"
     try:
         async with asyncio.timeout(_PROBE_TIMEOUT_SECONDS):
             result = await schema_model.ainvoke(_translate_messages(probe_payload))
     except Exception:
-        logger.info("json_schema probe failed; using json_object", exc_info=True)
-        return "json_object"
+        logger.info("json_schema probe failed; using json_mode", exc_info=True)
+        return "json_mode"
     batch = result if isinstance(result, TranslationBatch) else None
     if batch is None and isinstance(result, dict):
         try:
@@ -284,20 +284,20 @@ async def probe_structured_method(model) -> str:
     if batch is not None and batch.items:
         logger.info("model supports json_schema structured output")
         return "json_schema"
-    logger.info("json_schema probe returned no usable items; using json_object")
-    return "json_object"
+    logger.info("json_schema probe returned no usable items; using json_mode")
+    return "json_mode"
 
 
-def make_translate_fn(model, method: str = "json_object") -> Callable:
+def make_translate_fn(model, method: str = "json_mode") -> Callable:
     """Structured-output translator over ``with_structured_output``; injected into ``Translator``.
 
     ``method`` is chosen ahead of time by a probe (cached per model). A json_schema run that comes
-    back empty/None is retried once with json_object as a runtime safety net (in case the cached
+    back empty/None is retried once with json_mode as a runtime safety net (in case the cached
     probe is stale).
     """
     primary = model.with_structured_output(TranslationBatch, method=method)
     fallback = (
-        model.with_structured_output(TranslationBatch, method="json_object")
+        model.with_structured_output(TranslationBatch, method="json_mode")
         if method == "json_schema"
         else None
     )
@@ -311,7 +311,7 @@ def make_translate_fn(model, method: str = "json_object") -> Callable:
         }
         batch = await _structured_translate(primary, payload)
         if (batch is None or not batch.items) and fallback is not None:
-            logger.info("json_schema translate empty/failed; retrying json_object")
+            logger.info("json_schema translate empty/failed; retrying json_mode")
             batch = await _structured_translate(fallback, payload)
         if batch is None:
             return {}

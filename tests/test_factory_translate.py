@@ -2,7 +2,7 @@
 
 The LLM stack is faked — models expose ``with_structured_output(schema, method=...)`` returning a
 stub whose ``ainvoke`` yields a TranslationBatch / dict / raises, mirroring how json_schema and
-json_object behave on real (and z.ai-style) endpoints. No network, no real LLM.
+json_mode behave on real (and z.ai-style) endpoints. No network, no real LLM.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ class _Structured:
 
 
 class FakeModel:
-    """A model whose json_schema / json_object structured outputs are configured independently."""
+    """A model whose json_schema / json_mode structured outputs are configured independently."""
 
     def __init__(self, *, schema_result, json_result, counter=None, raise_on_schema_build=False):
         self._schema_result = schema_result
@@ -62,13 +62,13 @@ async def test_probe_returns_json_schema_when_supported():
 
 async def test_probe_falls_back_when_schema_empty_or_raises():
     # z.ai-style: HTTP 200 but ignores the schema → empty/garbage, no exception
-    assert await f.probe_structured_method(FakeModel(schema_result=_EMPTY, json_result=_GOOD)) == "json_object"
+    assert await f.probe_structured_method(FakeModel(schema_result=_EMPTY, json_result=_GOOD)) == "json_mode"
     # provider raises on the schema call
     err = FakeModel(schema_result=RuntimeError("ignored"), json_result=_GOOD)
-    assert await f.probe_structured_method(err) == "json_object"
+    assert await f.probe_structured_method(err) == "json_mode"
     # provider refuses to even build a json_schema structured model
     refuse = FakeModel(schema_result=_GOOD, json_result=_GOOD, raise_on_schema_build=True)
-    assert await f.probe_structured_method(refuse) == "json_object"
+    assert await f.probe_structured_method(refuse) == "json_mode"
 
 
 async def test_translate_fn_json_schema_path():
@@ -77,22 +77,22 @@ async def test_translate_fn_json_schema_path():
     assert await fn([(1, "hola")], "ru") == {1: "привет"}
 
 
-async def test_translate_fn_runtime_fallback_to_json_object():
-    # json_schema returns empty at runtime (stale probe) → retry json_object as a safety net
+async def test_translate_fn_runtime_fallback_to_json_mode():
+    # json_schema returns empty at runtime (stale probe) → retry json_mode as a safety net
     counter: dict[str, int] = {}
     model = FakeModel(schema_result=_EMPTY, json_result=_GOOD, counter=counter)
     fn = f.make_translate_fn(model, "json_schema")
     assert await fn([(1, "hola")], "ru") == {1: "привет"}
-    assert counter.get("json_schema") == 1 and counter.get("json_object") == 1
+    assert counter.get("json_schema") == 1 and counter.get("json_mode") == 1
 
 
-async def test_translate_fn_json_object_no_fallback():
-    # when method is already json_object there is no second attempt
+async def test_translate_fn_json_mode_no_fallback():
+    # when method is already json_mode there is no second attempt
     counter: dict[str, int] = {}
     model = FakeModel(schema_result=_GOOD, json_result=_EMPTY, counter=counter)
-    fn = f.make_translate_fn(model, "json_object")
+    fn = f.make_translate_fn(model, "json_mode")
     assert await fn([(1, "hola")], "ru") == {}
-    assert counter.get("json_object") == 1 and "json_schema" not in counter
+    assert counter.get("json_mode") == 1 and "json_schema" not in counter
 
 
 async def test_resolve_translate_method_caches_in_kv(tmp_path):

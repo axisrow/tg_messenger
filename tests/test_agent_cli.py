@@ -212,7 +212,7 @@ class _StructuredReply:
 
 
 class StructuredModel:
-    """A model with a configurable structured output per method (json_schema / json_object)."""
+    """A model with a configurable structured output per method (json_schema / json_mode)."""
 
     def __init__(self, *, schema_result, json_result=None):
         self._schema_result = schema_result
@@ -230,14 +230,14 @@ async def test_make_translate_fn_maps_structured_items():
         factory.TranslationItem(id=2, translation=None),
     ])
     model = StructuredModel(schema_result=batch)
-    translate_fn = factory.make_translate_fn(model, "json_object")
+    translate_fn = factory.make_translate_fn(model, "json_mode")
     assert await translate_fn([(1, "hello"), (2, "ok")], "ru") == {1: "привет", 2: None}
 
 
 async def test_make_translate_fn_garbage_returns_empty():
     # an unusable structured result (here: a non-batch type) yields no translations, never raises
     model = StructuredModel(schema_result="not a batch")
-    translate_fn = factory.make_translate_fn(model, "json_object")
+    translate_fn = factory.make_translate_fn(model, "json_mode")
     assert await translate_fn([(1, "hello")], "ru") == {}
 
 
@@ -245,7 +245,7 @@ async def test_make_translate_fn_timeout_is_swallowed(monkeypatch):
     # a hanging model is bounded by the translate timeout and yields {} (logged), not a TimeoutError
     monkeypatch.setattr(factory, "TRANSLATE_TIMEOUT_SECONDS", 0.01)
     model = StructuredModel(schema_result="__hang__")
-    translate_fn = factory.make_translate_fn(model, "json_object")
+    translate_fn = factory.make_translate_fn(model, "json_mode")
     assert await translate_fn([(1, "hello")], "ru") == {}
 
 

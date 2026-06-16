@@ -48,7 +48,7 @@ TRANSLATE_METHOD_KEY_PREFIX = "translate_method_"
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_MAX_MESSAGES = 100
 # structured-output strategies for the translator LLM (see agent/factory.py for the probe).
-STRUCTURED_METHODS = ("json_schema", "json_object")
+STRUCTURED_METHODS = ("json_schema", "json_mode")
 
 # Inbound translation modes (what to translate, by SOURCE language):
 #   off          — translation disabled (equivalent to no user_lang)
