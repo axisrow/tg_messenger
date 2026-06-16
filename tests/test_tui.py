@@ -4860,3 +4860,49 @@ async def test_tui_successful_model_change_commits_model_and_settings(monkeypatc
             assert dismissed.get("result") is new_translator
     finally:
         await storage.close()
+
+
+# --- #147: the 💡 hint renders with a suggester wired, and stays empty without one ---
+
+
+async def test_tui_suggest_hint_renders_with_suggester():
+    from tg_messenger.tui.app import SUGGEST_PREFIX
+
+    class FixedSuggester:
+        async def suggest(self, dialog_id):
+            return "Привет! Как дела?"
+
+    app = MessengerTUI(client=TuiStubClient(), suggester=FixedSuggester())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7  # Ann is a DM (kind="dm")
+        app._maybe_suggest(7)
+        await _pause_until(
+            pilot, lambda: SUGGEST_PREFIX in str(app.query_one("#suggestion", Static).render())
+        )
+        rendered = str(app.query_one("#suggestion", Static).render())
+        assert rendered == f"{SUGGEST_PREFIX}Привет! Как дела?"
+        assert app._pending_suggestion == "Привет! Как дела?"
+
+
+async def test_tui_suggest_strip_empty_without_suggester():
+    app = MessengerTUI(client=TuiStubClient())  # suggester=None
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        # pin the `_suggester is None` gate specifically: no suggest worker is even started
+        # (not merely that the draft happens to be empty). Spy on run_worker for group "suggest".
+        suggest_workers = []
+        real_run_worker = app.run_worker
+
+        def spy_run_worker(work, *a, **kw):
+            if kw.get("group") == "suggest":
+                suggest_workers.append(work)
+            return real_run_worker(work, *a, **kw)
+
+        app.run_worker = spy_run_worker  # type: ignore[method-assign]
+        app._maybe_suggest(7)  # no-op without a suggester
+        await pilot.pause()
+        assert suggest_workers == []  # the gate returned BEFORE scheduling any work
+        assert str(app.query_one("#suggestion", Static).render()) == ""
+        assert app._pending_suggestion is None
