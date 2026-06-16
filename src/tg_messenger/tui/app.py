@@ -25,6 +25,7 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
+    LoadingIndicator,
     RadioButton,
     RadioSet,
     Static,
@@ -561,11 +562,31 @@ class MessageBubble(Static):
         t.append(_terminal_safe_display_text(rest))
         if self._translation is not None:
             t.append("\n")
-            t.append(f"↳ {_terminal_safe_display_text(self._translation)}")
+            # the translation gets the theme accent so it visibly separates from the white original
+            # (author/id use "dim"); without a style it was the same white and merged in.
+            t.append(
+                f"↳ {_terminal_safe_display_text(self._translation)}",
+                style=self._translation_style(),
+            )
         if self._reactions:
             t.append("\n")
             t.append(_terminal_safe_display_text(" ".join(self._reactions)))
         return t
+
+    def _translation_style(self) -> str:
+        """Rich style for the translation line — the theme accent, resolved best-effort.
+
+        Text.append(style=) takes a Rich style (a colour name/hex), not a Textual CSS var, so we
+        resolve $accent to its hex via app.theme_variables. Before mount self.app raises
+        NoActiveAppError; fall back to a named colour so the translation is NEVER plain white
+        (a translation always re-renders after mount, so the real accent applies in practice).
+        """
+        try:
+            return self.app.theme_variables.get("accent") or "cyan"
+        except Exception:
+            # expected before mount (NoActiveAppError) — debug-logged, not silently swallowed
+            logger.debug("translation accent unavailable (bubble not mounted yet); using fallback")
+            return "cyan"
 
     def _recompose_text(self) -> None:
         self.update(self._build())
@@ -1211,14 +1232,24 @@ class MessengerTUI(App):
         scrollbar-size-vertical: 0;
         scrollbar-size-horizontal: 0;
     }
-    /* the whole-chat translate (Ctrl+T) status line — centered, accent, bold */
+    /* the whole-chat translate (Ctrl+T) status — centered container: accent label + animated dots.
+       both children take the full container width and center their own content, so the label and
+       the dots are vertically stacked AND horizontally aligned to the same centre line. */
     #messages .translate-status {
         width: 1fr;
         height: 1fr;
-        content-align: center middle;
+        align: center middle;
+    }
+    #messages .translate-status-label {
+        width: 1fr;
         text-align: center;
         color: $accent;
         text-style: bold;
+    }
+    #messages .translate-status LoadingIndicator {
+        width: 1fr;
+        height: auto;
+        content-align-horizontal: center;
     }
     /* #113/#118: each message is a framed, shrink-wrapped card. The in/out asymmetry is now a
        PROPORTIONAL alignment of the bubble inside a full-width BubbleRow (align-horizontal),
@@ -1784,12 +1815,30 @@ class MessengerTUI(App):
         spinner for the duration. A failed/empty pass is surfaced via notify (the Ctrl+T path is
         explicit, unlike the silent background auto-translate on open).
         """
+        # the worker is scheduled, not run inline: the user may have opened another dialog between
+        # pressing Ctrl+T and this body running. Bail BEFORE touching the pane, else we'd wipe the
+        # new dialog's history and mount this dialog's spinner into the wrong chat.
+        if dialog_id != self._current:
+            return
         pane = self.query_one("#messages", Vertical)
-        # the built-in loading overlay shows only dots; mount a labelled status line instead so it's
-        # clear WHAT is happening for the whole (possibly minute-long) pass.
+        # mount a labelled status WITH the animated LoadingIndicator (the same blinking dots the
+        # built-in pane.loading shows) — pane.loading would overlay/hide a mounted label, so we
+        # compose both ourselves: the label on top, the indicator below.
         await pane.remove_children()
+        # remove_children() awaited (yielded the loop): the user may have switched dialogs in that
+        # window. Re-check BEFORE clearing the shared bubble index / mounting this dialog's spinner,
+        # else the stale spinner could land on top of the new dialog's history.
+        if dialog_id != self._current:
+            return
         self._bubble_index.clear()
-        await pane.mount(Static("⏳ Идёт перевод…", id="translate-status", classes="translate-status"))
+        await pane.mount(
+            Vertical(
+                Label("Идёт перевод…", classes="translate-status-label"),
+                LoadingIndicator(),
+                id="translate-status",
+                classes="translate-status",
+            )
+        )
         ok = False
         try:
             cap = await self._translator.max_messages()

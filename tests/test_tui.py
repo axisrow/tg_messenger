@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Footer, Input, ListView, Static, Tabs
+from textual.widgets import Footer, Input, Label, ListView, LoadingIndicator, Static, Tabs
 
 from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.models import (
@@ -1949,6 +1949,31 @@ async def test_tui_translation_and_reactions_keep_content_after_styling():
         bubble.add_reaction("👍")
         await pilot.pause()
         assert str(bubble.render()) == "[1] hi\n↳ привет\n*"
+
+
+async def test_tui_translation_line_uses_accent_colour():
+    # the translation line must NOT be plain white (it merged with the original) — it gets the
+    # theme accent so it visibly separates from the body.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one("#messages", Vertical)
+        bubble = MessageBubble("[1] hi", out=False, message_id=1, dialog_id=7)
+        await pane.mount(bubble)
+        bubble.show_translation("привет")
+        await pilot.pause()
+        accent = app.theme_variables.get("accent")
+        assert accent  # the theme exposes an accent colour
+        assert bubble._translation_style() == accent
+        # the Rich Text span covering the translation carries that accent style (not empty/white)
+        text = bubble._build()
+        translation_start = str(text).index("↳")
+        styles = {
+            str(span.style)
+            for span in text.spans
+            if span.start <= translation_start < span.end and str(span.style)
+        }
+        assert accent in styles
 
 
 class IncomingDialogListClient(TuiStubClient):
@@ -4206,10 +4231,12 @@ async def test_tui_translate_all_shows_status_then_clears():
         await pilot.pause()
         app.action_translate_all()
         await pilot.pause()
-        # while translate_history is blocked, the labelled status line is mounted
-        status = app.query("#messages .translate-status")
-        assert status, "status line not shown during translation"
-        assert "Идёт перевод" in str(status.first().render())
+        # while translate_history is blocked, the status container is mounted with BOTH a labelled
+        # caption and the animated LoadingIndicator (the blinking dots, like history loading)
+        status = app.query_one("#translate-status")
+        label = status.query_one(Label)
+        assert "Идёт перевод" in str(label.render())
+        assert status.query(LoadingIndicator), "animated loading dots not shown during translation"
         # release the translator → status clears, bubbles appear WITH the translation rendered
         translator.gate.set()
         await pilot.pause()
@@ -4220,6 +4247,59 @@ async def test_tui_translate_all_shows_status_then_clears():
         # regression: the re-mounted snapshot must show the TRANSLATED text, not the originals
         rendered = "\n".join(str(b.render()) for b in bubbles)
         assert "ПЕРЕВОД" in rendered, "Ctrl+T mounted untranslated bubbles"
+
+
+async def test_tui_translate_all_aborts_when_dialog_already_switched():
+    # regression: the Ctrl+T worker is scheduled, not inline. If the user opens another dialog
+    # before the worker body runs, it must bail BEFORE touching the pane — not wipe the new
+    # dialog's history nor mount a stale #translate-status into the wrong chat.
+    store = FakeSessionStore(["alice"])
+    translator = _BlockingTranslator({"mode": "all_unknown", "target": "ru", "max_messages": 100})
+    app = MessengerTUI(
+        client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        bubbles_before = len(app.query("MessageBubble"))
+        assert bubbles_before  # dialog 7 history is on screen
+        # the user has switched to another dialog by the time the stale worker body runs
+        app._current = 8
+        await app._translate_whole_dialog(7)
+        await pilot.pause()
+        # the worker bailed early: no spinner mounted, dialog 7's pane untouched
+        assert not app.query("#translate-status")
+        assert len(app.query("MessageBubble")) == bubbles_before
+
+
+async def test_tui_translate_all_aborts_when_dialog_switches_during_first_await():
+    # regression: even past the entry guard, the dialog can switch DURING `await remove_children()`.
+    # The post-await re-check must then abort before mounting a stale spinner.
+    store = FakeSessionStore(["alice"])
+    translator = _BlockingTranslator({"mode": "all_unknown", "target": "ru", "max_messages": 100})
+    app = MessengerTUI(
+        client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        pane = app.query_one("#messages", Vertical)
+        original_remove = pane.remove_children
+
+        async def remove_then_switch(*args, **kwargs):
+            # simulate the user opening another dialog WHILE remove_children() is awaited
+            app._current = 8
+            return await original_remove(*args, **kwargs)
+
+        pane.remove_children = remove_then_switch
+        await app._translate_whole_dialog(7)
+        await pilot.pause()
+        # the post-remove_children guard fired: no stale spinner mounted for the old dialog
+        assert not app.query("#translate-status")
 
 
 async def test_tui_failed_model_change_does_not_persist_model_or_clear_cache(monkeypatch, tmp_path):
