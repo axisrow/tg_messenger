@@ -2591,9 +2591,12 @@ class MessengerTUI(App):
         """Ctrl+G — suggest a reply for the OPEN dialog on demand (#155).
 
         The automatic 💡 hint only fires on a new incoming message; this lets the user
-        ask for a draft while reading already-delivered history. Same guards as
-        _maybe_suggest, but each rejection NOTIFIES (the user pressed a key and expects
-        feedback) instead of silently no-opping.
+        ask for a draft while reading already-delivered history. Each rejection NOTIFIES
+        (the user pressed a key and expects feedback) instead of silently no-opping.
+
+        A non-empty composer blocks it: on_input_changed wipes the draft hint the moment
+        the field is touched, and silently clobbering typed text is worse. The toast points
+        at Escape, which clears the composer (action_clear_search) so Ctrl+G runs clean.
         """
         if self._suggester is None:
             self.notify("Суфлёр не настроен", severity="warning")
@@ -2608,10 +2611,12 @@ class MessengerTUI(App):
             self.notify("Суфлёр работает только в личных сообщениях", severity="warning")
             return
         if self.query_one("#composer", Input).value:
-            self.notify("Очистите поле ввода — черновик не перезаписывается", severity="warning")
+            self.notify("Очистите поле ввода (Esc) — черновик не перезаписывается", severity="warning")
             return
         self.run_worker(
-            self._suggest(self._current, notify_empty=True), group="suggest", exclusive=True
+            self._suggest(self._current, notify_empty=True),
+            group="suggest",
+            exclusive=True,
         )
 
     def _is_dm_dialog(self, dialog_id: int) -> bool:
@@ -2706,14 +2711,20 @@ class MessengerTUI(App):
             self.push_screen(HelpScreen())
 
     def action_clear_search(self) -> None:
-        """Escape — clear a non-empty search filter and re-render (a small, predictable global).
+        """Escape — clear a non-empty search filter AND a non-empty composer draft (#155).
 
-        A no-op when the search box is already empty, so Escape stays unsurprising elsewhere.
+        Clears whichever of the two is non-empty so Ctrl+G (which refuses to overwrite a typed
+        draft) has a clean field to write into. A no-op when both are already empty, so Escape
+        stays unsurprising elsewhere. The search clear re-renders via on_input_changed.
         """
         search = self.query_one("#search", Input)
-        if not search.value:
+        composer = self.query_one("#composer", Input)
+        if not search.value and not composer.value:
             return
-        search.value = ""  # triggers on_input_changed → _render_dialogs
+        if search.value:
+            search.value = ""  # triggers on_input_changed → _render_dialogs
+        if composer.value:
+            composer.value = ""  # drop the typed draft so a fresh Ctrl+G / reply starts clean
 
     def action_open_settings(self) -> None:
         """Ctrl+S — account settings (#115) + inbound-translation settings when a Translator is wired."""

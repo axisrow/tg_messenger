@@ -4965,6 +4965,48 @@ async def test_tui_ctrl_g_suggests_for_open_dm():
         assert app._pending_suggestion == "Конечно, давай завтра!"
 
 
+async def test_tui_ctrl_g_blocked_by_nonempty_composer_points_at_escape():
+    # #155 follow-up: a non-empty composer blocks Ctrl+G (on_input_changed would wipe the hint and
+    # clobbering typed text is worse). The toast tells the user to clear it with Escape; no draft
+    # is generated and the typed text is left intact.
+    class RecordingSuggester:
+        def __init__(self):
+            self.calls = []
+
+        async def suggest(self, dialog_id):
+            self.calls.append(dialog_id)
+            return "draft"
+
+    suggester = RecordingSuggester()
+    app = MessengerTUI(client=TuiStubClient(), suggester=suggester)
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7  # Ann, a DM
+        app.query_one("#composer", Input).value = "недописанное"
+        app.action_suggest_reply()
+        await pilot.pause()
+        assert app.query_one("#composer", Input).value == "недописанное"  # text untouched
+    assert suggester.calls == []  # blocked before the suggester is asked
+    assert any("Esc" in m for m in notes)  # the toast points at Escape
+
+
+async def test_tui_escape_clears_both_search_and_composer():
+    # #155: Escape clears a non-empty search filter AND a non-empty composer draft, so Ctrl+G has
+    # a clean field to write into.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        app.query_one("#search", Input).value = "ann"
+        app.query_one("#composer", Input).value = "черновик"
+        app.action_clear_search()
+        await pilot.pause()
+        assert app.query_one("#search", Input).value == ""
+        assert app.query_one("#composer", Input).value == ""
+
+
 async def test_tui_ctrl_g_notifies_without_suggester():
     app = MessengerTUI(client=TuiStubClient())  # suggester=None
     notes: list[str] = []
