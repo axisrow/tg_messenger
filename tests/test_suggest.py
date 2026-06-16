@@ -17,10 +17,12 @@ from tg_messenger.agent.suggest import (
     build_style_profile,
     last_read_key,
     load_last_read,
+    load_read_at,
     load_style_profile,
     record_last_read,
     register_suggest_migrations,
     save_style_profile,
+    should_nudge,
     watch_read_receipts,
 )
 from tg_messenger.core.models import Message, MessageReadEvent
@@ -303,3 +305,75 @@ async def test_watch_read_receipts_drains_and_records(tmp_path):
         assert await load_last_read(storage, 8) is None
     finally:
         await storage.close()
+
+
+# --- #145: read-receipt auto-nudge (record_at + should_nudge + nudge_candidates) ---
+
+
+async def test_record_last_read_stamps_read_at(tmp_path):
+    storage = Storage(tmp_path / "r.db")
+    register_suggest_migrations(storage)
+    await storage.connect()
+    try:
+        # injected clock → no real time
+        await record_last_read(
+            storage, MessageReadEvent(dialog_id=7, max_id=10, outbox=True),
+            clock=lambda: 1234.0,
+        )
+        assert await load_last_read(storage, 7) == 10
+        assert await load_read_at(storage, 7) == 1234.0
+    finally:
+        await storage.close()
+
+
+def test_should_nudge_truth_table():
+    def m(mid, out):
+        return _msg(mid, out=out, text="x")
+
+    now, win = 1000.0, 100.0
+    # our last message, read long enough ago, unanswered → nudge
+    assert should_nudge([m(1, False), m(2, True)],
+                        last_read_id=2, read_at=now - 200, now=now, after_sec=win) is True
+    # read too recently → no
+    assert should_nudge([m(1, False), m(2, True)],
+                        last_read_id=2, read_at=now - 50, now=now, after_sec=win) is False
+    # our latest not read yet → no
+    assert should_nudge([m(1, False), m(2, True)],
+                        last_read_id=1, read_at=now - 200, now=now, after_sec=win) is False
+    # they spoke last → no
+    assert should_nudge([m(1, True), m(2, False)],
+                        last_read_id=2, read_at=now - 200, now=now, after_sec=win) is False
+    # missing receipt / time / history → no
+    assert should_nudge([m(1, False), m(2, True)],
+                        last_read_id=None, read_at=None, now=now, after_sec=win) is False
+    assert should_nudge([], last_read_id=2, read_at=now - 200, now=now, after_sec=win) is False
+
+
+async def test_nudge_candidates_picks_aged_unanswered_dialogs(tmp_path):
+    # dialog history ends with OUR message; the contact read it 2h ago and went quiet
+    history = [_msg(1, out=False, text="hey"), _msg(2, out=True, text="you there?")]
+    client = FakeClient(history)
+    fn, _ = make_suggest_fn("Just checking in!")
+    storage = Storage(tmp_path / "n.db")
+    register_suggest_migrations(storage)
+    await storage.connect()
+    try:
+        await record_last_read(
+            storage, MessageReadEvent(dialog_id=7, max_id=2, outbox=True),
+            clock=lambda: 1000.0,
+        )
+        suggester = Suggester(client=client, suggest_fn=fn, storage=storage)
+        # 2h later, window 1h → candidate with a draft
+        out = await suggester.nudge_candidates([7], now=1000.0 + 2 * 3600, after_sec=3600)
+        assert out == [{"dialog_id": 7, "read_at": 1000.0, "draft": "Just checking in!"}]
+        # within the window → no candidate
+        none = await suggester.nudge_candidates([7], now=1000.0 + 60, after_sec=3600)
+        assert none == []
+    finally:
+        await storage.close()
+
+
+async def test_nudge_candidates_requires_storage():
+    suggester = Suggester(client=FakeClient([]), suggest_fn=make_suggest_fn()[0])
+    with pytest.raises(RuntimeError):
+        await suggester.nudge_candidates([7], now=0.0)

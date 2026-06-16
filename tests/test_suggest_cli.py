@@ -43,6 +43,8 @@ class StubSuggester:
         self.draft = draft
         self.suggested: list[int] = []
         self.learned: list[int] = []
+        self.nudge_result: list[dict] = []
+        self.nudge_calls: list[tuple] = []
 
     async def suggest(self, dialog_id):
         self.suggested.append(dialog_id)
@@ -53,6 +55,10 @@ class StubSuggester:
         from tg_messenger.agent.suggest import StyleProfile
 
         return StyleProfile(avg_length=5.0)
+
+    async def nudge_candidates(self, dialog_ids, *, now, after_sec=24 * 3600):
+        self.nudge_calls.append((list(dialog_ids), after_sec))
+        return list(self.nudge_result)
 
 
 class StubStorage:
@@ -133,6 +139,34 @@ def test_suggest_uses_requested_session_storage(suggest_cli):
     result = r.invoke(cli_main.cli, ["--profile", "work", "suggest", "42"])
     assert result.exit_code == 0, result.output
     assert storage_profiles == ["work"]
+
+
+# --- #145: suggest-nudges command ---
+
+
+def test_suggest_nudges_lists_candidates(suggest_cli):
+    r, client, suggester, _ = suggest_cli
+    suggester.nudge_result = [{"dialog_id": 42, "read_at": 100.0, "draft": "still around?"}]
+    result = r.invoke(cli_main.cli, ["suggest-nudges"])
+    assert result.exit_code == 0, result.output
+    assert "42 — Ann" in result.output
+    assert "still around?" in result.output
+    # the DM list was passed through (no per-dialog resolve)
+    assert suggester.nudge_calls[0][0] == [42]
+
+
+def test_suggest_nudges_empty(suggest_cli):
+    r, _, suggester, _ = suggest_cli
+    suggester.nudge_result = []
+    result = r.invoke(cli_main.cli, ["suggest-nudges"])
+    assert result.exit_code == 0, result.output
+    assert "No dialogs to nudge." in result.output
+
+
+def test_suggest_nudges_after_hours_to_seconds(suggest_cli):
+    r, _, suggester, _ = suggest_cli
+    r.invoke(cli_main.cli, ["suggest-nudges", "--after-hours", "2"])
+    assert suggester.nudge_calls[-1][1] == 2 * 3600
 
 
 @pytest.mark.asyncio

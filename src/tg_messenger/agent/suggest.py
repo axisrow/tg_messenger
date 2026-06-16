@@ -156,22 +156,38 @@ async def load_style_profile(storage, dialog_id: int) -> StyleProfile | None:
     return StyleProfile.model_validate_json(row[0])
 
 
-# --- read receipts (#17, cycle 98): "they've seen our message up to N" ----------
+# --- read receipts (#17, cycle 98 / #145 auto-nudge): "they've seen our message" --
 #
-# v1 only RECORDS the outbox receipt (the other party read our messages up to
-# max_id) in the kv table — the suggester does not act on it yet (no auto-nudge).
-# It's a stored signal a future ghostwrite (#18) can build on.
+# The OUTBOX receipt (the contact read our messages up to max_id) is persisted in
+# the kv table together with WHEN it was read (#145), so the nudge logic can fire
+# "they read it and went quiet for N hours" — still a DRAFT only (a human reviews
+# and sends), consistent with the suggester's never-auto-send contract.
+
+# default quiet window before a nudge is proposed (the contact read but didn't reply)
+DEFAULT_NUDGE_AFTER_SEC = 24 * 3600
 
 
 def last_read_key(dialog_id: int) -> str:
     return f"last_read_{int(dialog_id)}"
 
 
-async def record_last_read(storage, event: MessageReadEvent) -> None:
-    """Persist an OUTBOX read receipt (they read our messages up to ``max_id``)."""
+def read_at_key(dialog_id: int) -> str:
+    return f"read_at_{int(dialog_id)}"
+
+
+async def record_last_read(storage, event: MessageReadEvent, *, clock=None) -> None:
+    """Persist an OUTBOX read receipt (they read our messages up to ``max_id``).
+
+    Also stamps WHEN it was read (``read_at_<dialog>``) for the #145 nudge window.
+    ``clock`` is injected (``time.time`` default) so tests never use real time.
+    """
     if not event.outbox:
         return  # inbox = WE read theirs — not the signal the suggester cares about
+    if clock is None:
+        import time
+        clock = time.time
     await storage.set_value(last_read_key(event.dialog_id), int(event.max_id))
+    await storage.set_value(read_at_key(event.dialog_id), float(clock()))
 
 
 async def load_last_read(storage, dialog_id: int) -> int | None:
@@ -180,17 +196,48 @@ async def load_last_read(storage, dialog_id: int) -> int | None:
     return int(value) if value is not None else None
 
 
-async def watch_read_receipts(client, storage) -> None:
+async def load_read_at(storage, dialog_id: int) -> float | None:
+    """Return WHEN the contact last read our messages (Unix seconds), or None."""
+    value = await storage.get_value(read_at_key(dialog_id))
+    return float(value) if value is not None else None
+
+
+async def watch_read_receipts(client, storage, *, clock=None) -> None:
     """Drain ``client.listen_reads()`` and record every outbox receipt.
 
     Best-effort and non-fatal: one bad event is logged and the loop continues.
     """
     async for event in client.listen_reads():
         try:
-            await record_last_read(storage, event)
+            await record_last_read(storage, event, clock=clock)
         except Exception:
             logger.exception("failed to record read receipt for dialog %s",
                              getattr(event, "dialog_id", "?"))
+
+
+def should_nudge(
+    history: list[Message],
+    *,
+    last_read_id: int | None,
+    read_at: float | None,
+    now: float,
+    after_sec: float = DEFAULT_NUDGE_AFTER_SEC,
+) -> bool:
+    """Pure: does this dialog warrant a nudge draft right now?
+
+    True only when ALL hold: the dialog's last message is OURS (``out=True`` — the
+    contact hasn't replied), the contact has READ it (``last_read_id`` reaches that
+    message's id), and the read happened at least ``after_sec`` ago. A None receipt
+    or read time → no nudge (we only act on a confirmed, aged read).
+    """
+    if not history or last_read_id is None or read_at is None:
+        return False
+    last = history[-1]
+    if not last.out:
+        return False  # they replied (or spoke last) — nothing to nudge
+    if last_read_id < last.id:
+        return False  # our latest message hasn't been read yet
+    return (now - read_at) >= after_sec
 
 
 # --- Suggester (#17) -------------------------------------------------------------
@@ -242,3 +289,34 @@ class Suggester:
         profile = build_style_profile(history)
         await save_style_profile(self._storage, dialog_id, profile)
         return profile
+
+    async def nudge_candidates(
+        self, dialog_ids, *, now: float, after_sec: float = DEFAULT_NUDGE_AFTER_SEC,
+    ) -> list[dict]:
+        """For the given dialogs, return those the contact read but left unanswered.
+
+        DRAFT-only (#145): for each dialog whose last (own) message was read ≥
+        ``after_sec`` ago and never replied to, build a nudge draft. ``dialog_ids``
+        is an ALREADY-loaded list (the caller passes the cached DM list — no extra
+        dialog fetch, flood discipline). Needs a Storage (the read receipts live
+        there); returns ``[{dialog_id, read_at, draft}]``, empty when none qualify.
+        """
+        if self._storage is None:
+            raise RuntimeError("nudge_candidates() needs a Storage — none was wired")
+        out: list[dict] = []
+        for dialog_id in dialog_ids:
+            history = await self._client.history(dialog_id, self._history_limit)
+            last_read_id = await load_last_read(self._storage, dialog_id)
+            read_at = await load_read_at(self._storage, dialog_id)
+            if not should_nudge(
+                history, last_read_id=last_read_id, read_at=read_at,
+                now=now, after_sec=after_sec,
+            ):
+                continue
+            try:
+                draft = await self.suggest(dialog_id)
+            except Exception:
+                logger.exception("nudge draft failed for dialog %s", dialog_id)
+                continue
+            out.append({"dialog_id": dialog_id, "read_at": read_at, "draft": draft})
+        return out
