@@ -561,11 +561,29 @@ class MessageBubble(Static):
         t.append(_terminal_safe_display_text(rest))
         if self._translation is not None:
             t.append("\n")
-            t.append(f"↳ {_terminal_safe_display_text(self._translation)}")
+            # the translation gets the theme accent so it visibly separates from the white original
+            # (author/id use "dim"); without a style it was the same white and merged in.
+            t.append(
+                f"↳ {_terminal_safe_display_text(self._translation)}",
+                style=self._translation_style(),
+            )
         if self._reactions:
             t.append("\n")
             t.append(_terminal_safe_display_text(" ".join(self._reactions)))
         return t
+
+    def _translation_style(self) -> str:
+        """Rich style for the translation line — the theme accent, resolved best-effort.
+
+        Text.append(style=) takes a Rich style (a colour name/hex), not a Textual CSS var, so we
+        resolve $accent to its hex via app.theme_variables. Before mount self.app raises
+        NoActiveAppError; fall back to a named colour so the translation is NEVER plain white
+        (a translation always re-renders after mount, so the real accent applies in practice).
+        """
+        try:
+            return self.app.theme_variables.get("accent") or "cyan"
+        except Exception:
+            return "cyan"
 
     def _recompose_text(self) -> None:
         self.update(self._build())

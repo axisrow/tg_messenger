@@ -1951,6 +1951,31 @@ async def test_tui_translation_and_reactions_keep_content_after_styling():
         assert str(bubble.render()) == "[1] hi\n↳ привет\n*"
 
 
+async def test_tui_translation_line_uses_accent_colour():
+    # the translation line must NOT be plain white (it merged with the original) — it gets the
+    # theme accent so it visibly separates from the body.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one("#messages", Vertical)
+        bubble = MessageBubble("[1] hi", out=False, message_id=1, dialog_id=7)
+        await pane.mount(bubble)
+        bubble.show_translation("привет")
+        await pilot.pause()
+        accent = app.theme_variables.get("accent")
+        assert accent  # the theme exposes an accent colour
+        assert bubble._translation_style() == accent
+        # the Rich Text span covering the translation carries that accent style (not empty/white)
+        text = bubble._build()
+        translation_start = str(text).index("↳")
+        styles = {
+            str(span.style)
+            for span in text.spans
+            if span.start <= translation_start < span.end and str(span.style)
+        }
+        assert accent in styles
+
+
 class IncomingDialogListClient(TuiStubClient):
     """listen_all emits one new DM after the initial dialog snapshot was rendered."""
 
