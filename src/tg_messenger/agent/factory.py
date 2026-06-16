@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
 
 from deepagents import create_deep_agent
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from tg_messenger.agent.config import AgentConfig, IntentSpec
 from tg_messenger.agent.orchestrator import Orchestrator
@@ -23,11 +25,21 @@ from tg_messenger.agent.outbound import OutboundTranslator
 from tg_messenger.agent.search import build_search_fn
 from tg_messenger.agent.suggest import ContextMessage, StyleProfile, Suggester
 from tg_messenger.agent.tools import make_telegram_tools
-from tg_messenger.agent.translate import Translator
+from tg_messenger.agent.translate import (
+    Translator,
+    get_cached_method,
+    set_cached_method,
+)
 from tg_messenger.core.languages import SUPPORTED_LANG_CODES_PROMPT, clean_supported_lang_code
 
 logger = logging.getLogger(__name__)
 MODEL_CALL_TIMEOUT_SECONDS = 30.0
+# Translation can run over a whole chat (up to N messages) with a slow reasoning model — give it
+# a generous, env-overridable ceiling instead of the 30s used for short chat/vision/classify calls.
+TRANSLATE_TIMEOUT_SECONDS = float(os.environ.get("TG_TRANSLATE_TIMEOUT", "600"))
+# A tiny, predictable probe request used to detect whether a model honours native json_schema
+# structured output (some OpenAI-compatible gateways silently ignore it and return prose).
+_PROBE_TIMEOUT_SECONDS = 30.0
 
 
 async def _ainvoke_with_timeout(model, messages):
@@ -74,14 +86,31 @@ VISION_SYSTEM_PROMPT = (
 )
 
 TRANSLATE_SYSTEM_PROMPT = (
-    "Translate Telegram messages into the target language. Return ONLY JSON: "
-    "[{\"id\": number, \"translation\": string|null}]. Use null when a message is "
-    "already in the target language or should not be translated.\n"
+    "Translate Telegram messages into the target language. Return a JSON object "
+    "{\"items\": [{\"id\": number, \"translation\": string|null}]} with one entry per input "
+    "message. Use null for translation when a message is already in the target language or should "
+    "not be translated.\n"
     "Detect each message's source language. If \"only_langs\" is a non-empty list, translate "
     "ONLY messages whose source language is one of those codes and return null for every other "
     "message. Otherwise, return null for any message whose source language is in \"skip_langs\". "
     "Language codes are ISO 639-1 (e.g. ru, en, es)."
 )
+
+
+class TranslationItem(BaseModel):
+    """One translated message: the source id and the translation (null = leave untranslated)."""
+
+    id: int = Field(description="The message id, copied verbatim from the input")
+    translation: str | None = Field(
+        default=None,
+        description="Translated text, or null if already in the target language / must not translate",
+    )
+
+
+class TranslationBatch(BaseModel):
+    """Structured-output container the translator model fills, one item per input message."""
+
+    items: list[TranslationItem] = Field(default_factory=list)
 
 OUTBOUND_VARIANTS_SYSTEM_PROMPT = (
     "Translate the user's draft into the target language. Produce up to 3 alternative "
@@ -184,8 +213,94 @@ def make_suggest_fn(model) -> Callable:
     return suggest
 
 
-def make_translate_fn(model) -> Callable:
-    """Batch translator over a plain ainvoke; injected into ``Translator``."""
+def _translate_messages(payload: dict) -> list:
+    """The system+human messages for one structured translate call."""
+    return [
+        SystemMessage(content=TRANSLATE_SYSTEM_PROMPT),
+        HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+    ]
+
+
+async def _structured_translate(structured_model, payload: dict) -> TranslationBatch | None:
+    """One structured call → a TranslationBatch, or None on timeout / error / unusable shape.
+
+    z.ai-style gateways may silently ignore the schema and return prose with HTTP 200; with
+    ``with_structured_output`` that surfaces as an exception or a None/garbage value here — either
+    way we return None so the caller can fall back to a more lenient method.
+    """
+    try:
+        async with asyncio.timeout(TRANSLATE_TIMEOUT_SECONDS):
+            result = await structured_model.ainvoke(_translate_messages(payload))
+    except Exception:
+        logger.warning("structured translate call failed", exc_info=True)
+        return None
+    if isinstance(result, TranslationBatch):
+        return result
+    # some providers hand back a dict when method="json_mode"
+    if isinstance(result, dict):
+        try:
+            return TranslationBatch.model_validate(result)
+        except Exception:
+            logger.warning("structured translate returned unvalidatable dict: %r", result)
+            return None
+    logger.warning("structured translate returned unexpected type %s", type(result).__name__)
+    return None
+
+
+def _batch_to_map(batch: TranslationBatch) -> dict[int, str | None]:
+    return {int(item.id): item.translation for item in batch.items}
+
+
+async def probe_structured_method(model) -> str:
+    """Detect whether ``model`` honours native json_schema structured output.
+
+    Sends one tiny json_schema request with a predictable input. If it comes back as a usable
+    ``TranslationBatch`` with items, the model supports json_schema; otherwise we fall back to
+    json_object (lenient JSON mode). Result is meant to be cached per model by the caller.
+    """
+    probe_payload = {
+        "target_lang": "en",
+        "skip_langs": [],
+        "only_langs": [],
+        "messages": [{"id": 1, "text": "hola"}],
+    }
+    try:
+        schema_model = model.with_structured_output(TranslationBatch, method="json_schema")
+    except Exception:
+        logger.info("model does not support json_schema structured output; using json_object")
+        return "json_object"
+    try:
+        async with asyncio.timeout(_PROBE_TIMEOUT_SECONDS):
+            result = await schema_model.ainvoke(_translate_messages(probe_payload))
+    except Exception:
+        logger.info("json_schema probe failed; using json_object", exc_info=True)
+        return "json_object"
+    batch = result if isinstance(result, TranslationBatch) else None
+    if batch is None and isinstance(result, dict):
+        try:
+            batch = TranslationBatch.model_validate(result)
+        except Exception:
+            batch = None
+    if batch is not None and batch.items:
+        logger.info("model supports json_schema structured output")
+        return "json_schema"
+    logger.info("json_schema probe returned no usable items; using json_object")
+    return "json_object"
+
+
+def make_translate_fn(model, method: str = "json_object") -> Callable:
+    """Structured-output translator over ``with_structured_output``; injected into ``Translator``.
+
+    ``method`` is chosen ahead of time by a probe (cached per model). A json_schema run that comes
+    back empty/None is retried once with json_object as a runtime safety net (in case the cached
+    probe is stale).
+    """
+    primary = model.with_structured_output(TranslationBatch, method=method)
+    fallback = (
+        model.with_structured_output(TranslationBatch, method="json_object")
+        if method == "json_schema"
+        else None
+    )
 
     async def translate(messages, target_lang: str, skip_langs=(), only_langs=()) -> dict[int, str | None]:
         payload = {
@@ -194,31 +309,15 @@ def make_translate_fn(model) -> Callable:
             "only_langs": list(only_langs),
             "messages": [{"id": int(mid), "text": text} for mid, text in messages],
         }
-        response = await _ainvoke_with_timeout(
-            model,
-            [
-                SystemMessage(content=TRANSLATE_SYSTEM_PROMPT),
-                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
-            ]
-        )
-        raw = _strip_json_fence(str(response.content))
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning("translator returned non-json content: %r", response.content)
+        batch = await _structured_translate(primary, payload)
+        if (batch is None or not batch.items) and fallback is not None:
+            logger.info("json_schema translate empty/failed; retrying json_object")
+            batch = await _structured_translate(fallback, payload)
+        if batch is None:
             return {}
-        if not isinstance(parsed, list):
-            logger.warning("translator returned non-list content: %r", response.content)
-            return {}
-        result: dict[int, str | None] = {}
-        for item in parsed:
-            if not isinstance(item, dict) or "id" not in item:
-                continue
-            translation = item.get("translation")
-            if translation is not None and not isinstance(translation, str):
-                continue
-            result[int(item["id"])] = translation
-        return result
+        return _batch_to_map(batch)
+
+    return translate
 
     return translate
 
@@ -305,9 +404,66 @@ def build_outbound(store, storage, model_name: str) -> OutboundTranslator:
     )
 
 
+async def resolve_translate_method(storage, model_name: str, model) -> str:
+    """The structured-output method for ``model_name``: cached in kv, else probe once and cache it.
+
+    z.ai-style gateways silently ignore json_schema (HTTP 200, prose), so detection is an ACTIVE
+    probe, not a try/except. The result is cached per model so we never probe twice.
+    """
+    cached = await get_cached_method(storage, model_name)
+    if cached is not None:
+        return cached
+    method = await probe_structured_method(model)
+    try:
+        await set_cached_method(storage, model_name, method)
+    except Exception:
+        logger.warning("failed to cache structured method for %s", model_name, exc_info=True)
+    return method
+
+
+def make_self_probing_translate_fn(storage, model_name: str, model) -> Callable:
+    """A translate_fn that resolves+caches its structured method on first use, then reuses it.
+
+    Building the Translator stays synchronous (no network at TUI startup); the one-time probe runs
+    lazily inside the event loop on the first real translation. After the UI explicitly probes a
+    freshly chosen model the method is already in kv, so this path just reads it.
+    """
+    state: dict[str, Callable] = {}
+
+    async def translate(messages, target_lang, skip_langs=(), only_langs=()):
+        fn = state.get("fn")
+        if fn is None:
+            method = await resolve_translate_method(storage, model_name, model)
+            fn = make_translate_fn(model, method)
+            state["fn"] = fn
+        return await fn(messages, target_lang, skip_langs, only_langs)
+
+    return translate
+
+
 def build_translator(storage, model_name: str) -> Translator:
+    """Build a Translator for ``model_name``. The structured-output method is probed lazily on the
+    first translation (and cached per model in kv), so construction stays synchronous and fast."""
     model = init_chat_model(model_name)
-    return Translator(storage=storage, translate_fn=make_translate_fn(model))
+    return Translator(
+        storage=storage,
+        translate_fn=make_self_probing_translate_fn(storage, model_name, model),
+    )
+
+
+async def build_translator_with_probe(storage, model_name: str) -> Translator:
+    """Build a Translator and probe the model's structured method UP FRONT (caching it in kv).
+
+    For the TUI 'pick a model' flow, which runs inside the event loop: constructing the model can
+    raise on a bad name / missing key, and the probe surfaces support immediately so the first real
+    translation isn't slowed by detection. Raises if the model can't be constructed.
+    """
+    model = init_chat_model(model_name)
+    await resolve_translate_method(storage, model_name, model)  # probe + cache now
+    return Translator(
+        storage=storage,
+        translate_fn=make_self_probing_translate_fn(storage, model_name, model),
+    )
 
 
 def build_suggester(client, cfg: AgentConfig, storage=None) -> Suggester:

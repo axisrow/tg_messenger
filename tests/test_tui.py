@@ -3930,15 +3930,33 @@ async def test_tui_settings_add_empty_name_is_noop():
 class StubTranslator:
     """Minimal Translator stand-in for AccountsScreen tests (no Storage, no LLM)."""
 
-    def __init__(self, settings=None):
-        self._settings = settings or {"mode": "off", "target": None, "known": [], "unknown": []}
+    _DEFAULTS = {
+        "mode": "off", "target": None, "known": [], "unknown": [],
+        "model": None, "max_messages": 100,
+    }
+
+    def __init__(self, settings=None, *, history=None):
+        merged = dict(self._DEFAULTS)
+        merged.update(settings or {})
+        self._settings = merged
         self.saved = []
+        self._history = list(history or [])
 
     async def get_settings(self):
         return dict(self._settings)
 
-    async def set_settings(self, *, mode, target=None, known=None, unknown=None):
-        self.saved.append({"mode": mode, "target": target, "known": known, "unknown": unknown})
+    async def set_settings(self, *, mode, target=None, known=None, unknown=None,
+                           model=None, max_messages=None):
+        self.saved.append({
+            "mode": mode, "target": target, "known": known, "unknown": unknown,
+            "model": model, "max_messages": max_messages,
+        })
+
+    async def max_messages(self):
+        return self._settings.get("max_messages") or 100
+
+    async def translate_history(self, dialog_id, messages):
+        return list(self._history) if self._history else list(messages)
 
 
 async def test_tui_footer_is_present_and_shows_help_and_settings():
@@ -4008,8 +4026,10 @@ async def test_tui_settings_saves_all_three_fields_independently():
         screen.query_one("#known-langs", Input).value = "ru, en"
         screen.query_one("#unknown-langs", Input).value = "ja, ko"
         await screen._save_translate_settings()
+        # the model/max fields round-trip from the loaded settings (max 100 was prefilled on load)
         assert translator.saved[-1] == {
             "mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": ["ja", "ko"],
+            "model": "", "max_messages": 100,
         }
 
 
@@ -4081,3 +4101,76 @@ async def test_tui_settings_fields_have_persistent_border_titles():
         target.value = "ru"
         await pilot.pause()
         assert str(target.border_title) == "Мой язык (на что переводить)"
+
+
+async def test_tui_settings_model_and_max_fields_present_and_loaded():
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({
+        "mode": "all_unknown", "target": "ru", "model": "openai:glm-5.1", "max_messages": 250,
+    })
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        model_field = screen.query_one("#translate-model", Input)
+        max_field = screen.query_one("#translate-max", Input)
+        assert model_field.value == "openai:glm-5.1"
+        assert max_field.value == "250"
+        assert str(model_field.border_title) == "Модель для перевода"
+        assert str(max_field.border_title) == "Сколько переводить за раз (Ctrl+T)"
+        # both Tab-reachable (never disabled — #133 discipline)
+        chain_ids = [getattr(w, "id", None) for w in screen.focus_chain]
+        assert "translate-model" in chain_ids and "translate-max" in chain_ids
+
+
+async def test_tui_settings_rejects_bad_max_without_saving():
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "all_unknown", "target": "ru"})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#translate-max", Input).value = "0"  # < 1
+        await screen._save_translate_settings()
+        assert translator.saved == []  # nothing persisted
+        screen.query_one("#translate-max", Input).value = "abc"  # not a number
+        await screen._save_translate_settings()
+        assert translator.saved == []
+
+
+async def test_tui_translate_all_without_dialog_notifies():
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "all_unknown", "target": "ru"})
+    app = MessengerTUI(
+        client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        notes = []
+        app.notify = lambda msg, **kw: notes.append((msg, kw.get("severity")))
+        app._current = None
+        app.action_translate_all()
+        await pilot.pause()
+        assert any("диалог" in m.lower() for m, _ in notes)
+
+
+async def test_tui_translate_all_without_translator_notifies():
+    store = FakeSessionStore(["alice"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        notes = []
+        app.notify = lambda msg, **kw: notes.append((msg, kw.get("severity")))
+        app._current = 123
+        app._translator = None
+        app.action_translate_all()
+        await pilot.pause()
+        assert any("переводчик" in m.lower() for m, _ in notes)

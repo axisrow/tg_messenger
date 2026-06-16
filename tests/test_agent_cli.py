@@ -197,27 +197,56 @@ def test_build_suggester_wires_model(monkeypatch):
     assert isinstance(suggester, Suggester)
 
 
-async def test_make_translate_fn_parses_fenced_json_and_null():
-    model = FakeModel(reply='```json\n[{"id": 1, "translation": "привет"}, {"id": 2, "translation": null}]\n```')
-    translate_fn = factory.make_translate_fn(model)
-    result = await translate_fn([(1, "hello"), (2, "ok")], "ru")
-    assert result == {1: "привет", 2: None}
-    rendered = "\n".join(str(m.content) for m in model.calls[0])
-    assert "target_lang" in rendered
+class _StructuredReply:
+    """A with_structured_output result whose ainvoke yields a fixed value or raises/hangs."""
+
+    def __init__(self, result):
+        self._result = result
+
+    async def ainvoke(self, messages):
+        if isinstance(self._result, Exception):
+            raise self._result
+        if self._result == "__hang__":
+            await asyncio.Event().wait()
+        return self._result
 
 
-async def test_make_translate_fn_garbage_returns_empty(caplog):
-    translate_fn = factory.make_translate_fn(FakeModel(reply="not json"))
-    with caplog.at_level(logging.WARNING, logger="tg_messenger.agent.factory"):
-        assert await translate_fn([(1, "hello")], "ru") == {}
-    assert any("translator returned non-json" in rec.message for rec in caplog.records)
+class StructuredModel:
+    """A model with a configurable structured output per method (json_schema / json_object)."""
+
+    def __init__(self, *, schema_result, json_result=None):
+        self._schema_result = schema_result
+        self._json_result = json_result if json_result is not None else schema_result
+        self.calls = []
+
+    def with_structured_output(self, schema, method):
+        self.calls.append(method)
+        return _StructuredReply(self._schema_result if method == "json_schema" else self._json_result)
 
 
-async def test_make_translate_fn_times_out(monkeypatch):
-    monkeypatch.setattr(factory, "MODEL_CALL_TIMEOUT_SECONDS", 0.01)
-    translate_fn = factory.make_translate_fn(HangingModel())
-    with pytest.raises(TimeoutError):
-        await translate_fn([(1, "hello")], "ru")
+async def test_make_translate_fn_maps_structured_items():
+    batch = factory.TranslationBatch(items=[
+        factory.TranslationItem(id=1, translation="привет"),
+        factory.TranslationItem(id=2, translation=None),
+    ])
+    model = StructuredModel(schema_result=batch)
+    translate_fn = factory.make_translate_fn(model, "json_object")
+    assert await translate_fn([(1, "hello"), (2, "ok")], "ru") == {1: "привет", 2: None}
+
+
+async def test_make_translate_fn_garbage_returns_empty():
+    # an unusable structured result (here: a non-batch type) yields no translations, never raises
+    model = StructuredModel(schema_result="not a batch")
+    translate_fn = factory.make_translate_fn(model, "json_object")
+    assert await translate_fn([(1, "hello")], "ru") == {}
+
+
+async def test_make_translate_fn_timeout_is_swallowed(monkeypatch):
+    # a hanging model is bounded by the translate timeout and yields {} (logged), not a TimeoutError
+    monkeypatch.setattr(factory, "TRANSLATE_TIMEOUT_SECONDS", 0.01)
+    model = StructuredModel(schema_result="__hang__")
+    translate_fn = factory.make_translate_fn(model, "json_object")
+    assert await translate_fn([(1, "hello")], "ru") == {}
 
 
 async def test_make_outbound_variants_fn_parses_array():
