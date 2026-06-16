@@ -4390,6 +4390,91 @@ async def test_tui_settings_hides_translate_section_without_translator():
         assert not screen.query("#translate-section")
 
 
+class StubSuggesterTUI:
+    """Minimal Suggester stand-in for AccountsScreen tests (no Storage, no LLM)."""
+
+    def __init__(self, settings=None):
+        self._settings = settings or {"enabled": True, "history": 30, "model": None}
+        self.saved = []
+
+    async def get_settings(self):
+        return dict(self._settings)
+
+    async def save_settings(self, *, enabled, history, model):
+        if history < 1:
+            raise ValueError("history must be positive")
+        self._settings = {"enabled": enabled, "history": history, "model": model}
+        self.saved.append(dict(self._settings))
+
+
+async def test_tui_settings_shows_suggest_section_when_suggester_wired():
+    store = FakeSessionStore(["alice"])
+    suggester = StubSuggesterTUI({"enabled": True, "history": 25, "model": "openai:gpt-4o"})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, suggester=suggester,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.pause()
+        assert screen.query("#suggest-section")
+        from textual.widgets import Switch
+        assert screen.query_one("#suggest-enabled", Switch).value is True
+        assert screen.query_one("#suggest-history", Input).value == "25"
+        assert screen.query_one("#suggest-model", Input).value == "openai:gpt-4o"
+
+
+async def test_tui_settings_disabled_load_does_not_spurious_save():
+    # #143 review: loading a stored enabled=False flips the Switch (compose default True),
+    # whose Changed fires ASYNC — must NOT be mistaken for a user toggle and auto-save.
+    store = FakeSessionStore(["alice"])
+    suggester = StubSuggesterTUI({"enabled": False, "history": 30, "model": None})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, suggester=suggester,
+        )
+        app.push_screen(screen)
+        # several pumps so the async Switch.Changed echo is delivered
+        await pilot.pause()
+        await pilot.pause()
+        await pilot.pause()
+        from textual.widgets import Switch
+        assert screen.query_one("#suggest-enabled", Switch).value is False
+        assert suggester.saved == []  # load alone never persists
+
+
+async def test_tui_settings_hides_suggest_section_without_suggester():
+    store = FakeSessionStore(["alice"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="alice", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        assert not screen.query("#suggest-section")
+
+
+async def test_tui_settings_saves_suggest_fields():
+    store = FakeSessionStore(["alice"])
+    suggester = StubSuggesterTUI()
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, suggester=suggester,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#suggest-history", Input).value = "12"
+        screen.query_one("#suggest-model", Input).value = "openai:gpt-4o"
+        await screen._save_suggest_settings()
+        assert suggester.saved[-1] == {"enabled": True, "history": 12, "model": "openai:gpt-4o"}
+
+
 async def test_tui_settings_saves_all_three_fields_independently():
     # the three fields each write their own setting — editing one never clobbers another
     store = FakeSessionStore(["alice"])
@@ -4811,3 +4896,49 @@ async def test_tui_no_disabled_notice_when_suggester_wired(monkeypatch):
         await pilot.pause()
         await pilot.pause()
     assert not any("Суфлёр" in m for m in notes)
+
+
+# --- #147: the 💡 hint renders with a suggester wired, and stays empty without one ---
+
+
+async def test_tui_suggest_hint_renders_with_suggester():
+    from tg_messenger.tui.app import SUGGEST_PREFIX
+
+    class FixedSuggester:
+        async def suggest(self, dialog_id):
+            return "Привет! Как дела?"
+
+    app = MessengerTUI(client=TuiStubClient(), suggester=FixedSuggester())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7  # Ann is a DM (kind="dm")
+        app._maybe_suggest(7)
+        await _pause_until(
+            pilot, lambda: SUGGEST_PREFIX in str(app.query_one("#suggestion", Static).render())
+        )
+        rendered = str(app.query_one("#suggestion", Static).render())
+        assert rendered == f"{SUGGEST_PREFIX}Привет! Как дела?"
+        assert app._pending_suggestion == "Привет! Как дела?"
+
+
+async def test_tui_suggest_strip_empty_without_suggester():
+    app = MessengerTUI(client=TuiStubClient())  # suggester=None
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        # pin the `_suggester is None` gate specifically: no suggest worker is even started
+        # (not merely that the draft happens to be empty). Spy on run_worker for group "suggest".
+        suggest_workers = []
+        real_run_worker = app.run_worker
+
+        def spy_run_worker(work, *a, **kw):
+            if kw.get("group") == "suggest":
+                suggest_workers.append(work)
+            return real_run_worker(work, *a, **kw)
+
+        app.run_worker = spy_run_worker  # type: ignore[method-assign]
+        app._maybe_suggest(7)  # no-op without a suggester
+        await pilot.pause()
+        assert suggest_workers == []  # the gate returned BEFORE scheduling any work
+        assert str(app.query_one("#suggestion", Static).render()) == ""
+        assert app._pending_suggestion is None

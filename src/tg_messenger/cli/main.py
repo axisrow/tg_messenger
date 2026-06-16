@@ -212,6 +212,25 @@ class _StorageBackedSuggester:
             if not self._connected:
                 await self._storage.connect()
                 self._connected = True
+                await self._apply_stored_model()
+
+    async def _apply_stored_model(self) -> None:
+        """Apply a persisted model override (#143) once storage is live.
+
+        Best-effort: a bad stored model is logged and the default model kept, so a
+        once-good-now-broken override never disables the suggester at startup.
+        """
+        from tg_messenger.agent.suggest import SUGGEST_MODEL_KEY
+
+        if not getattr(self._suggester, "supports_model_swap", False):
+            return
+        model = await self._storage.get_value(SUGGEST_MODEL_KEY)
+        if not model:
+            return
+        try:
+            self._suggester.set_suggest_fn(self._suggester.build_suggest_fn(str(model)))
+        except Exception as exc:
+            logger.warning("suggester model override %r ignored: %s", model, exc)
 
     async def suggest(self, dialog_id: int) -> str:
         await self._ensure_connected()
@@ -220,6 +239,36 @@ class _StorageBackedSuggester:
     async def learn(self, dialog_id: int):
         await self._ensure_connected()
         return await self._suggester.learn(dialog_id)
+
+    async def get_settings(self) -> dict:
+        """Read the live suggester settings (for the settings UI)."""
+        await self._ensure_connected()
+        from tg_messenger.agent.suggest import get_suggest_settings
+
+        return await get_suggest_settings(self._storage)
+
+    async def save_settings(self, *, enabled: bool, history: int, model: str | None) -> None:
+        """Persist settings and apply them live (validates the model before commit)."""
+        await self._ensure_connected()
+        from tg_messenger.agent.suggest import _coerce_history, set_suggest_settings
+
+        # Validate the cheap field (history) FIRST so a bad history doesn't trigger a
+        # wasted init_chat_model build; then validate/build the model BEFORE persisting,
+        # so a bad model never half-commits (mirrors the translator validate-then-commit).
+        history = _coerce_history(history)
+        supports_swap = getattr(self._suggester, "supports_model_swap", False)
+        new_fn = None
+        if model and supports_swap:
+            new_fn = self._suggester.build_suggest_fn(model)
+        await set_suggest_settings(
+            self._storage, enabled=enabled, history=history, model=model
+        )
+        if new_fn is not None:
+            self._suggester.set_suggest_fn(new_fn)
+        elif not model and supports_swap:
+            # the override was CLEARED — live-revert to the default model, else drafts
+            # keep using the previously-overridden model until restart (#143 review).
+            self._suggester.reset_suggest_fn()
 
     async def close(self) -> None:
         if self._connected:
@@ -1950,13 +1999,23 @@ def heartbeat_run(ctx: click.Context, session: str) -> None:
         register_heartbeat_migrations(storage)
         await storage.connect()
         await client.connect()
+        # #146: the суфлёр hook — let the Suggester compose each ping's text when the [agent]
+        # extra + TG_AGENT_MODEL are configured; None falls back to plan templates (heartbeat's
+        # built-in fallback also catches a per-ping failure, so this is best-effort).
+        suggester = make_optional_suggester(client, session=session)
+        text_provider = suggester.suggest if suggester is not None else None
         try:
             await _ensure_authorized(client, session)
-            click.echo("Heartbeat scheduler running — Ctrl+C to stop...")
+            click.echo(
+                "Heartbeat scheduler running — Ctrl+C to stop... "
+                f"(suggester text {'on' if text_provider else 'off — using templates'})"
+            )
             # сигнал «прочитал и молчит»: last_read пишется и здесь (#17/#19)
             async with _read_receipts_watcher(client, storage):
-                await HeartbeatService(client, storage).run()
+                await HeartbeatService(client, storage, text_provider=text_provider).run()
         finally:
+            if suggester is not None:
+                await suggester.close()
             await client.disconnect()
             await storage.close()
 

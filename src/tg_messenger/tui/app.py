@@ -29,6 +29,7 @@ from textual.widgets import (
     RadioButton,
     RadioSet,
     Static,
+    Switch,
     Tab,
     Tabs,
 )
@@ -50,6 +51,8 @@ logger = logging.getLogger(__name__)
 
 # shown before a draft in the suggestion strip; Tab accepts it into the composer
 SUGGEST_PREFIX = "💡 Tab: "
+# default context size for the suggester settings field (#143); mirrors suggest.DEFAULT_HISTORY_LIMIT
+DEFAULT_SUGGEST_HISTORY = 30
 ORIGINAL_SENTINEL = "__tg_messenger_original__"
 # #93: the per-message reaction presets — the same four as the web palette (chat.html).
 REACTION_PRESETS = ["👍", "❤️", "🔥", "😂"]
@@ -915,10 +918,14 @@ class AccountsScreen(ModalScreen[object]):
         "padding: 1 2; border: round $primary; background: $surface; } "
         "#translate-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
         "#translate-section RadioSet { height: auto; } "
+        "#suggest-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
+        "#suggest-enabled-row { height: auto; } "
+        "#suggest-enabled-row Label { padding: 1 1 0 0; } "
         # the field captions live in border_title, which inherits the (grey, blurred) border colour
         # and is nearly unreadable by default — give the translation inputs a visible border + a
         # bold accent caption so the labels stay legible whether the field is focused or not.
-        "#target-lang, #known-langs, #unknown-langs, #translate-model, #translate-max "
+        "#target-lang, #known-langs, #unknown-langs, #translate-model, #translate-max, "
+        "#suggest-history, #suggest-model "
         "{ border: round $primary; border-title-color: $accent; border-title-style: bold; }"
     )
 
@@ -938,7 +945,7 @@ class AccountsScreen(ModalScreen[object]):
     )
 
     def __init__(self, *, profiles, active, store, account_client_factory=None,
-                 login_session=None, translator=None):
+                 login_session=None, translator=None, suggester=None):
         super().__init__()
         # #121: profiles from list_profiles() are already canonical (sanitized stems); the active
         # name comes from the raw session_name, so canonicalize it ONCE here. Marker + delete guard
@@ -960,6 +967,15 @@ class AccountsScreen(ModalScreen[object]):
         # the model last loaded-from / saved-to storage; a save only re-probes/rebuilds the
         # Translator when this actually changes (an empty string means "fall back to env").
         self._applied_model: str = ""
+        # reply-suggester settings (#143) live on the injected Suggester (it owns its Storage).
+        # None means the [agent] extra / TG_AGENT_MODEL isn't configured — the section is hidden.
+        self._suggester = suggester
+        # the suggester model last loaded/saved; a save only rebuilds the suggest_fn on a real change.
+        self._applied_suggest_model: str = ""
+        # the enabled state last loaded/saved. Switch.Changed is delivered ASYNC (after the worker
+        # that set Switch.value returns), so a synchronous "loading" flag can't gate it — instead we
+        # save only when the toggled value DIFFERS from this, exactly like the translate _applied_mode.
+        self._applied_suggest_enabled: bool = True
 
     def compose(self) -> ComposeResult:
         with Vertical(id="accounts-box"):
@@ -997,10 +1013,27 @@ class AccountsScreen(ModalScreen[object]):
                     max_field.border_title = "Сколько переводить за раз (Ctrl+T)"
                     yield max_field
                     yield Label("Enter в поле — сохранить", id="translate-help")
+            # reply-suggester settings (#143) — only when a Suggester is wired ([agent] extra +
+            # TG_AGENT_MODEL). Loaded async in on_mount, like the translation section.
+            if self._suggester is not None:
+                with Vertical(id="suggest-section"):
+                    yield Label("Суфлёр ответов (💡)", id="suggest-title")
+                    with Horizontal(id="suggest-enabled-row"):
+                        yield Label("Подсказывать ответы")
+                        yield Switch(value=True, id="suggest-enabled")
+                    history_field = Input(placeholder="напр. 30", id="suggest-history")
+                    history_field.border_title = "Сколько сообщений контекста"
+                    yield history_field
+                    suggest_model_field = Input(placeholder="напр. openai:gpt-4o", id="suggest-model")
+                    suggest_model_field.border_title = "Модель суфлёра (пусто = по умолчанию)"
+                    yield suggest_model_field
+                    yield Label("Enter в поле — сохранить", id="suggest-help")
 
     def on_mount(self) -> None:
         if self._translator is not None:
             self.run_worker(self._load_translate_settings(), exclusive=False)
+        if self._suggester is not None:
+            self.run_worker(self._load_suggest_settings(), exclusive=False)
 
     async def _load_translate_settings(self) -> None:
         if self._translator is None:
@@ -1149,11 +1182,70 @@ class AccountsScreen(ModalScreen[object]):
             return None
         return new_translator
 
+    async def _load_suggest_settings(self) -> None:
+        if self._suggester is None:
+            return
+        try:
+            settings = await self._suggester.get_settings()
+        except Exception:
+            logger.exception("settings: failed to load suggester settings")
+            return
+        enabled = bool(settings.get("enabled", True))
+        # record the loaded value FIRST so the async Switch.Changed echo is recognised as the load,
+        # not a user toggle, and doesn't auto-save (the synchronous flag couldn't — Changed fires later).
+        self._applied_suggest_enabled = enabled
+        self.query_one("#suggest-enabled", Switch).value = enabled
+        self.query_one("#suggest-history", Input).value = str(settings.get("history") or "")
+        model = settings.get("model") or ""
+        self.query_one("#suggest-model", Input).value = model
+        self._applied_suggest_model = model
+
+    async def _save_suggest_settings(self) -> None:
+        if self._suggester is None:
+            return
+        enabled = self.query_one("#suggest-enabled", Switch).value
+        history_raw = self.query_one("#suggest-history", Input).value.strip()
+        model = self.query_one("#suggest-model", Input).value.strip()
+        try:
+            history = int(history_raw) if history_raw else DEFAULT_SUGGEST_HISTORY
+        except ValueError:
+            self.notify("Контекст: введите число", severity="error")
+            return
+        model_changed = model != self._applied_suggest_model
+        if model_changed and model:
+            self.notify("Проверяю модель суфлёра…")
+        try:
+            # save_settings validates the model (building its suggest_fn) BEFORE persisting, so a bad
+            # model name raises here and nothing is half-committed (mirrors the translator ordering).
+            await self._suggester.save_settings(enabled=enabled, history=history, model=model or None)
+        except ValueError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        except Exception:
+            logger.exception("settings: failed to save suggester settings")
+            self.notify("Не удалось сохранить настройки суфлёра", severity="error")
+            return
+        self._applied_suggest_model = model
+        self._applied_suggest_enabled = enabled
+        self.notify("Настройки суфлёра сохранены")
+
+    def on_switch_changed(self, event: Switch.Changed) -> None:
+        if event.switch.id != "suggest-enabled":
+            return
+        # ignore the async echo of the programmatic load (value == what we just loaded) — only a
+        # genuine user toggle (differs from the applied state) should persist. Same shape as the
+        # translate RadioSet.Changed guard, which is timing-robust where a sync flag is not.
+        if event.value == self._applied_suggest_enabled:
+            return
+        self.run_worker(self._save_suggest_settings(), exclusive=True)
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # Enter in a translation field saves; the profile-name field keeps its add-account flow.
         if event.input.id in ("target-lang", "known-langs", "unknown-langs",
                                "translate-model", "translate-max"):
             self.run_worker(self._save_translate_settings(), exclusive=True)
+        elif event.input.id in ("suggest-history", "suggest-model"):
+            self.run_worker(self._save_suggest_settings(), exclusive=True)
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -2593,6 +2685,7 @@ class MessengerTUI(App):
                 store=store,
                 account_client_factory=self._account_client_factory,
                 translator=self._translator,
+                suggester=self._suggester,
             )
         )
         if result is not None:
