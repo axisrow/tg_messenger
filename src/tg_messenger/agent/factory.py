@@ -487,7 +487,9 @@ def make_suggest_fn_factory() -> Callable:
 
 def build_suggester(client, cfg: AgentConfig, storage=None) -> Suggester:
     factory = make_suggest_fn_factory()
-    model = init_chat_model(cfg.model)
+    # #158: prefer the suggester-specific (typically faster) model; fall back to the main model.
+    # A stored `suggest_model` kv override (#143) is applied later and still wins over this default.
+    model = init_chat_model(cfg.suggest_model or cfg.model)
     return Suggester(
         client=client,
         suggest_fn=make_suggest_fn(model),

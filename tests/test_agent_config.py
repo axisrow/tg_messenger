@@ -157,6 +157,23 @@ def test_vision_model_without_colon_raises_with_format_example():
         AgentConfig.from_env({**VALID_ENV, "TG_AGENT_VISION_MODEL": "gpt-5-vision"})
 
 
+# --- #158: TG_SUGGEST_MODEL (a separate, faster model for the suggester) ---
+
+
+def test_suggest_model_unset_is_none():
+    assert AgentConfig.from_env(VALID_ENV).suggest_model is None
+
+
+def test_suggest_model_parsed():
+    cfg = AgentConfig.from_env({**VALID_ENV, "TG_SUGGEST_MODEL": "openai:glm-5-turbo"})
+    assert cfg.suggest_model == "openai:glm-5-turbo"
+
+
+def test_suggest_model_without_colon_raises_with_format_example():
+    with pytest.raises(ValueError, match=r"TG_SUGGEST_MODEL.*provider:model"):
+        AgentConfig.from_env({**VALID_ENV, "TG_SUGGEST_MODEL": "glm-5-turbo"})
+
+
 # --- Цикл 23: кастомные интенты из agent.json ---
 
 TRANSLATE = {
