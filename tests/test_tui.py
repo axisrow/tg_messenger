@@ -2380,6 +2380,70 @@ async def test_tui_send_echo_not_suppressed_when_navigated_away_mid_send():
         assert any("hi" in str(b.render()) for b in app.query(MessageBubble))
 
 
+class OutgoingEchoWhileAwayClient(TuiStubClient):
+    """The dangerous interleaving (Codex local review, PR #161): send_text enqueues the self-echo
+    so listen_outgoing() yields it WHILE _touch_dialog_for_message is awaiting AND the user has
+    navigated away (peer != _current). The echo arrives while the dedup key is still armed, so
+    _drain_outgoing drops it; the send path's else-branch must still pop the key so the message is
+    not suppressed forever. A second (resync) echo on return must then render via _drain_outgoing.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._echo_q: asyncio.Queue = asyncio.Queue()
+
+    async def send_text(self, peer, text, reply_to=None):
+        self.sent.append((peer, text, reply_to))
+        self.sent_event.set()
+        msg = Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
+                      date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        # echo the just-sent message back immediately — yielded DURING the send's own
+        # _touch_dialog_for_message await (which suspends across several loop turns)
+        await self._echo_q.put(OutgoingEvent(dialog_id=peer, message=msg))
+        return msg
+
+    def resync_echo(self, peer):
+        """Simulate Telegram re-echoing the message after a reconnect/resync."""
+        self._echo_q.put_nowait(OutgoingEvent(
+            dialog_id=peer,
+            message=Message(id=2, dialog_id=peer, sender_id=1, out=True, text="hi",
+                            date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+        ))
+
+    async def listen_outgoing(self):
+        while True:
+            yield await self._echo_q.get()
+
+
+async def test_tui_navigated_away_echo_during_await_is_not_permanently_suppressed():
+    # Codex local-review regression (PR #161): the echo races in DURING the send await while the
+    # user is on another dialog. The armed key dedups that first echo (no spurious bubble in the
+    # away view), but the else-branch pop must leave _sent_ids un-armed so the message is NOT
+    # suppressed forever — a later resync echo renders it on return. The existing navigated-away
+    # test only fires the echo AFTER the pop; this covers the dangerous interleaving.
+    stub = OutgoingEchoWhileAwayClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _select_dialog(pilot, app, 7)
+        app._current = 8  # navigated away during the in-flight send
+        await app._send_text(7, "hi")  # echo enqueued during the _touch_dialog await
+        for _ in range(5):  # let the racing echo be consumed by _drain_outgoing
+            await pilot.pause()
+        # end state: the key was popped (bubble not drawn), so the echo is recoverable, not lost
+        assert (7, 2) not in app._sent_ids
+        # no away-view bubble was duplicated for dialog 8
+        assert not any("hi" in str(b.render()) for b in app.query(MessageBubble))
+
+        # back in dialog 7, a resync echo must now render via the _drain_outgoing fallback
+        await _select_dialog(pilot, app, 7)
+        stub.resync_echo(7)
+        await _pause_until(
+            pilot, lambda: any("hi" in str(b.render()) for b in app.query(MessageBubble))
+        )
+        assert any("hi" in str(b.render()) for b in app.query(MessageBubble))
+
+
 class LongHistorySendClient(TuiStubClient):
     """A dialog with enough history that the pane scrolls — so a freshly-sent bubble appended at
     the bottom is below the viewport unless the scroll reaches the recomputed end (#160 r3)."""
