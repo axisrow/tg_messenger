@@ -1230,21 +1230,24 @@ class MessengerTUI(App):
         scrollbar-size-vertical: 0;
         scrollbar-size-horizontal: 0;
     }
-    /* the whole-chat translate (Ctrl+T) status — centered container: accent label + animated dots */
+    /* the whole-chat translate (Ctrl+T) status — centered container: accent label + animated dots.
+       both children take the full container width and center their own content, so the label and
+       the dots are vertically stacked AND horizontally aligned to the same centre line. */
     #messages .translate-status {
         width: 1fr;
         height: 1fr;
         align: center middle;
     }
     #messages .translate-status-label {
-        width: auto;
+        width: 1fr;
         text-align: center;
         color: $accent;
         text-style: bold;
     }
     #messages .translate-status LoadingIndicator {
-        width: auto;
+        width: 1fr;
         height: auto;
+        content-align-horizontal: center;
     }
     /* #113/#118: each message is a framed, shrink-wrapped card. The in/out asymmetry is now a
        PROPORTIONAL alignment of the bubble inside a full-width BubbleRow (align-horizontal),
