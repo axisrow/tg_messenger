@@ -4942,3 +4942,89 @@ async def test_tui_suggest_strip_empty_without_suggester():
         assert suggest_workers == []  # the gate returned BEFORE scheduling any work
         assert str(app.query_one("#suggestion", Static).render()) == ""
         assert app._pending_suggestion is None
+
+
+# --- #155: Ctrl+G suggests a reply for the OPEN dialog on demand (history, no new incoming) ---
+
+
+async def test_tui_ctrl_g_suggests_for_open_dm():
+    from tg_messenger.tui.app import SUGGEST_PREFIX
+
+    class FixedSuggester:
+        async def suggest(self, dialog_id):
+            return "Конечно, давай завтра!"
+
+    app = MessengerTUI(client=TuiStubClient(), suggester=FixedSuggester())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7  # Ann is a DM (kind="dm"); opened from history, no live incoming
+        app.action_suggest_reply()
+        await _pause_until(
+            pilot, lambda: SUGGEST_PREFIX in str(app.query_one("#suggestion", Static).render())
+        )
+        assert app._pending_suggestion == "Конечно, давай завтра!"
+
+
+async def test_tui_ctrl_g_notifies_without_suggester():
+    app = MessengerTUI(client=TuiStubClient())  # suggester=None
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    suggest_workers = []
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        real_run_worker = app.run_worker
+
+        def spy_run_worker(work, *a, **kw):
+            if kw.get("group") == "suggest":
+                suggest_workers.append(work)
+            return real_run_worker(work, *a, **kw)
+
+        app.run_worker = spy_run_worker  # type: ignore[method-assign]
+        app.action_suggest_reply()
+        await pilot.pause()
+    assert suggest_workers == []  # no work scheduled
+    assert any("Суфлёр" in m for m in notes)  # the user got feedback, not silence
+
+
+async def test_tui_ctrl_g_dm_only_notifies_in_group():
+    class RecordingSuggester:
+        def __init__(self):
+            self.calls = []
+
+        async def suggest(self, dialog_id):
+            self.calls.append(dialog_id)
+            return "draft"
+
+    suggester = RecordingSuggester()
+    app = MessengerTUI(client=TuiStubClient(), suggester=suggester)
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        # -100200 ("Devs") is a real group in the stub dialog list, so the REAL DM-detection
+        # (_kind_for_rendering → "group") must reject it — no monkeypatch, faithful end-to-end check.
+        app._current = -100200
+        app.action_suggest_reply()
+        await pilot.pause()
+    assert suggester.calls == []  # never asked for a draft in a group
+    assert any("личных сообщениях" in m for m in notes)
+
+
+async def test_tui_ctrl_g_notifies_on_empty_draft():
+    # an explicit Ctrl+G that yields no draft must give feedback (silence reads as "key did
+    # nothing"); the auto-path stays a silent no-op (notify_empty defaults to False).
+    class EmptySuggester:
+        async def suggest(self, dialog_id):
+            return ""
+
+    app = MessengerTUI(client=TuiStubClient(), suggester=EmptySuggester())
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7  # Ann, a DM
+        app.action_suggest_reply()
+        await _pause_until(pilot, lambda: any("не предложил" in m for m in notes))
+        assert app._pending_suggestion is None  # nothing pending on an empty draft
+        assert str(app.query_one("#suggestion", Static).render()) == ""

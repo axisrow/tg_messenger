@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Footer,
@@ -914,6 +914,9 @@ class AccountsScreen(ModalScreen[object]):
     # #116-parity: a centered, bordered card (the box geometry mirrors the other modals).
     DEFAULT_CSS = (
         "AccountsScreen { align: center middle; } "
+        # VerticalScroll: keep the card sized to its content (height auto) but capped at 80% of the
+        # screen; past that it scrolls instead of clipping the trailing suggester section. Override
+        # VerticalScroll's default height: 1fr so an empty-ish card doesn't balloon to full height.
         "#accounts-box { width: 60%; max-width: 64; height: auto; max-height: 80%; "
         "padding: 1 2; border: round $primary; background: $surface; } "
         "#translate-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
@@ -978,7 +981,11 @@ class AccountsScreen(ModalScreen[object]):
         self._applied_suggest_enabled: bool = True
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="accounts-box"):
+        # VerticalScroll (not a plain Vertical): once profiles + translate + suggester sections
+        # exceed max-height the card must SCROLL, and the scroll container has to be focusable so
+        # arrow/page keys actually move it — a bare Vertical with overflow-y clips the last section
+        # (the suggester settings) below the card edge and swallows scroll keys into the background.
+        with VerticalScroll(id="accounts-box"):
             yield Label("Аккаунты", id="accounts-title")
             yield ListView(
                 *(AccountItem(p, p == self._active) for p in self._profiles),
@@ -1379,6 +1386,12 @@ class MessengerTUI(App):
         # (`translate_all`, bound above) — non-printable + priority, so it fires from inside the
         # composer or a read-only channel where the composer is disabled.
         Binding("t", "toggle_auto_translate", "Авто-перевод", show=True),
+        # #155: suggest a reply for the OPEN DM on demand. The automatic 💡 hint only fires on a
+        # NEW incoming message (_drain_incoming); opening a DM with existing history never triggers
+        # it, so the suggester felt dead when reading an already-delivered message. Ctrl+G generates
+        # a draft for the current dialog. Non-printable + priority so it fires from inside the
+        # composer too (like Ctrl+T), without stealing a literal key typed into a message.
+        Binding("ctrl+g", "suggest_reply", "Подсказать ответ", priority=True, show=True),
     ]
 
     CSS = """
@@ -2574,6 +2587,33 @@ class MessengerTUI(App):
             return  # don't suggest over a draft the user is writing
         self.run_worker(self._suggest(dialog_id), group="suggest", exclusive=True)
 
+    def action_suggest_reply(self) -> None:
+        """Ctrl+G — suggest a reply for the OPEN dialog on demand (#155).
+
+        The automatic 💡 hint only fires on a new incoming message; this lets the user
+        ask for a draft while reading already-delivered history. Same guards as
+        _maybe_suggest, but each rejection NOTIFIES (the user pressed a key and expects
+        feedback) instead of silently no-opping.
+        """
+        if self._suggester is None:
+            self.notify("Суфлёр не настроен", severity="warning")
+            return
+        if self._current is None:
+            self.notify("Сначала откройте диалог", severity="warning")
+            return
+        # _kind_for_rendering prefers the kind captured at open time (_current_kind), so the DM
+        # check stays correct even after a tab switch (e.g. to Archive) drops the open dialog from
+        # _all_dialogs — without it Ctrl+G would wrongly reject a DM as "not a DM" there.
+        if self._kind_for_rendering(self._current) != "dm":
+            self.notify("Суфлёр работает только в личных сообщениях", severity="warning")
+            return
+        if self.query_one("#composer", Input).value:
+            self.notify("Очистите поле ввода — черновик не перезаписывается", severity="warning")
+            return
+        self.run_worker(
+            self._suggest(self._current, notify_empty=True), group="suggest", exclusive=True
+        )
+
     def _is_dm_dialog(self, dialog_id: int) -> bool:
         return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
 
@@ -2615,7 +2655,7 @@ class MessengerTUI(App):
                 return getattr(dialog, "telegram_lang_code", None)
         return None
 
-    async def _suggest(self, dialog_id: int) -> None:
+    async def _suggest(self, dialog_id: int, *, notify_empty: bool = False) -> None:
         try:
             draft = await self._suggester.suggest(dialog_id)
         except Exception:
@@ -2623,6 +2663,11 @@ class MessengerTUI(App):
             return
         # the user may have switched dialogs or started typing while we waited
         if dialog_id != self._current or self.query_one("#composer", Input).value:
+            return
+        # Ctrl+G is an explicit request, so an empty draft (suggester off / nothing to add) gets a
+        # toast — silence would read as "the key did nothing". The auto-path passes notify_empty=False.
+        if not draft and notify_empty:
+            self.notify("Суфлёр не предложил ответ", severity="warning")
             return
         self._pending_suggestion = draft
         self.query_one("#suggestion", Static).update(f"{SUGGEST_PREFIX}{draft}" if draft else "")
