@@ -2601,13 +2601,18 @@ class MessengerTUI(App):
         if self._current is None:
             self.notify("Сначала откройте диалог", severity="warning")
             return
-        if not self._is_dm_dialog(self._current):
+        # _kind_for_rendering prefers the kind captured at open time (_current_kind), so the DM
+        # check stays correct even after a tab switch (e.g. to Archive) drops the open dialog from
+        # _all_dialogs — without it Ctrl+G would wrongly reject a DM as "not a DM" there.
+        if self._kind_for_rendering(self._current) != "dm":
             self.notify("Суфлёр работает только в личных сообщениях", severity="warning")
             return
         if self.query_one("#composer", Input).value:
             self.notify("Очистите поле ввода — черновик не перезаписывается", severity="warning")
             return
-        self.run_worker(self._suggest(self._current), group="suggest", exclusive=True)
+        self.run_worker(
+            self._suggest(self._current, notify_empty=True), group="suggest", exclusive=True
+        )
 
     def _is_dm_dialog(self, dialog_id: int) -> bool:
         return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
@@ -2650,7 +2655,7 @@ class MessengerTUI(App):
                 return getattr(dialog, "telegram_lang_code", None)
         return None
 
-    async def _suggest(self, dialog_id: int) -> None:
+    async def _suggest(self, dialog_id: int, *, notify_empty: bool = False) -> None:
         try:
             draft = await self._suggester.suggest(dialog_id)
         except Exception:
@@ -2658,6 +2663,11 @@ class MessengerTUI(App):
             return
         # the user may have switched dialogs or started typing while we waited
         if dialog_id != self._current or self.query_one("#composer", Input).value:
+            return
+        # Ctrl+G is an explicit request, so an empty draft (suggester off / nothing to add) gets a
+        # toast — silence would read as "the key did nothing". The auto-path passes notify_empty=False.
+        if not draft and notify_empty:
+            self.notify("Суфлёр не предложил ответ", severity="warning")
             return
         self._pending_suggestion = draft
         self.query_one("#suggestion", Static).update(f"{SUGGEST_PREFIX}{draft}" if draft else "")

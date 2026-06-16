@@ -5002,10 +5002,29 @@ async def test_tui_ctrl_g_dm_only_notifies_in_group():
     app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
     async with app.run_test() as pilot:
         await _pause_until(pilot, lambda: app._started)
-        app._current = -100200  # a group id — suggester is DM-only
-        # force the dialog to be seen as a non-DM regardless of stub dialog list
-        app._is_dm_dialog = lambda did: False  # type: ignore[method-assign]
+        # -100200 ("Devs") is a real group in the stub dialog list, so the REAL DM-detection
+        # (_kind_for_rendering → "group") must reject it — no monkeypatch, faithful end-to-end check.
+        app._current = -100200
         app.action_suggest_reply()
         await pilot.pause()
     assert suggester.calls == []  # never asked for a draft in a group
     assert any("личных сообщениях" in m for m in notes)
+
+
+async def test_tui_ctrl_g_notifies_on_empty_draft():
+    # an explicit Ctrl+G that yields no draft must give feedback (silence reads as "key did
+    # nothing"); the auto-path stays a silent no-op (notify_empty defaults to False).
+    class EmptySuggester:
+        async def suggest(self, dialog_id):
+            return ""
+
+    app = MessengerTUI(client=TuiStubClient(), suggester=EmptySuggester())
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7  # Ann, a DM
+        app.action_suggest_reply()
+        await _pause_until(pilot, lambda: any("не предложил" in m for m in notes))
+        assert app._pending_suggestion is None  # nothing pending on an empty draft
+        assert str(app.query_one("#suggestion", Static).render()) == ""
