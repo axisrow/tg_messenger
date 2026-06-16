@@ -1498,13 +1498,12 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 continue
                             if result.status == "error":
                                 # prepare timed out or failed — surface why, then offer the original
-                                # (the coordinator collapses timeout and other failures into "error")
-                                click.echo(
-                                    f"{result.error or 'translation failed'} — send original?",
-                                    err=True,
-                                )
+                                # (the coordinator collapses timeout and other failures into "error").
+                                # The "send original?" question lives in the prompt below, not here,
+                                # so the line isn't asked twice.
+                                click.echo(result.error or "перевод не удался", err=True)
                                 confirm = await asyncio.to_thread(
-                                    input, "перевод не удался, отправить оригинал? [y/N] "
+                                    input, "отправить оригинал? [y/N] "
                                 )
                                 if confirm.strip().lower() not in {"y", "yes", "д", "да"}:
                                     continue
