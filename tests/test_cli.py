@@ -828,6 +828,35 @@ def test_chat_outbound_ready_cancel_sends_nothing(runner, monkeypatch):
     assert stub.sent == []
 
 
+def test_chat_outbound_ready_negative_index_cancels(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+    # a negative index must cancel, never send variants[-2] (Python negative indexing does
+    # NOT raise IndexError, so "-1" with two variants would otherwise pick the wrong one)
+    coord = _patch_coordinator(
+        monkeypatch, _PrepareResult(status="ready", variants=["hi", "hello"], token="tok")
+    )
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n-1\n")
+    assert result.exit_code == 0, result.output
+    assert coord.sent_variants == [] and coord.sent_originals == []
+    assert stub.sent == []
+    assert "cancelled." in result.output
+
+
+def test_chat_outbound_ready_out_of_range_index_cancels(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+    # an index above [N+1] original is out of range → cancel (here 9 with 2 variants + original)
+    coord = _patch_coordinator(
+        monkeypatch, _PrepareResult(status="ready", variants=["hi", "hello"], token="tok")
+    )
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n9\n")
+    assert result.exit_code == 0, result.output
+    assert coord.sent_variants == [] and coord.sent_originals == []
+    assert stub.sent == []
+    assert "cancelled." in result.output
+
+
 def test_chat_outbound_not_applicable_sends_original_silently(runner, monkeypatch):
     r, stub = runner
     stub.listen_interrupt = False

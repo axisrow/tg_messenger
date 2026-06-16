@@ -1532,10 +1532,16 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 sent_ids.append((dialog_id, msg.id))
                                 continue
                             try:
-                                picked = variants[int(choice) - 1]
-                            except (ValueError, IndexError):
+                                idx = int(choice)
+                            except ValueError:
                                 click.echo("cancelled.", err=True)
                                 continue
+                            # require an in-range 1-based index — negative ints index from the end
+                            # in Python (variants[-2] etc.), so guard the bound explicitly
+                            if not 1 <= idx <= len(variants):
+                                click.echo("cancelled.", err=True)
+                                continue
+                            picked = variants[idx - 1]
                             try:
                                 msg = await coordinator.send_variant(
                                     dialog_id, result.token, picked, _coord_send,
