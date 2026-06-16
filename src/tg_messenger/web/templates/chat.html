@@ -69,7 +69,8 @@
       <span id="reply-banner-text"></span>
       <button type="button" id="reply-cancel" title="Cancel reply">✕</button>
     </div>
-    <form id="composer" hx-post="/send" hx-target="#messages" hx-swap="beforeend">
+    <form id="composer" hx-post="/send" hx-target="#messages" hx-swap="beforeend"
+          hx-headers='{"X-TG-Messenger-CSRF": "1"}'>
       <input type="hidden" name="dialog_id" id="dialog_id" value="">
       <input type="hidden" name="web_client_id" id="web_client_id" value="">
       <input type="hidden" name="outbound_nonce" id="outbound_nonce" value="">
@@ -125,7 +126,12 @@
           return;
         }
         if (data.type === 'translation') {
-          const msg = document.querySelector('.msg[data-id="' + CSS.escape(String(data.message_id)) + '"]');
+          // #125-A5: match BOTH data-dialog AND data-id — message ids collide across dialogs, so
+          // matching id alone can attach a translation under a same-id bubble of a previously-open
+          // dialog still lingering in the DOM (the #95/#96 race the reaction path already guards).
+          const msg = document.querySelector(
+            '.msg[data-dialog="' + CSS.escape(String(id)) + '"]' +
+            '[data-id="' + CSS.escape(String(data.message_id)) + '"]');
           if (msg && !msg.querySelector('.translation')) {
             const line = document.createElement('div');
             line.className = 'translation';
@@ -177,7 +183,9 @@
       fd.append('file', file);
       fd.append('caption', document.getElementById('composer-text').value);
       fd.append('web_client_id', webClientId);
-      const resp = await fetch('/dialogs/' + id + '/media', { method: 'POST', body: fd });
+      const resp = await fetch('/dialogs/' + id + '/media', {
+        method: 'POST', body: fd, headers: { 'X-TG-Messenger-CSRF': '1' },
+      });
       const html = await resp.text();
       if (resp.ok) {
         // Clear THIS upload's compose state (clearComposeState only touches the visible
@@ -312,7 +320,8 @@
       fd.append('web_client_id', webClientId);
       const resp = await fetch('/dialogs/' + encodeURIComponent(dialogId) + '/reaction', {
         method: 'POST',
-        body: fd
+        body: fd,
+        headers: { 'X-TG-Messenger-CSRF': '1' },
       });
       if (resp.ok) {
         // #106: the server returns 204 (no body); the optimistic attach is client-side via the

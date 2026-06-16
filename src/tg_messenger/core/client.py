@@ -869,9 +869,17 @@ class StandaloneTelegramClient:
 
     async def _on_reaction(self, update) -> None:
         try:
+            reactions = getattr(update, "reactions", None)
+            # #125-A1: Telegram fires UpdateMessageReactions on REMOVAL too — then BOTH
+            # recent_reactions and the aggregate results are empty. Publishing a None-emoticon
+            # event there is indistinguishable from a genuine custom/premium reaction, so every
+            # UI renders a permanent fake "<custom>". Suppress the no-reactions (removal) state;
+            # a real custom reaction (results/recent non-empty, emoticon unreadable) still emits.
+            if self._is_reaction_cleared(reactions):
+                return
             peer = getattr(update, "peer", None)
             dialog_id = int(tl_utils.get_peer_id(peer)) if peer is not None else 0
-            emoticon = self._recent_emoticon(getattr(update, "reactions", None))
+            emoticon = self._recent_emoticon(reactions)
             self._bus_reactions.publish(
                 ReactionEvent(
                     dialog_id=dialog_id,
@@ -883,6 +891,17 @@ class StandaloneTelegramClient:
         except Exception:
             # unknown update shape: log and skip, never break the stream
             logger.warning("failed to handle reaction update — skipping", exc_info=True)
+
+    @staticmethod
+    def _is_reaction_cleared(reactions) -> bool:
+        """True when the update carries NO reactions at all (the last one was removed).
+
+        Both ``recent_reactions`` and the aggregate ``results`` empty/absent == a removal.
+        Distinguished from a custom/premium reaction, where one of them is non-empty.
+        """
+        recent = getattr(reactions, "recent_reactions", None) or []
+        results = getattr(reactions, "results", None) or []
+        return not recent and not results
 
     @staticmethod
     def _recent_emoticon(reactions) -> str | None:

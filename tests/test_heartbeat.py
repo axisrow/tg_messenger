@@ -13,6 +13,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+import pytest
+from pydantic import ValidationError
+
 from tg_messenger.core.heartbeat import (
     HeartbeatPlan,
     HeartbeatService,
@@ -35,6 +38,33 @@ def _msg(text="hi", *, out=False, dialog_id=PEER, msg_id=1):
         id=msg_id, dialog_id=dialog_id, sender_id=(1 if out else dialog_id), out=out,
         text=text, date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     )
+
+
+# --- #125-A7: model validation (fail-fast on out-of-range plan values) ----------------
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"interval_hours": 0},
+        {"interval_hours": -1},
+        {"jitter_minutes": -1},
+        {"max_per_day": 0},
+        {"max_per_day": -1},
+        {"quiet_start": 24},
+        {"quiet_start": -1},
+        {"quiet_end": 25},
+    ],
+)
+def test_heartbeat_plan_rejects_out_of_range(kwargs):
+    with pytest.raises(ValidationError):
+        HeartbeatPlan(peer=PEER, templates=["ping"], **kwargs)
+
+
+def test_heartbeat_plan_accepts_valid_edges():
+    # boundary-valid values build fine
+    HeartbeatPlan(peer=PEER, templates=["ping"], interval_hours=0.5, max_per_day=1,
+                  jitter_minutes=0, quiet_start=0, quiet_end=23)
 
 
 # --- цикл 100: storage слой ----------------------------------------------------------
@@ -336,6 +366,51 @@ async def test_send_error_keeps_loop_alive(tmp_path, caplog):
         with caplog.at_level(logging.ERROR):
             await svc.process_plans(now=t["now"])  # must not raise
         assert any("heartbeat" in r.message.lower() for r in caplog.records)
+    finally:
+        await storage.close()
+
+
+async def test_send_failure_does_not_re_fire_next_tick(tmp_path, caplog):
+    # #125-A8: the ping is recorded BEFORE the send. A send that fails after the record must
+    # NOT re-fire on the next interval (last_ping_at was advanced) — bounded, non-spammy pings.
+    class BoomClient(FakeHbClient):
+        async def send_text(self, peer, text, reply_to=None, schedule=None):
+            raise RuntimeError("network down")
+
+    svc, client, storage, t = _mk_service(tmp_path, client=BoomClient())
+    await storage.connect()
+    try:
+        await add_plan(storage, HeartbeatPlan(peer=PEER, templates=["a"], interval_hours=24.0))
+        with caplog.at_level(logging.ERROR):
+            await svc.process_plans(now=1000.0)  # send raises, but record already persisted
+        plan = (await list_plans(storage))[0]
+        assert plan.last_ping_at == 1000.0  # advanced despite the send failure
+        assert plan.pings_today == 1
+        # the next interval is now consumed — a tick just past one interval does NOT re-fire
+        await svc.process_plans(now=1000.0 + 24 * 3600.0 - 1)
+        assert plan.pings_today == 1  # unchanged: not due again yet
+    finally:
+        await storage.close()
+
+
+async def test_record_write_failure_aborts_send(tmp_path):
+    # #125-A8: if the durable record write itself fails, we must NOT send — process_plans logs
+    # and continues, nothing is sent for that plan.
+    class RecordBoomStorage(Storage):
+        async def execute(self, sql, params=()):
+            if sql.startswith("UPDATE heartbeat_plans SET last_ping_at"):
+                raise RuntimeError("db write failed")
+            return await super().execute(sql, params)
+
+    storage = RecordBoomStorage(tmp_path / "hb.db")
+    register_heartbeat_migrations(storage)
+    client = FakeHbClient()
+    svc = HeartbeatService(client, storage, clock=lambda: 0.0, rng=lambda a, b: 0.0)
+    await storage.connect()
+    try:
+        await add_plan(storage, HeartbeatPlan(peer=PEER, templates=["a"], interval_hours=24.0))
+        await svc.process_plans(now=1000.0)  # record write boom -> caught, no send
+        assert client.sent == []
     finally:
         await storage.close()
 

@@ -202,7 +202,13 @@ async def client_app():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        # #125-A2: the legit same-origin client always sends the CSRF header on write routes;
+        # default it here so existing POST tests exercise the authorised path. Dedicated tests
+        # below POST WITHOUT it to assert the 403 guard on /send, /reaction, /media.
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"X-TG-Messenger-CSRF": "1"},
+        ) as ac:
             yield ac, stub
 
 
@@ -396,7 +402,8 @@ async def test_messages_mark_read_does_not_block_response():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await asyncio.wait_for(ac.get("/dialogs/7/messages"), timeout=1)
             assert r.status_code == 200
             assert "hi" in r.text
@@ -417,7 +424,8 @@ async def test_messages_empty_history_does_not_mark_read():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.get("/dialogs/7/messages")
             await asyncio.sleep(0)
     assert r.status_code == 200
@@ -437,7 +445,8 @@ async def test_messages_mark_read_failure_does_not_break(caplog):
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             with caplog.at_level(logging.WARNING):
                 r = await ac.get("/dialogs/7/messages")
                 await asyncio.sleep(0)
@@ -498,6 +507,45 @@ async def test_reaction_endpoint_rejects_empty_emoticon(client_app):
     r = await ac.post("/dialogs/7/reaction", data={"message_id": "10", "emoticon": "   "})
     assert r.status_code == 400
     assert stub.reactions == []
+
+
+# --- #125-A2: same-origin (CSRF) guard on the write routes ---
+
+
+async def test_send_without_csrf_header_is_rejected(client_app):
+    ac, stub = client_app
+    r = await ac.post("/send", data={"dialog_id": "7", "text": "hi"},
+                      headers={"X-TG-Messenger-CSRF": ""})
+    assert r.status_code == 403
+    assert stub.sent == []
+
+
+async def test_reaction_without_csrf_header_is_rejected(client_app):
+    ac, stub = client_app
+    r = await ac.post("/dialogs/7/reaction", data={"message_id": "10", "emoticon": "👍"},
+                      headers={"X-TG-Messenger-CSRF": ""})
+    assert r.status_code == 403
+    assert stub.reactions == []
+
+
+async def test_media_without_csrf_header_is_rejected(client_app):
+    ac, stub = client_app
+    r = await ac.post(
+        "/dialogs/7/media",
+        files={"file": ("pic.jpg", b"binarydata", "image/jpeg")},
+        headers={"X-TG-Messenger-CSRF": ""},
+    )
+    assert r.status_code == 403
+    assert stub.sent == []
+
+
+async def test_write_routes_reject_cross_origin(client_app):
+    # header present but Origin mismatched → 403 (a cross-origin form that managed to set both)
+    ac, stub = client_app
+    r = await ac.post("/send", data={"dialog_id": "7", "text": "hi"},
+                      headers={"Origin": "http://evil.example"})
+    assert r.status_code == 403
+    assert stub.sent == []
 
 
 async def test_media_upload_calls_send_media(client_app):
@@ -573,7 +621,8 @@ async def test_dialog_li_marks_readonly_channel():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.get("/dialogs?tab=groups")
     assert 'data-can-send="0"' in r.text  # the read-only channel
     assert 'data-can-send="1"' in r.text  # the writable group
@@ -585,7 +634,8 @@ async def test_send_to_readonly_channel_returns_403():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post("/send", data={"dialog_id": "-100123", "text": "x"})
     assert r.status_code == 403
     assert stub.sent == []
@@ -599,7 +649,8 @@ async def test_reaction_in_readonly_channel_succeeds():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post("/dialogs/-100123/reaction",
                               data={"message_id": "5", "emoticon": "👍"})
     assert r.status_code == 204, r.text  # #106: 204, attach is client-side
@@ -616,7 +667,8 @@ async def test_reaction_maps_send_forbidden_error_to_403():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post("/dialogs/7/reaction",
                               data={"message_id": "1", "emoticon": "👍"})
     assert r.status_code == 403
@@ -637,7 +689,8 @@ async def test_media_in_readonly_channel_returns_403_without_temp_file(monkeypat
 
     monkeypatch.setattr(web_app.tempfile, "NamedTemporaryFile", spy)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/-100123/media",
                 files={"file": ("pic.jpg", b"binarydata", "image/jpeg")},
@@ -656,7 +709,8 @@ async def test_send_maps_send_forbidden_error_to_403():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post("/send", data={"dialog_id": "7", "text": "hi"})
     assert r.status_code == 403
     # #92: the body carries Telegram's specific reason (HTML-escaped), not a fixed line
@@ -675,7 +729,8 @@ async def test_send_forbidden_surfaces_raw_text_in_403_body():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post("/send", data={"dialog_id": "7", "text": "hi"})
     assert r.status_code == 403
     assert "privacy settings do not allow" in r.text
@@ -689,7 +744,8 @@ async def test_send_permissive_when_dialog_lookup_fails():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post("/send", data={"dialog_id": "7", "text": "hi"})
     assert r.status_code == 200, r.text
     assert stub.sent == [(7, "hi", None)]
@@ -705,7 +761,8 @@ async def test_media_upload_unlink_failure_does_not_mask_response(monkeypatch, c
 
     monkeypatch.setattr(web_app.os, "unlink", fail_unlink)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             with caplog.at_level("WARNING", logger="tg_messenger.web.app"):
                 r = await ac.post(
                     "/dialogs/7/media",
@@ -716,6 +773,41 @@ async def test_media_upload_unlink_failure_does_not_mask_response(monkeypatch, c
     assert r.status_code == 200
     assert stub.sent == [(7, "media", "look")]
     assert any("failed to remove temporary upload" in rec.message for rec in caplog.records)
+
+
+async def test_media_upload_read_exception_mid_stream_unlinks_temp(monkeypatch):
+    # #125-A3: if file.read() raises mid-stream (ClientDisconnect / CancelledError), the temp
+    # file (created with delete=False) must STILL be unlinked — the streaming phase is now inside
+    # the cleanup finally. Without the fix it leaks (disk-exhaustion vector).
+    from starlette.datastructures import UploadFile as StarletteUploadFile
+
+    unlinked: list[str] = []
+    orig_unlink = web_app.os.unlink
+
+    def spy_unlink(path):
+        unlinked.append(path)
+        return orig_unlink(path)
+
+    async def boom_read(self, size=-1):
+        raise RuntimeError("client disconnected mid-stream")
+
+    monkeypatch.setattr(web_app.os, "unlink", spy_unlink)
+    monkeypatch.setattr(StarletteUploadFile, "read", boom_read)
+
+    stub = WebStubClient()
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
+            r = await ac.post(
+                "/dialogs/7/media",
+                files={"file": ("pic.jpg", b"binarydata", "image/jpeg")},
+            )
+    assert r.status_code == 500  # the read exception propagates after cleanup
+    assert stub.sent == []  # never sent
+    assert len(unlinked) == 1  # the temp file was cleaned up despite the mid-stream abort
+    assert not web_app.os.path.exists(unlinked[0])
 
 
 async def test_profiles_route_lists_saved_profiles(monkeypatch, tmp_path):
@@ -732,7 +824,8 @@ async def test_profiles_route_lists_saved_profiles(monkeypatch, tmp_path):
     app = build_app(client=stub, session_name="bob")
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.get("/profiles")
     assert r.status_code == 200
     assert "alice" in r.text
@@ -755,7 +848,8 @@ async def test_unauthorized_session_redirects_to_tg_login():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.get("/dialogs", follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == "/tg-login"
@@ -771,7 +865,8 @@ async def test_unhandled_error_returns_500_fragment_and_is_logged(caplog):
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             with caplog.at_level("ERROR", logger="tg_messenger.web.app"):
                 r = await ac.get("/dialogs")
     assert r.status_code == 500
@@ -792,7 +887,8 @@ async def test_flood_wait_returns_503_with_hint():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.get("/dialogs")
     assert r.status_code == 503
     assert "flood wait" in r.text.lower()
@@ -1143,7 +1239,8 @@ async def test_stream_does_not_skip_message_sent_by_other_web_client():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post("/send", data={"dialog_id": "7", "text": "from a", "web_client_id": "a"})
 
         assert r.status_code == 200
@@ -1174,7 +1271,8 @@ async def test_stream_skips_reaction_echo_sent_by_same_web_client():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/reaction",
                 data={"message_id": "51", "emoticon": "👍", "web_client_id": "a"},
@@ -1210,7 +1308,8 @@ async def test_stream_does_not_skip_reaction_sent_by_other_web_client():
     app = build_app(client=stub)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/reaction",
                 data={"message_id": "51", "emoticon": "👍", "web_client_id": "a"},
@@ -1262,6 +1361,8 @@ async def suggest_app():
     app = build_app(client=stub, suggester=suggester)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
+        # NO default CSRF header here: suggest tests pass SUGGEST_HEADERS explicitly, and the
+        # csrf-required / GET-rejection tests assert the guard fires without it.
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
             yield ac, suggester
 
@@ -1273,7 +1374,8 @@ async def translation_app():
     app = build_app(client=stub, translator=translator)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             yield ac, translator
 
 
@@ -1296,7 +1398,8 @@ async def test_language_settings_post_invalid_code_returns_400():
     app = build_app(client=stub, translator=RejectingTranslator())
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post("/settings/lang", data={"code": "fr"}, headers=SUGGEST_HEADERS)
     assert r.status_code == 400
     assert "invalid language code" in r.text
@@ -1327,7 +1430,8 @@ async def test_outbound_endpoint_returns_variants():
     app = build_app(client=stub, outbound=WebOutboundStub())
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/outbound",
                 data={"text": "привет", "web_client_id": "browser-a"},
@@ -1358,7 +1462,8 @@ async def test_outbound_endpoint_blank_text_is_invalid_empty():
     app = build_app(client=stub, outbound=outbound)
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/outbound",
                 data={"text": "   ", "web_client_id": "browser-a"},
@@ -1376,7 +1481,8 @@ async def test_outbound_endpoint_passes_dialog_telegram_lang_hint():
     app = build_app(client=stub, outbound=outbound)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/outbound",
                 data={"text": "привет", "web_client_id": "browser-a"},
@@ -1392,7 +1498,8 @@ async def test_outbound_endpoint_rejects_unknown_dialog_before_llm():
     app = build_app(client=stub, outbound=outbound)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/999/outbound",
                 data={"text": "привет", "web_client_id": "browser-a"},
@@ -1408,7 +1515,8 @@ async def test_outbound_endpoint_dialog_lookup_failure_returns_503_without_llm()
     app = build_app(client=FailingDialogsClient(), outbound=outbound)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/outbound",
                 data={"text": "привет", "web_client_id": "browser-a"},
@@ -1501,7 +1609,8 @@ async def test_send_without_nonce_ignores_untrusted_source_text():
     app = build_app(client=stub, store=store)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/send",
                 data={"dialog_id": "7", "text": "hello", "source_text": "привет"},
@@ -1516,7 +1625,8 @@ async def test_outbound_endpoint_disabled_status_when_unconfigured():
     app = build_app(client=stub, outbound=None)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/outbound",
                 data={"text": "привет"},
@@ -1531,7 +1641,8 @@ async def test_outbound_endpoint_not_applicable_status():
     app = build_app(client=stub, outbound=WebOutboundNotApplicableStub())
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/outbound",
                 data={"text": "hello"},
@@ -1547,7 +1658,8 @@ async def test_send_with_valid_outbound_nonce_records_source_once():
     app = build_app(client=stub, store=store, outbound=WebOutboundStub())
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             outbound = await ac.post(
                 "/dialogs/7/outbound",
                 data={"text": "привет", "web_client_id": "browser-a"},
@@ -1586,7 +1698,8 @@ async def test_send_with_wrong_dialog_outbound_nonce_does_not_send_or_record():
     app = build_app(client=stub, store=store, outbound=WebOutboundStub())
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             outbound = await ac.post(
                 "/dialogs/7/outbound",
                 data={"text": "привет", "web_client_id": "browser-a"},
@@ -1614,7 +1727,8 @@ async def test_send_with_expired_outbound_nonce_does_not_send_or_record():
     async with app.router.lifespan_context(app):
         # force every issued token to be already expired (#73: TTL is on the coordinator)
         app.state.outbound_coordinator._token_ttl = -1
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             outbound = await ac.post(
                 "/dialogs/7/outbound",
                 data={"text": "привет", "web_client_id": "browser-a"},
@@ -1639,7 +1753,8 @@ async def test_outbound_lang_invalid_code_returns_400():
     app = build_app(client=stub, outbound=WebOutboundWithStorage())
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/lang",
                 data={"code": "english"},
@@ -1655,7 +1770,8 @@ async def test_outbound_lang_saves_code_and_enabled_flag():
     app = build_app(client=stub, outbound=outbound)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/lang",
                 data={"code": "EN", "enabled": "off"},
@@ -1674,7 +1790,8 @@ async def test_outbound_lang_rejects_unknown_dialog_without_write():
     app = build_app(client=stub, outbound=outbound)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/999/lang",
                 data={"code": "en", "enabled": "off"},
@@ -1689,7 +1806,8 @@ async def test_outbound_lang_dialog_lookup_failure_returns_503_without_write():
     app = build_app(client=FailingDialogsClient(), outbound=outbound)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/lang",
                 data={"code": "en", "enabled": "off"},
@@ -1704,7 +1822,8 @@ async def test_outbound_lang_rolls_back_when_enabled_write_fails():
     app = build_app(client=WebStubClient(), outbound=outbound)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post(
                 "/dialogs/7/lang",
                 data={"code": "en", "enabled": "off"},
@@ -1721,7 +1840,7 @@ async def test_outbound_lang_requires_csrf_header():
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-            r = await ac.post("/dialogs/7/lang", data={"code": "en"})
+            r = await ac.post("/dialogs/7/lang", data={"code": "en"})  # no CSRF header
     assert r.status_code == 403
 
 
@@ -1730,7 +1849,8 @@ async def test_outbound_lang_missing_outbound_returns_503():
     app = build_app(client=stub, outbound=None)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.post("/dialogs/7/lang", data={"code": "en"}, headers=SUGGEST_HEADERS)
     assert r.status_code == 503
 
@@ -1741,7 +1861,7 @@ async def test_outbound_endpoint_csrf_failure_returns_json():
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-            r = await ac.post("/dialogs/7/outbound", data={"text": "привет"})
+            r = await ac.post("/dialogs/7/outbound", data={"text": "привет"})  # no CSRF header
     assert r.status_code == 403
     assert r.headers["content-type"].startswith("application/json")
     assert r.json()["applies"] is False
@@ -1765,7 +1885,8 @@ async def test_outbound_endpoint_timeout_returns_json(monkeypatch):
     app = build_app(client=stub, outbound=HangingOutbound())
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await asyncio.wait_for(
                 ac.post(
                     "/dialogs/7/outbound",
@@ -1940,6 +2061,17 @@ async def test_index_attaches_reaction_under_message(client_app):
     assert "pendingReactions" in r.text  # the per-dialog buffer for the swap race
     assert "function drainPendingReactions(" in r.text  # replays buffered reactions after mount
     assert "addEventListener('htmx:afterSettle'" in r.text  # drains once #messages has swapped in
+
+
+async def test_sse_translation_branch_matches_both_dialog_and_id(client_app):
+    # #125-A5: the SSE translation frame must locate its bubble by BOTH data-dialog AND data-id,
+    # not id alone — ids collide across dialogs and a frame can land mid-dialog-switch.
+    ac, _ = client_app
+    r = await ac.get("/")
+    # the translation branch builds the selector from the in-scope stream dialog `id`
+    assert "'.msg[data-dialog=\"' + CSS.escape(String(id)) + '\"]'" in r.text
+    # and the CSRF header is wired on the write routes (composer form + media/reaction fetch)
+    assert 'hx-headers=\'{"X-TG-Messenger-CSRF": "1"}\'' in r.text
 
 
 async def test_index_has_cross_dialog_reaction_toast(client_app):
@@ -2128,7 +2260,8 @@ def _login_app(session, *, web_pass=None, save_hook=None):
 async def _login_client(app):
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             yield ac
 
 
@@ -2372,7 +2505,8 @@ async def test_unauthorized_routes_redirect_to_tg_login():
     app = build_app(client=stub, login_session=FakeLoginSession())
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.get("/dialogs", follow_redirects=False)
     assert r.status_code in (302, 303)
     assert r.headers["location"] == "/tg-login"
@@ -2384,7 +2518,8 @@ async def test_tg_login_behind_web_pass():
     app = _login_app(FakeLoginSession(), web_pass="s3cret")
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test",
+                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             r = await ac.get("/tg-login", headers={"accept": "text/html"},
                              follow_redirects=False)
     assert r.status_code == 302

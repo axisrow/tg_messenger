@@ -1586,10 +1586,14 @@ def worker(ctx: click.Context, session: str, factory_url: str | None, types: str
                 f"Worker polling {factory_url} for {', '.join(task_types)} "
                 f"(prompt tasks {'on' if agent is not None else 'off'}; Ctrl+C to stop)..."
             )
-            await Worker(
-                client, factory, types=task_types, sleep=_sleep, idle_sleep=interval,
-                agent=agent,
-            ).run()
+            # #125-A6: the factory owns its httpx.AsyncClient (http=None) — close it via
+            # `async with` so the process doesn't leak the connection / emit "Unclosed
+            # AsyncClient" ResourceWarning on shutdown (mirrors agent/tools.py).
+            async with factory:
+                await Worker(
+                    client, factory, types=task_types, sleep=_sleep, idle_sleep=interval,
+                    agent=agent,
+                ).run()
         finally:
             await client.disconnect()
 
@@ -1827,14 +1831,18 @@ def heartbeat() -> None:
 @heartbeat.command("plan")
 @click.argument("peer", type=int)
 @click.option("--at", "at", default=None, help="One-shot HH:MM (server-side scheduled send).")
-@click.option("--interval", "interval_hours", type=float, default=None,
+@click.option("--interval", "interval_hours",
+              type=click.FloatRange(min=0, min_open=True), default=None,
               help="Recurring: hours between pings (stores a plan).")
 @click.option("--template", "templates", multiple=True, help="Ping text (repeatable).")
-@click.option("--jitter", "jitter_minutes", type=float, default=0.0,
+@click.option("--jitter", "jitter_minutes", type=click.FloatRange(min=0), default=0.0,
               help="Random +0..N minutes added to each interval.")
-@click.option("--quiet-start", type=int, default=None, help="Quiet window open hour (local).")
-@click.option("--quiet-end", type=int, default=None, help="Quiet window close hour (local).")
-@click.option("--max-per-day", type=int, default=1, help="Daily ping cap (recurring plans).")
+@click.option("--quiet-start", type=click.IntRange(0, 23), default=None,
+              help="Quiet window open hour (local).")
+@click.option("--quiet-end", type=click.IntRange(0, 23), default=None,
+              help="Quiet window close hour (local).")
+@click.option("--max-per-day", type=click.IntRange(min=1), default=1,
+              help="Daily ping cap (recurring plans).")
 @click.option("--session", default="default")
 @click.pass_context
 def heartbeat_plan(ctx: click.Context, peer: int, at: str | None, interval_hours: float | None,

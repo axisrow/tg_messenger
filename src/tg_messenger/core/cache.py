@@ -35,6 +35,11 @@ class TTLCache(Generic[K, V]):
         self._store: OrderedDict[K, tuple[V, float]] = OrderedDict()
         # per-key (lock, in-flight waiter count); the last waiter out drops the entry
         self._locks: dict[K, list] = {}
+        # #125-A4: per-key monotonic generation. Bumped by every invalidate*/that targets the
+        # key — INCLUDING a key present only as an in-flight fetch (not yet in _store).
+        # get_or_fetch snapshots it before the await and refuses to cache a value computed
+        # against a superseded generation, so an invalidation racing the fetch is not defeated.
+        self._epochs: dict[K, int] = {}
 
     def get(self, key: K, default=None):
         entry = self._store.get(key)
@@ -53,23 +58,52 @@ class TTLCache(Generic[K, V]):
             self._store.move_to_end(key)
         self._store[key] = (value, self._clock() + self._ttl)
         while len(self._store) > self._maxsize:
-            self._store.popitem(last=False)
+            oldest, _ = self._store.popitem(last=False)
+            self._prune_epoch(oldest)
+
+    def _bump_epoch(self, key: K) -> None:
+        """Advance a key's generation — any in-flight fetch for it is now stale (#125-A4)."""
+        self._epochs[key] = self._epochs.get(key, 0) + 1
+
+    def _prune_epoch(self, key: K) -> None:
+        """Drop a key's epoch once nothing references it (not stored, no in-flight fetch).
+
+        Keeps ``_epochs`` bounded as keys churn. Safe because a re-created key restarts at 0:
+        ``get_or_fetch`` always re-snapshots the epoch under the lock right before the fetch,
+        so a fresh key can never collide with a stale snapshot.
+        """
+        if key not in self._store and key not in self._locks:
+            self._epochs.pop(key, None)
 
     def invalidate(self, key: K | None = None) -> None:
-        """Drop one key, or everything when ``key`` is None. Missing key is a no-op."""
+        """Drop one key, or everything when ``key`` is None. Missing key is a no-op.
+
+        Bumps the epoch of every affected key (stored or not) so an invalidation racing an
+        in-flight fetch defeats the post-fetch ``set()`` (#125-A4).
+        """
         if key is None:
+            # every in-flight fetch (for ANY key) is now stale
+            for k in list(self._epochs):
+                self._epochs[k] += 1
             self._store.clear()
         else:
+            self._bump_epoch(key)
             self._store.pop(key, None)
+            self._prune_epoch(key)
 
     def invalidate_if(self, predicate: Callable[[K], bool]) -> None:
-        """Drop every key for which ``predicate(key)`` is true.
+        """Drop every key for which ``predicate(key)`` is true, and bump its epoch.
 
-        Collects keys first, then deletes — never mutates the dict mid-iteration.
+        Considers stored keys AND keys present only as an in-flight fetch (in ``_locks`` /
+        ``_epochs``), so an invalidation racing a not-yet-stored fetch still invalidates it.
+        Collects keys first, then mutates — never mutates a dict mid-iteration.
         """
-        doomed = [k for k in self._store if predicate(k)]
+        candidates = set(self._store) | set(self._locks) | set(self._epochs)
+        doomed = [k for k in candidates if predicate(k)]
         for k in doomed:
+            self._bump_epoch(k)
             self._store.pop(k, None)
+            self._prune_epoch(k)
 
     async def get_or_fetch(self, key: K, fetch: Callable[[], Awaitable[V]]) -> V:
         """Return the cached value or fetch it, coalescing concurrent misses.
@@ -77,6 +111,9 @@ class TTLCache(Generic[K, V]):
         A per-key lock serialises misses on the same key; the value is
         double-checked under the lock so only the first waiter calls ``fetch``.
         A failing ``fetch`` propagates, is not cached, and releases its lock.
+        #125-A4: if ``invalidate``/``invalidate_if`` bumps this key's epoch DURING the
+        fetch, the freshly-fetched value is returned to the caller but NOT cached
+        (the invalidation wins — the next read re-fetches).
         """
         hit = self.get(key, _MISSING)
         if hit is not _MISSING:
@@ -92,10 +129,16 @@ class TTLCache(Generic[K, V]):
                 hit = self.get(key, _MISSING)
                 if hit is not _MISSING:
                     return hit  # type: ignore[return-value]
+                # snapshot the generation BEFORE the await; a concurrent invalidate* of this
+                # key bumps it and we then refuse to cache the stale result.
+                epoch = self._epochs.get(key, 0)
                 value = await fetch()
-                self.set(key, value)
+                if self._epochs.get(key, 0) == epoch:
+                    self.set(key, value)
+                # else: invalidated mid-fetch — return the fresh value uncached.
                 return value
         finally:
             entry[1] -= 1
             if entry[1] <= 0:
                 self._locks.pop(key, None)  # last one out — a failed fetch too
+                self._prune_epoch(key)  # epoch is dead once no fetch references it

@@ -1436,14 +1436,59 @@ async def test_reaction_custom_emoji_maps_to_none(fake_client):
     assert out.emoticon is None
 
 
+async def test_reaction_removal_publishes_no_phantom_event(fake_client):
+    # #125-A1: Telegram fires UpdateMessageReactions on REMOVAL too (recent_reactions AND
+    # results both empty). Publishing a None-emoticon event there is indistinguishable from a
+    # real custom reaction → UIs render a permanent fake "<custom>". A removal must be SUPPRESSED.
+    client = _build(fake_client)
+    await client.connect()
+    received: list[ReactionEvent] = []
+
+    async def consume():
+        async for ev in client.listen_reactions():
+            received.append(ev)
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0)
+    # both recent_reactions and results empty == the last reaction was removed
+    reactions = FakeMessageReactions(results=[], recent_reactions=[])
+    await fake_client.push_event(FakeReactionUpdate(PeerUser(7), msg_id=55, reactions=reactions))
+    await asyncio.sleep(0)
+    # also the all-None shape (no attributes at all) is a removal/no-reaction state
+    await fake_client.push_event(FakeReactionUpdate(PeerUser(7), msg_id=55, reactions=None))
+    await asyncio.sleep(0)
+    task.cancel()
+    assert received == []  # no phantom reaction event for a removal
+
+
+async def test_reaction_custom_still_published_when_results_present(fake_client):
+    # #125-A1 guard: a genuine custom/premium reaction (results show a reaction but no readable
+    # standard emoticon) must STILL publish with emoticon=None — only a true removal is suppressed.
+    client = _build(fake_client)
+    await client.connect()
+
+    class CustomReaction:  # ReactionCustomEmoji — no .emoticon attribute
+        document_id = 12345
+
+    reactions = FakeMessageReactions(
+        results=[FakeReactionResult(CustomReaction())],
+        recent_reactions=[FakeRecentReaction(CustomReaction())],
+    )
+    upd = FakeReactionUpdate(PeerUser(7), msg_id=56, reactions=reactions)
+    out = await _collect_one(client.listen_reactions, fake_client.push_event, upd)
+    assert out.emoticon is None
+
+
 async def test_reaction_unknown_structure_is_warned_not_raised(fake_client, caplog):
     client = _build(fake_client)
     await client.connect()
 
-    # _raw_update routes it, but accessing msg_id explodes → warning, no crash
+    # _raw_update routes it, the update is non-empty (not a removal) but accessing msg_id
+    # explodes → warning, no crash
     class Broken:
         _raw_update = True
         peer = None
+        reactions = FakeMessageReactions(results=[FakeReactionResult(FakeReaction("👍"))])
 
         @property
         def msg_id(self):
