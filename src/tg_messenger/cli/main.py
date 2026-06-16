@@ -254,14 +254,19 @@ class _StorageBackedSuggester:
 
         # Validate/build the model BEFORE persisting so a bad model never half-commits
         # (mirrors the translator's _validate_model-then-commit ordering).
+        supports_swap = getattr(self._suggester, "supports_model_swap", False)
         new_fn = None
-        if model and getattr(self._suggester, "supports_model_swap", False):
+        if model and supports_swap:
             new_fn = self._suggester.build_suggest_fn(model)
         await set_suggest_settings(
             self._storage, enabled=enabled, history=history, model=model
         )
         if new_fn is not None:
             self._suggester.set_suggest_fn(new_fn)
+        elif not model and supports_swap:
+            # the override was CLEARED — live-revert to the default model, else drafts
+            # keep using the previously-overridden model until restart (#143 review).
+            self._suggester.reset_suggest_fn()
 
     async def close(self) -> None:
         if self._connected:

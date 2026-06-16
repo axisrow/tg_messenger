@@ -972,8 +972,10 @@ class AccountsScreen(ModalScreen[object]):
         self._suggester = suggester
         # the suggester model last loaded/saved; a save only rebuilds the suggest_fn on a real change.
         self._applied_suggest_model: str = ""
-        # guards the programmatic Switch toggle during load from firing a save (Switch.Changed is async).
-        self._loading_suggest = False
+        # the enabled state last loaded/saved. Switch.Changed is delivered ASYNC (after the worker
+        # that set Switch.value returns), so a synchronous "loading" flag can't gate it — instead we
+        # save only when the toggled value DIFFERS from this, exactly like the translate _applied_mode.
+        self._applied_suggest_enabled: bool = True
 
     def compose(self) -> ComposeResult:
         with Vertical(id="accounts-box"):
@@ -1188,11 +1190,11 @@ class AccountsScreen(ModalScreen[object]):
         except Exception:
             logger.exception("settings: failed to load suggester settings")
             return
-        self._loading_suggest = True
-        try:
-            self.query_one("#suggest-enabled", Switch).value = bool(settings.get("enabled", True))
-        finally:
-            self._loading_suggest = False
+        enabled = bool(settings.get("enabled", True))
+        # record the loaded value FIRST so the async Switch.Changed echo is recognised as the load,
+        # not a user toggle, and doesn't auto-save (the synchronous flag couldn't — Changed fires later).
+        self._applied_suggest_enabled = enabled
+        self.query_one("#suggest-enabled", Switch).value = enabled
         self.query_one("#suggest-history", Input).value = str(settings.get("history") or "")
         model = settings.get("model") or ""
         self.query_one("#suggest-model", Input).value = model
@@ -1224,10 +1226,16 @@ class AccountsScreen(ModalScreen[object]):
             self.notify("Не удалось сохранить настройки суфлёра", severity="error")
             return
         self._applied_suggest_model = model
+        self._applied_suggest_enabled = enabled
         self.notify("Настройки суфлёра сохранены")
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
-        if event.switch.id != "suggest-enabled" or self._loading_suggest:
+        if event.switch.id != "suggest-enabled":
+            return
+        # ignore the async echo of the programmatic load (value == what we just loaded) — only a
+        # genuine user toggle (differs from the applied state) should persist. Same shape as the
+        # translate RadioSet.Changed guard, which is timing-robust where a sync flag is not.
+        if event.value == self._applied_suggest_enabled:
             return
         self.run_worker(self._save_suggest_settings(), exclusive=True)
 

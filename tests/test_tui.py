@@ -4426,6 +4426,27 @@ async def test_tui_settings_shows_suggest_section_when_suggester_wired():
         assert screen.query_one("#suggest-model", Input).value == "openai:gpt-4o"
 
 
+async def test_tui_settings_disabled_load_does_not_spurious_save():
+    # #143 review: loading a stored enabled=False flips the Switch (compose default True),
+    # whose Changed fires ASYNC — must NOT be mistaken for a user toggle and auto-save.
+    store = FakeSessionStore(["alice"])
+    suggester = StubSuggesterTUI({"enabled": False, "history": 30, "model": None})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, suggester=suggester,
+        )
+        app.push_screen(screen)
+        # several pumps so the async Switch.Changed echo is delivered
+        await pilot.pause()
+        await pilot.pause()
+        await pilot.pause()
+        from textual.widgets import Switch
+        assert screen.query_one("#suggest-enabled", Switch).value is False
+        assert suggester.saved == []  # load alone never persists
+
+
 async def test_tui_settings_hides_suggest_section_without_suggester():
     store = FakeSessionStore(["alice"])
     app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)

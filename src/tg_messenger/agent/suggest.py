@@ -269,6 +269,10 @@ class Suggester:
     ):
         self._client = client
         self._suggest_fn = suggest_fn
+        # the original (env/default-model) contact — restored when a model override
+        # is CLEARED, so clearing live-reverts to the default instead of leaving the
+        # previously-overridden model active in-process (#143 review).
+        self._default_suggest_fn = suggest_fn
         self._storage = storage
         self._history_limit = history_limit
         # builds a fresh suggest_fn for a model name (factory.py owns init_chat_model);
@@ -313,6 +317,11 @@ class Suggester:
     def set_suggest_fn(self, suggest_fn) -> None:
         """Swap the model contact in place (used after a live model-override change)."""
         self._suggest_fn = suggest_fn
+
+    def reset_suggest_fn(self) -> None:
+        """Revert to the default (env/``TG_AGENT_MODEL``) contact — used when the
+        model override is cleared, so live drafts stop using the old override."""
+        self._suggest_fn = self._default_suggest_fn
 
     @property
     def supports_model_swap(self) -> bool:

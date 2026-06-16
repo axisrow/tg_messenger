@@ -64,6 +64,9 @@ class StubStorage:
     def register_migrations(self, statements):
         self.migrations.extend(statements)
 
+    async def get_value(self, key):
+        return None
+
     async def connect(self):
         self.connected += 1
 
@@ -247,3 +250,36 @@ def test_suggest_missing_model_friendly_error(monkeypatch, tmp_path):
     assert result.exit_code != 0
     assert "TG_AGENT_MODEL" in result.output
     assert "Traceback" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_storage_backed_save_clears_model_reverts_fn(monkeypatch):
+    """#143 review: clearing the model override live-reverts to the default fn."""
+    events = []
+
+    class SwapInner:
+        supports_model_swap = True
+
+        def build_suggest_fn(self, name):
+            return f"fn:{name}"
+
+        def set_suggest_fn(self, fn):
+            events.append(("set", fn))
+
+        def reset_suggest_fn(self):
+            events.append(("reset", None))
+
+    captured = {}
+
+    async def fake_set(storage, *, enabled, history, model):
+        captured["model"] = model
+
+    monkeypatch.setattr("tg_messenger.agent.suggest.set_suggest_settings", fake_set)
+
+    backed = cli_main._StorageBackedSuggester(SwapInner(), StubStorage())
+    # set an override → set_suggest_fn called
+    await backed.save_settings(enabled=True, history=30, model="openai:gpt-4o")
+    assert events[-1] == ("set", "fn:openai:gpt-4o")
+    # clear it → reset_suggest_fn called (revert to default), NOT left on the old override
+    await backed.save_settings(enabled=True, history=30, model=None)
+    assert events[-1] == ("reset", None)

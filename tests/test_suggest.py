@@ -406,3 +406,24 @@ def test_model_swap_seam():
     sug = Suggester(client=client, suggest_fn=fn, suggest_fn_factory=factory)
     assert sug.supports_model_swap is True
     sug.set_suggest_fn(sug.build_suggest_fn("openai:gpt-4o"))
+
+
+# --- #143 review: clearing the model override reverts to the default suggest_fn ---
+
+
+def test_reset_suggest_fn_reverts_to_default():
+    client = FakeClient([])
+
+    async def default_fn(ctx, prof):
+        return "DEFAULT"
+
+    def factory(name):
+        async def overridden(ctx, prof):
+            return f"OVERRIDE:{name}"
+        return overridden
+
+    sug = Suggester(client=client, suggest_fn=default_fn, suggest_fn_factory=factory)
+    # swap to an override, then clear → back to the default, not the override
+    sug.set_suggest_fn(sug.build_suggest_fn("openai:gpt-4o"))
+    sug.reset_suggest_fn()
+    assert sug._suggest_fn is default_fn
