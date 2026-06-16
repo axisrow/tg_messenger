@@ -212,6 +212,25 @@ class _StorageBackedSuggester:
             if not self._connected:
                 await self._storage.connect()
                 self._connected = True
+                await self._apply_stored_model()
+
+    async def _apply_stored_model(self) -> None:
+        """Apply a persisted model override (#143) once storage is live.
+
+        Best-effort: a bad stored model is logged and the default model kept, so a
+        once-good-now-broken override never disables the suggester at startup.
+        """
+        from tg_messenger.agent.suggest import SUGGEST_MODEL_KEY
+
+        if not getattr(self._suggester, "supports_model_swap", False):
+            return
+        model = await self._storage.get_value(SUGGEST_MODEL_KEY)
+        if not model:
+            return
+        try:
+            self._suggester.set_suggest_fn(self._suggester.build_suggest_fn(str(model)))
+        except Exception as exc:
+            logger.warning("suggester model override %r ignored: %s", model, exc)
 
     async def suggest(self, dialog_id: int) -> str:
         await self._ensure_connected()
@@ -220,6 +239,29 @@ class _StorageBackedSuggester:
     async def learn(self, dialog_id: int):
         await self._ensure_connected()
         return await self._suggester.learn(dialog_id)
+
+    async def get_settings(self) -> dict:
+        """Read the live suggester settings (for the settings UI)."""
+        await self._ensure_connected()
+        from tg_messenger.agent.suggest import get_suggest_settings
+
+        return await get_suggest_settings(self._storage)
+
+    async def save_settings(self, *, enabled: bool, history: int, model: str | None) -> None:
+        """Persist settings and apply them live (validates the model before commit)."""
+        await self._ensure_connected()
+        from tg_messenger.agent.suggest import set_suggest_settings
+
+        # Validate/build the model BEFORE persisting so a bad model never half-commits
+        # (mirrors the translator's _validate_model-then-commit ordering).
+        new_fn = None
+        if model and getattr(self._suggester, "supports_model_swap", False):
+            new_fn = self._suggester.build_suggest_fn(model)
+        await set_suggest_settings(
+            self._storage, enabled=enabled, history=history, model=model
+        )
+        if new_fn is not None:
+            self._suggester.set_suggest_fn(new_fn)
 
     async def close(self) -> None:
         if self._connected:

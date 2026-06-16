@@ -1038,6 +1038,61 @@ def build_app(
             return _error_response(str(exc), 400)
         return HTMLResponse(f'<div id="lang-status">Language: {escape(value or "unset")}</div>')
 
+    def _suggest_settings_form(settings: dict) -> str:
+        enabled = bool(settings.get("enabled", True))
+        history = settings.get("history", 30)
+        model = settings.get("model") or ""
+        return (
+            '<form id="suggest-settings" hx-post="/settings/suggest" hx-swap="outerHTML" '
+            'hx-headers=\'{"x-tg-messenger-csrf": "1"}\'>'
+            '<label><input type="checkbox" name="enabled" value="1"'
+            f'{" checked" if enabled else ""}> Suggest replies</label>'
+            f'<input name="history" value="{escape(str(history))}" placeholder="History limit">'
+            f'<input name="model" value="{escape(model)}" placeholder="Model (optional override)">'
+            '<button type="submit">Save</button>'
+            "</form>"
+        )
+
+    @app.get("/settings/suggest", response_class=HTMLResponse)
+    async def suggest_settings(request: Request):
+        suggester = request.app.state.suggester
+        if suggester is None:
+            return _error_response(
+                "Suggest is not configured — needs the [agent] extra and TG_AGENT_MODEL.", 503
+            )
+        settings = await suggester.get_settings()
+        return HTMLResponse(_suggest_settings_form(settings))
+
+    @app.post("/settings/suggest", response_class=HTMLResponse)
+    async def suggest_settings_update(
+        request: Request,
+        enabled: str = Form(""),
+        history: str = Form(""),
+        model: str = Form(""),
+    ):
+        same_origin_error = _same_origin_error(request)
+        if same_origin_error is not None:
+            return same_origin_error
+        suggester = request.app.state.suggester
+        if suggester is None:
+            return _error_response(
+                "Suggest is not configured — needs the [agent] extra and TG_AGENT_MODEL.", 503
+            )
+        try:
+            history_value = int(history.strip())
+        except ValueError:
+            return _error_response("History limit must be an integer.", 400)
+        try:
+            await suggester.save_settings(
+                enabled=bool(enabled.strip()),
+                history=history_value,
+                model=model.strip() or None,
+            )
+        except ValueError as exc:  # invalid history or unusable model
+            logger.warning("invalid suggester settings: %s", exc)
+            return _error_response(str(exc), 400)
+        return HTMLResponse(_suggest_settings_form(await suggester.get_settings()))
+
     @app.get("/stream/{dialog_id}")
     async def stream(request: Request, dialog_id: int, client_id: str = ""):
         return StreamingResponse(

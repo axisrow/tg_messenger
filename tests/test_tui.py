@@ -4390,6 +4390,70 @@ async def test_tui_settings_hides_translate_section_without_translator():
         assert not screen.query("#translate-section")
 
 
+class StubSuggesterTUI:
+    """Minimal Suggester stand-in for AccountsScreen tests (no Storage, no LLM)."""
+
+    def __init__(self, settings=None):
+        self._settings = settings or {"enabled": True, "history": 30, "model": None}
+        self.saved = []
+
+    async def get_settings(self):
+        return dict(self._settings)
+
+    async def save_settings(self, *, enabled, history, model):
+        if history < 1:
+            raise ValueError("history must be positive")
+        self._settings = {"enabled": enabled, "history": history, "model": model}
+        self.saved.append(dict(self._settings))
+
+
+async def test_tui_settings_shows_suggest_section_when_suggester_wired():
+    store = FakeSessionStore(["alice"])
+    suggester = StubSuggesterTUI({"enabled": True, "history": 25, "model": "openai:gpt-4o"})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, suggester=suggester,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.pause()
+        assert screen.query("#suggest-section")
+        from textual.widgets import Switch
+        assert screen.query_one("#suggest-enabled", Switch).value is True
+        assert screen.query_one("#suggest-history", Input).value == "25"
+        assert screen.query_one("#suggest-model", Input).value == "openai:gpt-4o"
+
+
+async def test_tui_settings_hides_suggest_section_without_suggester():
+    store = FakeSessionStore(["alice"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="alice", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        assert not screen.query("#suggest-section")
+
+
+async def test_tui_settings_saves_suggest_fields():
+    store = FakeSessionStore(["alice"])
+    suggester = StubSuggesterTUI()
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, suggester=suggester,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#suggest-history", Input).value = "12"
+        screen.query_one("#suggest-model", Input).value = "openai:gpt-4o"
+        await screen._save_suggest_settings()
+        assert suggester.saved[-1] == {"enabled": True, "history": 12, "model": "openai:gpt-4o"}
+
+
 async def test_tui_settings_saves_all_three_fields_independently():
     # the three fields each write their own setting — editing one never clobbers another
     store = FakeSessionStore(["alice"])
