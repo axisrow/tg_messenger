@@ -932,7 +932,7 @@ class ProfileListCard(Vertical):
         lv = self.query_one("#accounts", ListView)
         await lv.clear()
         for p in self._profiles:
-            await lv.append(AccountItem(p, p == active))
+            await lv.append(AccountItem(p, p == self._active))
 
 
 class TranslateSettingsCard(Vertical):
@@ -1040,8 +1040,9 @@ class TranslateSettingsCard(Vertical):
         self.run_worker(self._save(), exclusive=True)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        # Enter in any translation field saves. (Children of OTHER cards never reach here — Textual
-        # bubbles a widget message to its owning widget; the profile-name Input lives on a sibling.)
+        # Enter in any translation field saves. The message still bubbles on past this card to the
+        # App regardless, so the explicit id allowlist below — not bubbling isolation — is what keeps
+        # a foreign field (e.g. the sibling profile-name Input) from triggering a translate save.
         if event.input.id in ("target-lang", "known-langs", "unknown-langs",
                                "translate-model", "translate-max"):
             self.run_worker(self._save(), exclusive=True)
