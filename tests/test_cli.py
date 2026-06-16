@@ -2242,7 +2242,7 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
     class FakeTUI:
         def __init__(
             self, *, client=None, session_name="default", suggester=None,
-            store=None, translator=None, outbound=None,
+            store=None, translator=None, outbound=None, auto_translate=False,
         ):
             captured["client"] = client
             captured["session_name"] = session_name
@@ -2250,6 +2250,7 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
             captured["store"] = store
             captured["translator"] = translator
             captured["outbound"] = outbound
+            captured["auto_translate"] = auto_translate
 
         def run(self):
             pass
@@ -2295,7 +2296,7 @@ def test_tui_eager_when_single_profile(monkeypatch, tmp_path):
         cli_main, "make_tui_deps",
         lambda profile, **kw: (deps_calls.append(profile) or cli_main.TuiDeps(
             client=StubClient(), session_name=profile, suggester=None,
-            store=None, translator=None, outbound=None,
+            store=None, translator=None, outbound=None, auto_translate=False,
         )),
     )
     _patch_tui(monkeypatch)
@@ -2321,7 +2322,7 @@ def test_tui_eager_when_explicit_profile(monkeypatch, tmp_path):
         cli_main, "make_tui_deps",
         lambda profile, **kw: (deps_calls.append(profile) or cli_main.TuiDeps(
             client=StubClient(), session_name=profile, suggester=None,
-            store=None, translator=None, outbound=None,
+            store=None, translator=None, outbound=None, auto_translate=False,
         )),
     )
     _patch_tui(monkeypatch)
