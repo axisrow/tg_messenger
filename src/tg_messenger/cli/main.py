@@ -1711,6 +1711,55 @@ def suggest(ctx: click.Context, dialog_id: int, do_send: bool, do_learn: bool, s
     _run(_do(), session=session)
 
 
+@cli.command("suggest-nudges")
+@click.option("--after-hours", type=float, default=24.0,
+              help="Only nudge dialogs read at least this many hours ago (default 24).")
+@click.option("--session", default="default")
+@click.pass_context
+def suggest_nudges(ctx: click.Context, after_hours: float, session: str) -> None:
+    """List DMs the contact READ but never replied to, with a nudge draft (#145).
+
+    Human-in-the-loop: prints each candidate and a draft you review/send. Acts on
+    the stored outbox read-receipts (recorded by `chat`/`heartbeat run`/`ghostwrite`);
+    if you've never run a receipt watcher there will be nothing to nudge yet.
+    """
+    import time
+
+    session = _effective_session(ctx, session)
+
+    async def _do():
+        client = make_client(session_name=session)
+        from tg_messenger.agent.suggest import register_suggest_migrations
+
+        storage = make_storage(session)
+        register_suggest_migrations(storage)
+        suggester = make_suggester(client, storage=storage)
+        await client.connect()
+        try:
+            await _ensure_authorized(client, session)
+            await storage.connect()
+            try:
+                dms = await client.dialogs(dm_only=True)  # cached list — no per-dialog resolve
+                candidates = await suggester.nudge_candidates(
+                    [d.id for d in dms], now=time.time(), after_sec=after_hours * 3600,
+                )
+                if not candidates:
+                    click.echo("No dialogs to nudge.")
+                    return
+                titles = {d.id: d.title for d in dms}
+                for c in candidates:
+                    did = c["dialog_id"]
+                    title = titles.get(did) or str(did)
+                    click.echo(f"{did} — {title}")
+                    click.echo(f"  draft: {c['draft']}")
+            finally:
+                await storage.close()
+        finally:
+            await client.disconnect()
+
+    _run(_do(), session=session)
+
+
 # --- ghostwrite (#18): auto-reply in your style in explicitly enabled DMs ---------
 
 
