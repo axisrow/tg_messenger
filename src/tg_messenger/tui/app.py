@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Footer,
@@ -914,6 +914,9 @@ class AccountsScreen(ModalScreen[object]):
     # #116-parity: a centered, bordered card (the box geometry mirrors the other modals).
     DEFAULT_CSS = (
         "AccountsScreen { align: center middle; } "
+        # VerticalScroll: keep the card sized to its content (height auto) but capped at 80% of the
+        # screen; past that it scrolls instead of clipping the trailing suggester section. Override
+        # VerticalScroll's default height: 1fr so an empty-ish card doesn't balloon to full height.
         "#accounts-box { width: 60%; max-width: 64; height: auto; max-height: 80%; "
         "padding: 1 2; border: round $primary; background: $surface; } "
         "#translate-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
@@ -978,7 +981,11 @@ class AccountsScreen(ModalScreen[object]):
         self._applied_suggest_enabled: bool = True
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="accounts-box"):
+        # VerticalScroll (not a plain Vertical): once profiles + translate + suggester sections
+        # exceed max-height the card must SCROLL, and the scroll container has to be focusable so
+        # arrow/page keys actually move it — a bare Vertical with overflow-y clips the last section
+        # (the suggester settings) below the card edge and swallows scroll keys into the background.
+        with VerticalScroll(id="accounts-box"):
             yield Label("Аккаунты", id="accounts-title")
             yield ListView(
                 *(AccountItem(p, p == self._active) for p in self._profiles),
