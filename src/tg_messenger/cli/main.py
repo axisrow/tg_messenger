@@ -357,6 +357,18 @@ def make_optional_outbound(store, storage):
         return None
 
 
+def make_outbound_coordinator(outbound, store):
+    """The UI-agnostic outbound-send coordinator the chat REPL drives (#162).
+
+    Mirrors how the TUI and web build it; a seam so tests can stub the whole prepare→send flow.
+    Pass the chat timeout so the named constant stays the single source (it equals the
+    coordinator's own default, so behaviour is unchanged).
+    """
+    from tg_messenger.agent.outbound_coordinator import OutboundSendCoordinator
+
+    return OutboundSendCoordinator(outbound=outbound, store=store, timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS)
+
+
 def translate_auto_from_env(env=None) -> bool:
     """Default auto-translate state for inbound messages (off — don't burn tokens).
 
@@ -1342,7 +1354,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             await store.connect()
             store_task = asyncio.create_task(store.run())
             from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
-            from tg_messenger.agent.translate import get_user_lang
+            from tg_messenger.agent.outbound_coordinator import OutboundError
 
             telegram_lang_code = None
             # read the dialog once: telegram_lang_code (outbound) AND can_send (read-only gate)
@@ -1372,6 +1384,24 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();
             # skip them so our own input isn't printed back. Bounded (deque).
             sent_ids: deque[tuple[int, int]] = deque(maxlen=200)
+
+            # #162: outbound translation goes through the same coordinator the TUI/web use — it owns
+            # the prepare timeout, the variant token lifecycle and source recording. The REPL only
+            # presents the picker. Built once (None when outbound isn't configured).
+            coordinator = make_outbound_coordinator(outbound, store) if outbound is not None else None
+
+            async def _coord_send(peer, body):
+                """SendFn for the coordinator: send + return the Message; a rights rejection is
+                surfaced (like _send_or_warn) but RE-RAISED so the coordinator restores its token
+                and the REPL loop can skip this line without sending."""
+                try:
+                    return await client.send_text(peer, body)
+                except SendForbiddenError as exc:
+                    logger.warning(
+                        "send rejected (rights) in chat REPL (dialog %s): %s", peer, exc
+                    )
+                    click.echo(str(exc), err=True)
+                    raise
 
             async def printer():
                 async for ev in client.listen():
@@ -1450,97 +1480,78 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 continue
                             click.echo("language setting saved.")
                             continue
-                        if outbound is not None:
-                            try:
-                                prepare = getattr(outbound, "prepare_variants", None)
-                                if prepare is not None:
-                                    target_lang, variants = await asyncio.wait_for(
-                                        prepare(
-                                            dialog_id,
-                                            line,
-                                            telegram_lang_code=telegram_lang_code,
-                                        ),
-                                        timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS,
-                                    )
-                                else:
-                                    target_lang = await asyncio.wait_for(
-                                        outbound.applies(
-                                            dialog_id,
-                                            line,
-                                            telegram_lang_code=telegram_lang_code,
-                                        ),
-                                        timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS,
-                                    )
-                                    variants = []
-                            except TimeoutError:
-                                logger.warning(
-                                    "outbound applicability timed out (dialog %s)", dialog_id
-                                )
-                                click.echo("translation timed out — sending original.", err=True)
-                                msg = await _send_or_warn(client.send_text(dialog_id, line))
-                                if msg is not None:
-                                    sent_ids.append((dialog_id, msg.id))
-                                continue
-                            if target_lang is not None:
+                        if coordinator is not None:
+                            # prepare → (REPL picker) → send, all via the coordinator. It owns the
+                            # timeout, the variant token and source recording; the REPL only presents
+                            # the picker and tracks sent_ids for the echo dedup.
+                            result = await coordinator.prepare(
+                                dialog_id, line, telegram_lang_code=telegram_lang_code,
+                                owner_id=str(dialog_id),
+                            )
+                            if result.status in {"disabled", "not_applicable", "invalid_empty"}:
+                                # translation doesn't apply (or the line is blank) → send the original
                                 try:
-                                    if not variants:
-                                        variants = await asyncio.wait_for(
-                                            outbound.variants(dialog_id, line, target_lang),
-                                            timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS,
-                                        )
-                                except TimeoutError:
-                                    logger.warning("outbound variants timed out (dialog %s)", dialog_id)
-                                    click.echo("translation timed out — sending original.", err=True)
-                                    msg = await _send_or_warn(client.send_text(dialog_id, line))
-                                    if msg is not None:
-                                        sent_ids.append((dialog_id, msg.id))
-                                    continue
-                                except Exception:
-                                    logger.exception("outbound variants failed (dialog %s)", dialog_id)
-                                    confirm = await asyncio.to_thread(
-                                        input, "перевод не удался, отправить оригинал? [y/N] "
-                                    )
-                                    if confirm.strip().lower() not in {"y", "yes", "д", "да"}:
-                                        continue
-                                    msg = await _send_or_warn(client.send_text(dialog_id, line))
-                                    if msg is not None:
-                                        sent_ids.append((dialog_id, msg.id))
-                                    continue
-                                for idx, variant in enumerate(variants, start=1):
-                                    click.echo(f"[{idx}] {variant}")
-                                original_idx = len(variants) + 1
-                                click.echo(f"[{original_idx}] original: {line}")
-                                click.echo("[0] cancel")
-                                choice = await asyncio.to_thread(input, "вариант> ")
-                                if not choice.strip() or choice.strip() == "0":
-                                    continue
-                                if choice.strip() == str(original_idx):
-                                    msg = await _send_or_warn(client.send_text(dialog_id, line))
-                                    if msg is not None:
-                                        sent_ids.append((dialog_id, msg.id))
-                                    continue
-                                try:
-                                    picked = variants[int(choice.strip()) - 1]
-                                except (ValueError, IndexError):
-                                    click.echo("cancelled.", err=True)
-                                    continue
-                                msg = await _send_or_warn(client.send_text(dialog_id, picked))
-                                if msg is None:
+                                    msg = await coordinator.send_original(dialog_id, line, _coord_send)
+                                except SendForbiddenError:
                                     continue
                                 sent_ids.append((dialog_id, msg.id))
-                                source_lang = await get_user_lang(storage) or ""
-                                if source_lang:
-                                    try:
-                                        await store.record_outgoing(
-                                            dialog_id,
-                                            msg,
-                                            source_text=line,
-                                            source_lang=source_lang,
-                                        )
-                                    except Exception:
-                                        logger.exception("failed to record outbound source text")
-                                click.echo(f"  ↳ {line}")
                                 continue
+                            if result.status == "error":
+                                # prepare timed out or failed — surface why, then offer the original
+                                # (the coordinator collapses timeout and other failures into "error")
+                                click.echo(
+                                    f"{result.error or 'translation failed'} — send original?",
+                                    err=True,
+                                )
+                                confirm = await asyncio.to_thread(
+                                    input, "перевод не удался, отправить оригинал? [y/N] "
+                                )
+                                if confirm.strip().lower() not in {"y", "yes", "д", "да"}:
+                                    continue
+                                try:
+                                    msg = await coordinator.send_original(dialog_id, line, _coord_send)
+                                except SendForbiddenError:
+                                    continue
+                                sent_ids.append((dialog_id, msg.id))
+                                continue
+                            # status == "ready": present the REPL picker (the one CLI-specific part)
+                            variants = result.variants
+                            for idx, variant in enumerate(variants, start=1):
+                                click.echo(f"[{idx}] {variant}")
+                            original_idx = len(variants) + 1
+                            click.echo(f"[{original_idx}] original: {line}")
+                            click.echo("[0] cancel")
+                            choice = (await asyncio.to_thread(input, "вариант> ")).strip()
+                            if not choice or choice == "0":
+                                continue
+                            if choice == str(original_idx):
+                                try:
+                                    msg = await coordinator.send_original(dialog_id, line, _coord_send)
+                                except SendForbiddenError:
+                                    continue
+                                sent_ids.append((dialog_id, msg.id))
+                                continue
+                            try:
+                                picked = variants[int(choice) - 1]
+                            except (ValueError, IndexError):
+                                click.echo("cancelled.", err=True)
+                                continue
+                            try:
+                                msg = await coordinator.send_variant(
+                                    dialog_id, result.token, picked, _coord_send,
+                                    owner_id=str(dialog_id),
+                                )
+                            except SendForbiddenError:
+                                continue
+                            except OutboundError:
+                                logger.warning(
+                                    "outbound token rejected in chat REPL (dialog %s)", dialog_id
+                                )
+                                click.echo("Выбор перевода истёк", err=True)
+                                continue
+                            sent_ids.append((dialog_id, msg.id))
+                            click.echo(f"  ↳ {line}")  # show the original under the sent variant
+                            continue
                         msg = await _send_or_warn(client.send_text(dialog_id, line))
                         if msg is not None:
                             sent_ids.append((dialog_id, msg.id))  # suppress this line's echo
