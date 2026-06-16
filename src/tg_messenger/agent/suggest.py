@@ -193,6 +193,32 @@ async def watch_read_receipts(client, storage) -> None:
                              getattr(event, "dialog_id", "?"))
 
 
+# --- diagnostics (#144): why the suggester is OFF --------------------------------
+
+
+def suggester_disabled_reason(*, env=None) -> str | None:
+    """Why the reply suggester would be OFF, or None when it should work.
+
+    A cheap, side-effect-free check (no client, no Storage, no network) shared by
+    the CLI wiring (for a loud startup log) and the UIs (to show the user WHY the 💡
+    draft feature is silent). Distinguishes the two real cases — the [agent] extra
+    missing vs ``TG_AGENT_MODEL`` unset/malformed — so the message is actionable,
+    not a blank "no hint ever appears". The LLM stack is imported LAZILY here so this
+    module stays import-light on a bare ``[dev]`` install.
+    """
+    try:
+        import tg_messenger.agent.factory  # noqa: F401  (presence of the [agent] extra)
+    except ImportError:
+        return 'the [agent] extra is not installed — pip install "tg-messenger[agent]"'
+    from tg_messenger.agent.config import AgentConfig
+
+    try:
+        AgentConfig.from_env(env, require_allowlist=False)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
 # --- Suggester (#17) -------------------------------------------------------------
 
 

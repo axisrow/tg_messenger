@@ -4775,3 +4775,39 @@ async def test_tui_successful_model_change_commits_model_and_settings(monkeypatc
             assert dismissed.get("result") is new_translator
     finally:
         await storage.close()
+
+
+# --- #144: TUI notifies once, with the reason, when the suggester is disabled ---
+
+
+async def test_tui_notifies_when_suggester_disabled(monkeypatch):
+    monkeypatch.setattr(
+        "tg_messenger.agent.suggest.suggester_disabled_reason",
+        lambda env=None: "TG_AGENT_MODEL is not set — expected 'provider:model'",
+    )
+    app = MessengerTUI(client=TuiStubClient())  # suggester=None by default
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.pause()
+    assert any("Суфлёр" in m and "TG_AGENT_MODEL" in m for m in notes)
+
+
+async def test_tui_no_disabled_notice_when_suggester_wired(monkeypatch):
+    monkeypatch.setattr(
+        "tg_messenger.agent.suggest.suggester_disabled_reason",
+        lambda env=None: "should-not-be-called",
+    )
+
+    class _Sugg:
+        async def suggest(self, dialog_id):
+            return ""
+
+    app = MessengerTUI(client=TuiStubClient(), suggester=_Sugg())
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.pause()
+    assert not any("Суфлёр" in m for m in notes)

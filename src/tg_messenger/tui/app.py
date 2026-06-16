@@ -1647,6 +1647,22 @@ class MessengerTUI(App):
             self.run_worker(
                 self._load_auto_translate_pref(), group="translate-pref", exclusive=False
             )
+        # #144: the 💡 draft feature is off when no suggester is wired (no [agent] extra or
+        # TG_AGENT_MODEL). Tell the user ONCE, with the actionable reason, instead of a silent
+        # strip that never appears.
+        if self._suggester is None:
+            self._notify_suggester_disabled()
+
+    def _notify_suggester_disabled(self) -> None:
+        try:
+            from tg_messenger.agent.suggest import suggester_disabled_reason
+
+            reason = suggester_disabled_reason()
+        except Exception:
+            logger.exception("could not determine why the suggester is disabled")
+            reason = None
+        if reason:
+            self.notify(f"Суфлёр (💡) выключен: {reason}", severity="warning", timeout=8)
 
     async def _load_auto_translate_pref(self) -> None:
         try:

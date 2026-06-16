@@ -168,6 +168,38 @@ async def test_make_optional_suggester_wires_profile_storage(monkeypatch):
     assert storage.closed == 1
 
 
+async def test_make_optional_suggester_logs_reason_when_disabled(monkeypatch, caplog):
+    import click
+
+    monkeypatch.setattr(cli_main, "make_storage", lambda profile="default": StubStorage())
+    monkeypatch.setattr(
+        cli_main, "make_suggester",
+        lambda c, **kw: (_ for _ in ()).throw(click.ClickException("boom")),
+    )
+    # the reason probe returns an actionable string instead of the raw exception
+    monkeypatch.setattr(
+        "tg_messenger.agent.suggest.suggester_disabled_reason",
+        lambda env=None: "TG_AGENT_MODEL is not set — expected 'provider:model'",
+    )
+    with caplog.at_level("WARNING"):
+        result = cli_main.make_optional_suggester(StubClient(), session="work")
+    assert result is None
+    assert any("reply suggester disabled" in r.message and "TG_AGENT_MODEL" in r.message
+               for r in caplog.records)
+
+
+async def test_make_optional_suggester_logs_unexpected_error(monkeypatch, caplog):
+    monkeypatch.setattr(cli_main, "make_storage", lambda profile="default": StubStorage())
+    monkeypatch.setattr(
+        cli_main, "make_suggester",
+        lambda c, **kw: (_ for _ in ()).throw(RuntimeError("unexpected")),
+    )
+    with caplog.at_level("ERROR"):
+        result = cli_main.make_optional_suggester(StubClient(), session="work")
+    assert result is None
+    assert any("unexpected error" in r.message for r in caplog.records)
+
+
 def test_suggest_listed_in_help(suggest_cli):
     r, *_ = suggest_cli
     result = r.invoke(cli_main.cli, ["--help"])

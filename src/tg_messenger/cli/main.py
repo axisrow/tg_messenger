@@ -231,7 +231,8 @@ def make_optional_suggester(client, *, session: str = "default"):
     """Best-effort production suggester for web/TUI.
 
     Suggest is an optional [agent] feature. A missing extra or model should disable
-    the draft endpoint/strip, not prevent the web UI or TUI from starting.
+    the draft endpoint/strip, not prevent the web UI or TUI from starting. The
+    disabled state is logged LOUDLY with the concrete reason (#144) — never silent.
     """
     try:
         from tg_messenger.agent.suggest import register_suggest_migrations
@@ -239,10 +240,20 @@ def make_optional_suggester(client, *, session: str = "default"):
         storage = make_storage(session)
         register_suggest_migrations(storage)
         suggester = make_suggester(client, storage=storage)
-        return _StorageBackedSuggester(suggester, storage)
     except (click.ClickException, ImportError) as exc:
-        logger.warning("reply suggester disabled: %s", exc)
+        # the expected "feature off" paths — log the actionable reason
+        from tg_messenger.agent.suggest import suggester_disabled_reason
+
+        logger.warning(
+            "reply suggester disabled: %s", suggester_disabled_reason() or exc
+        )
         return None
+    except Exception:
+        # anything else is unexpected: never swallow it silently (project rule)
+        logger.exception("reply suggester disabled by an unexpected error")
+        return None
+    logger.info("reply suggester enabled (session=%s)", session)
+    return _StorageBackedSuggester(suggester, storage)
 
 
 def make_message_store(client, *, session: str = "default"):
