@@ -4992,19 +4992,38 @@ async def test_tui_ctrl_g_blocked_by_nonempty_composer_points_at_escape():
     assert any("Esc" in m for m in notes)  # the toast points at Escape
 
 
-async def test_tui_escape_clears_both_search_and_composer():
-    # #155: Escape clears a non-empty search filter AND a non-empty composer draft, so Ctrl+G has
-    # a clean field to write into.
+async def test_tui_escape_clears_composer_when_composer_focused():
+    # #156: Escape clears the composer when the composer is focused, so Ctrl+G has a clean field.
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
         await _pause_until(pilot, lambda: app._started)
         app._current = 7
-        app.query_one("#search", Input).value = "ann"
-        app.query_one("#composer", Input).value = "черновик"
+        composer = app.query_one("#composer", Input)
+        composer.value = "черновик"
+        composer.focus()
+        await pilot.pause()
         app.action_clear_search()
         await pilot.pause()
-        assert app.query_one("#search", Input).value == ""
-        assert app.query_one("#composer", Input).value == ""
+        assert composer.value == ""
+
+
+async def test_tui_escape_clearing_search_preserves_composer_draft():
+    # #156 regression (Codex): Escape pressed to clear the SEARCH filter must NOT wipe a reply
+    # typed in the composer — that draft is persisted and unrecoverable on a dialog switch.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        search = app.query_one("#search", Input)
+        composer = app.query_one("#composer", Input)
+        composer.value = "важный черновик"
+        search.value = "ann"
+        search.focus()  # focus is on the SEARCH box, not the composer
+        await pilot.pause()
+        app.action_clear_search()
+        await pilot.pause()
+        assert search.value == ""  # search cleared
+        assert composer.value == "важный черновик"  # draft preserved — no data loss
 
 
 async def test_tui_ctrl_g_notifies_without_suggester():

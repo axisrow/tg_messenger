@@ -2711,20 +2711,23 @@ class MessengerTUI(App):
             self.push_screen(HelpScreen())
 
     def action_clear_search(self) -> None:
-        """Escape — clear a non-empty search filter AND a non-empty composer draft (#155).
+        """Escape — clear the FOCUSED input (#155/#156).
 
-        Clears whichever of the two is non-empty so Ctrl+G (which refuses to overwrite a typed
-        draft) has a clean field to write into. A no-op when both are already empty, so Escape
-        stays unsurprising elsewhere. The search clear re-renders via on_input_changed.
+        Context-aware so it never destroys an unrelated draft: when the composer is focused,
+        Escape clears the composer (so Ctrl+G has a clean field) and the per-dialog draft goes
+        with it; otherwise it clears a non-empty search filter (the long-standing global). This
+        avoids the data-loss trap where Escape-to-clear-search would also wipe a reply typed in
+        the composer (the draft is persisted via on_input_changed → state.draft, unrecoverable on
+        a dialog switch). A no-op when the relevant field is already empty.
         """
-        search = self.query_one("#search", Input)
         composer = self.query_one("#composer", Input)
-        if not search.value and not composer.value:
+        if composer.has_focus:
+            if composer.value:
+                composer.value = ""  # explicit: clear the draft so a fresh Ctrl+G / reply is clean
             return
+        search = self.query_one("#search", Input)
         if search.value:
             search.value = ""  # triggers on_input_changed → _render_dialogs
-        if composer.value:
-            composer.value = ""  # drop the typed draft so a fresh Ctrl+G / reply starts clean
 
     def action_open_settings(self) -> None:
         """Ctrl+S — account settings (#115) + inbound-translation settings when a Translator is wired."""
