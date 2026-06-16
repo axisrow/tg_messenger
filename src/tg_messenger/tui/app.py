@@ -18,6 +18,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import (
     Footer,
@@ -902,45 +903,46 @@ class AccountItem(ListItem):
         self.profile = profile
 
 
-class AccountsScreen(ModalScreen[object]):
-    """Account settings (#115): list saved profiles (active marked), add a new one, remove one.
+class ProfileListCard(Vertical):
+    """The saved-profile list section of AccountsScreen (#163).
 
-    Dismisses with a rebuilt Translator when the user picks a new translation model (so the main
-    app can swap it in), or with None otherwise.
-
-    Adding runs the SAME LoginScreen/LoginSession wizard against a freshly-built client for the
-    typed profile name, then persists via the client's save_session() (→ SessionStore). Switching
-    the active profile in-session is deferred (it would need a full deps rebuild + reconnect).
-    Reuses LoginSession + SessionStore — login is NOT reimplemented here.
+    A thin composition wrapper: it owns the profile-list markup (`#accounts` + `#new-profile`),
+    but the add/remove ACTIONS stay on AccountsScreen — they are key-bound (`a`/`d`) and mount the
+    LoginScreen/ConfirmScreen sub-screens, which is naturally screen-level work. The screen reaches
+    into `#accounts`/`#new-profile` (query searches the whole DOM subtree) for those flows.
     """
 
-    # #116-parity: a centered, bordered card (the box geometry mirrors the other modals).
-    DEFAULT_CSS = (
-        "AccountsScreen { align: center middle; } "
-        # VerticalScroll: keep the card sized to its content (height auto) but capped at 80% of the
-        # screen; past that it scrolls instead of clipping the trailing suggester section. Override
-        # VerticalScroll's default height: 1fr so an empty-ish card doesn't balloon to full height.
-        "#accounts-box { width: 60%; max-width: 64; height: auto; max-height: 80%; "
-        "padding: 1 2; border: round $primary; background: $surface; } "
-        "#translate-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
-        "#translate-section RadioSet { height: auto; } "
-        "#suggest-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
-        "#suggest-enabled-row { height: auto; } "
-        "#suggest-enabled-row Label { padding: 1 1 0 0; } "
-        # the field captions live in border_title, which inherits the (grey, blurred) border colour
-        # and is nearly unreadable by default — give the translation inputs a visible border + a
-        # bold accent caption so the labels stay legible whether the field is focused or not.
-        "#target-lang, #known-langs, #unknown-langs, #translate-model, #translate-max, "
-        "#suggest-history, #suggest-model "
-        "{ border: round $primary; border-title-color: $accent; border-title-style: bold; }"
-    )
+    def __init__(self, *, profiles, active):
+        super().__init__(id="profiles-section")
+        self._profiles = list(profiles)
+        self._active = active
 
-    BINDINGS = [
-        Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
-        Binding("escape", "close", "Close", show=False),
-        Binding("a", "add_account", "Add account", show=False),
-        Binding("d", "remove_account", "Remove", show=False),
-    ]
+    def compose(self) -> ComposeResult:
+        yield Label("Аккаунты", id="accounts-title")
+        yield ListView(
+            *(AccountItem(p, p == self._active) for p in self._profiles),
+            id="accounts",
+        )
+        yield Label("a — добавить · d — удалить · Esc — закрыть", id="accounts-help")
+        yield Input(placeholder="Имя нового профиля", id="new-profile")
+
+    async def refresh_profiles(self, profiles, active) -> None:
+        self._profiles = list(profiles)
+        self._active = active
+        lv = self.query_one("#accounts", ListView)
+        await lv.clear()
+        for p in self._profiles:
+            await lv.append(AccountItem(p, p == self._active))
+
+
+class TranslateSettingsCard(Vertical):
+    """Inbound-translation settings (#143/#163), composed only when a Translator is wired.
+
+    Owns its own compose + load/save + the load-echo guards; it handles its OWN children's
+    RadioSet.Changed / Input.Submitted (Textual bubbles widget messages to the owning widget).
+    A model change can't dismiss the screen from here — the card posts ModelChanged and the screen
+    dismisses with the rebuilt Translator.
+    """
 
     # Inbound-translation modes, in display order. The id is the stored TranslateMode literal.
     _TRANSLATE_MODE_LABELS = (
@@ -950,21 +952,16 @@ class AccountsScreen(ModalScreen[object]):
         ("only_unknown", "Только указанные (список ниже)"),
     )
 
-    def __init__(self, *, profiles, active, store, account_client_factory=None,
-                 login_session=None, translator=None, suggester=None):
-        super().__init__()
-        # #121: profiles from list_profiles() are already canonical (sanitized stems); the active
-        # name comes from the raw session_name, so canonicalize it ONCE here. Marker + delete guard
-        # then compare canonical-to-canonical, so an active raw name that sanitizes differently
-        # (e.g. "work/personal" → "work_personal") is still recognised and protected.
-        self._profiles = list(profiles)
-        self._active = sanitize_profile_name(active)
-        self._store = store
-        # test seams: build the new-profile client / skip the network login flow
-        self._account_client_factory = account_client_factory or _make_real_client
-        self._login_session = login_session
-        # inbound-translation settings live on the injected Translator (it owns the Storage). None
-        # means the [agent] extra / translate model isn't configured — the section is then hidden.
+    class ModelChanged(Message):
+        """Posted when a new translation model is committed — the screen dismisses with it."""
+
+        def __init__(self, translator) -> None:
+            self.translator = translator
+            super().__init__()
+
+    def __init__(self, *, translator):
+        super().__init__(id="translate-section")
+        # inbound-translation settings live on the injected Translator (it owns the Storage).
         self._translator = translator
         # the mode last loaded-from / saved-to storage. RadioSet.Changed is delivered async (after
         # the worker that set it returns), so a sync "loading" flag can't gate it; instead we save
@@ -973,79 +970,33 @@ class AccountsScreen(ModalScreen[object]):
         # the model last loaded-from / saved-to storage; a save only re-probes/rebuilds the
         # Translator when this actually changes (an empty string means "fall back to env").
         self._applied_model: str = ""
-        # reply-suggester settings (#143) live on the injected Suggester (it owns its Storage).
-        # None means the [agent] extra / TG_AGENT_MODEL isn't configured — the section is hidden.
-        self._suggester = suggester
-        # the suggester model last loaded/saved; a save only rebuilds the suggest_fn on a real change.
-        self._applied_suggest_model: str = ""
-        # the enabled state last loaded/saved. Switch.Changed is delivered ASYNC (after the worker
-        # that set Switch.value returns), so a synchronous "loading" flag can't gate it — instead we
-        # save only when the toggled value DIFFERS from this, exactly like the translate _applied_mode.
-        self._applied_suggest_enabled: bool = True
 
     def compose(self) -> ComposeResult:
-        # VerticalScroll (not a plain Vertical): once profiles + translate + suggester sections
-        # exceed max-height the card must SCROLL, and the scroll container has to be focusable so
-        # arrow/page keys actually move it — a bare Vertical with overflow-y clips the last section
-        # (the suggester settings) below the card edge and swallows scroll keys into the background.
-        with VerticalScroll(id="accounts-box"):
-            yield Label("Аккаунты", id="accounts-title")
-            yield ListView(
-                *(AccountItem(p, p == self._active) for p in self._profiles),
-                id="accounts",
-            )
-            yield Label("a — добавить · d — удалить · Esc — закрыть", id="accounts-help")
-            yield Input(placeholder="Имя нового профиля", id="new-profile")
-            # inbound-translation settings — only when a Translator is wired ([agent] extra +
-            # translate model configured). Values are loaded in on_mount (async, can't read in compose).
-            if self._translator is not None:
-                with Vertical(id="translate-section"):
-                    yield Label("Перевод входящих", id="translate-title")
-                    with RadioSet(id="translate-mode"):
-                        for mode_id, label in self._TRANSLATE_MODE_LABELS:
-                            yield RadioButton(label, id=f"mode-{mode_id}")
-                    # THREE explicit fields, each with a PERSISTENT border_title caption (visible on
-                    # the frame even with a value typed — a placeholder vanishes on input). The two
-                    # language lists are always shown so nothing silently changes meaning by mode.
-                    target = Input(placeholder="напр. ru", id="target-lang")
-                    target.border_title = "Мой язык (на что переводить)"
-                    yield target
-                    known = Input(placeholder="напр. ru, en", id="known-langs")
-                    known.border_title = "Не переводить"
-                    yield known
-                    unknown = Input(placeholder="напр. en, ja", id="unknown-langs")
-                    unknown.border_title = "Переводить (пусто = всё переводить)"
-                    yield unknown
-                    model_field = Input(placeholder="напр. openai:glm-5.1", id="translate-model")
-                    model_field.border_title = "Модель для перевода"
-                    yield model_field
-                    max_field = Input(placeholder="напр. 100", id="translate-max")
-                    max_field.border_title = "Сколько переводить за раз (Ctrl+T)"
-                    yield max_field
-                    yield Label("Enter в поле — сохранить", id="translate-help")
-            # reply-suggester settings (#143) — only when a Suggester is wired ([agent] extra +
-            # TG_AGENT_MODEL). Loaded async in on_mount, like the translation section.
-            if self._suggester is not None:
-                with Vertical(id="suggest-section"):
-                    yield Label("Суфлёр ответов (💡)", id="suggest-title")
-                    with Horizontal(id="suggest-enabled-row"):
-                        yield Label("Подсказывать ответы")
-                        yield Switch(value=True, id="suggest-enabled")
-                    history_field = Input(placeholder="напр. 30", id="suggest-history")
-                    history_field.border_title = "Сколько сообщений контекста"
-                    yield history_field
-                    suggest_model_field = Input(placeholder="напр. openai:gpt-4o", id="suggest-model")
-                    suggest_model_field.border_title = "Модель суфлёра (пусто = по умолчанию)"
-                    yield suggest_model_field
-                    yield Label("Enter в поле — сохранить", id="suggest-help")
+        yield Label("Перевод входящих", id="translate-title")
+        with RadioSet(id="translate-mode"):
+            for mode_id, label in self._TRANSLATE_MODE_LABELS:
+                yield RadioButton(label, id=f"mode-{mode_id}")
+        # THREE explicit fields, each with a PERSISTENT border_title caption (visible on
+        # the frame even with a value typed — a placeholder vanishes on input). The two
+        # language lists are always shown so nothing silently changes meaning by mode.
+        target = Input(placeholder="напр. ru", id="target-lang")
+        target.border_title = "Мой язык (на что переводить)"
+        yield target
+        known = Input(placeholder="напр. ru, en", id="known-langs")
+        known.border_title = "Не переводить"
+        yield known
+        unknown = Input(placeholder="напр. en, ja", id="unknown-langs")
+        unknown.border_title = "Переводить (пусто = всё переводить)"
+        yield unknown
+        model_field = Input(placeholder="напр. openai:glm-5.1", id="translate-model")
+        model_field.border_title = "Модель для перевода"
+        yield model_field
+        max_field = Input(placeholder="напр. 100", id="translate-max")
+        max_field.border_title = "Сколько переводить за раз (Ctrl+T)"
+        yield max_field
+        yield Label("Enter в поле — сохранить", id="translate-help")
 
-    def on_mount(self) -> None:
-        if self._translator is not None:
-            self.run_worker(self._load_translate_settings(), exclusive=False)
-        if self._suggester is not None:
-            self.run_worker(self._load_suggest_settings(), exclusive=False)
-
-    async def _load_translate_settings(self) -> None:
+    async def _load(self) -> None:
         if self._translator is None:
             return
         try:
@@ -1086,9 +1037,17 @@ class AccountsScreen(ModalScreen[object]):
         # mode change (differs from what's stored/applied) should persist.
         if mode == self._applied_mode:
             return
-        self.run_worker(self._save_translate_settings(), exclusive=True)
+        self.run_worker(self._save(), exclusive=True)
 
-    async def _save_translate_settings(self) -> None:
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Enter in any translation field saves. The message still bubbles on past this card to the
+        # App regardless, so the explicit id allowlist below — not bubbling isolation — is what keeps
+        # a foreign field (e.g. the sibling profile-name Input) from triggering a translate save.
+        if event.input.id in ("target-lang", "known-langs", "unknown-langs",
+                               "translate-model", "translate-max"):
+            self.run_worker(self._save(), exclusive=True)
+
+    async def _save(self) -> None:
         if self._translator is None:
             return
         mode = self._selected_mode()
@@ -1136,13 +1095,14 @@ class AccountsScreen(ModalScreen[object]):
             return
         self._applied_mode = mode
         if model_changed:
-            # everything committed → adopt the new translator and hand it back to the app.
+            # everything committed → adopt the new translator and hand it back to the app via the
+            # screen (a card can't dismiss the screen; it posts ModelChanged and the screen does).
             # NB: the probe only checks structured-output support, NOT credentials — an invalid API
             # key surfaces on the first actual translation, not here, so don't claim "verified".
             self._translator = new_translator
             self._applied_model = model
             self.notify("Модель сохранена — проверьте перевод в чате")
-            self.dismiss(new_translator)
+            self.post_message(self.ModelChanged(new_translator))
             return
         self.notify("Настройки перевода сохранены")
 
@@ -1181,8 +1141,8 @@ class AccountsScreen(ModalScreen[object]):
         if not target_model:
             self.notify("Не задана модель перевода", severity="error")
             return None
-        # the SQLite Storage the Translator caches into lives on the current translator, NOT on
-        # self._store (which is the SessionStore). Reuse it so settings/cache stay in one DB.
+        # the SQLite Storage the Translator caches into lives on the current translator.
+        # Reuse it so settings/cache stay in one DB.
         storage = self._translator.storage
         try:
             new_translator = await build_translator_with_probe(storage, target_model)
@@ -1192,7 +1152,39 @@ class AccountsScreen(ModalScreen[object]):
             return None
         return new_translator
 
-    async def _load_suggest_settings(self) -> None:
+
+class SuggestSettingsCard(Vertical):
+    """Reply-suggester settings (#143/#163), composed only when a Suggester is wired.
+
+    Owns its own compose + load/save + the enabled-toggle load-echo guard, and handles its OWN
+    children's Switch.Changed / Input.Submitted.
+    """
+
+    def __init__(self, *, suggester):
+        super().__init__(id="suggest-section")
+        # reply-suggester settings (#143) live on the injected Suggester (it owns its Storage).
+        self._suggester = suggester
+        # the suggester model last loaded/saved; a save only rebuilds the suggest_fn on a real change.
+        self._applied_suggest_model: str = ""
+        # the enabled state last loaded/saved. Switch.Changed is delivered ASYNC (after the worker
+        # that set Switch.value returns), so a synchronous "loading" flag can't gate it — instead we
+        # save only when the toggled value DIFFERS from this, exactly like the translate _applied_mode.
+        self._applied_suggest_enabled: bool = True
+
+    def compose(self) -> ComposeResult:
+        yield Label("Суфлёр ответов (💡)", id="suggest-title")
+        with Horizontal(id="suggest-enabled-row"):
+            yield Label("Подсказывать ответы")
+            yield Switch(value=True, id="suggest-enabled")
+        history_field = Input(placeholder="напр. 30", id="suggest-history")
+        history_field.border_title = "Сколько сообщений контекста"
+        yield history_field
+        suggest_model_field = Input(placeholder="напр. openai:gpt-4o", id="suggest-model")
+        suggest_model_field.border_title = "Модель суфлёра (пусто = по умолчанию)"
+        yield suggest_model_field
+        yield Label("Enter в поле — сохранить", id="suggest-help")
+
+    async def _load(self) -> None:
         if self._suggester is None:
             return
         try:
@@ -1210,7 +1202,7 @@ class AccountsScreen(ModalScreen[object]):
         self.query_one("#suggest-model", Input).value = model
         self._applied_suggest_model = model
 
-    async def _save_suggest_settings(self) -> None:
+    async def _save(self) -> None:
         if self._suggester is None:
             return
         enabled = self.query_one("#suggest-enabled", Switch).value
@@ -1247,15 +1239,113 @@ class AccountsScreen(ModalScreen[object]):
         # translate RadioSet.Changed guard, which is timing-robust where a sync flag is not.
         if event.value == self._applied_suggest_enabled:
             return
-        self.run_worker(self._save_suggest_settings(), exclusive=True)
+        self.run_worker(self._save(), exclusive=True)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        # Enter in a translation field saves; the profile-name field keeps its add-account flow.
-        if event.input.id in ("target-lang", "known-langs", "unknown-langs",
-                               "translate-model", "translate-max"):
-            self.run_worker(self._save_translate_settings(), exclusive=True)
-        elif event.input.id in ("suggest-history", "suggest-model"):
-            self.run_worker(self._save_suggest_settings(), exclusive=True)
+        if event.input.id in ("suggest-history", "suggest-model"):
+            self.run_worker(self._save(), exclusive=True)
+
+
+class AccountsScreen(ModalScreen[object]):
+    """Account settings (#115): list saved profiles (active marked), add a new one, remove one.
+
+    A thin orchestrator (#163): it composes three sibling cards — ProfileListCard,
+    TranslateSettingsCard, SuggestSettingsCard — inside one scroll container and coordinates
+    dismiss. Each settings card owns its own load/save/guards.
+
+    Dismisses with a rebuilt Translator when the user picks a new translation model (so the main
+    app can swap it in), or with None otherwise.
+
+    Adding runs the SAME LoginScreen/LoginSession wizard against a freshly-built client for the
+    typed profile name, then persists via the client's save_session() (→ SessionStore). Switching
+    the active profile in-session is deferred (it would need a full deps rebuild + reconnect).
+    Reuses LoginSession + SessionStore — login is NOT reimplemented here.
+    """
+
+    # #116-parity: a centered, bordered card (the box geometry mirrors the other modals).
+    DEFAULT_CSS = (
+        "AccountsScreen { align: center middle; } "
+        # VerticalScroll: keep the card sized to its content (height auto) but capped at 80% of the
+        # screen; past that it scrolls instead of clipping the trailing suggester section. Override
+        # VerticalScroll's default height: 1fr so an empty-ish card doesn't balloon to full height.
+        "#accounts-box { width: 60%; max-width: 64; height: auto; max-height: 80%; "
+        "padding: 1 2; border: round $primary; background: $surface; } "
+        "#profiles-section { height: auto; } "
+        "#translate-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
+        "#translate-section RadioSet { height: auto; } "
+        "#suggest-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
+        "#suggest-enabled-row { height: auto; } "
+        "#suggest-enabled-row Label { padding: 1 1 0 0; } "
+        # the field captions live in border_title, which inherits the (grey, blurred) border colour
+        # and is nearly unreadable by default — give the translation inputs a visible border + a
+        # bold accent caption so the labels stay legible whether the field is focused or not.
+        "#target-lang, #known-langs, #unknown-langs, #translate-model, #translate-max, "
+        "#suggest-history, #suggest-model "
+        "{ border: round $primary; border-title-color: $accent; border-title-style: bold; }"
+    )
+
+    BINDINGS = [
+        Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
+        Binding("escape", "close", "Close", show=False),
+        Binding("a", "add_account", "Add account", show=False),
+        Binding("d", "remove_account", "Remove", show=False),
+    ]
+
+    def __init__(self, *, profiles, active, store, account_client_factory=None,
+                 login_session=None, translator=None, suggester=None):
+        super().__init__()
+        # #121: profiles from list_profiles() are already canonical (sanitized stems); the active
+        # name comes from the raw session_name, so canonicalize it ONCE here. Marker + delete guard
+        # then compare canonical-to-canonical, so an active raw name that sanitizes differently
+        # (e.g. "work/personal" → "work_personal") is still recognised and protected.
+        self._profiles = list(profiles)
+        self._active = sanitize_profile_name(active)
+        self._store = store
+        # test seams: build the new-profile client / skip the network login flow
+        self._account_client_factory = account_client_factory or _make_real_client
+        self._login_session = login_session
+        # None means the [agent] extra / model isn't configured — the section's card is then hidden.
+        self._translator = translator
+        self._suggester = suggester
+
+    def compose(self) -> ComposeResult:
+        # VerticalScroll (not a plain Vertical): once profiles + translate + suggester sections
+        # exceed max-height the card must SCROLL, and the scroll container has to be focusable so
+        # arrow/page keys actually move it — a bare Vertical with overflow-y clips the last section
+        # (the suggester settings) below the card edge and swallows scroll keys into the background.
+        with VerticalScroll(id="accounts-box"):
+            yield ProfileListCard(profiles=self._profiles, active=self._active)
+            # the settings cards are composed only when their dependency is wired ([agent] extra +
+            # the relevant model). Their values load async in on_mount (can't read in compose).
+            if self._translator is not None:
+                yield TranslateSettingsCard(translator=self._translator)
+            if self._suggester is not None:
+                yield SuggestSettingsCard(suggester=self._suggester)
+
+    def on_mount(self) -> None:
+        if self._translator is not None:
+            self.run_worker(self.query_one(TranslateSettingsCard)._load(), exclusive=False)
+        if self._suggester is not None:
+            self.run_worker(self.query_one(SuggestSettingsCard)._load(), exclusive=False)
+
+    def on_translate_settings_card_model_changed(
+        self, event: "TranslateSettingsCard.ModelChanged"
+    ) -> None:
+        # a card can't dismiss the screen; it posts ModelChanged and we hand the rebuilt translator
+        # back to the app (so it can swap the live translator in).
+        self._translator = event.translator
+        self.dismiss(event.translator)
+
+    # --- thin shims so direct-call tests keep targeting the screen (the card owns the real work) ---
+
+    async def _save_translate_settings(self) -> None:
+        await self.query_one(TranslateSettingsCard)._save()
+
+    async def _save_suggest_settings(self) -> None:
+        await self.query_one(SuggestSettingsCard)._save()
+
+    async def _validate_model(self, model: str):
+        return await self.query_one(TranslateSettingsCard)._validate_model(model)
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -1341,11 +1431,9 @@ class AccountsScreen(ModalScreen[object]):
         self.notify(f"Профиль удалён: {profile}")
 
     async def _refresh(self, profiles) -> None:
+        # the profile list lives on its card now; the screen only coordinates the add/remove flow.
         self._profiles = list(profiles)
-        lv = self.query_one("#accounts", ListView)
-        await lv.clear()
-        for p in self._profiles:
-            await lv.append(AccountItem(p, p == self._active))
+        await self.query_one(ProfileListCard).refresh_profiles(self._profiles, self._active)
 
 
 class MessengerTUI(App):
