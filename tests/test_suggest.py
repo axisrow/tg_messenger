@@ -377,3 +377,29 @@ async def test_nudge_candidates_requires_storage():
     suggester = Suggester(client=FakeClient([]), suggest_fn=make_suggest_fn()[0])
     with pytest.raises(RuntimeError):
         await suggester.nudge_candidates([7], now=0.0)
+
+
+async def test_nudge_candidates_skips_history_for_ineligible_dialogs(tmp_path):
+    # flood discipline: a DM with no stored receipt — and one read too recently — must
+    # be rejected by the cheap local check BEFORE any network history() read happens.
+    history = [_msg(1, out=False, text="hey"), _msg(2, out=True, text="you there?")]
+    client = FakeClient(history)
+    fn, _ = make_suggest_fn("ping")
+    storage = Storage(tmp_path / "n.db")
+    register_suggest_migrations(storage)
+    await storage.connect()
+    try:
+        # dialog 7 has a receipt but was read just now; dialog 8 has NO receipt at all
+        await record_last_read(
+            storage, MessageReadEvent(dialog_id=7, max_id=2, outbox=True),
+            clock=lambda: 1000.0,
+        )
+        suggester = Suggester(client=client, suggest_fn=fn, storage=storage)
+        out = await suggester.nudge_candidates(
+            [7, 8], now=1000.0 + 60, after_sec=3600,  # within window for 7, no receipt for 8
+        )
+        assert out == []
+        # neither dialog warranted a network read — the local receipt check gated it
+        assert client.history_calls == []
+    finally:
+        await storage.close()

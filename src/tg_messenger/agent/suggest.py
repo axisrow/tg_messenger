@@ -305,9 +305,15 @@ class Suggester:
             raise RuntimeError("nudge_candidates() needs a Storage — none was wired")
         out: list[dict] = []
         for dialog_id in dialog_ids:
-            history = await self._client.history(dialog_id, self._history_limit)
+            # flood discipline: check the CHEAP local receipt (SQLite kv) FIRST and skip
+            # before any network read. Most DMs have no stored receipt and never qualify,
+            # so fetching history for all of them would be an unbounded read storm over the
+            # whole DM list — the network history() is gated behind the aged-receipt test.
             last_read_id = await load_last_read(self._storage, dialog_id)
             read_at = await load_read_at(self._storage, dialog_id)
+            if last_read_id is None or read_at is None or (now - read_at) < after_sec:
+                continue
+            history = await self._client.history(dialog_id, self._history_limit)
             if not should_nudge(
                 history, last_read_id=last_read_id, read_at=read_at,
                 now=now, after_sec=after_sec,
