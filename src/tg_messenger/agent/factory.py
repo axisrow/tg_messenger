@@ -319,8 +319,6 @@ def make_translate_fn(model, method: str = "json_mode") -> Callable:
 
     return translate
 
-    return translate
-
 
 def _style_lines(profile: StyleProfile | None) -> list[str]:
     if profile is None:

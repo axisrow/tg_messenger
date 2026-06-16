@@ -4026,10 +4026,11 @@ async def test_tui_settings_saves_all_three_fields_independently():
         screen.query_one("#known-langs", Input).value = "ru, en"
         screen.query_one("#unknown-langs", Input).value = "ja, ko"
         await screen._save_translate_settings()
-        # the model/max fields round-trip from the loaded settings (max 100 was prefilled on load)
+        # the model is applied via _apply_model_change (validate-then-commit), NOT through
+        # set_settings, so it isn't part of this save; max 100 was prefilled on load.
         assert translator.saved[-1] == {
             "mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": ["ja", "ko"],
-            "model": "", "max_messages": 100,
+            "model": None, "max_messages": 100,
         }
 
 
@@ -4186,7 +4187,10 @@ class _BlockingTranslator(StubTranslator):
     async def translate_history(self, dialog_id, messages):
         await self.gate.wait()
         # mark every inbound message translated so the pass counts as a success
-        return [m.model_copy(update={"translated_text": "tr"}) if not m.out else m for m in messages]
+        return [
+            m.model_copy(update={"translated_text": "ПЕРЕВОД"}) if not m.out else m
+            for m in messages
+        ]
 
 
 async def test_tui_translate_all_shows_status_then_clears():
@@ -4206,9 +4210,69 @@ async def test_tui_translate_all_shows_status_then_clears():
         status = app.query("#messages .translate-status")
         assert status, "status line not shown during translation"
         assert "Идёт перевод" in str(status.first().render())
-        # release the translator → status clears, bubbles appear
+        # release the translator → status clears, bubbles appear WITH the translation rendered
         translator.gate.set()
         await pilot.pause()
         await pilot.pause()
         assert not app.query("#messages .translate-status")
-        assert app.query("#messages MessageBubble")
+        bubbles = app.query("MessageBubble")
+        assert bubbles
+        # regression: the re-mounted snapshot must show the TRANSLATED text, not the originals
+        rendered = "\n".join(str(b.render()) for b in bubbles)
+        assert "ПЕРЕВОД" in rendered, "Ctrl+T mounted untranslated bubbles"
+
+
+async def test_tui_failed_model_change_does_not_persist_model_or_clear_cache(monkeypatch, tmp_path):
+    # regression: a bad model must NOT be written to kv (and the cache must NOT be cleared) before
+    # the probe/build succeeds — validate-then-commit.
+    pytest.importorskip("deepagents")
+    from tg_messenger.agent import factory as factory_mod
+    from tg_messenger.agent.translate import Translator, get_translate_model, set_translate_model
+    from tg_messenger.core.message_store import register_message_store_migrations
+    from tg_messenger.core.storage import Storage
+
+    storage = Storage(tmp_path / "t.db")
+    register_message_store_migrations(storage)
+    await storage.connect()
+    cleared = {"count": 0}
+    try:
+        await set_translate_model(storage, "openai:good")  # the working model already persisted
+
+        async def fake_translate_fn(batch, lang, skip=(), only=()):
+            return {}
+
+        translator = Translator(storage=storage, translate_fn=fake_translate_fn, env={})
+
+        # building the candidate model raises (bad name / missing key)
+        async def boom(_storage, _model):
+            raise RuntimeError("bad model")
+
+        monkeypatch.setattr(factory_mod, "build_translator_with_probe", boom)
+        import tg_messenger.core.message_store as ms
+
+        real_clear = ms.clear_all_translations
+
+        async def counting_clear(s):
+            cleared["count"] += 1
+            await real_clear(s)
+
+        monkeypatch.setattr("tg_messenger.agent.translate.clear_all_translations", counting_clear)
+
+        store = FakeSessionStore(["alice"])
+        app = MessengerTUI(
+            client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = AccountsScreen(
+                profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+            )
+            app.push_screen(screen)
+            await pilot.pause()
+            screen.query_one("#translate-model", Input).value = "openai:bad"
+            await screen._apply_model_change("openai:bad")
+            # the bad model was NOT persisted; the working one survives; cache was not cleared
+            assert await get_translate_model(storage, {}) == "openai:good"
+            assert cleared["count"] == 0
+    finally:
+        await storage.close()

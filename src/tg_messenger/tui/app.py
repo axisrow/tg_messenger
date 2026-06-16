@@ -972,10 +972,14 @@ class AccountsScreen(ModalScreen[object]):
             self.notify(str(exc), severity="error")
             return
         model = self.query_one("#translate-model", Input).value.strip()
+        # NB: the model is deliberately NOT persisted here. set_translate_model() also clears the
+        # translation cache, so writing it before the model is proven buildable would leave a broken
+        # model + wiped cache on a typo. _apply_model_change validates first, commits the model only
+        # on success (validate-then-commit).
         try:
             await self._translator.set_settings(
                 mode=mode, target=target_code, known=known, unknown=unknown,
-                model=model, max_messages=max_messages,
+                max_messages=max_messages,
             )
         except ValueError as exc:
             self.notify(str(exc), severity="error")
@@ -986,7 +990,7 @@ class AccountsScreen(ModalScreen[object]):
             return
         self._applied_mode = mode
         # A changed model means a different LLM: probe its structured method and rebuild the
-        # Translator, then hand the new instance back to the app via dismiss() (see action below).
+        # Translator, persist the model only on success, then hand the new instance back to the app.
         if model != self._applied_model:
             await self._apply_model_change(model)
             return
@@ -1015,7 +1019,7 @@ class AccountsScreen(ModalScreen[object]):
         self.notify("Проверяю модель…")
         try:
             from tg_messenger.agent.factory import build_translator_with_probe
-            from tg_messenger.agent.translate import translate_model_from_env
+            from tg_messenger.agent.translate import set_translate_model, translate_model_from_env
         except ImportError:
             logger.exception("settings: agent extra unavailable for model change")
             self.notify("Переводчик недоступен (нет extra [agent])", severity="error")
@@ -1027,11 +1031,21 @@ class AccountsScreen(ModalScreen[object]):
         # the SQLite Storage the Translator caches into lives on the current translator, NOT on
         # self._store (which is the SessionStore). Reuse it so settings/cache stay in one DB.
         storage = self._translator.storage
+        # validate-then-commit: build+probe the candidate FIRST, persist the model only on success.
+        # A bad name/key raises here without ever touching kv, so storage keeps pointing at the
+        # working model and the cache isn't wiped on a typo.
         try:
             new_translator = await build_translator_with_probe(storage, target_model)
         except Exception:
             logger.exception("settings: failed to build translator for model %r", target_model)
             self.notify("Не удалось применить модель — проверьте имя/ключ", severity="error")
+            return
+        try:
+            # blank field → clear the kv override (fall back to env); else persist the chosen model
+            await set_translate_model(storage, model or None)
+        except Exception:
+            logger.exception("settings: failed to persist model %r", target_model)
+            self.notify("Не удалось сохранить модель", severity="error")
             return
         self._translator = new_translator
         self._applied_model = model
@@ -1779,13 +1793,18 @@ class MessengerTUI(App):
                 messages = await self._client.history(dialog_id, limit=cap)
             translated = await self._translator.translate_history(dialog_id, messages)
             if dialog_id == self._current:
-                # drop the status line, then mount the (now translated) snapshot
+                # drop the status line, then mount the TRANSLATED snapshot — translate_history
+                # returns model-copies carrying translated_text; mounting `messages` (the originals)
+                # would show the untranslated text and the whole pass would appear to do nothing.
                 await pane.remove_children()
                 self._bubble_index.clear()
-                bubbles = [self._message_bubble_for(m, dialog_id) for m in messages]
+                bubbles = [self._message_bubble_for(m, dialog_id) for m in translated]
                 await pane.mount(*(_wrap_bubble(b) for b in bubbles))
+                self._drain_pending_reactions(dialog_id)  # replay reactions buffered during the pass
                 self._scroll_messages_to_end(pane)
-            ok = any(m.translated_text for m in translated)
+            # success = the pass ran (no exception). A chat that's entirely in the target language
+            # legitimately yields zero translations — that is NOT a failure.
+            ok = True
         except Exception:
             logger.exception("whole-chat translation failed (dialog %s)", dialog_id)
         if dialog_id == self._current:
