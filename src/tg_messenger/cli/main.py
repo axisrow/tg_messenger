@@ -1939,13 +1939,23 @@ def heartbeat_run(ctx: click.Context, session: str) -> None:
         register_heartbeat_migrations(storage)
         await storage.connect()
         await client.connect()
+        # #146: the суфлёр hook — let the Suggester compose each ping's text when the [agent]
+        # extra + TG_AGENT_MODEL are configured; None falls back to plan templates (heartbeat's
+        # built-in fallback also catches a per-ping failure, so this is best-effort).
+        suggester = make_optional_suggester(client, session=session)
+        text_provider = suggester.suggest if suggester is not None else None
         try:
             await _ensure_authorized(client, session)
-            click.echo("Heartbeat scheduler running — Ctrl+C to stop...")
+            click.echo(
+                "Heartbeat scheduler running — Ctrl+C to stop... "
+                f"(suggester text {'on' if text_provider else 'off — using templates'})"
+            )
             # сигнал «прочитал и молчит»: last_read пишется и здесь (#17/#19)
             async with _read_receipts_watcher(client, storage):
-                await HeartbeatService(client, storage).run()
+                await HeartbeatService(client, storage, text_provider=text_provider).run()
         finally:
+            if suggester is not None:
+                await suggester.close()
             await client.disconnect()
             await storage.close()
 
