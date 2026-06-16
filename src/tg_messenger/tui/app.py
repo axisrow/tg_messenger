@@ -1376,8 +1376,9 @@ class MessengerTUI(App):
         # hidden to avoid a duplicate "Справка" entry.
         Binding("f1", "toggle_help", "Справка", priority=True, show=True),
         Binding("question_mark", "toggle_help", "Справка", show=False),
-        # #124: Escape clears a non-empty search filter (a small, predictable global). NOT priority,
-        # so any open modal's own Escape still wins (the modal binding chain truncates above the app).
+        # #124/#156: Escape clears the FOCUSED input — the composer when it's focused (#156, so
+        # Ctrl+G gets a clean field), else a non-empty search filter (the original global). NOT
+        # priority, so any open modal's own Escape still wins (the modal chain truncates above the app).
         Binding("escape", "clear_search", "Clear search", show=False),
         # #126: inbound translation. `t` toggles auto-translate; it is PRINTABLE so — like `?` — it
         # is filtered out while an Input (composer/search) is focused and works everywhere else
