@@ -1,11 +1,12 @@
 import asyncio
 import inspect
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
+from textual.css.scalar import Unit
 from textual.widgets import Footer, Input, Label, ListView, LoadingIndicator, Static, Tabs
 
 from tg_messenger.core.client import SendForbiddenError
@@ -345,6 +346,41 @@ async def test_tui_dialog_item_uses_terminal_safe_title_display():
         assert "\u0e31" in rendered  # mai han-akat preserved
         assert "\u0e48" in rendered  # mai ek tone mark preserved
         assert "7วันปั่นลูกหนัง V4" in rendered  # full title intact
+
+
+def test_tui_dialog_rows_pin_full_width_css():
+    # #160: the dialog rows pin width:1fr so the row background paints past Thai/Indic
+    # combining-mark width drift (Rich width 0 vs terminal width >0) — no stray dark patch.
+    assert "#dialogs > DialogItem > Static" in MessengerTUI.CSS
+    assert "#dialogs > DialogItem {" in MessengerTUI.CSS
+
+
+class ThaiDialogClient(TuiStubClient):
+    """A dialog list whose first entry has a Thai title with combining marks (#160)."""
+
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        return [Dialog(id=-100200, title="7วันปั่นลูกหนัง V4", kind="group", unread=1)]
+
+
+async def test_tui_dialog_row_fills_full_row_width_for_thai_title():
+    # #160: a Thai title with combining marks (Rich width 0, terminal width >0) must not leave a
+    # stray unpainted patch — the row's inner Static spans the full list width so Textual paints
+    # the whole row background. The title letters stay intact (see the terminal-safe display test).
+    app = MessengerTUI(client=ThaiDialogClient())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        item = app.query_one(DialogItem)
+        inner = item.query_one(Static)
+        # the inner Static is pinned to a fraction width (1fr) — the fix that fills the whole row
+        assert inner.styles.width is not None
+        assert inner.styles.width.unit == Unit.FRACTION
+        # and it actually spans the full row content width (no short-by-glyph-drift background fill)
+        assert inner.region.width == item.content_region.width
+        # title still intact (the fix must not strip Thai marks)
+        rendered = str(inner.render())
+        assert "ั" in rendered  # mai han-akat preserved
+        assert "7วันปั่นลูกหนัง V4" in rendered
 
 
 class UnreadClient(TuiStubClient):
@@ -2249,6 +2285,211 @@ async def test_tui_own_send_is_not_duplicated_by_outgoing_echo():
         bubbles = [str(b.render()) for b in app.query(MessageBubble)]
         # ровно один пузырёк, эхо не продублировало
         assert bubbles == ["[2] привет"]
+
+
+class OutgoingEchoOnSendClient(TuiStubClient):
+    """send_text enqueues the self-echo so listen_outgoing() yields it DURING the
+    _touch_dialog_for_message await — reproducing the duplicate-echo race (regression from
+    the #160 fix, where _remember_sent ran AFTER that await)."""
+
+    def __init__(self):
+        super().__init__()
+        self._echo_q: asyncio.Queue = asyncio.Queue()
+
+    async def send_text(self, peer, text, reply_to=None):
+        self.sent.append((peer, text, reply_to))
+        self.sent_event.set()
+        msg = Message(id=99, dialog_id=peer, sender_id=1, out=True, text=text,
+                      date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        # the real account echoes our own message back almost immediately
+        await self._echo_q.put(OutgoingEvent(dialog_id=peer, message=msg))
+        return msg
+
+    async def listen_outgoing(self):
+        while True:
+            yield await self._echo_q.get()
+
+
+async def test_tui_real_send_path_not_duplicated_by_fast_outgoing_echo():
+    # Regression for the #160 fix: _remember_sent ran AFTER the _touch_dialog_for_message await,
+    # so a fast listen_outgoing() echo raced in before the dedup key was armed and _drain_outgoing
+    # drew a SECOND bubble. Exercise the REAL path (on_input_submitted → worker), which the
+    # direct-_send_text #160 test missed.
+    stub = OutgoingEchoOnSendClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _select_dialog(pilot, app, 7)
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "hi there"))
+        # one bubble for our send (echo deduped); robust to the seeded "[1]" history bubble
+        await _pause_until(
+            pilot,
+            lambda: sum("hi there" in str(b.render()) for b in app.query(MessageBubble)) >= 1,
+        )
+        for _ in range(5):  # let any racing echo bubble mount too, so a dup would show
+            await pilot.pause()
+        n = sum("hi there" in str(b.render()) for b in app.query(MessageBubble))
+        assert n == 1, f"expected exactly one sent bubble, got {n} (duplicate echo)"
+
+
+class OutgoingFallbackClient(TuiStubClient):
+    """listen_outgoing, отдающий эхо нашего отправленного сообщения по сигналу fire.
+
+    Имитирует уход из диалога во время отправки: пузырёк не нарисуется (peer != _current),
+    но эхо ДОЛЖНО появиться через _drain_outgoing при возврате — ключ подавления не записан.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def listen_outgoing(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        # id=2 — ровно то, что вернёт send_text стаба (см. TuiStubClient)
+        yield OutgoingEvent(dialog_id=7, message=Message(
+            id=2, dialog_id=7, sender_id=1, out=True, text="hi", date=date))
+        await asyncio.Event().wait()
+
+
+async def test_tui_send_echo_not_suppressed_when_navigated_away_mid_send():
+    # #160: a send whose optimistic bubble is SKIPPED (the user switched dialogs during the
+    # in-flight send) must end up NOT in _sent_ids — otherwise its listen_outgoing() echo is
+    # suppressed forever and the message stays invisible until the chat is reopened. The key is
+    # armed before the send await (to dedup a fast echo) and POPPED here because the bubble was
+    # not drawn — so the END state is un-armed and _drain_outgoing renders the echo on return.
+    stub = OutgoingFallbackClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _select_dialog(pilot, app, 7)
+        # simulate "navigated away during the send": _current is 8 by the time the bubble would mount
+        app._current = 8
+        await app._send_text(7, "hi")  # peer=7 != _current=8 → bubble skipped
+        await pilot.pause()
+        # the key must NOT be recorded — no bubble was drawn for it
+        assert (7, 2) not in app._sent_ids
+
+        # back in dialog 7, the live echo must now be drawn by _drain_outgoing (the fallback)
+        await _select_dialog(pilot, app, 7)
+        stub.fire.set()
+        await _pause_until(
+            pilot, lambda: any("hi" in str(b.render()) for b in app.query(MessageBubble))
+        )
+        assert any("hi" in str(b.render()) for b in app.query(MessageBubble))
+
+
+class OutgoingEchoWhileAwayClient(TuiStubClient):
+    """The dangerous interleaving (Codex local review, PR #161): send_text enqueues the self-echo
+    so listen_outgoing() yields it WHILE _touch_dialog_for_message is awaiting AND the user has
+    navigated away (peer != _current). The echo arrives while the dedup key is still armed, so
+    _drain_outgoing drops it; the send path's else-branch must still pop the key so the message is
+    not suppressed forever. A second (resync) echo on return must then render via _drain_outgoing.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._echo_q: asyncio.Queue = asyncio.Queue()
+
+    async def send_text(self, peer, text, reply_to=None):
+        self.sent.append((peer, text, reply_to))
+        self.sent_event.set()
+        msg = Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
+                      date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        # echo the just-sent message back immediately — yielded DURING the send's own
+        # _touch_dialog_for_message await (which suspends across several loop turns)
+        await self._echo_q.put(OutgoingEvent(dialog_id=peer, message=msg))
+        return msg
+
+    def resync_echo(self, peer):
+        """Simulate Telegram re-echoing the message after a reconnect/resync."""
+        self._echo_q.put_nowait(OutgoingEvent(
+            dialog_id=peer,
+            message=Message(id=2, dialog_id=peer, sender_id=1, out=True, text="hi",
+                            date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+        ))
+
+    async def listen_outgoing(self):
+        while True:
+            yield await self._echo_q.get()
+
+
+async def test_tui_navigated_away_echo_during_await_is_not_permanently_suppressed():
+    # Codex local-review regression (PR #161): the echo races in DURING the send await while the
+    # user is on another dialog. The armed key dedups that first echo (no spurious bubble in the
+    # away view), but the else-branch pop must leave _sent_ids un-armed so the message is NOT
+    # suppressed forever — a later resync echo renders it on return. The existing navigated-away
+    # test only fires the echo AFTER the pop; this covers the dangerous interleaving.
+    stub = OutgoingEchoWhileAwayClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _select_dialog(pilot, app, 7)
+        app._current = 8  # navigated away during the in-flight send
+        await app._send_text(7, "hi")  # echo enqueued during the _touch_dialog await
+        for _ in range(5):  # let the racing echo be consumed by _drain_outgoing
+            await pilot.pause()
+        # end state: the key was popped (bubble not drawn), so the echo is recoverable, not lost
+        assert (7, 2) not in app._sent_ids
+        # no away-view bubble was duplicated for dialog 8
+        assert not any("hi" in str(b.render()) for b in app.query(MessageBubble))
+
+        # back in dialog 7, a resync echo must now render via the _drain_outgoing fallback
+        await _select_dialog(pilot, app, 7)
+        stub.resync_echo(7)
+        await _pause_until(
+            pilot, lambda: any("hi" in str(b.render()) for b in app.query(MessageBubble))
+        )
+        assert any("hi" in str(b.render()) for b in app.query(MessageBubble))
+
+
+class LongHistorySendClient(TuiStubClient):
+    """A dialog with enough history that the pane scrolls — so a freshly-sent bubble appended at
+    the bottom is below the viewport unless the scroll reaches the recomputed end (#160 r3)."""
+
+    async def history(self, peer, limit=50, offset_id=0):
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        return [
+            Message(id=i, dialog_id=peer, sender_id=peer, out=(i % 2 == 0),
+                    text=f"history message number {i} with some length to fill the row",
+                    date=date + timedelta(minutes=i))
+            for i in range(1, 29)
+        ]
+
+    async def send_text(self, peer, text, reply_to=None):
+        self.sent.append((peer, text, reply_to))
+        self.sent_event.set()
+        return Message(id=216, dialog_id=peer, sender_id=1, out=True, text=text,
+                       date=datetime(2024, 1, 1, 1, tzinfo=timezone.utc))
+
+
+async def test_tui_sent_bubble_is_scrolled_into_view_in_a_long_chat():
+    # #160 r3 (the REAL "message doesn't show until refresh" bug): the optimistic bubble IS mounted,
+    # but _scroll_messages_to_end ran before Textual recomputed the layout for the new widget, so
+    # the pane stayed scrolled above it and the message was off-screen until a manual reopen.
+    # Assert the new bubble's region is INSIDE the pane viewport — presence in the DOM is not enough.
+    stub = LongHistorySendClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await _select_dialog(pilot, app, 7)
+        for _ in range(8):
+            await pilot.pause()
+        pane = app.query_one("#messages", Vertical)
+        assert pane.max_scroll_y > 0, "history did not fill the pane — test precondition broken"
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "MY NEW MESSAGE"))
+        # the optimistic bubble mounts at the bottom; the pane MUST scroll to the recomputed end so
+        # it is on screen. Presence in the DOM is not enough — assert the scroll reached max.
+        await _pause_until(pilot, lambda: pane.scroll_y == pane.max_scroll_y)
+        b = next(b for b in app.query(MessageBubble) if "MY NEW MESSAGE" in str(b.render()))
+        pr = b.region
+        viewport = pane.region
+        assert viewport.y <= pr.y < viewport.y + viewport.height, (
+            f"sent bubble off-screen: bubble.y={pr.y} viewport={viewport} "
+            f"scroll_y={pane.scroll_y} max_scroll_y={pane.max_scroll_y}"
+        )
 
 
 class OutgoingSameIdOtherDialogClient(TuiStubClient):

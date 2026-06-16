@@ -1404,6 +1404,14 @@ class MessengerTUI(App):
        so the default 32 width is unchanged. */
     #sidebar { width: 32; max-width: 50%; border-right: solid $primary; }
     #chat { width: 1fr; min-width: 16; }
+    /* #160: the dialog rows must paint their FULL row background. Rich computes Thai/Indic
+       combining marks (Unicode category Mn) as 0-width while the terminal paints them wider, so a
+       row whose background spans only the Rich-computed text width leaves a stray dark patch at the
+       right edge (most visible as a gap in the blue highlight on the selected row). Pinning the row
+       and its inner Static to the full list width makes Textual paint the whole row regardless of
+       the per-glyph width disagreement — without touching the (load-bearing) combining marks. */
+    #dialogs > DialogItem { width: 1fr; }
+    #dialogs > DialogItem > Static { width: 1fr; }
     /* #124: focus indicator — the pane holding focus gets an accent border so "where am I" is
        always visible. :focus-within styles a container while any descendant (search/tabs/list/
        bubble/composer) is focused. Keeps the sidebar's existing right border; the chat's left
@@ -1577,6 +1585,12 @@ class MessengerTUI(App):
                 self.call_later(scroll_once)
 
         scroll_once()
+        # #160 r3: when a SINGLE bubble is appended to an already-tall pane (a send into a long
+        # chat), `max_scroll_y` is still the pre-mount value at scroll_once() time, so the loop
+        # converges to the OLD bottom and the new bubble lands just below the viewport — invisible
+        # until a manual reopen (the reported bug). call_after_refresh fires once Textual has
+        # recomputed the layout, so this final pass sees the real max_scroll_y and reaches it.
+        self.call_after_refresh(scroll_once)
         self.call_later(scroll_once)
 
     def _compose_state_for(self, dialog_id: int) -> ComposeState:
@@ -2431,13 +2445,22 @@ class MessengerTUI(App):
             self._restore_draft(peer, text)
             return
         self._clear_compose_state_after_send(peer, text)
-        self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
+        # #160 (+ regression fix): ARM echo-dedup BEFORE the await window. `_touch_dialog_for_message`
+        # awaits `_render_dialogs` (several loop turns); the real account echoes our just-sent message
+        # back on `listen_outgoing()` during that window. If the key isn't set yet, `_drain_outgoing`
+        # (membership-only, no pop) draws its OWN bubble and we then draw a second — a DUPLICATE.
+        self._remember_sent(peer, msg.id)  # suppress the listen_outgoing() echo
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
             bubble = self._message_bubble_for(msg, peer)
             await pane.mount(_wrap_bubble(bubble))
             self._scroll_messages_to_end(pane)
+        else:
+            # #160: navigated away mid-send → no optimistic bubble drawn. Un-arm the dedup so the
+            # live echo is rendered by the `_drain_outgoing` fallback on return, instead of the
+            # message staying invisible until a manual reopen.
+            self._sent_ids.pop((peer, msg.id), None)
 
     async def _send_media(
         self, peer: int, path: str, caption: str | None, source_text: str | None = None,
@@ -2457,13 +2480,17 @@ class MessengerTUI(App):
             self.notify(f"Send failed: {exc}", severity="error")
             self._restore_draft(peer, source_text)
             return
-        self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
+        # #160 (+ regression fix): arm echo-dedup BEFORE the await window — see `_send_text`.
+        self._remember_sent(peer, msg.id)  # suppress the listen_outgoing() echo
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
             pane = self.query_one("#messages", Vertical)
             bubble = self._message_bubble_for(msg, peer)
             await pane.mount(_wrap_bubble(bubble))
             self._scroll_messages_to_end(pane)
+        else:
+            # #160: navigated away → no bubble; un-arm so `_drain_outgoing` renders the live echo.
+            self._sent_ids.pop((peer, msg.id), None)
 
     async def _react_from_bubble(self, peer: int, message_id: int) -> None:
         # #93: the "r" hotkey path — open the 4-emoji picker, then send. No composer text
@@ -2717,6 +2744,11 @@ class MessengerTUI(App):
             return
         composer = self.query_one("#composer", Input)
         composer.value = self._pending_suggestion
+        if self._current is not None:
+            # #160: the programmatic value set above doesn't reach on_input_changed (the
+            # stale-value guard early-returns), so persist the accepted draft into the per-dialog
+            # state ourselves — otherwise switching dialogs before Enter silently drops it.
+            self._compose_state_for(self._current).draft = self._pending_suggestion
         self._clear_suggestion()
         composer.focus()
 
