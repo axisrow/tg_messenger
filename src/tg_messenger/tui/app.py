@@ -1386,6 +1386,12 @@ class MessengerTUI(App):
         # (`translate_all`, bound above) — non-printable + priority, so it fires from inside the
         # composer or a read-only channel where the composer is disabled.
         Binding("t", "toggle_auto_translate", "Авто-перевод", show=True),
+        # #155: suggest a reply for the OPEN DM on demand. The automatic 💡 hint only fires on a
+        # NEW incoming message (_drain_incoming); opening a DM with existing history never triggers
+        # it, so the suggester felt dead when reading an already-delivered message. Ctrl+G generates
+        # a draft for the current dialog. Non-printable + priority so it fires from inside the
+        # composer too (like Ctrl+T), without stealing a literal key typed into a message.
+        Binding("ctrl+g", "suggest_reply", "Подсказать ответ", priority=True, show=True),
     ]
 
     CSS = """
@@ -2580,6 +2586,28 @@ class MessengerTUI(App):
         if self.query_one("#composer", Input).value:
             return  # don't suggest over a draft the user is writing
         self.run_worker(self._suggest(dialog_id), group="suggest", exclusive=True)
+
+    def action_suggest_reply(self) -> None:
+        """Ctrl+G — suggest a reply for the OPEN dialog on demand (#155).
+
+        The automatic 💡 hint only fires on a new incoming message; this lets the user
+        ask for a draft while reading already-delivered history. Same guards as
+        _maybe_suggest, but each rejection NOTIFIES (the user pressed a key and expects
+        feedback) instead of silently no-opping.
+        """
+        if self._suggester is None:
+            self.notify("Суфлёр не настроен", severity="warning")
+            return
+        if self._current is None:
+            self.notify("Сначала откройте диалог", severity="warning")
+            return
+        if not self._is_dm_dialog(self._current):
+            self.notify("Суфлёр работает только в личных сообщениях", severity="warning")
+            return
+        if self.query_one("#composer", Input).value:
+            self.notify("Очистите поле ввода — черновик не перезаписывается", severity="warning")
+            return
+        self.run_worker(self._suggest(self._current), group="suggest", exclusive=True)
 
     def _is_dm_dialog(self, dialog_id: int) -> bool:
         return any(d.id == dialog_id and d.kind == "dm" for d in self._all_dialogs)
