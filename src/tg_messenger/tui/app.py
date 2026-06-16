@@ -2439,17 +2439,22 @@ class MessengerTUI(App):
             self._restore_draft(peer, text)
             return
         self._clear_compose_state_after_send(peer, text)
+        # #160 (+ regression fix): ARM echo-dedup BEFORE the await window. `_touch_dialog_for_message`
+        # awaits `_render_dialogs` (several loop turns); the real account echoes our just-sent message
+        # back on `listen_outgoing()` during that window. If the key isn't set yet, `_drain_outgoing`
+        # (membership-only, no pop) draws its OWN bubble and we then draw a second — a DUPLICATE.
+        self._remember_sent(peer, msg.id)  # suppress the listen_outgoing() echo
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
-            # #160: record the suppression key ONLY when we actually draw the optimistic bubble.
-            # If the user navigated away during the (possibly slow, e.g. outbound LLM) send await,
-            # we draw nothing and must NOT suppress — _drain_outgoing then renders the live echo
-            # when they return, instead of the message staying invisible until a manual reopen.
-            self._remember_sent(peer, msg.id)  # suppress the listen_outgoing() echo we just drew
             pane = self.query_one("#messages", Vertical)
             bubble = self._message_bubble_for(msg, peer)
             await pane.mount(_wrap_bubble(bubble))
             self._scroll_messages_to_end(pane)
+        else:
+            # #160: navigated away mid-send → no optimistic bubble drawn. Un-arm the dedup so the
+            # live echo is rendered by the `_drain_outgoing` fallback on return, instead of the
+            # message staying invisible until a manual reopen.
+            self._sent_ids.pop((peer, msg.id), None)
 
     async def _send_media(
         self, peer: int, path: str, caption: str | None, source_text: str | None = None,
@@ -2469,16 +2474,17 @@ class MessengerTUI(App):
             self.notify(f"Send failed: {exc}", severity="error")
             self._restore_draft(peer, source_text)
             return
+        # #160 (+ regression fix): arm echo-dedup BEFORE the await window — see `_send_text`.
+        self._remember_sent(peer, msg.id)  # suppress the listen_outgoing() echo
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
-            # #160: suppress the echo only because we draw the bubble here — see _send_text. A
-            # send whose bubble is skipped (navigated away) must stay un-suppressed so the
-            # _drain_outgoing fallback renders it on return.
-            self._remember_sent(peer, msg.id)  # suppress the listen_outgoing() echo we just drew
             pane = self.query_one("#messages", Vertical)
             bubble = self._message_bubble_for(msg, peer)
             await pane.mount(_wrap_bubble(bubble))
             self._scroll_messages_to_end(pane)
+        else:
+            # #160: navigated away → no bubble; un-arm so `_drain_outgoing` renders the live echo.
+            self._sent_ids.pop((peer, msg.id), None)
 
     async def _react_from_bubble(self, peer: int, message_id: int) -> None:
         # #93: the "r" hotkey path — open the 4-emoji picker, then send. No composer text

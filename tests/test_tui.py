@@ -2287,6 +2287,52 @@ async def test_tui_own_send_is_not_duplicated_by_outgoing_echo():
         assert bubbles == ["[2] привет"]
 
 
+class OutgoingEchoOnSendClient(TuiStubClient):
+    """send_text enqueues the self-echo so listen_outgoing() yields it DURING the
+    _touch_dialog_for_message await — reproducing the duplicate-echo race (regression from
+    the #160 fix, where _remember_sent ran AFTER that await)."""
+
+    def __init__(self):
+        super().__init__()
+        self._echo_q: asyncio.Queue = asyncio.Queue()
+
+    async def send_text(self, peer, text, reply_to=None):
+        self.sent.append((peer, text, reply_to))
+        self.sent_event.set()
+        msg = Message(id=99, dialog_id=peer, sender_id=1, out=True, text=text,
+                      date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+        # the real account echoes our own message back almost immediately
+        await self._echo_q.put(OutgoingEvent(dialog_id=peer, message=msg))
+        return msg
+
+    async def listen_outgoing(self):
+        while True:
+            yield await self._echo_q.get()
+
+
+async def test_tui_real_send_path_not_duplicated_by_fast_outgoing_echo():
+    # Regression for the #160 fix: _remember_sent ran AFTER the _touch_dialog_for_message await,
+    # so a fast listen_outgoing() echo raced in before the dedup key was armed and _drain_outgoing
+    # drew a SECOND bubble. Exercise the REAL path (on_input_submitted → worker), which the
+    # direct-_send_text #160 test missed.
+    stub = OutgoingEchoOnSendClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _select_dialog(pilot, app, 7)
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "hi there"))
+        # one bubble for our send (echo deduped); robust to the seeded "[1]" history bubble
+        await _pause_until(
+            pilot,
+            lambda: sum("hi there" in str(b.render()) for b in app.query(MessageBubble)) >= 1,
+        )
+        for _ in range(5):  # let any racing echo bubble mount too, so a dup would show
+            await pilot.pause()
+        n = sum("hi there" in str(b.render()) for b in app.query(MessageBubble))
+        assert n == 1, f"expected exactly one sent bubble, got {n} (duplicate echo)"
+
+
 class OutgoingFallbackClient(TuiStubClient):
     """listen_outgoing, отдающий эхо нашего отправленного сообщения по сигналу fire.
 
@@ -2309,9 +2355,10 @@ class OutgoingFallbackClient(TuiStubClient):
 
 async def test_tui_send_echo_not_suppressed_when_navigated_away_mid_send():
     # #160: a send whose optimistic bubble is SKIPPED (the user switched dialogs during the
-    # in-flight send) must NOT be added to _sent_ids — otherwise its listen_outgoing() echo is
-    # suppressed forever and the message stays invisible until the chat is reopened. The
-    # suppression key and the drawn bubble must be consistent.
+    # in-flight send) must end up NOT in _sent_ids — otherwise its listen_outgoing() echo is
+    # suppressed forever and the message stays invisible until the chat is reopened. The key is
+    # armed before the send await (to dedup a fast echo) and POPPED here because the bubble was
+    # not drawn — so the END state is un-armed and _drain_outgoing renders the echo on return.
     stub = OutgoingFallbackClient()
     app = MessengerTUI(client=stub)
     async with app.run_test() as pilot:
