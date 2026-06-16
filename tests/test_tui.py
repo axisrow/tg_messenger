@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import unicodedata
 from datetime import datetime, timezone
 
 import pytest
@@ -39,18 +40,39 @@ def test_parse_media_simple():
     assert parse_media_command("@a.jpg") == ("a.jpg", None)
 
 
-def test_tui_terminal_safe_display_text_preserves_text_but_simplifies_problem_glyphs():
-    raw = "⚽️เปิดทุกคู่ 🇩🇪 https://777sportplus.net/register?m_ref=bh"
-    safe = _terminal_safe_display_text(raw)
+def test_tui_terminal_safe_display_text_preserves_letters_and_emoji():
+    # #129: the workaround must NOT corrupt text. Combining marks are load-bearing LETTERS in
+    # these scripts; emoji must stay visible. Only the zero-width width-ambiguous glyphs
+    # (variation selectors FE0E/FE0F, ZWJ) are stripped.
+    thai = "เปิดทุกคู่"  # Mn marks U+0E34/0E38/0E39/0E48 must survive
+    devanagari = "नमस्ते"  # virama U+094D + matras
+    arabic = "السَّلامُ"  # shadda/harakat (Mn)
+    hebrew = "שָׁלוֹם"  # niqqud points (Mn)
+    for s in (thai, devanagari, arabic, hebrew):
+        out = _terminal_safe_display_text(s)
+        # canonically identical (the function NFC-normalizes) — NO letter/mark dropped
+        assert out == unicodedata.normalize("NFC", s)
+        # every combining mark is still present (the exact corruption #129 fixes)
+        decomposed = unicodedata.normalize("NFD", out)
+        for ch in unicodedata.normalize("NFD", s):
+            if unicodedata.category(ch) == "Mn":
+                assert ch in decomposed
 
-    assert "https://777sportplus.net/register?m_ref=bh" in safe
-    assert "เปดทกค" in safe
-    assert "⚽" not in safe
-    assert "🇩" not in safe
-    assert "\ufe0f" not in safe
-    assert "\u0e34" not in safe
-    assert "*" in safe
+    url = "https://777sportplus.net/register?m_ref=bh"
+    assert _terminal_safe_display_text(url) == url  # URLs/ASCII untouched
 
+    # emoji stay visible — never replaced with "*"
+    assert _terminal_safe_display_text("👍") == "👍"
+    mixed = "⚽ เปิด 🇩🇪"
+    assert "*" not in _terminal_safe_display_text(mixed)
+    assert "⚽" in _terminal_safe_display_text(mixed)
+    assert "เปิด" in _terminal_safe_display_text(mixed)
+
+    # the three width-ambiguous zero-width glyphs ARE stripped (the realignment that remains)
+    assert "\ufe0f" not in _terminal_safe_display_text("❤️")  # FE0F dropped...
+    assert "❤" in _terminal_safe_display_text("❤️")  # ...heart survives
+    assert "\u200d" not in _terminal_safe_display_text("👨‍👩")  # ZWJ dropped
+    assert _terminal_safe_display_text("a︎b") == "ab"  # FE0E (text VS) dropped
 
 def test_parse_media_quoted_path_with_caption():
     assert parse_media_command('@"с пробелом.png" подпись') == ("с пробелом.png", "подпись")
@@ -319,8 +341,10 @@ async def test_tui_dialog_item_uses_terminal_safe_title_display():
         rendered = str(item.query_one(Static).render())
         assert "V4" in rendered
         assert "#-100200" in rendered
-        assert "\u0e31" not in rendered
-        assert "\u0e48" not in rendered
+        # #129: the Thai marks are LETTERS — they must be preserved, not dropped
+        assert "\u0e31" in rendered  # mai han-akat preserved
+        assert "\u0e48" in rendered  # mai ek tone mark preserved
+        assert "7วันปั่นลูกหนัง V4" in rendered  # full title intact
 
 
 class UnreadClient(TuiStubClient):
@@ -665,7 +689,9 @@ async def test_tui_thai_emoji_bubbles_keep_right_padding_slack():
         assert thai_bubble.styles.padding.left == 1
         assert thai_bubble.styles.padding.right >= 4
         assert "https://777sportplus.net/register?m_ref=bh" in rendered
-        assert "⚽" not in rendered
+        # #129: the border fix is the CSS right-padding slack (asserted above), NOT glyph
+        # deletion — the emoji and Thai are now PRESERVED; only the FE0F selector is stripped.
+        assert "⚽" in rendered
         assert "\ufe0f" not in rendered
 
 
@@ -1960,7 +1986,8 @@ async def test_tui_translation_and_reactions_keep_content_after_styling():
         bubble.show_translation("привет")
         bubble.add_reaction("👍")
         await pilot.pause()
-        assert str(bubble.render()) == "[1] hi\n↳ привет\n*"
+        # #129: the reaction line shows the real emoji, not "*"
+        assert str(bubble.render()) == "[1] hi\n↳ привет\n👍"
 
 
 async def test_tui_translation_line_uses_accent_colour():
@@ -2312,11 +2339,11 @@ async def test_tui_sent_reaction_echo_is_not_duplicated():
         stub.fire.set()  # live echo for (7,1,"👍") — deduped, must not double-attach
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
-    # one bubble (the message), reaction line shows a single safe reaction marker, not two.
+    # one bubble (the message); the reaction line shows the real emoji ONCE (deduped), #129.
     assert len(bubbles) == 1
     rendered = str(bubbles[0].render())
-    assert rendered.count("*") == 1
-    assert "👍" not in rendered
+    assert "👍" in rendered
+    assert rendered.count("👍") == 1
     assert rendered.startswith("[1] ")
 
 
@@ -2336,10 +2363,11 @@ async def test_tui_reaction_accumulates_distinct_emoji_and_dedups():
         bubbles = list(app.query(MessageBubble))
     assert len(bubbles) == 1
     rendered = str(bubbles[0].render())
-    assert rendered.endswith("* *")
-    assert rendered.count("*") == 2
-    assert "👍" not in rendered
-    assert "❤️" not in rendered
+    # #129: real emoji on the reaction line — ❤️ renders as ❤ (FE0F stripped), 👍 unchanged
+    assert rendered.endswith("👍 ❤")
+    assert "👍" in rendered
+    assert "❤" in rendered
+    assert "️" not in rendered  # the only thing still stripped is the variation selector
 
 
 async def test_tui_reaction_and_translation_coexist_either_order():
@@ -2355,14 +2383,14 @@ async def test_tui_reaction_and_translation_coexist_either_order():
         bubble.show_translation("привет")
         bubble.add_reaction("👍")
         first = str(bubble.render())
-        assert "↳ привет" in first and "*" in first and "👍" not in first and "[1] hi" in first
+        assert "↳ привет" in first and "👍" in first and "[1] hi" in first
 
         bubble2 = MessageBubble("[2] yo", out=False, message_id=2, dialog_id=7)
         await pane.mount(bubble2)
         bubble2.add_reaction("🔥")
         bubble2.show_translation("здарова")  # reverse order
         second = str(bubble2.render())
-        assert "↳ здарова" in second and "*" in second and "🔥" not in second and "[2] yo" in second
+        assert "↳ здарова" in second and "🔥" in second and "[2] yo" in second
 
 
 async def test_tui_reaction_for_unknown_message_is_silently_ignored():
@@ -2379,7 +2407,7 @@ async def test_tui_reaction_for_unknown_message_is_silently_ignored():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
     assert len(bubbles) == 1  # still just the one message, no reaction bubble
-    assert "*" not in str(bubbles[0].render())
+    assert "👍" not in str(bubbles[0].render())  # #129: no reaction landed (emoji not added)
 
 
 class ChannelReactionClient(TuiStubClient):
@@ -2412,7 +2440,7 @@ async def test_tui_reaction_attaches_in_channel():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
     assert len(bubbles) == 1
-    assert str(bubbles[0].render()).endswith("*")
+    assert str(bubbles[0].render()).endswith("🔥")  # #129: real emoji, not "*"
 
 
 async def test_tui_reaction_during_history_load_is_buffered_and_replayed():
@@ -2431,7 +2459,7 @@ async def test_tui_reaction_during_history_load_is_buffered_and_replayed():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
     assert len(bubbles) == 1
-    assert str(bubbles[0].render()).endswith("*")
+    assert str(bubbles[0].render()).endswith("👍")  # #129: real emoji, not "*"
     assert app._pending_reactions.get(7) is None  # buffer drained, not left dangling
 
 
@@ -2466,7 +2494,7 @@ async def test_tui_reaction_not_attached_to_same_id_bubble_of_other_dialog():
         app._apply_reaction(7, 1, "👍")  # current dialog 7, colliding id 1
         await pilot.pause()
         rendered = str(stale.render())
-    assert "*" not in rendered  # the reaction did not land under the other dialog's bubble
+    assert "👍" not in rendered  # #129: the reaction did not land under the other dialog's bubble
     assert app._pending_reactions == {}  # nor was it buffered (the bubble existed, just mismatched)
 
 

@@ -75,27 +75,27 @@ HELP_TEXT = """Навигация (стрелки):
   Ctrl+C    выход"""
 
 
+# #129: the three zero-width glyphs whose DISPLAY WIDTH Rich/Textual and the terminal disagree
+# on \u2014 the text/emoji variation selectors (FE0E/FE0F) and the ZWJ that fuses emoji sequences.
+# Stripping ONLY these realigns the bubble border without touching any load-bearing letter.
+_WIDTH_AMBIGUOUS_ZERO_WIDTH = "\ufe0e\ufe0f\u200d"
+
+
 def _terminal_safe_display_text(value: str) -> str:
     """Return a terminal-safe display copy of Telegram-sourced text.
 
-    macOS Terminal and Rich/Textual disagree on a few zero-width Thai marks and emoji glyph
-    widths. Keep the model text untouched, but render a conservative one-cell display form in
-    the TUI so borders and line clearing stay aligned.
+    #126/#127: Rich/Textual and some terminals disagree on the display width of a few zero-width
+    glyphs (variation selectors FE0E/FE0F, the emoji ZWJ), which knocked the bubble border out of
+    alignment. We drop ONLY those three; the bubble's right CSS padding absorbs any residual drift.
+
+    #129: we deliberately do NOT drop combining marks (Unicode ``Mn``) or replace emoji \u2014 those
+    are load-bearing. Thai/Devanagari/Arabic/Hebrew vowels & tone marks are letters; removing them
+    changes the message. Emoji stay visible so the displayed text matches Telegram.
     """
-    safe: list[str] = []
-    for ch in unicodedata.normalize("NFC", value):
-        codepoint = ord(ch)
-        if ch in "\ufe0e\ufe0f\u200d" or unicodedata.category(ch) == "Mn":
-            continue
-        if (
-            0x1F000 <= codepoint <= 0x1FAFF
-            or 0x2600 <= codepoint <= 0x27BF
-            or 0x2B00 <= codepoint <= 0x2BFF
-        ):
-            safe.append("*")
-        else:
-            safe.append(ch)
-    return "".join(safe)
+    normalized = unicodedata.normalize("NFC", value)
+    if not any(ch in _WIDTH_AMBIGUOUS_ZERO_WIDTH for ch in normalized):
+        return normalized
+    return "".join(ch for ch in normalized if ch not in _WIDTH_AMBIGUOUS_ZERO_WIDTH)
 
 
 @dataclass
