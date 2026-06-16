@@ -2576,6 +2576,7 @@ async def test_tui_switching_dialogs_clears_pending_suggestion():
     async with app.run_test() as pilot:
         await pilot.pause()
         app._pending_suggestion = "draft for Ann"
+        app._pending_suggestion_dialog = 7
         app.query_one("#suggestion", Static).update("Suggest: draft for Ann")
         lv = app.query_one("#dialogs", ListView)
         lv.index = 1
@@ -2584,6 +2585,7 @@ async def test_tui_switching_dialogs_clears_pending_suggestion():
         await pilot.pause()
 
         assert app._pending_suggestion is None
+        assert app._pending_suggestion_dialog is None  # #158: dialog scope cleared too
         assert str(app.query_one("#suggestion", Static).render()) == ""
 
 
@@ -4963,6 +4965,121 @@ async def test_tui_ctrl_g_suggests_for_open_dm():
             pilot, lambda: SUGGEST_PREFIX in str(app.query_one("#suggestion", Static).render())
         )
         assert app._pending_suggestion == "Конечно, давай завтра!"
+
+
+# --- #158: thinking indicator, instant Ctrl+G reuse, dialog scope ---
+
+
+async def test_tui_ctrl_g_shows_thinking_indicator_while_blocked():
+    from tg_messenger.tui.app import SUGGEST_PREFIX, SUGGEST_THINKING
+
+    gate = asyncio.Event()
+
+    class BlockingSuggester:
+        async def suggest(self, dialog_id):
+            await gate.wait()  # hold the "LLM" until the test releases it
+            return "готовый ответ"
+
+    app = MessengerTUI(client=TuiStubClient(), suggester=BlockingSuggester())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        app.action_suggest_reply()
+        # the indicator is shown synchronously BEFORE the await resolves
+        await _pause_until(
+            pilot, lambda: str(app.query_one("#suggestion", Static).render()) == SUGGEST_THINKING
+        )
+        gate.set()  # release the LLM call
+        await _pause_until(
+            pilot, lambda: SUGGEST_PREFIX in str(app.query_one("#suggestion", Static).render())
+        )
+        assert app._pending_suggestion == "готовый ответ"
+
+
+async def test_tui_ctrl_g_instant_when_pending_for_current_dialog():
+    from tg_messenger.tui.app import SUGGEST_PREFIX
+
+    class RecordingSuggester:
+        def __init__(self):
+            self.calls = []
+
+        async def suggest(self, dialog_id):
+            self.calls.append(dialog_id)
+            return "fresh"
+
+    suggester = RecordingSuggester()
+    app = MessengerTUI(client=TuiStubClient(), suggester=suggester)
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        # a draft was pre-generated for dialog 7 (e.g. by the auto-path on an incoming message)
+        app._pending_suggestion = "уже готов"
+        app._pending_suggestion_dialog = 7
+        suggest_workers = []
+        real_run_worker = app.run_worker
+
+        def spy_run_worker(work, *a, **kw):
+            if kw.get("group") == "suggest":
+                suggest_workers.append(work)
+            return real_run_worker(work, *a, **kw)
+
+        app.run_worker = spy_run_worker  # type: ignore[method-assign]
+        app.action_suggest_reply()
+        await pilot.pause()
+        assert suggest_workers == []  # no LLM worker scheduled — instant
+        assert suggester.calls == []  # the suggester was never asked again
+        assert str(app.query_one("#suggestion", Static).render()) == f"{SUGGEST_PREFIX}уже готов"
+
+
+async def test_tui_ctrl_g_cross_dialog_pending_not_shown_runs_worker():
+    class RecordingSuggester:
+        def __init__(self):
+            self.calls = []
+
+        async def suggest(self, dialog_id):
+            self.calls.append(dialog_id)
+            return "fresh for current"
+
+    suggester = RecordingSuggester()
+    app = MessengerTUI(client=TwoDmClient(), suggester=suggester)
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 8  # a different DM than the pending draft's dialog
+        app._pending_suggestion = "draft for dialog 7"
+        app._pending_suggestion_dialog = 7
+        suggest_workers = []
+        real_run_worker = app.run_worker
+
+        def spy_run_worker(work, *a, **kw):
+            if kw.get("group") == "suggest":
+                suggest_workers.append(work)
+            return real_run_worker(work, *a, **kw)
+
+        app.run_worker = spy_run_worker  # type: ignore[method-assign]
+        app.action_suggest_reply()
+        await pilot.pause()
+        assert len(suggest_workers) == 1  # stale cross-dialog draft NOT reused; a fresh call runs
+
+
+async def test_tui_auto_path_does_not_show_thinking_indicator():
+    from tg_messenger.tui.app import SUGGEST_THINKING
+
+    gate = asyncio.Event()
+
+    class BlockingSuggester:
+        async def suggest(self, dialog_id):
+            await gate.wait()
+            return "draft"
+
+    app = MessengerTUI(client=TuiStubClient(), suggester=BlockingSuggester())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        app._maybe_suggest(7)  # the auto-path (incoming message), notify_empty/show_thinking False
+        await pilot.pause()
+        # the auto-path never flashes "⏳" — the strip stays empty until the draft lands
+        assert str(app.query_one("#suggestion", Static).render()) != SUGGEST_THINKING
+        gate.set()
 
 
 async def test_tui_ctrl_g_blocked_by_nonempty_composer_points_at_escape():

@@ -139,3 +139,26 @@ def test_make_suggest_fn_factory_builds_callable(monkeypatch):
     build = f.make_suggest_fn_factory()
     fn = build("openai:gpt-4o")
     assert callable(fn)
+
+
+# --- #158: build_suggester resolves cfg.suggest_model (fast model) over cfg.model ---
+
+
+def _cfg(*, model, suggest_model):
+    from tg_messenger.agent.config import AgentConfig
+
+    return AgentConfig(model=model, allow_all=True, suggest_model=suggest_model)
+
+
+def test_build_suggester_uses_suggest_model_when_set(monkeypatch):
+    seen = []
+    monkeypatch.setattr(f, "init_chat_model", lambda name: seen.append(name) or object())
+    f.build_suggester(object(), _cfg(model="openai:gpt-4o", suggest_model="openai:glm-5-turbo"))
+    assert seen == ["openai:glm-5-turbo"]  # the fast model, not cfg.model
+
+
+def test_build_suggester_falls_back_to_model_when_suggest_unset(monkeypatch):
+    seen = []
+    monkeypatch.setattr(f, "init_chat_model", lambda name: seen.append(name) or object())
+    f.build_suggester(object(), _cfg(model="openai:gpt-4o", suggest_model=None))
+    assert seen == ["openai:gpt-4o"]  # falls back to the main model

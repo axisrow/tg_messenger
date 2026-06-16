@@ -112,6 +112,7 @@ class AgentConfig:
     allow_usernames: frozenset[str] = field(default_factory=frozenset)
     search_provider: str = "duckduckgo"
     vision_model: str | None = None  # None — картинки идут в основную модель
+    suggest_model: str | None = None  # None — суфлёр берёт основную model; быстрая модель (#158)
     intents: tuple[IntentSpec, ...] = ()  # кастомные интенты из agent.json
     suggest_history_limit: int = 30  # сколько сообщений диалога уходит суфлёру (#17)
     factory_url: str | None = None  # tg_content_factory base URL (#20) — None отключает factory-инструменты
@@ -174,6 +175,15 @@ class AgentConfig:
                 " e.g. 'openai:gpt-5.4' or 'anthropic:claude-sonnet-4-6'."
             )
 
+        # #158: a SEPARATE (typically faster) model for the reply suggester — falls back to the
+        # main model when unset. A live `suggest_model` kv override (#143) still wins over this.
+        suggest_model = (env.get("TG_SUGGEST_MODEL") or "").strip() or None
+        if suggest_model is not None and ":" not in suggest_model:
+            raise ValueError(
+                f"TG_SUGGEST_MODEL={suggest_model!r} is not in 'provider:model' format,"
+                " e.g. 'openai:glm-5-turbo' or 'anthropic:claude-haiku-4-5'."
+            )
+
         raw_history = (env.get("TG_SUGGEST_HISTORY") or "30").strip()
         try:
             suggest_history_limit = int(raw_history)
@@ -202,6 +212,7 @@ class AgentConfig:
             allow_usernames=frozenset(allow_usernames),
             search_provider=search,
             vision_model=vision_model,
+            suggest_model=suggest_model,
             intents=intents,
             suggest_history_limit=suggest_history_limit,
             factory_url=factory_url,

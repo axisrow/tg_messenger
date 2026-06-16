@@ -51,6 +51,9 @@ logger = logging.getLogger(__name__)
 
 # shown before a draft in the suggestion strip; Tab accepts it into the composer
 SUGGEST_PREFIX = "💡 Tab: "
+# #158: shown in the suggestion strip while an explicit Ctrl+G LLM call is in flight (~seconds),
+# so the user sees the suggester is working instead of "nothing happening"
+SUGGEST_THINKING = "⏳ Суфлёр думает…"
 # default context size for the suggester settings field (#143); mirrors suggest.DEFAULT_HISTORY_LIMIT
 DEFAULT_SUGGEST_HISTORY = 30
 ORIGINAL_SENTINEL = "__tg_messenger_original__"
@@ -1540,6 +1543,9 @@ class MessengerTUI(App):
         # #126: re-entrancy guard so a second t/Ctrl+T can't stack a second reading-language modal.
         self._lang_prompt_open = False
         self._pending_suggestion: str | None = None
+        # #158: which dialog the pending draft belongs to — so an instant Ctrl+G never shows a
+        # draft pre-generated for dialog A while dialog B is open.
+        self._pending_suggestion_dialog: int | None = None
         # (dialog_id, message_id) keys we sent from this composer — the same messages echo back on
         # listen_outgoing(); skip them so our optimistic bubble isn't duplicated.
         # Bounded (OrderedDict-as-set, watch.py pattern): a long session can't grow it.
@@ -2614,8 +2620,14 @@ class MessengerTUI(App):
         if self.query_one("#composer", Input).value:
             self.notify("Очистите поле ввода (Esc) — черновик не перезаписывается", severity="warning")
             return
+        # #158: a draft pre-generated for THIS dialog (e.g. by the auto-path on an incoming message)
+        # is shown INSTANTLY — no second LLM call, no ⏳ wait. _pending_suggestion is left intact so
+        # Tab still accepts it. Otherwise fall through to a fresh call WITH the thinking indicator.
+        if self._pending_suggestion and self._pending_suggestion_dialog == self._current:
+            self.query_one("#suggestion", Static).update(f"{SUGGEST_PREFIX}{self._pending_suggestion}")
+            return
         self.run_worker(
-            self._suggest(self._current, notify_empty=True),
+            self._suggest(self._current, notify_empty=True, show_thinking=True),
             group="suggest",
             exclusive=True,
         )
@@ -2661,11 +2673,26 @@ class MessengerTUI(App):
                 return getattr(dialog, "telegram_lang_code", None)
         return None
 
-    async def _suggest(self, dialog_id: int, *, notify_empty: bool = False) -> None:
+    async def _suggest(
+        self, dialog_id: int, *, notify_empty: bool = False, show_thinking: bool = False
+    ) -> None:
+        # #158: show "⏳ Суфлёр думает…" BEFORE the (multi-second) LLM await, so an explicit Ctrl+G
+        # isn't a silent ~20s wait. Synchronous on purpose — the only way it's visible during the
+        # real call, and the only way a stub-based test can observe it. Auto-path passes
+        # show_thinking=False so it never flickers on every incoming message.
+        thinking_shown = (
+            show_thinking
+            and dialog_id == self._current
+            and not self.query_one("#composer", Input).value
+        )
+        if thinking_shown:
+            self.query_one("#suggestion", Static).update(SUGGEST_THINKING)
         try:
             draft = await self._suggester.suggest(dialog_id)
         except Exception:
             logger.exception("suggest failed (dialog %s)", dialog_id)
+            if thinking_shown and dialog_id == self._current:
+                self.query_one("#suggestion", Static).update("")  # don't leave ⏳ hanging
             return
         # the user may have switched dialogs or started typing while we waited
         if dialog_id != self._current or self.query_one("#composer", Input).value:
@@ -2673,9 +2700,12 @@ class MessengerTUI(App):
         # Ctrl+G is an explicit request, so an empty draft (suggester off / nothing to add) gets a
         # toast — silence would read as "the key did nothing". The auto-path passes notify_empty=False.
         if not draft and notify_empty:
+            if thinking_shown:
+                self.query_one("#suggestion", Static).update("")  # clear ⏳ before the toast
             self.notify("Суфлёр не предложил ответ", severity="warning")
             return
         self._pending_suggestion = draft
+        self._pending_suggestion_dialog = dialog_id if draft else None
         self.query_one("#suggestion", Static).update(f"{SUGGEST_PREFIX}{draft}" if draft else "")
 
     def action_accept_suggestion(self) -> None:
@@ -2692,6 +2722,7 @@ class MessengerTUI(App):
 
     def _clear_suggestion(self) -> None:
         self._pending_suggestion = None
+        self._pending_suggestion_dialog = None  # #158: keep the dialog scope in sync with the draft
         self.query_one("#suggestion", Static).update("")
 
     def action_toggle_help(self) -> None:
