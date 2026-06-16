@@ -211,8 +211,11 @@ async def clear_last_read(storage, dialog_id: int) -> None:
     outbox receipt (``record_last_read``), which is exactly when nudging matters
     again.
     """
-    await storage.execute("DELETE FROM kv WHERE key = ?", (last_read_key(dialog_id),))
-    await storage.execute("DELETE FROM kv WHERE key = ?", (read_at_key(dialog_id),))
+    # one statement so the two keys clear atomically (no half-cleared window)
+    await storage.execute(
+        "DELETE FROM kv WHERE key IN (?, ?)",
+        (last_read_key(dialog_id), read_at_key(dialog_id)),
+    )
 
 
 async def watch_read_receipts(client, storage, *, clock=None) -> None:

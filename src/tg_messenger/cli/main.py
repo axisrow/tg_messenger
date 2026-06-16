@@ -1689,7 +1689,8 @@ def suggest_nudges(ctx: click.Context, after_hours: float, session: str) -> None
                 titles = {d.id: d.title for d in dms}
                 for c in candidates:
                     did = c["dialog_id"]
-                    click.echo(f"{did} — {titles.get(did, did)}")
+                    title = titles.get(did) or str(did)
+                    click.echo(f"{did} — {title}")
                     click.echo(f"  draft: {c['draft']}")
             finally:
                 await storage.close()
