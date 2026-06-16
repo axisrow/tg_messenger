@@ -25,6 +25,7 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
+    LoadingIndicator,
     RadioButton,
     RadioSet,
     Static,
@@ -1229,14 +1230,21 @@ class MessengerTUI(App):
         scrollbar-size-vertical: 0;
         scrollbar-size-horizontal: 0;
     }
-    /* the whole-chat translate (Ctrl+T) status line — centered, accent, bold */
+    /* the whole-chat translate (Ctrl+T) status — centered container: accent label + animated dots */
     #messages .translate-status {
         width: 1fr;
         height: 1fr;
-        content-align: center middle;
+        align: center middle;
+    }
+    #messages .translate-status-label {
+        width: auto;
         text-align: center;
         color: $accent;
         text-style: bold;
+    }
+    #messages .translate-status LoadingIndicator {
+        width: auto;
+        height: auto;
     }
     /* #113/#118: each message is a framed, shrink-wrapped card. The in/out asymmetry is now a
        PROPORTIONAL alignment of the bubble inside a full-width BubbleRow (align-horizontal),
@@ -1803,11 +1811,19 @@ class MessengerTUI(App):
         explicit, unlike the silent background auto-translate on open).
         """
         pane = self.query_one("#messages", Vertical)
-        # the built-in loading overlay shows only dots; mount a labelled status line instead so it's
-        # clear WHAT is happening for the whole (possibly minute-long) pass.
+        # mount a labelled status WITH the animated LoadingIndicator (the same blinking dots the
+        # built-in pane.loading shows) — pane.loading would overlay/hide a mounted label, so we
+        # compose both ourselves: the label on top, the indicator below.
         await pane.remove_children()
         self._bubble_index.clear()
-        await pane.mount(Static("⏳ Идёт перевод…", id="translate-status", classes="translate-status"))
+        await pane.mount(
+            Vertical(
+                Label("Идёт перевод…", classes="translate-status-label"),
+                LoadingIndicator(),
+                id="translate-status",
+                classes="translate-status",
+            )
+        )
         ok = False
         try:
             cap = await self._translator.max_messages()

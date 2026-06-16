@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Footer, Input, ListView, Static, Tabs
+from textual.widgets import Footer, Input, Label, ListView, LoadingIndicator, Static, Tabs
 
 from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.models import (
@@ -4231,10 +4231,12 @@ async def test_tui_translate_all_shows_status_then_clears():
         await pilot.pause()
         app.action_translate_all()
         await pilot.pause()
-        # while translate_history is blocked, the labelled status line is mounted
-        status = app.query("#messages .translate-status")
-        assert status, "status line not shown during translation"
-        assert "Идёт перевод" in str(status.first().render())
+        # while translate_history is blocked, the status container is mounted with BOTH a labelled
+        # caption and the animated LoadingIndicator (the blinking dots, like history loading)
+        status = app.query_one("#translate-status")
+        label = status.query_one(Label)
+        assert "Идёт перевод" in str(label.render())
+        assert status.query(LoadingIndicator), "animated loading dots not shown during translation"
         # release the translator → status clears, bubbles appear WITH the translation rendered
         translator.gate.set()
         await pilot.pause()
