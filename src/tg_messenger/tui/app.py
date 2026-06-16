@@ -19,7 +19,19 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Input, Label, ListItem, ListView, Static, Tab, Tabs
+from textual.widgets import (
+    Footer,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    LoadingIndicator,
+    RadioButton,
+    RadioSet,
+    Static,
+    Tab,
+    Tabs,
+)
 
 from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
 from tg_messenger.core.auth import (
@@ -29,6 +41,7 @@ from tg_messenger.core.auth import (
     session_store_from_env,
 )
 from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
+from tg_messenger.core.languages import parse_lang_codes, validate_supported_lang_code
 from tg_messenger.core.models import format_author
 from tg_messenger.core.names import is_safe_profile_name, sanitize_profile_name
 from tg_messenger.core.search import can_send_in
@@ -52,11 +65,11 @@ HELP_TEXT = """Навигация (стрелки):
   Tab       принять подсказку ответа (иначе — вперёд по фокусу)
   Shift+Tab назад по фокусу
   r / x     реакция на выбранном сообщении
-  Ctrl+S    настройки аккаунтов
+  Ctrl+S    настройки: аккаунты + перевод входящих (режим и языки)
   t         вкл/выкл авто-перевод входящих (вне поля ввода)
-  Ctrl+T    перевести текущий чат сейчас
+  Ctrl+T    перевести весь чат сейчас
   /tlang    язык перевода входящих (команда в поле ввода; иначе спросит)
-  /lang     язык перевода исходящих в текущем диалоге (команда в поле ввода)
+  /lang     язык перевода ИСХОДЯЩИХ в текущем диалоге (команда в поле ввода)
   ? / F1    эта справка
   Esc       очистить поиск · закрыть окно
   Ctrl+C    выход"""
@@ -569,11 +582,31 @@ class MessageBubble(Static):
         t.append(_terminal_safe_display_text(rest))
         if self._translation is not None:
             t.append("\n")
-            t.append(f"↳ {_terminal_safe_display_text(self._translation)}")
+            # the translation gets the theme accent so it visibly separates from the white original
+            # (author/id use "dim"); without a style it was the same white and merged in.
+            t.append(
+                f"↳ {_terminal_safe_display_text(self._translation)}",
+                style=self._translation_style(),
+            )
         if self._reactions:
             t.append("\n")
             t.append(_terminal_safe_display_text(" ".join(self._reactions)))
         return t
+
+    def _translation_style(self) -> str:
+        """Rich style for the translation line — the theme accent, resolved best-effort.
+
+        Text.append(style=) takes a Rich style (a colour name/hex), not a Textual CSS var, so we
+        resolve $accent to its hex via app.theme_variables. Before mount self.app raises
+        NoActiveAppError; fall back to a named colour so the translation is NEVER plain white
+        (a translation always re-renders after mount, so the real accent applies in practice).
+        """
+        try:
+            return self.app.theme_variables.get("accent") or "cyan"
+        except Exception:
+            # expected before mount (NoActiveAppError) — debug-logged, not silently swallowed
+            logger.debug("translation accent unavailable (bubble not mounted yet); using fallback")
+            return "cyan"
 
     def _recompose_text(self) -> None:
         self.update(self._build())
@@ -847,8 +880,11 @@ class AccountItem(ListItem):
         self.profile = profile
 
 
-class AccountsScreen(ModalScreen[None]):
+class AccountsScreen(ModalScreen[object]):
     """Account settings (#115): list saved profiles (active marked), add a new one, remove one.
+
+    Dismisses with a rebuilt Translator when the user picks a new translation model (so the main
+    app can swap it in), or with None otherwise.
 
     Adding runs the SAME LoginScreen/LoginSession wizard against a freshly-built client for the
     typed profile name, then persists via the client's save_session() (→ SessionStore). Switching
@@ -860,7 +896,14 @@ class AccountsScreen(ModalScreen[None]):
     DEFAULT_CSS = (
         "AccountsScreen { align: center middle; } "
         "#accounts-box { width: 60%; max-width: 64; height: auto; max-height: 80%; "
-        "padding: 1 2; border: round $primary; background: $surface; }"
+        "padding: 1 2; border: round $primary; background: $surface; } "
+        "#translate-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
+        "#translate-section RadioSet { height: auto; } "
+        # the field captions live in border_title, which inherits the (grey, blurred) border colour
+        # and is nearly unreadable by default — give the translation inputs a visible border + a
+        # bold accent caption so the labels stay legible whether the field is focused or not.
+        "#target-lang, #known-langs, #unknown-langs, #translate-model, #translate-max "
+        "{ border: round $primary; border-title-color: $accent; border-title-style: bold; }"
     )
 
     BINDINGS = [
@@ -870,8 +913,16 @@ class AccountsScreen(ModalScreen[None]):
         Binding("d", "remove_account", "Remove", show=False),
     ]
 
+    # Inbound-translation modes, in display order. The id is the stored TranslateMode literal.
+    _TRANSLATE_MODE_LABELS = (
+        ("off", "Выкл — не переводить"),
+        ("all_unknown", "Всё незнакомое (кроме моих языков)"),
+        ("skip_known", "Кроме знакомых (список ниже)"),
+        ("only_unknown", "Только указанные (список ниже)"),
+    )
+
     def __init__(self, *, profiles, active, store, account_client_factory=None,
-                 login_session=None):
+                 login_session=None, translator=None):
         super().__init__()
         # #121: profiles from list_profiles() are already canonical (sanitized stems); the active
         # name comes from the raw session_name, so canonicalize it ONCE here. Marker + delete guard
@@ -883,6 +934,16 @@ class AccountsScreen(ModalScreen[None]):
         # test seams: build the new-profile client / skip the network login flow
         self._account_client_factory = account_client_factory or _make_real_client
         self._login_session = login_session
+        # inbound-translation settings live on the injected Translator (it owns the Storage). None
+        # means the [agent] extra / translate model isn't configured — the section is then hidden.
+        self._translator = translator
+        # the mode last loaded-from / saved-to storage. RadioSet.Changed is delivered async (after
+        # the worker that set it returns), so a sync "loading" flag can't gate it; instead we save
+        # only when the pressed mode actually DIFFERS from this, which the programmatic load never does.
+        self._applied_mode: str | None = None
+        # the model last loaded-from / saved-to storage; a save only re-probes/rebuilds the
+        # Translator when this actually changes (an empty string means "fall back to env").
+        self._applied_model: str = ""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="accounts-box"):
@@ -893,6 +954,190 @@ class AccountsScreen(ModalScreen[None]):
             )
             yield Label("a — добавить · d — удалить · Esc — закрыть", id="accounts-help")
             yield Input(placeholder="Имя нового профиля", id="new-profile")
+            # inbound-translation settings — only when a Translator is wired ([agent] extra +
+            # translate model configured). Values are loaded in on_mount (async, can't read in compose).
+            if self._translator is not None:
+                with Vertical(id="translate-section"):
+                    yield Label("Перевод входящих", id="translate-title")
+                    with RadioSet(id="translate-mode"):
+                        for mode_id, label in self._TRANSLATE_MODE_LABELS:
+                            yield RadioButton(label, id=f"mode-{mode_id}")
+                    # THREE explicit fields, each with a PERSISTENT border_title caption (visible on
+                    # the frame even with a value typed — a placeholder vanishes on input). The two
+                    # language lists are always shown so nothing silently changes meaning by mode.
+                    target = Input(placeholder="напр. ru", id="target-lang")
+                    target.border_title = "Мой язык (на что переводить)"
+                    yield target
+                    known = Input(placeholder="напр. ru, en", id="known-langs")
+                    known.border_title = "Не переводить"
+                    yield known
+                    unknown = Input(placeholder="напр. en, ja", id="unknown-langs")
+                    unknown.border_title = "Переводить (пусто = всё переводить)"
+                    yield unknown
+                    model_field = Input(placeholder="напр. openai:glm-5.1", id="translate-model")
+                    model_field.border_title = "Модель для перевода"
+                    yield model_field
+                    max_field = Input(placeholder="напр. 100", id="translate-max")
+                    max_field.border_title = "Сколько переводить за раз (Ctrl+T)"
+                    yield max_field
+                    yield Label("Enter в поле — сохранить", id="translate-help")
+
+    def on_mount(self) -> None:
+        if self._translator is not None:
+            self.run_worker(self._load_translate_settings(), exclusive=False)
+
+    async def _load_translate_settings(self) -> None:
+        if self._translator is None:
+            return
+        try:
+            settings = await self._translator.get_settings()
+        except Exception:
+            logger.exception("settings: failed to load translation settings")
+            return
+        # select the stored mode in the RadioSet; record it so the resulting (async) RadioSet.Changed
+        # is recognised as the load echo, not a user change, and doesn't auto-save.
+        mode = settings.get("mode") or "off"
+        self._applied_mode = mode
+        try:
+            self.query_one(f"#mode-{mode}", RadioButton).value = True
+        except Exception:
+            logger.warning("settings: unknown stored translate mode %r", mode)
+        # three independent fields → three independent settings (no per-mode branching)
+        self.query_one("#target-lang", Input).value = settings.get("target") or ""
+        self.query_one("#known-langs", Input).value = ", ".join(settings.get("known") or [])
+        self.query_one("#unknown-langs", Input).value = ", ".join(settings.get("unknown") or [])
+        self.query_one("#translate-model", Input).value = settings.get("model") or ""
+        # remember the loaded model so a save only re-probes/rebuilds when it actually changed
+        self._applied_model = settings.get("model") or ""
+        max_msgs = settings.get("max_messages")
+        self.query_one("#translate-max", Input).value = str(max_msgs) if max_msgs else ""
+
+    def _selected_mode(self) -> str:
+        """The currently-pressed translate-mode RadioButton id → its TranslateMode literal."""
+        pressed = self.query_one("#translate-mode", RadioSet).pressed_button
+        if pressed is not None and pressed.id and pressed.id.startswith("mode-"):
+            return pressed.id[len("mode-"):]
+        return "off"
+
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        if event.radio_set.id != "translate-mode":
+            return
+        mode = self._selected_mode()
+        # ignore the echo of the programmatic selection done while loading — only a genuine user
+        # mode change (differs from what's stored/applied) should persist.
+        if mode == self._applied_mode:
+            return
+        self.run_worker(self._save_translate_settings(), exclusive=True)
+
+    async def _save_translate_settings(self) -> None:
+        if self._translator is None:
+            return
+        mode = self._selected_mode()
+        target = self.query_one("#target-lang", Input).value.strip()
+        max_raw = self.query_one("#translate-max", Input).value.strip()
+        try:
+            # three independent fields → persist all three every save (no per-mode branching),
+            # so editing one field never clobbers another
+            target_code = validate_supported_lang_code(target) if target else None
+            known = parse_lang_codes(self.query_one("#known-langs", Input).value)
+            unknown = parse_lang_codes(self.query_one("#unknown-langs", Input).value)
+            max_messages = self._parse_max_messages(max_raw)
+        except ValueError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        model = self.query_one("#translate-model", Input).value.strip()
+        # Validate-then-commit, atomic across the WHOLE save: a CHANGED model is built+probed FIRST
+        # (validation only — no persistence, no cache clear, no translator swap). Only once the model
+        # is proven AND nothing else can fail do we commit everything together (settings + the model
+        # override). This way a bad model never wipes the cache / half-writes settings, and a later
+        # settings failure can't leave a persisted model diverging from the live translator.
+        model_changed = model != self._applied_model
+        new_translator = None
+        if model_changed:
+            new_translator = await self._validate_model(model)
+            if new_translator is None:
+                return  # bad model → nothing persisted, cache untouched
+        try:
+            # commit the other settings; for a changed model also persist it in the SAME block so the
+            # two writes succeed or fail together (no persisted-model-without-settings window).
+            await self._translator.set_settings(
+                mode=mode, target=target_code, known=known, unknown=unknown,
+                max_messages=max_messages,
+            )
+            if model_changed:
+                from tg_messenger.agent.translate import set_translate_model
+                # blank field → clear the kv override (fall back to env); else persist the model
+                await set_translate_model(self._translator.storage, model or None)
+        except ValueError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        except Exception:
+            logger.exception("settings: failed to save translation settings")
+            self.notify("Не удалось сохранить настройки перевода", severity="error")
+            return
+        self._applied_mode = mode
+        if model_changed:
+            # everything committed → adopt the new translator and hand it back to the app.
+            # NB: the probe only checks structured-output support, NOT credentials — an invalid API
+            # key surfaces on the first actual translation, not here, so don't claim "verified".
+            self._translator = new_translator
+            self._applied_model = model
+            self.notify("Модель сохранена — проверьте перевод в чате")
+            self.dismiss(new_translator)
+            return
+        self.notify("Настройки перевода сохранены")
+
+    @staticmethod
+    def _parse_max_messages(raw: str) -> int | None:
+        """Parse the per-pass cap field: blank → None (use env/default); else a positive int."""
+        if not raw:
+            return None
+        try:
+            n = int(raw)
+        except ValueError as exc:
+            raise ValueError("Сколько переводить: введите число") from exc
+        if n < 1:
+            raise ValueError("Сколько переводить: число должно быть ≥ 1")
+        return n
+
+    async def _validate_model(self, model: str):
+        """Build+probe a freshly chosen model and return the candidate Translator, or None on failure.
+
+        VALIDATION ONLY — no side effects: it does NOT persist the model, clear the cache, swap
+        self._translator, or change _applied_model. The caller commits all of that atomically only
+        after this succeeds, so a bad model leaves storage and the live translator untouched.
+
+        (build_translator_with_probe does cache the per-model structured-output method in kv; that is
+        a harmless detection cache keyed by model name, not the model override or any translation.)
+        """
+        self.notify("Проверяю модель…")
+        try:
+            from tg_messenger.agent.factory import build_translator_with_probe
+            from tg_messenger.agent.translate import translate_model_from_env
+        except ImportError:
+            logger.exception("settings: agent extra unavailable for model change")
+            self.notify("Переводчик недоступен (нет extra [agent])", severity="error")
+            return None
+        target_model = model or translate_model_from_env()
+        if not target_model:
+            self.notify("Не задана модель перевода", severity="error")
+            return None
+        # the SQLite Storage the Translator caches into lives on the current translator, NOT on
+        # self._store (which is the SessionStore). Reuse it so settings/cache stay in one DB.
+        storage = self._translator.storage
+        try:
+            new_translator = await build_translator_with_probe(storage, target_model)
+        except Exception:
+            logger.exception("settings: failed to build translator for model %r", target_model)
+            self.notify("Не удалось применить модель — проверьте имя/ключ", severity="error")
+            return None
+        return new_translator
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Enter in a translation field saves; the profile-name field keeps its add-account flow.
+        if event.input.id in ("target-lang", "known-langs", "unknown-langs",
+                               "translate-model", "translate-max"):
+            self.run_worker(self._save_translate_settings(), exclusive=True)
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -1000,24 +1245,32 @@ class MessengerTUI(App):
         Binding("shift+tab", "focus_previous", "Back", show=False),
         # #115: open account settings (add/list/remove a profile). priority so it works from
         # inside the composer Input.
-        Binding("ctrl+s", "open_settings", "Settings", priority=True),
+        Binding("ctrl+s", "open_settings", "Настройки", priority=True),
+        # translate the whole open chat (up to the configured cap) on demand — opening a dialog
+        # stays fast (cache only); this runs the long LLM pass with a spinner.
+        Binding("ctrl+t", "translate_all", "Перевести чат", priority=True, show=True),
         # #124: the key-help overlay (toggle). F1 is non-printable so a priority binding fires
         # even from inside an Input; "?" is printable and so is filtered out while an Input is
         # focused — it works everywhere ELSE (tabs/dialogs/a bubble). Documented: ? outside text
         # inputs, F1 anywhere.
-        Binding("f1", "toggle_help", "Help", priority=True, show=True),
-        Binding("question_mark", "toggle_help", "Help", show=True),
+        # The Footer shows ONE help hint. It must be F1, not "?": the Footer only renders bindings
+        # active in the CURRENT focus context, and "?" (printable, non-priority) is filtered out
+        # while the search Input has focus on startup — so a "?"-hint would be invisible exactly
+        # when the user first looks (the original complaint). F1 is priority, stays active inside an
+        # Input, and so is always shown. "?" keeps working everywhere outside a text input but is
+        # hidden to avoid a duplicate "Справка" entry.
+        Binding("f1", "toggle_help", "Справка", priority=True, show=True),
+        Binding("question_mark", "toggle_help", "Справка", show=False),
         # #124: Escape clears a non-empty search filter (a small, predictable global). NOT priority,
         # so any open modal's own Escape still wins (the modal binding chain truncates above the app).
         Binding("escape", "clear_search", "Clear search", show=False),
         # #126: inbound translation. `t` toggles auto-translate; it is PRINTABLE so — like `?` — it
         # is filtered out while an Input (composer/search) is focused and works everywhere else
         # (tabs/dialogs/a bubble). Making it priority would steal every literal "t" typed into a
-        # message, so it stays non-priority. Ctrl+T translates the open chat on demand; it is
-        # non-printable, so priority=True lets it fire even from inside the composer or a read-only
-        # channel where the composer is disabled.
+        # message, so it stays non-priority. The on-demand whole-chat translate is Ctrl+T
+        # (`translate_all`, bound above) — non-printable + priority, so it fires from inside the
+        # composer or a read-only channel where the composer is disabled.
         Binding("t", "toggle_auto_translate", "Авто-перевод", show=True),
-        Binding("ctrl+t", "translate_chat", "Перевести чат", priority=True, show=True),
     ]
 
     CSS = """
@@ -1038,6 +1291,25 @@ class MessengerTUI(App):
         overflow-y: auto;
         scrollbar-size-vertical: 0;
         scrollbar-size-horizontal: 0;
+    }
+    /* the whole-chat translate (Ctrl+T) status — centered container: accent label + animated dots.
+       both children take the full container width and center their own content, so the label and
+       the dots are vertically stacked AND horizontally aligned to the same centre line. */
+    #messages .translate-status {
+        width: 1fr;
+        height: 1fr;
+        align: center middle;
+    }
+    #messages .translate-status-label {
+        width: 1fr;
+        text-align: center;
+        color: $accent;
+        text-style: bold;
+    }
+    #messages .translate-status LoadingIndicator {
+        width: 1fr;
+        height: auto;
+        content-align-horizontal: center;
     }
     /* #113/#118: each message is a framed, shrink-wrapped card. The in/out asymmetry is now a
        PROPORTIONAL alignment of the bubble inside a full-width BubbleRow (align-horizontal),
@@ -1254,6 +1526,9 @@ class MessengerTUI(App):
                 yield Vertical(id="messages")
                 yield Static("", id="suggestion", markup=False)
                 yield ComposerInput(placeholder="Message…", id="composer")
+        # #124-followup: the Footer surfaces the show=True bindings (Справка, Настройки, Выход) —
+        # without it the key hints exist but are invisible (the reported "не вижу настроек/?").
+        yield Footer()
 
     async def on_mount(self) -> None:
         # Textual's real App.run() installs asyncio.eager_task_factory (py3.12+),
@@ -1610,6 +1885,86 @@ class MessengerTUI(App):
             bubble = self._bubble_index.get(message.id)
             if bubble is not None:
                 bubble.show_translation(message.translated_text)
+
+    def action_translate_all(self) -> None:
+        """Ctrl+T — translate the whole open chat (up to the configured cap), with a spinner.
+
+        Routes through ``_ensure_lang_then_translate_all`` so it prompts for a reading language
+        (ReadLangScreen) when none is set — works in read-only channels where the composer/`/tlang`
+        is disabled — then runs the whole-chat pass regardless of the auto-translate toggle (#126).
+        """
+        if self._translator is None:
+            self.notify("Переводчик не настроен", severity="warning")
+            return
+        if self._current is None:
+            self.notify("Нет открытого диалога", severity="warning")
+            return
+        self.run_worker(
+            self._ensure_lang_then_translate_all(self._current),
+            group="translate-all",
+            exclusive=True,
+        )
+
+    async def _translate_whole_dialog(self, dialog_id: int) -> None:
+        """Reload up to N recent messages and translate them in one pass, showing a spinner.
+
+        Long by design (a reasoning model over a whole chat) — the #messages pane shows its loading
+        spinner for the duration. A failed/empty pass is surfaced via notify (the Ctrl+T path is
+        explicit, unlike the silent background auto-translate on open).
+        """
+        # the worker is scheduled, not run inline: the user may have opened another dialog between
+        # pressing Ctrl+T and this body running. Bail BEFORE touching the pane, else we'd wipe the
+        # new dialog's history and mount this dialog's spinner into the wrong chat.
+        if dialog_id != self._current:
+            return
+        pane = self.query_one("#messages", Vertical)
+        # mount a labelled status WITH the animated LoadingIndicator (the same blinking dots the
+        # built-in pane.loading shows) — pane.loading would overlay/hide a mounted label, so we
+        # compose both ourselves: the label on top, the indicator below.
+        await pane.remove_children()
+        # remove_children() awaited (yielded the loop): the user may have switched dialogs in that
+        # window. Re-check BEFORE clearing the shared bubble index / mounting this dialog's spinner,
+        # else the stale spinner could land on top of the new dialog's history.
+        if dialog_id != self._current:
+            return
+        self._bubble_index.clear()
+        await pane.mount(
+            Vertical(
+                Label("Идёт перевод…", classes="translate-status-label"),
+                LoadingIndicator(),
+                id="translate-status",
+                classes="translate-status",
+            )
+        )
+        ok = False
+        try:
+            cap = await self._translator.max_messages()
+            if self._store is not None:
+                messages = await self._store.history(dialog_id, limit=cap)
+            else:
+                messages = await self._client.history(dialog_id, limit=cap)
+            translated = await self._translator.translate_history(dialog_id, messages)
+            if dialog_id == self._current:
+                # drop the status line, then mount the TRANSLATED snapshot — translate_history
+                # returns model-copies carrying translated_text; mounting `messages` (the originals)
+                # would show the untranslated text and the whole pass would appear to do nothing.
+                await pane.remove_children()
+                self._bubble_index.clear()
+                bubbles = [self._message_bubble_for(m, dialog_id) for m in translated]
+                await pane.mount(*(_wrap_bubble(b) for b in bubbles))
+                self._drain_pending_reactions(dialog_id)  # replay reactions buffered during the pass
+                self._scroll_messages_to_end(pane)
+            # success = the pass ran (no exception). A chat that's entirely in the target language
+            # legitimately yields zero translations — that is NOT a failure.
+            ok = True
+        except Exception:
+            logger.exception("whole-chat translation failed (dialog %s)", dialog_id)
+        if dialog_id == self._current:
+            # if the status line is still up (error path), clear it so the pane isn't stuck
+            for stale in pane.query("#translate-status"):
+                await stale.remove()
+        if not ok and dialog_id == self._current:
+            self.notify("Перевод не удался — см. лог", severity="warning")
 
     async def _translate_bubble(self, dialog_id: int, message, bubble: MessageBubble) -> None:
         try:
@@ -2184,16 +2539,24 @@ class MessengerTUI(App):
         search.value = ""  # triggers on_input_changed → _render_dialogs
 
     def action_open_settings(self) -> None:
-        """Ctrl+S — open account settings (add/list/remove a profile, #115)."""
+        """Ctrl+S — account settings (#115) + inbound-translation settings when a Translator is wired."""
+        self.run_worker(self._open_settings(), exclusive=True)
+
+    async def _open_settings(self) -> None:
         store = self._session_store or session_store_from_env()
-        self.push_screen(
+        # the settings screen dismisses with a rebuilt Translator when the user changes the model;
+        # swap it in so live/history/whole-chat translation uses the new model. Otherwise it's None.
+        result = await self.push_screen_wait(
             AccountsScreen(
                 profiles=store.list_profiles(),
                 active=self._session_name,
                 store=store,
                 account_client_factory=self._account_client_factory,
+                translator=self._translator,
             )
         )
+        if result is not None:
+            self._translator = result
 
     def action_toggle_auto_translate(self) -> None:
         """`t` — flip inbound auto-translate on/off (#126).
@@ -2202,7 +2565,7 @@ class MessengerTUI(App):
         open, immediately translates it (prompting for a reading language first if none is set).
         """
         if self._translator is None:
-            self.notify("Перевод не настроен (нет TG_TRANSLATE_MODEL).", severity="warning")
+            self.notify("Переводчик не настроен", severity="warning")
             return
         self._auto_translate = not self._auto_translate
         self.notify(f"Авто-перевод {'включён' if self._auto_translate else 'выключен'}")
@@ -2211,22 +2574,14 @@ class MessengerTUI(App):
             group="translate-pref",
             exclusive=False,
         )
-        if self._auto_translate and self._current is not None and self._current_messages:
+        # turning ON with a chat open: kick the same on-demand whole-chat translate Ctrl+T runs,
+        # so the open chat is translated immediately instead of waiting for the next message.
+        if self._auto_translate and self._current is not None:
             self.run_worker(
-                self._translate_chat_flow(), group="translate-ondemand", exclusive=False
+                self._ensure_lang_then_translate_all(self._current),
+                group="translate-all",
+                exclusive=True,
             )
-
-    def action_translate_chat(self) -> None:
-        """Ctrl+T — translate the open chat now, regardless of the auto-translate toggle (#126)."""
-        if self._translator is None:
-            self.notify("Перевод не настроен (нет TG_TRANSLATE_MODEL).", severity="warning")
-            return
-        if self._current is None or not self._current_messages:
-            self.notify("Нет открытого чата для перевода.", severity="warning")
-            return
-        self.run_worker(
-            self._translate_chat_flow(), group="translate-ondemand", exclusive=False
-        )
 
     async def _persist_auto_translate(self, enabled: bool) -> None:
         try:
@@ -2234,9 +2589,14 @@ class MessengerTUI(App):
         except Exception:
             logger.exception("persisting auto-translate preference failed")
 
-    async def _translate_chat_flow(self) -> None:
-        """Ensure a reading language is set (prompt via ReadLangScreen if not), then translate
-        the messages currently shown in the open chat (#126)."""
+    async def _ensure_lang_then_translate_all(self, dialog_id: int) -> None:
+        """Ensure a reading language is set (prompt via ReadLangScreen if not), then run the
+        whole-chat translate pass (#126/#136).
+
+        The on-demand Ctrl+T path and the `t`-turns-ON path both route here: ``_translate_whole_dialog``
+        translates into ``target_lang`` and silently yields the originals when no reading language is
+        set, so we prompt for one first (works in read-only channels where the composer is disabled).
+        """
         try:
             target = await self._translator.target_lang()
         except Exception:
@@ -2262,9 +2622,4 @@ class MessengerTUI(App):
                 logger.exception("saving reading language failed")
                 self.notify("Не удалось сохранить язык перевода.", severity="error")
                 return
-        dialog_id = self._current
-        if dialog_id is None or not self._current_messages:
-            return
-        # _translate_history_bubbles re-checks dialog_id == self._current and looks bubbles up in
-        # _bubble_index, so a dialog switch mid-flight resolves to a harmless no-op.
-        await self._translate_history_bubbles(dialog_id, list(self._current_messages))
+        await self._translate_whole_dialog(dialog_id)

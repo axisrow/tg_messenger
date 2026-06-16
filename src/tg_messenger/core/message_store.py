@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -474,6 +475,26 @@ async def set_message_translation(
         "WHERE dialog_id = ? AND id = ?",
         (text, lang, int(dialog_id), int(message_id)),
     )
+
+
+async def clear_all_translations(storage) -> None:
+    """Drop every cached translation (text + lang).
+
+    Called when the inbound-translation policy changes (target language, mode, or the
+    known/unknown language lists): the cache key is ``(dialog, id, target, source_text)`` and
+    encodes a *decision* (translated text OR a NULL "no translation needed" marker), so a policy
+    change must invalidate it wholesale — otherwise a message previously decided "skip" never
+    re-translates under the new rules.
+
+    Tolerant of a storage where the message-store migrations were never registered (no
+    ``messages`` table): there's no cache to clear, so it's a logged no-op rather than an error.
+    """
+    try:
+        await storage.execute("UPDATE messages SET translated_text = NULL, translated_lang = NULL")
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        logger.debug("clear_all_translations: no messages table; nothing to clear")
 
 
 async def get_message_translation(
