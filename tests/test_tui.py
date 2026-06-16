@@ -4174,3 +4174,41 @@ async def test_tui_translate_all_without_translator_notifies():
         app.action_translate_all()
         await pilot.pause()
         assert any("переводчик" in m.lower() for m, _ in notes)
+
+
+class _BlockingTranslator(StubTranslator):
+    """Holds translate_history until released, so a test can observe the in-progress status line."""
+
+    def __init__(self, settings=None):
+        super().__init__(settings)
+        self.gate = asyncio.Event()
+
+    async def translate_history(self, dialog_id, messages):
+        await self.gate.wait()
+        # mark every inbound message translated so the pass counts as a success
+        return [m.model_copy(update={"translated_text": "tr"}) if not m.out else m for m in messages]
+
+
+async def test_tui_translate_all_shows_status_then_clears():
+    store = FakeSessionStore(["alice"])
+    translator = _BlockingTranslator({"mode": "all_unknown", "target": "ru", "max_messages": 100})
+    app = MessengerTUI(
+        client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        app.action_translate_all()
+        await pilot.pause()
+        # while translate_history is blocked, the labelled status line is mounted
+        status = app.query("#messages .translate-status")
+        assert status, "status line not shown during translation"
+        assert "Идёт перевод" in str(status.first().render())
+        # release the translator → status clears, bubbles appear
+        translator.gate.set()
+        await pilot.pause()
+        await pilot.pause()
+        assert not app.query("#messages .translate-status")
+        assert app.query("#messages MessageBubble")

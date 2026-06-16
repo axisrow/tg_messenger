@@ -1191,6 +1191,15 @@ class MessengerTUI(App):
         scrollbar-size-vertical: 0;
         scrollbar-size-horizontal: 0;
     }
+    /* the whole-chat translate (Ctrl+T) status line — centered, accent, bold */
+    #messages .translate-status {
+        width: 1fr;
+        height: 1fr;
+        content-align: center middle;
+        text-align: center;
+        color: $accent;
+        text-style: bold;
+    }
     /* #113/#118: each message is a framed, shrink-wrapped card. The in/out asymmetry is now a
        PROPORTIONAL alignment of the bubble inside a full-width BubbleRow (align-horizontal),
        NOT a fixed side margin — a fixed 20-col margin pushed the bubble off the right edge once
@@ -1756,7 +1765,11 @@ class MessengerTUI(App):
         explicit, unlike the silent background auto-translate on open).
         """
         pane = self.query_one("#messages", Vertical)
-        pane.loading = True
+        # the built-in loading overlay shows only dots; mount a labelled status line instead so it's
+        # clear WHAT is happening for the whole (possibly minute-long) pass.
+        await pane.remove_children()
+        self._bubble_index.clear()
+        await pane.mount(Static("⏳ Идёт перевод…", id="translate-status", classes="translate-status"))
         ok = False
         try:
             cap = await self._translator.max_messages()
@@ -1764,26 +1777,21 @@ class MessengerTUI(App):
                 messages = await self._store.history(dialog_id, limit=cap)
             else:
                 messages = await self._client.history(dialog_id, limit=cap)
-            # re-mount the (possibly larger) snapshot; cached translations come back on the models
+            translated = await self._translator.translate_history(dialog_id, messages)
             if dialog_id == self._current:
+                # drop the status line, then mount the (now translated) snapshot
                 await pane.remove_children()
                 self._bubble_index.clear()
                 bubbles = [self._message_bubble_for(m, dialog_id) for m in messages]
                 await pane.mount(*(_wrap_bubble(b) for b in bubbles))
-            translated = await self._translator.translate_history(dialog_id, messages)
-            if dialog_id == self._current:
-                for message in translated:
-                    if not message.translated_text:
-                        continue
-                    bubble = self._bubble_index.get(message.id)
-                    if bubble is not None:
-                        bubble.show_translation(message.translated_text)
                 self._scroll_messages_to_end(pane)
             ok = any(m.translated_text for m in translated)
         except Exception:
             logger.exception("whole-chat translation failed (dialog %s)", dialog_id)
-        finally:
-            pane.loading = False
+        if dialog_id == self._current:
+            # if the status line is still up (error path), clear it so the pane isn't stuck
+            for stale in pane.query("#translate-status"):
+                await stale.remove()
         if not ok and dialog_id == self._current:
             self.notify("Перевод не удался — см. лог", severity="warning")
 
