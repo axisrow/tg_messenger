@@ -403,3 +403,34 @@ async def test_nudge_candidates_skips_history_for_ineligible_dialogs(tmp_path):
         assert client.history_calls == []
     finally:
         await storage.close()
+
+
+async def test_nudge_candidates_clears_receipt_after_reply(tmp_path):
+    # the contact read our message (aged receipt) but THEN replied — last message is
+    # incoming. should_nudge is False, and the spent receipt must be cleared so the next
+    # run rejects the dialog at the cheap local gate WITHOUT fetching history again.
+    history = [_msg(1, out=True, text="you there?"), _msg(2, out=False, text="yes!")]
+    client = FakeClient(history)
+    fn, _ = make_suggest_fn("ping")
+    storage = Storage(tmp_path / "n.db")
+    register_suggest_migrations(storage)
+    await storage.connect()
+    try:
+        await record_last_read(
+            storage, MessageReadEvent(dialog_id=7, max_id=1, outbox=True),
+            clock=lambda: 1000.0,
+        )
+        suggester = Suggester(client=client, suggest_fn=fn, storage=storage)
+        # first run: aged receipt passes the local gate → one history() read, no candidate
+        first = await suggester.nudge_candidates([7], now=1000.0 + 2 * 3600, after_sec=3600)
+        assert first == []
+        assert client.history_calls == [(7, 30)]
+        # the spent receipt was cleared
+        assert await load_last_read(storage, 7) is None
+        assert await load_read_at(storage, 7) is None
+        # second run: rejected at the cheap local gate — NO further history() read
+        second = await suggester.nudge_candidates([7], now=1000.0 + 3 * 3600, after_sec=3600)
+        assert second == []
+        assert client.history_calls == [(7, 30)]
+    finally:
+        await storage.close()

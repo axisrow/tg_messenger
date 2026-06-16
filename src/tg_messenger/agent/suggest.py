@@ -202,6 +202,19 @@ async def load_read_at(storage, dialog_id: int) -> float | None:
     return float(value) if value is not None else None
 
 
+async def clear_last_read(storage, dialog_id: int) -> None:
+    """Drop the stored outbox receipt for ``dialog_id`` (both kv keys).
+
+    Used when the contact has replied so the aged receipt no longer warrants a
+    nudge — keeping it would make ``nudge_candidates`` re-fetch history every run
+    (flood discipline, #145). Safe: the keys are only re-stamped by a FRESH
+    outbox receipt (``record_last_read``), which is exactly when nudging matters
+    again.
+    """
+    await storage.execute("DELETE FROM kv WHERE key = ?", (last_read_key(dialog_id),))
+    await storage.execute("DELETE FROM kv WHERE key = ?", (read_at_key(dialog_id),))
+
+
 async def watch_read_receipts(client, storage, *, clock=None) -> None:
     """Drain ``client.listen_reads()`` and record every outbox receipt.
 
@@ -318,6 +331,11 @@ class Suggester:
                 history, last_read_id=last_read_id, read_at=read_at,
                 now=now, after_sec=after_sec,
             ):
+                # If the contact has REPLIED (last message is incoming), the aged receipt
+                # is spent — drop it so we don't re-fetch history for this dialog every run
+                # (it's only re-stamped by a fresh outbox receipt). #145 flood discipline.
+                if history and not history[-1].out:
+                    await clear_last_read(self._storage, dialog_id)
                 continue
             try:
                 draft = await self.suggest(dialog_id)
