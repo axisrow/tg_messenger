@@ -1003,9 +1003,12 @@ class AccountsScreen(ModalScreen[object]):
             return
         self._applied_mode = mode
         if model_changed:
-            # everything committed → adopt the new translator and hand it back to the app
+            # everything committed → adopt the new translator and hand it back to the app.
+            # NB: the probe only checks structured-output support, NOT credentials — an invalid API
+            # key surfaces on the first actual translation, not here, so don't claim "verified".
             self._translator = new_translator
             self._applied_model = model
+            self.notify("Модель сохранена — проверьте перевод в чате")
             self.dismiss(new_translator)
             return
         self.notify("Настройки перевода сохранены")
