@@ -1376,8 +1376,9 @@ class MessengerTUI(App):
         # hidden to avoid a duplicate "Справка" entry.
         Binding("f1", "toggle_help", "Справка", priority=True, show=True),
         Binding("question_mark", "toggle_help", "Справка", show=False),
-        # #124: Escape clears a non-empty search filter (a small, predictable global). NOT priority,
-        # so any open modal's own Escape still wins (the modal binding chain truncates above the app).
+        # #124/#156: Escape clears the FOCUSED input — the composer when it's focused (#156, so
+        # Ctrl+G gets a clean field), else a non-empty search filter (the original global). NOT
+        # priority, so any open modal's own Escape still wins (the modal chain truncates above the app).
         Binding("escape", "clear_search", "Clear search", show=False),
         # #126: inbound translation. `t` toggles auto-translate; it is PRINTABLE so — like `?` — it
         # is filtered out while an Input (composer/search) is focused and works everywhere else
@@ -2591,9 +2592,12 @@ class MessengerTUI(App):
         """Ctrl+G — suggest a reply for the OPEN dialog on demand (#155).
 
         The automatic 💡 hint only fires on a new incoming message; this lets the user
-        ask for a draft while reading already-delivered history. Same guards as
-        _maybe_suggest, but each rejection NOTIFIES (the user pressed a key and expects
-        feedback) instead of silently no-opping.
+        ask for a draft while reading already-delivered history. Each rejection NOTIFIES
+        (the user pressed a key and expects feedback) instead of silently no-opping.
+
+        A non-empty composer blocks it: on_input_changed wipes the draft hint the moment
+        the field is touched, and silently clobbering typed text is worse. The toast points
+        at Escape, which clears the composer (action_clear_search) so Ctrl+G runs clean.
         """
         if self._suggester is None:
             self.notify("Суфлёр не настроен", severity="warning")
@@ -2608,10 +2612,12 @@ class MessengerTUI(App):
             self.notify("Суфлёр работает только в личных сообщениях", severity="warning")
             return
         if self.query_one("#composer", Input).value:
-            self.notify("Очистите поле ввода — черновик не перезаписывается", severity="warning")
+            self.notify("Очистите поле ввода (Esc) — черновик не перезаписывается", severity="warning")
             return
         self.run_worker(
-            self._suggest(self._current, notify_empty=True), group="suggest", exclusive=True
+            self._suggest(self._current, notify_empty=True),
+            group="suggest",
+            exclusive=True,
         )
 
     def _is_dm_dialog(self, dialog_id: int) -> bool:
@@ -2706,14 +2712,23 @@ class MessengerTUI(App):
             self.push_screen(HelpScreen())
 
     def action_clear_search(self) -> None:
-        """Escape — clear a non-empty search filter and re-render (a small, predictable global).
+        """Escape — clear the FOCUSED input (#155/#156).
 
-        A no-op when the search box is already empty, so Escape stays unsurprising elsewhere.
+        Context-aware so it never destroys an unrelated draft: when the composer is focused,
+        Escape clears the composer (so Ctrl+G has a clean field) and the per-dialog draft goes
+        with it; otherwise it clears a non-empty search filter (the long-standing global). This
+        avoids the data-loss trap where Escape-to-clear-search would also wipe a reply typed in
+        the composer (the draft is persisted via on_input_changed → state.draft, unrecoverable on
+        a dialog switch). A no-op when the relevant field is already empty.
         """
-        search = self.query_one("#search", Input)
-        if not search.value:
+        composer = self.query_one("#composer", Input)
+        if composer.has_focus:
+            if composer.value:
+                composer.value = ""  # explicit: clear the draft so a fresh Ctrl+G / reply is clean
             return
-        search.value = ""  # triggers on_input_changed → _render_dialogs
+        search = self.query_one("#search", Input)
+        if search.value:
+            search.value = ""  # triggers on_input_changed → _render_dialogs
 
     def action_open_settings(self) -> None:
         """Ctrl+S — account settings (#115) + inbound-translation settings when a Translator is wired."""

@@ -4965,6 +4965,67 @@ async def test_tui_ctrl_g_suggests_for_open_dm():
         assert app._pending_suggestion == "Конечно, давай завтра!"
 
 
+async def test_tui_ctrl_g_blocked_by_nonempty_composer_points_at_escape():
+    # #155 follow-up: a non-empty composer blocks Ctrl+G (on_input_changed would wipe the hint and
+    # clobbering typed text is worse). The toast tells the user to clear it with Escape; no draft
+    # is generated and the typed text is left intact.
+    class RecordingSuggester:
+        def __init__(self):
+            self.calls = []
+
+        async def suggest(self, dialog_id):
+            self.calls.append(dialog_id)
+            return "draft"
+
+    suggester = RecordingSuggester()
+    app = MessengerTUI(client=TuiStubClient(), suggester=suggester)
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7  # Ann, a DM
+        app.query_one("#composer", Input).value = "недописанное"
+        app.action_suggest_reply()
+        await pilot.pause()
+        assert app.query_one("#composer", Input).value == "недописанное"  # text untouched
+    assert suggester.calls == []  # blocked before the suggester is asked
+    assert any("Esc" in m for m in notes)  # the toast points at Escape
+
+
+async def test_tui_escape_clears_composer_when_composer_focused():
+    # #156: Escape clears the composer when the composer is focused, so Ctrl+G has a clean field.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        composer.value = "черновик"
+        composer.focus()
+        await pilot.pause()
+        app.action_clear_search()
+        await pilot.pause()
+        assert composer.value == ""
+
+
+async def test_tui_escape_clearing_search_preserves_composer_draft():
+    # #156 regression (Codex): Escape pressed to clear the SEARCH filter must NOT wipe a reply
+    # typed in the composer — that draft is persisted and unrecoverable on a dialog switch.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        search = app.query_one("#search", Input)
+        composer = app.query_one("#composer", Input)
+        composer.value = "важный черновик"
+        search.value = "ann"
+        search.focus()  # focus is on the SEARCH box, not the composer
+        await pilot.pause()
+        app.action_clear_search()
+        await pilot.pause()
+        assert search.value == ""  # search cleared
+        assert composer.value == "важный черновик"  # draft preserved — no data loss
+
+
 async def test_tui_ctrl_g_notifies_without_suggester():
     app = MessengerTUI(client=TuiStubClient())  # suggester=None
     notes: list[str] = []
