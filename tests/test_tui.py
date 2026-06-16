@@ -4274,6 +4274,34 @@ async def test_tui_translate_all_aborts_when_dialog_already_switched():
         assert len(app.query("MessageBubble")) == bubbles_before
 
 
+async def test_tui_translate_all_aborts_when_dialog_switches_during_first_await():
+    # regression: even past the entry guard, the dialog can switch DURING `await remove_children()`.
+    # The post-await re-check must then abort before mounting a stale spinner.
+    store = FakeSessionStore(["alice"])
+    translator = _BlockingTranslator({"mode": "all_unknown", "target": "ru", "max_messages": 100})
+    app = MessengerTUI(
+        client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        pane = app.query_one("#messages", Vertical)
+        original_remove = pane.remove_children
+
+        async def remove_then_switch(*args, **kwargs):
+            # simulate the user opening another dialog WHILE remove_children() is awaited
+            app._current = 8
+            return await original_remove(*args, **kwargs)
+
+        pane.remove_children = remove_then_switch
+        await app._translate_whole_dialog(7)
+        await pilot.pause()
+        # the post-remove_children guard fired: no stale spinner mounted for the old dialog
+        assert not app.query("#translate-status")
+
+
 async def test_tui_failed_model_change_does_not_persist_model_or_clear_cache(monkeypatch, tmp_path):
     # regression: a bad model must NOT be written to kv (and the cache must NOT be cleared) before
     # the probe/build succeeds — validate-then-commit.

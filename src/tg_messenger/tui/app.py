@@ -1825,6 +1825,11 @@ class MessengerTUI(App):
         # built-in pane.loading shows) — pane.loading would overlay/hide a mounted label, so we
         # compose both ourselves: the label on top, the indicator below.
         await pane.remove_children()
+        # remove_children() awaited (yielded the loop): the user may have switched dialogs in that
+        # window. Re-check BEFORE clearing the shared bubble index / mounting this dialog's spinner,
+        # else the stale spinner could land on top of the new dialog's history.
+        if dialog_id != self._current:
+            return
         self._bubble_index.clear()
         await pane.mount(
             Vertical(
