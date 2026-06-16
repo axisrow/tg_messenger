@@ -434,3 +434,36 @@ async def test_nudge_candidates_clears_receipt_after_reply(tmp_path):
         assert client.history_calls == [(7, 30)]
     finally:
         await storage.close()
+
+
+async def test_nudge_candidates_clears_receipt_predating_newer_unread_message(tmp_path):
+    # the contact read msg 1 (aged receipt), then we sent a NEWER message (id 3) they
+    # haven't read yet — the tail is ours but last_read_id (1) < tail.id (3). should_nudge
+    # is False (our latest is unread), and the stored receipt predates that newer message,
+    # so it's spent: it must be cleared so the next run doesn't re-fetch history forever
+    # (it's re-stamped only when the newer message is actually read). #145 flood discipline.
+    history = [_msg(1, out=True, text="you there?"), _msg(3, out=True, text="still around?")]
+    client = FakeClient(history)
+    fn, _ = make_suggest_fn("ping")
+    storage = Storage(tmp_path / "n.db")
+    register_suggest_migrations(storage)
+    await storage.connect()
+    try:
+        await record_last_read(
+            storage, MessageReadEvent(dialog_id=7, max_id=1, outbox=True),
+            clock=lambda: 1000.0,
+        )
+        suggester = Suggester(client=client, suggest_fn=fn, storage=storage)
+        # first run: aged receipt passes the local gate → one history() read, no candidate
+        first = await suggester.nudge_candidates([7], now=1000.0 + 2 * 3600, after_sec=3600)
+        assert first == []
+        assert client.history_calls == [(7, 30)]
+        # the spent (pre-dating) receipt was cleared
+        assert await load_last_read(storage, 7) is None
+        assert await load_read_at(storage, 7) is None
+        # second run: rejected at the cheap local gate — NO further history() read
+        second = await suggester.nudge_candidates([7], now=1000.0 + 3 * 3600, after_sec=3600)
+        assert second == []
+        assert client.history_calls == [(7, 30)]
+    finally:
+        await storage.close()

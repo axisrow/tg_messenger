@@ -331,10 +331,16 @@ class Suggester:
                 history, last_read_id=last_read_id, read_at=read_at,
                 now=now, after_sec=after_sec,
             ):
-                # If the contact has REPLIED (last message is incoming), the aged receipt
-                # is spent — drop it so we don't re-fetch history for this dialog every run
-                # (it's only re-stamped by a fresh outbox receipt). #145 flood discipline.
-                if history and not history[-1].out:
+                # The aged receipt is SPENT whenever the fetched history shows it can't
+                # produce a nudge for the current tail — drop it so we don't re-fetch
+                # history for this dialog every run (it's re-stamped only by a fresh
+                # outbox receipt, exactly when nudging matters again). #145 flood
+                # discipline. Two spent shapes:
+                #   - the contact REPLIED (tail is incoming), or
+                #   - we sent a NEWER message the contact hasn't read yet
+                #     (tail is ours but last_read_id < tail.id) — the stored receipt
+                #     predates it, so it can't nudge until that newer message is read.
+                if history and (not history[-1].out or last_read_id < history[-1].id):
                     await clear_last_read(self._storage, dialog_id)
                 continue
             try:
