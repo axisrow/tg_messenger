@@ -28,7 +28,10 @@ from tg_messenger.tui.app import (
     MessageBubble,
     MessengerTUI,
     ProfileItem,
+    ProfileListCard,
     ReadLangScreen,
+    SuggestSettingsCard,
+    TranslateSettingsCard,
     VariantItem,
     _terminal_safe_display_text,
     parse_lang_command,
@@ -4601,6 +4604,37 @@ async def test_tui_footer_is_present_and_shows_help_and_settings():
         active_help = [b for b in active if b.description == "Справка"]
         assert len(active_help) == 1 and active_help[0].key == "f1"
         assert any(b.description == "Настройки" for b in active)
+
+
+async def test_tui_settings_sections_are_card_widgets():
+    # #163: each settings section is its OWN composable card widget (compose + handlers + guard),
+    # not inline screen markup; AccountsScreen only orchestrates. The profiles card is always
+    # present; translate/suggest cards are gated on their wired dependency.
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "off", "target": "", "known": [], "unknown": []})
+    suggester = StubSuggesterTUI()
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store,
+            translator=translator, suggester=suggester,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        profiles_card = screen.query_one(ProfileListCard)
+        translate_card = screen.query_one(TranslateSettingsCard)
+        suggest_card = screen.query_one(SuggestSettingsCard)
+        # the load-echo guards now live on the cards, not the screen
+        assert hasattr(translate_card, "_applied_mode")
+        assert hasattr(suggest_card, "_applied_suggest_enabled")
+        # the section ids stay reachable from the screen (query searches the whole DOM subtree)
+        assert screen.query("#translate-section")
+        assert screen.query("#suggest-section")
+        # the preserved widget ids resolve to children of their owning card
+        assert profiles_card.query("#accounts")
+        assert translate_card.query("#translate-mode")
+        assert suggest_card.query("#suggest-enabled")
 
 
 async def test_tui_settings_shows_translate_section_when_translator_wired():
