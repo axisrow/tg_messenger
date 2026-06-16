@@ -250,10 +250,12 @@ class _StorageBackedSuggester:
     async def save_settings(self, *, enabled: bool, history: int, model: str | None) -> None:
         """Persist settings and apply them live (validates the model before commit)."""
         await self._ensure_connected()
-        from tg_messenger.agent.suggest import set_suggest_settings
+        from tg_messenger.agent.suggest import _coerce_history, set_suggest_settings
 
-        # Validate/build the model BEFORE persisting so a bad model never half-commits
-        # (mirrors the translator's _validate_model-then-commit ordering).
+        # Validate the cheap field (history) FIRST so a bad history doesn't trigger a
+        # wasted init_chat_model build; then validate/build the model BEFORE persisting,
+        # so a bad model never half-commits (mirrors the translator validate-then-commit).
+        history = _coerce_history(history)
         supports_swap = getattr(self._suggester, "supports_model_swap", False)
         new_fn = None
         if model and supports_swap:
