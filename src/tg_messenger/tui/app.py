@@ -1408,9 +1408,6 @@ class MessengerTUI(App):
         self._compose_states: dict[int, ComposeState] = {}
         self._bubble_index: dict[int, MessageBubble] = {}
         # #126: the messages currently mounted in the open dialog — the source for on-demand
-        # Ctrl+T translation. Captured in _show_history and appended to as live messages arrive,
-        # cleared on dialog switch so a stale snapshot can't translate the wrong chat.
-        self._current_messages: list = []
         # #126: re-entrancy guard so a second t/Ctrl+T can't stack a second reading-language modal.
         self._lang_prompt_open = False
         self._pending_suggestion: str | None = None
@@ -1805,7 +1802,6 @@ class MessengerTUI(App):
         self._apply_composer_writable(dialog_id)
         self._clear_suggestion()
         self._bubble_index.clear()
-        self._current_messages = []  # #126: drop the prior chat's Ctrl+T snapshot until reloaded
         self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
         # exclusive group: selecting another dialog cancels a still-loading history
         self.run_worker(self._show_history(dialog_id), group="history", exclusive=True)
@@ -1848,9 +1844,6 @@ class MessengerTUI(App):
         pane.loading = False
         bubbles = []
         self._bubble_index.clear()
-        # #126: snapshot the loaded messages so on-demand Ctrl+T can translate them even when
-        # auto-translate is OFF. Set unconditionally (above the auto gate below).
-        self._current_messages = list(messages)
         for m in messages:
             bubbles.append(self._message_bubble_for(m, dialog_id))
         await pane.mount(*(_wrap_bubble(b) for b in bubbles))  # #118: align via wrapper row
@@ -2360,7 +2353,6 @@ class MessengerTUI(App):
                     pane = self.query_one("#messages", Vertical)
                     bubble = self._message_bubble_for(ev.message, ev.dialog_id)
                     await pane.mount(_wrap_bubble(bubble))
-                    self._current_messages.append(ev.message)  # #126: keep Ctrl+T snapshot fresh
                     if (
                         not ev.message.translated_text
                         and self._translator is not None
@@ -2398,7 +2390,6 @@ class MessengerTUI(App):
                     pane = self.query_one("#messages", Vertical)
                     bubble = self._message_bubble_for(ev.message, ev.dialog_id)
                     await pane.mount(_wrap_bubble(bubble))
-                    self._current_messages.append(ev.message)  # #126: keep Ctrl+T snapshot fresh
                     if (
                         not ev.message.translated_text
                         and self._translator is not None
