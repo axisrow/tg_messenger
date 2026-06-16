@@ -4227,7 +4227,12 @@ async def test_tui_failed_model_change_does_not_persist_model_or_clear_cache(mon
     # the probe/build succeeds — validate-then-commit.
     pytest.importorskip("deepagents")
     from tg_messenger.agent import factory as factory_mod
-    from tg_messenger.agent.translate import Translator, get_translate_model, set_translate_model
+    from tg_messenger.agent.translate import (
+        Translator,
+        get_translate_model,
+        get_user_lang,
+        set_translate_model,
+    )
     from tg_messenger.core.message_store import register_message_store_migrations
     from tg_messenger.core.storage import Storage
 
@@ -4248,15 +4253,14 @@ async def test_tui_failed_model_change_does_not_persist_model_or_clear_cache(mon
             raise RuntimeError("bad model")
 
         monkeypatch.setattr(factory_mod, "build_translator_with_probe", boom)
-        import tg_messenger.core.message_store as ms
 
-        real_clear = ms.clear_all_translations
-
-        async def counting_clear(s):
+        # count cache-clears across the whole save path (every setter calls clear_all_translations)
+        async def counting_clear(_s):
             cleared["count"] += 1
-            await real_clear(s)
 
-        monkeypatch.setattr("tg_messenger.agent.translate.clear_all_translations", counting_clear)
+        monkeypatch.setattr(
+            "tg_messenger.agent.translate.clear_all_translations", counting_clear
+        )
 
         store = FakeSessionStore(["alice"])
         app = MessengerTUI(
@@ -4269,10 +4273,17 @@ async def test_tui_failed_model_change_does_not_persist_model_or_clear_cache(mon
             )
             app.push_screen(screen)
             await pilot.pause()
+            # fill the other settings too — they must NOT be written when the new model is bad
+            screen.query_one("#target-lang", Input).value = "en"
+            screen.query_one("#known-langs", Input).value = "de"
             screen.query_one("#translate-model", Input).value = "openai:bad"
-            await screen._apply_model_change("openai:bad")
-            # the bad model was NOT persisted; the working one survives; cache was not cleared
-            assert await get_translate_model(storage, {}) == "openai:good"
-            assert cleared["count"] == 0
+            # the REAL UI save path (not _apply_model_change directly): a bad changed model must
+            # abort BEFORE set_settings, so neither the cache nor any setting is touched.
+            await screen._save_translate_settings()
+            assert await get_translate_model(storage, {}) == "openai:good"  # working model survives
+            assert cleared["count"] == 0  # cache never cleared
+            assert await get_user_lang(storage, {}) is None  # target NOT written
+            # _apply_model_change itself returns None on a bad model
+            assert await screen._apply_model_change("openai:bad") is None
     finally:
         await storage.close()

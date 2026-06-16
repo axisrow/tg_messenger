@@ -972,10 +972,16 @@ class AccountsScreen(ModalScreen[object]):
             self.notify(str(exc), severity="error")
             return
         model = self.query_one("#translate-model", Input).value.strip()
-        # NB: the model is deliberately NOT persisted here. set_translate_model() also clears the
-        # translation cache, so writing it before the model is proven buildable would leave a broken
-        # model + wiped cache on a typo. _apply_model_change validates first, commits the model only
-        # on success (validate-then-commit).
+        # Order matters: set_settings() clears the translation cache (each setter does), so a CHANGED
+        # model must be validated (build+probe) FIRST. Otherwise a typo in the model field would wipe
+        # the cache + write the other settings before the probe fails — irreversibly, while reporting
+        # "model not applied". Validate-then-commit across the WHOLE save, not just the model write.
+        if model != self._applied_model:
+            new_translator = await self._apply_model_change(model)
+            if new_translator is None:
+                return  # bad model → nothing persisted, cache untouched
+        else:
+            new_translator = None
         try:
             await self._translator.set_settings(
                 mode=mode, target=target_code, known=known, unknown=unknown,
@@ -989,10 +995,9 @@ class AccountsScreen(ModalScreen[object]):
             self.notify("Не удалось сохранить настройки перевода", severity="error")
             return
         self._applied_mode = mode
-        # A changed model means a different LLM: probe its structured method and rebuild the
-        # Translator, persist the model only on success, then hand the new instance back to the app.
-        if model != self._applied_model:
-            await self._apply_model_change(model)
+        if new_translator is not None:
+            # model changed and validated → hand the rebuilt translator back to the app
+            self.dismiss(new_translator)
             return
         self.notify("Настройки перевода сохранены")
 
@@ -1009,12 +1014,14 @@ class AccountsScreen(ModalScreen[object]):
             raise ValueError("Сколько переводить: число должно быть ≥ 1")
         return n
 
-    async def _apply_model_change(self, model: str) -> None:
-        """Probe the freshly chosen model and rebuild the Translator, propagating it to the app.
+    async def _apply_model_change(self, model: str):
+        """Validate a freshly chosen model and rebuild the Translator. Returns the new Translator
+        on success, or None on failure (caller then aborts the save WITHOUT touching any settings).
 
-        A blank model falls back to env; an unbuildable model (bad name / missing key) is reported
-        and NOT applied (the old translator stays). On success we dismiss with the new Translator so
-        the main app swaps it in for live/history/whole-chat translation.
+        A blank model falls back to env; an unbuildable model (bad name) is reported and NOT applied.
+        This builds+probes the candidate and persists the model (set_translate_model), but does NOT
+        write the other settings or dismiss — the caller does that only after this succeeds, so a bad
+        model never clears the translation cache or half-applies the other fields.
         """
         self.notify("Проверяю модель…")
         try:
@@ -1023,35 +1030,34 @@ class AccountsScreen(ModalScreen[object]):
         except ImportError:
             logger.exception("settings: agent extra unavailable for model change")
             self.notify("Переводчик недоступен (нет extra [agent])", severity="error")
-            return
+            return None
         target_model = model or translate_model_from_env()
         if not target_model:
             self.notify("Не задана модель перевода", severity="error")
-            return
+            return None
         # the SQLite Storage the Translator caches into lives on the current translator, NOT on
         # self._store (which is the SessionStore). Reuse it so settings/cache stay in one DB.
         storage = self._translator.storage
         # validate-then-commit: build+probe the candidate FIRST, persist the model only on success.
-        # A bad name/key raises here without ever touching kv, so storage keeps pointing at the
-        # working model and the cache isn't wiped on a typo.
+        # A bad name raises here without ever touching kv, so storage keeps pointing at the working
+        # model and the cache isn't wiped on a typo.
         try:
             new_translator = await build_translator_with_probe(storage, target_model)
         except Exception:
             logger.exception("settings: failed to build translator for model %r", target_model)
             self.notify("Не удалось применить модель — проверьте имя/ключ", severity="error")
-            return
+            return None
         try:
             # blank field → clear the kv override (fall back to env); else persist the chosen model
             await set_translate_model(storage, model or None)
         except Exception:
             logger.exception("settings: failed to persist model %r", target_model)
             self.notify("Не удалось сохранить модель", severity="error")
-            return
+            return None
         self._translator = new_translator
         self._applied_model = model
         self.notify("Модель перевода применена")
-        # hand the rebuilt translator back to the main app (it propagates on screen dismiss)
-        self.dismiss(new_translator)
+        return new_translator
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # Enter in a translation field saves; the profile-name field keeps its add-account flow.
