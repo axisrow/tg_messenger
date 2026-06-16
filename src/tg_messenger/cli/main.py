@@ -369,6 +369,19 @@ def make_outbound_coordinator(outbound, store):
     return OutboundSendCoordinator(outbound=outbound, store=store, timeout=CHAT_OUTBOUND_TIMEOUT_SECONDS)
 
 
+def make_translation_deps(client, *, session: str = "default"):
+    """The shared message-store → inbound/outbound translator setup (#164).
+
+    The same three-step build is needed by both ``make_tui_deps`` and ``serve``; one helper keeps
+    them in step. Returns ``(translator, outbound, store, storage)``. (``chat`` builds the store
+    too but then connects it + runs its sync loop, so it stays inline.)
+    """
+    store, storage = make_message_store(client, session=session)
+    translator = make_optional_translator(storage)
+    outbound = make_optional_outbound(store, storage)
+    return translator, outbound, store, storage
+
+
 def translate_auto_from_env(env=None) -> bool:
     """Default auto-translate state for inbound messages (off — don't burn tokens).
 
@@ -404,9 +417,7 @@ def make_tui_deps(profile: str, *, log_kwargs: dict) -> TuiDeps:
     setup_logging(profile=profile, **log_kwargs)
     client = make_client(session_name=profile)
     suggester = make_optional_suggester(client, session=profile)
-    store, storage = make_message_store(client, session=profile)
-    translator = make_optional_translator(storage)
-    outbound = make_optional_outbound(store, storage)
+    translator, outbound, store, _storage = make_translation_deps(client, session=profile)
     return TuiDeps(
         client=client,
         session_name=profile,
@@ -2190,9 +2201,7 @@ def serve(ctx: click.Context, host: str, port: int, session: str, insecure: bool
     session = _effective_session(ctx, session)
     client = make_client(session_name=session)
     suggester = make_optional_suggester(client, session=session)
-    store, storage = make_message_store(client, session=session)
-    translator = make_optional_translator(storage)
-    outbound = make_optional_outbound(store, storage)
+    translator, outbound, store, _storage = make_translation_deps(client, session=session)
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
     click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
     uvicorn.run(
