@@ -162,3 +162,34 @@ def test_build_suggester_falls_back_to_model_when_suggest_unset(monkeypatch):
     monkeypatch.setattr(f, "init_chat_model", lambda name: seen.append(name) or object())
     f.build_suggester(object(), _cfg(model="openai:gpt-4o", suggest_model=None))
     assert seen == ["openai:gpt-4o"]  # falls back to the main model
+
+
+# --- #164: _with_fallback_method — the extracted runtime json_mode safety net ---
+
+_PAYLOAD = {"target_lang": "ru", "skip_langs": [], "only_langs": [], "messages": [{"id": 1, "text": "hola"}]}
+
+
+async def test_with_fallback_method_retries_on_empty_primary():
+    counter: dict[str, int] = {}
+    primary = _Structured(_EMPTY, counter, "primary")
+    fallback = _Structured(_GOOD, counter, "fallback")
+    batch = await f._with_fallback_method(primary, fallback, _PAYLOAD)
+    assert batch is _GOOD
+    assert counter == {"primary": 1, "fallback": 1}  # primary empty → fallback tried once
+
+
+async def test_with_fallback_method_no_retry_when_primary_good():
+    counter: dict[str, int] = {}
+    primary = _Structured(_GOOD, counter, "primary")
+    fallback = _Structured(_GOOD, counter, "fallback")
+    batch = await f._with_fallback_method(primary, fallback, _PAYLOAD)
+    assert batch is _GOOD
+    assert counter == {"primary": 1}  # good primary → fallback never called
+
+
+async def test_with_fallback_method_no_fallback_returns_primary():
+    counter: dict[str, int] = {}
+    primary = _Structured(_EMPTY, counter, "primary")
+    batch = await f._with_fallback_method(primary, None, _PAYLOAD)
+    assert batch is _EMPTY  # fallback None (already json_mode) → primary returned as-is
+    assert counter == {"primary": 1}

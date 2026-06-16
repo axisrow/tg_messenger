@@ -1916,6 +1916,22 @@ def test_make_client_uses_tg_session_dir(monkeypatch, tmp_path):
     assert captured["session_dir"] == str(tmp_path)
 
 
+def test_make_translation_deps_returns_four_tuple_in_order(monkeypatch):
+    # #164: the shared store→translator→outbound build returns (translator, outbound, store, storage)
+    store, storage = object(), object()
+    translator, outbound = object(), object()
+    monkeypatch.setattr(cli_main, "make_message_store", lambda client, **kw: (store, storage))
+    monkeypatch.setattr(cli_main, "make_optional_translator", lambda s: translator if s is storage else None)
+    monkeypatch.setattr(
+        cli_main, "make_optional_outbound",
+        lambda st, s: outbound if (st is store and s is storage) else None,
+    )
+
+    result = cli_main.make_translation_deps(object(), session="work")
+
+    assert result == (translator, outbound, store, storage)
+
+
 @pytest.mark.parametrize(
     ("args", "input_text"),
     [

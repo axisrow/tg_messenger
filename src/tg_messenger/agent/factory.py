@@ -288,6 +288,20 @@ async def probe_structured_method(model) -> str:
     return "json_mode"
 
 
+async def _with_fallback_method(primary, fallback, payload: dict) -> TranslationBatch | None:
+    """One structured translate via ``primary``, retried via ``fallback`` if it comes back empty/None.
+
+    The runtime safety net for a stale per-model probe: a cached json_schema choice that yields
+    no items is retried once with json_mode. ``fallback`` is None when no retry applies (the method
+    is already json_mode), in which case the primary result is returned as-is.
+    """
+    batch = await _structured_translate(primary, payload)
+    if (batch is None or not batch.items) and fallback is not None:
+        logger.info("json_schema translate empty/failed; retrying json_mode")
+        batch = await _structured_translate(fallback, payload)
+    return batch
+
+
 def make_translate_fn(model, method: str = "json_mode") -> Callable:
     """Structured-output translator over ``with_structured_output``; injected into ``Translator``.
 
@@ -309,10 +323,7 @@ def make_translate_fn(model, method: str = "json_mode") -> Callable:
             "only_langs": list(only_langs),
             "messages": [{"id": int(mid), "text": text} for mid, text in messages],
         }
-        batch = await _structured_translate(primary, payload)
-        if (batch is None or not batch.items) and fallback is not None:
-            logger.info("json_schema translate empty/failed; retrying json_mode")
-            batch = await _structured_translate(fallback, payload)
+        batch = await _with_fallback_method(primary, fallback, payload)
         if batch is None:
             return {}
         return _batch_to_map(batch)
