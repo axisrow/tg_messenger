@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import pytest
@@ -664,11 +665,9 @@ def test_chat_outbound_variant_sends_pick(runner, monkeypatch):
             self.recorded.append((dialog_id, message.text, source_text, source_lang))
 
     class FakeOutbound:
-        async def applies(self, dialog_id, text, *, telegram_lang_code=None):
-            return "en"
-
-        async def variants(self, dialog_id, text, target_lang):
-            return ["hi", "hello", "hey"]
+        # the coordinator drives prepare_variants → (target_lang, variants), not applies()/variants()
+        async def prepare_variants(self, dialog_id, text, *, telegram_lang_code=None):
+            return "en", ["hi", "hello", "hey"]
 
     store = FakeStore(stub)
     monkeypatch.setattr(cli_main, "make_message_store", lambda client, **kw: (store, store.storage))
@@ -676,6 +675,7 @@ def test_chat_outbound_variant_sends_pick(runner, monkeypatch):
     result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n2\n")
     assert result.exit_code == 0, result.output
     assert (7, "hello", None, None) in stub.sent
+    # record_outgoing is now owned by the coordinator's send_variant (source recorded once)
     assert store.recorded == [(7, "hello", "привет", "ru")]
     assert "↳ привет" in result.output
 
@@ -734,14 +734,152 @@ def test_chat_outbound_timeout_sends_original(runner, monkeypatch):
     stub.listen_interrupt = False
 
     class FakeOutbound:
-        async def applies(self, dialog_id, text, *, telegram_lang_code=None):
+        # a prepare timeout surfaces as PrepareResult(status="error", error="Translation timed out.")
+        async def prepare_variants(self, dialog_id, text, *, telegram_lang_code=None):
             raise TimeoutError
 
     monkeypatch.setattr(cli_main, "make_optional_outbound", lambda s, storage: FakeOutbound())
-    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n")
+    # #162 MC-2: the coordinator collapses timeout into "error", so the REPL now confirms before
+    # sending the original ([y/N]) and shows the reason via result.error instead of auto-sending.
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\ny\n")
     assert result.exit_code == 0, result.output
     assert (7, "привет", None, None) in stub.sent
-    assert "translation timed out" in result.output
+    assert "Translation timed out" in result.output
+
+
+# --- #162: the chat REPL drives the outbound flow through make_outbound_coordinator ---
+
+
+@dataclass
+class _PrepareResult:
+    status: str
+    target_lang: str | None = None
+    variants: list = field(default_factory=list)
+    token: str | None = None
+    error: str | None = None
+
+
+class _StubCoordinator:
+    """Records the prepare/send calls the REPL makes; no real translation/network."""
+
+    def __init__(self, result):
+        self._result = result
+        self.prepared = []
+        self.sent_variants = []
+        self.sent_originals = []
+
+    async def prepare(self, dialog_id, text, *, telegram_lang_code=None, owner_id=""):
+        self.prepared.append((dialog_id, text, telegram_lang_code, owner_id))
+        return self._result
+
+    async def send_variant(self, dialog_id, token, variant_text, send_fn, *, owner_id=""):
+        self.sent_variants.append((dialog_id, token, variant_text, owner_id))
+        return await send_fn(dialog_id, variant_text)
+
+    async def send_original(self, dialog_id, text, send_fn):
+        self.sent_originals.append((dialog_id, text))
+        return await send_fn(dialog_id, text)
+
+
+def _patch_coordinator(monkeypatch, result):
+    coord = _StubCoordinator(result)
+    monkeypatch.setattr(cli_main, "make_optional_outbound", lambda s, storage: object())
+    monkeypatch.setattr(cli_main, "make_outbound_coordinator", lambda outbound, store: coord)
+    return coord
+
+
+def test_chat_outbound_ready_variant_through_coordinator(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+    coord = _patch_coordinator(
+        monkeypatch, _PrepareResult(status="ready", variants=["hi", "hello"], token="tok")
+    )
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n2\n")
+    assert result.exit_code == 0, result.output
+    # the picked variant is sent via the coordinator's send_variant with the prepare token
+    assert coord.sent_variants == [(7, "tok", "hello", "7")]
+    assert (7, "hello", None, None) in stub.sent
+    assert "↳ привет" in result.output
+
+
+def test_chat_outbound_ready_pick_original_through_coordinator(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+    coord = _patch_coordinator(
+        monkeypatch, _PrepareResult(status="ready", variants=["hi", "hello"], token="tok")
+    )
+    # the "[N+1] original" index sends the original via send_original (no variant)
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n3\n")
+    assert result.exit_code == 0, result.output
+    assert coord.sent_originals == [(7, "привет")]
+    assert coord.sent_variants == []
+    assert (7, "привет", None, None) in stub.sent
+
+
+def test_chat_outbound_ready_cancel_sends_nothing(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+    coord = _patch_coordinator(
+        monkeypatch, _PrepareResult(status="ready", variants=["hi"], token="tok")
+    )
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n0\n")
+    assert result.exit_code == 0, result.output
+    assert coord.sent_variants == [] and coord.sent_originals == []
+    assert stub.sent == []
+
+
+def test_chat_outbound_ready_negative_index_cancels(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+    # a negative index must cancel, never send variants[-2] (Python negative indexing does
+    # NOT raise IndexError, so "-1" with two variants would otherwise pick the wrong one)
+    coord = _patch_coordinator(
+        monkeypatch, _PrepareResult(status="ready", variants=["hi", "hello"], token="tok")
+    )
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n-1\n")
+    assert result.exit_code == 0, result.output
+    assert coord.sent_variants == [] and coord.sent_originals == []
+    assert stub.sent == []
+    assert "cancelled." in result.output
+
+
+def test_chat_outbound_ready_out_of_range_index_cancels(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+    # an index above [N+1] original is out of range → cancel (here 9 with 2 variants + original)
+    coord = _patch_coordinator(
+        monkeypatch, _PrepareResult(status="ready", variants=["hi", "hello"], token="tok")
+    )
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n9\n")
+    assert result.exit_code == 0, result.output
+    assert coord.sent_variants == [] and coord.sent_originals == []
+    assert stub.sent == []
+    assert "cancelled." in result.output
+
+
+def test_chat_outbound_not_applicable_sends_original_silently(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+    coord = _patch_coordinator(monkeypatch, _PrepareResult(status="not_applicable"))
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
+    assert result.exit_code == 0, result.output
+    # not_applicable → original sent, no picker prompt
+    assert coord.sent_originals == [(7, "hello")]
+    assert (7, "hello", None, None) in stub.sent
+    assert "вариант>" not in result.output
+
+
+def test_chat_outbound_error_confirm_no_skips_send(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+    coord = _patch_coordinator(
+        monkeypatch, _PrepareResult(status="error", error="Translation failed.")
+    )
+    # answering 'n' to the confirm sends nothing
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\nn\n")
+    assert result.exit_code == 0, result.output
+    assert coord.sent_originals == [] and stub.sent == []
+    assert "Translation failed." in result.output
 
 
 def test_dialog_lang_show_set_and_off(monkeypatch, tmp_path):
