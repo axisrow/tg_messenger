@@ -308,6 +308,27 @@ async def test_watch_read_receipts_drains_and_records(tmp_path):
         await storage.close()
 
 
+# --- #144: suggester_disabled_reason (cheap, side-effect-free diagnostics) ---
+
+
+def test_suggester_disabled_reason_unset_model(monkeypatch):
+    from tg_messenger.agent.suggest import suggester_disabled_reason
+
+    # [agent] extra is installed in this env-job; with no model the reason names TG_AGENT_MODEL
+    pytest.importorskip("langchain")
+    reason = suggester_disabled_reason(env={})
+    assert reason is not None
+    assert "TG_AGENT_MODEL" in reason
+
+
+def test_suggester_disabled_reason_none_when_configured():
+    from tg_messenger.agent.suggest import suggester_disabled_reason
+
+    pytest.importorskip("langchain")
+    reason = suggester_disabled_reason(env={"TG_AGENT_MODEL": "openai:gpt-4o"})
+    assert reason is None
+
+
 # --- #143: live settings (enabled / history / model), persisted in kv ---
 
 
