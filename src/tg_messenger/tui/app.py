@@ -562,6 +562,10 @@ class MessageBubble(Static):
         # #102: the SOURCE dialog of this bubble (web #96 parity, data-dialog) — a reaction
         # targets it, not the globally-current dialog, so action_react is self-contained.
         self.dialog_id = dialog_id
+        # #128: the app's dialog-switch generation when this bubble was mounted (set by
+        # _message_bubble_for). Stays None for bubbles built outside that path (e.g. tests
+        # that mount a MessageBubble directly); action_react then can't classify it as stale.
+        self.switch_gen: int | None = None
         # #106: translation + reactions are SEPARATE state composed by _build(), so neither
         # clobbers the other regardless of arrival order (both rewrite the whole widget text).
         self._translation: str | None = None
@@ -673,6 +677,18 @@ class MessageBubble(Static):
         # parity with web #96 and self-contained (no app-global read).
         if self.message_id is None or self.dialog_id is None:
             return  # reaction-echo bubble, or no source dialog — nothing to react to
+        # #128: reject a reaction on a STALE bubble — one mounted under an older dialog-switch
+        # generation than the app's current, i.e. a previous-dialog bubble still lingering in the
+        # DOM during the async history render after a switch (reachable only via a mouse click;
+        # the keyboard path is already gated by _navigable_bubbles). A deliberate cross-dialog
+        # target (#102/#105) carries the CURRENT generation, so it stays allowed.
+        app_gen = getattr(self.app, "_switch_gen", None)
+        if self.switch_gen is not None and app_gen is not None and self.switch_gen < app_gen:
+            logger.debug(
+                "ignoring reaction on stale bubble (dialog %s, gen %s < %s)",
+                self.dialog_id, self.switch_gen, app_gen,
+            )
+            return
         self.app.run_worker(
             self.app._react_from_bubble(self.dialog_id, self.message_id)
         )
@@ -1380,6 +1396,13 @@ class MessengerTUI(App):
         # so the in-app picker, not a CLI menu, resolves the profile. None = library path.
         self._deps_factory = deps_factory
         self._current: int | None = None
+        # #128: a monotonic dialog-switch generation. Bumped on every _open_dialog; each
+        # MessageBubble is stamped with the generation it was mounted under. action_react
+        # rejects a reaction on a bubble whose generation is OLDER than the current one — i.e.
+        # a stale previous-dialog bubble still lingering in the DOM during the async history
+        # render. A deliberate cross-dialog target (#102/#105) carries the CURRENT generation
+        # (its dialog != _current, but it belongs to the live view), so it is still allowed.
+        self._switch_gen = 0
         # #108 (Codex review): the open dialog's kind, captured at selection time as a stable value
         # for the author-line decision (read by _kind_for_rendering). Since #110 _all_dialogs is the
         # full snapshot (a dialog no longer drops out on a tab switch), but keeping the captured kind
@@ -1795,6 +1818,12 @@ class MessengerTUI(App):
         # send (Codex finding). Setting _current here, before focus moves, closes that window.
         self._save_current_compose_state()
         self._current = dialog_id
+        # #128: a real dialog switch advances the generation. The previous dialog's bubbles stay
+        # mounted until the async _show_history below runs remove_children; they now carry an
+        # OLDER generation than _switch_gen, so a mouse-click + react on one (the render-window
+        # gap) is rejected by MessageBubble.action_react — while a same-view cross-dialog target
+        # (#102/#105) keeps the current generation and is still allowed.
+        self._switch_gen += 1
         # #108: capture the kind now, while this dialog's <li> is in _all_dialogs — a later
         # tab switch can drop it from the list, but the open chat keeps showing author lines.
         self._current_kind = self._dialog_kind(dialog_id)
@@ -1822,6 +1851,10 @@ class MessengerTUI(App):
             dialog_id=dialog_id,
             author=_message_author_line(message, show_author=show_author),
         )
+        # #128: stamp the switch generation this bubble was built under. A later dialog switch
+        # bumps _switch_gen, leaving this (now previous-view) bubble's generation older — which
+        # action_react rejects, closing the stale-bubble mouse-react window.
+        bubble.switch_gen = self._switch_gen
         if message.translated_text:
             bubble.show_translation(message.translated_text)
         self._bubble_index[message.id] = bubble

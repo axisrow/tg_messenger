@@ -2498,6 +2498,35 @@ async def test_tui_reaction_not_attached_to_same_id_bubble_of_other_dialog():
     assert app._pending_reactions == {}  # nor was it buffered (the bubble existed, just mismatched)
 
 
+async def test_tui_stale_bubble_after_switch_cannot_be_reacted_via_mouse():
+    # #128: after a dialog switch, the previous dialog's bubbles linger until the async history
+    # worker removes them. A mouse focus + action_react on such a STALE bubble must be rejected
+    # (older switch generation than the app's), so a reaction can't land in a half-replaced view.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+
+    async def pick(screen):
+        return "👍"
+
+    app.push_screen_wait = pick  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)  # dialog-7 bubble built under the current generation
+        await pilot.pause()
+        stale = list(app.query(MessageBubble))[0]
+        gen_before = app._switch_gen
+        # a real switch to dialog 8: bumps the generation; the dialog-7 bubble is now stale
+        # (the async _show_history(8) hasn't run remove_children yet — the render window).
+        app._open_dialog(8)
+        assert app._switch_gen == gen_before + 1
+        assert stale.switch_gen == gen_before  # the lingering bubble carries the OLD generation
+        # mouse-click path: focus + action_react on the stale bubble — must be rejected
+        stale.action_react()
+        await pilot.pause()
+    assert stub.reactions == []  # no reaction sent on the stale previous-dialog bubble
+
+
 async def test_tui_group_incoming_does_not_trigger_suggester():
     class RecordingSuggester:
         def __init__(self):
