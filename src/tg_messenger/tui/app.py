@@ -584,6 +584,8 @@ class MessageBubble(Static):
         try:
             return self.app.theme_variables.get("accent") or "cyan"
         except Exception:
+            # expected before mount (NoActiveAppError) — debug-logged, not silently swallowed
+            logger.debug("translation accent unavailable (bubble not mounted yet); using fallback")
             return "cyan"
 
     def _recompose_text(self) -> None:
@@ -1813,6 +1815,11 @@ class MessengerTUI(App):
         spinner for the duration. A failed/empty pass is surfaced via notify (the Ctrl+T path is
         explicit, unlike the silent background auto-translate on open).
         """
+        # the worker is scheduled, not run inline: the user may have opened another dialog between
+        # pressing Ctrl+T and this body running. Bail BEFORE touching the pane, else we'd wipe the
+        # new dialog's history and mount this dialog's spinner into the wrong chat.
+        if dialog_id != self._current:
+            return
         pane = self.query_one("#messages", Vertical)
         # mount a labelled status WITH the animated LoadingIndicator (the same blinking dots the
         # built-in pane.loading shows) — pane.loading would overlay/hide a mounted label, so we

@@ -4249,6 +4249,31 @@ async def test_tui_translate_all_shows_status_then_clears():
         assert "ПЕРЕВОД" in rendered, "Ctrl+T mounted untranslated bubbles"
 
 
+async def test_tui_translate_all_aborts_when_dialog_already_switched():
+    # regression: the Ctrl+T worker is scheduled, not inline. If the user opens another dialog
+    # before the worker body runs, it must bail BEFORE touching the pane — not wipe the new
+    # dialog's history nor mount a stale #translate-status into the wrong chat.
+    store = FakeSessionStore(["alice"])
+    translator = _BlockingTranslator({"mode": "all_unknown", "target": "ru", "max_messages": 100})
+    app = MessengerTUI(
+        client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        bubbles_before = len(app.query("MessageBubble"))
+        assert bubbles_before  # dialog 7 history is on screen
+        # the user has switched to another dialog by the time the stale worker body runs
+        app._current = 8
+        await app._translate_whole_dialog(7)
+        await pilot.pause()
+        # the worker bailed early: no spinner mounted, dialog 7's pane untouched
+        assert not app.query("#translate-status")
+        assert len(app.query("MessageBubble")) == bubbles_before
+
+
 async def test_tui_failed_model_change_does_not_persist_model_or_clear_cache(monkeypatch, tmp_path):
     # regression: a bad model must NOT be written to kv (and the cache must NOT be cleared) before
     # the probe/build succeeds — validate-then-commit.
