@@ -178,14 +178,21 @@ async def resolve_skip_only(storage, target: str | None, env=None) -> tuple[list
 
     ``skip_langs`` — source languages NOT to translate (return null). ``only_langs`` — when
     non-empty, translate ONLY these source languages (null for everything else). At most one is
-    non-empty. The target language is always implicitly skipped under ``all_unknown`` (no point
-    translating a message already in the language we'd translate INTO).
+    non-empty. The target language is always implicitly skipped (no point translating a message
+    already in the language we'd translate INTO) under ``all_unknown`` and under ``only_unknown``
+    with an EMPTY whitelist — an empty whitelist means "translate everything that differs from the
+    target" rather than "translate nothing".
     """
     mode = await get_translate_mode(storage, env)
     if mode == "skip_known":
         return await get_known_langs(storage), []
     if mode == "only_unknown":
-        return [], await get_unknown_langs(storage)
+        unknown = await get_unknown_langs(storage)
+        if unknown:
+            return [], unknown
+        # empty whitelist = translate everything that differs from the target:
+        # no "only" restriction, just skip the target language itself.
+        return ([target] if target else []), []
     # all_unknown: skip the user's known languages plus the target language itself
     known = await get_known_langs(storage)
     skip = list(known)

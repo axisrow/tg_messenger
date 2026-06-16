@@ -376,6 +376,41 @@ async def test_resolve_skip_only_per_mode(tmp_path):
         await store.close()
 
 
+async def test_only_unknown_empty_whitelist_translates_all_but_target(tmp_path):
+    """Empty unknown_langs in only_unknown = translate everything except the target language."""
+    storage, store = await _connected_store(tmp_path)
+    try:
+        await set_translate_mode(storage, "only_unknown")
+        await set_unknown_langs(storage, "")  # explicit empty whitelist
+        # no "only" restriction, just skip the target itself
+        assert await resolve_skip_only(storage, "en", {}) == (["en"], [])
+        # no target → nothing to skip, still no "only" restriction
+        assert await resolve_skip_only(storage, None, {}) == ([], [])
+    finally:
+        await store.close()
+
+
+async def test_only_unknown_empty_whitelist_sends_skip_target_to_translator(tmp_path):
+    storage, store = await _connected_store(tmp_path)
+    seen = {}
+
+    async def translate_fn(batch, lang, skip=(), only=()):
+        seen["skip"] = list(skip)
+        seen["only"] = list(only)
+        return {mid: f"ru:{text}" for mid, text in batch}
+
+    translator = Translator(storage=storage, translate_fn=translate_fn, env={"TG_USER_LANG": "ru"})
+    try:
+        await set_translate_mode(storage, "only_unknown")
+        await set_unknown_langs(storage, "")  # empty whitelist = translate all but the target
+        await translator.translate_history(7, [_msg(1, "こんにちは")])
+    finally:
+        await store.close()
+
+    assert seen["only"] == []
+    assert seen["skip"] == ["ru"]
+
+
 async def test_changing_mode_clears_translation_cache(tmp_path):
     storage, store = await _connected_store(tmp_path)
     calls = []
