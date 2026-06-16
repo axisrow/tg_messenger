@@ -3930,15 +3930,33 @@ async def test_tui_settings_add_empty_name_is_noop():
 class StubTranslator:
     """Minimal Translator stand-in for AccountsScreen tests (no Storage, no LLM)."""
 
-    def __init__(self, settings=None):
-        self._settings = settings or {"mode": "off", "target": None, "known": [], "unknown": []}
+    _DEFAULTS = {
+        "mode": "off", "target": None, "known": [], "unknown": [],
+        "model": None, "max_messages": 100,
+    }
+
+    def __init__(self, settings=None, *, history=None):
+        merged = dict(self._DEFAULTS)
+        merged.update(settings or {})
+        self._settings = merged
         self.saved = []
+        self._history = list(history or [])
 
     async def get_settings(self):
         return dict(self._settings)
 
-    async def set_settings(self, *, mode, target=None, known=None, unknown=None):
-        self.saved.append({"mode": mode, "target": target, "known": known, "unknown": unknown})
+    async def set_settings(self, *, mode, target=None, known=None, unknown=None,
+                           model=None, max_messages=None):
+        self.saved.append({
+            "mode": mode, "target": target, "known": known, "unknown": unknown,
+            "model": model, "max_messages": max_messages,
+        })
+
+    async def max_messages(self):
+        return self._settings.get("max_messages") or 100
+
+    async def translate_history(self, dialog_id, messages):
+        return list(self._history) if self._history else list(messages)
 
 
 async def test_tui_footer_is_present_and_shows_help_and_settings():
@@ -3964,7 +3982,7 @@ async def test_tui_footer_is_present_and_shows_help_and_settings():
 
 async def test_tui_settings_shows_translate_section_when_translator_wired():
     store = FakeSessionStore(["alice"])
-    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": []})
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": ["ja"]})
     app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -3974,10 +3992,11 @@ async def test_tui_settings_shows_translate_section_when_translator_wired():
         app.push_screen(screen)
         await pilot.pause()
         assert screen.query("#translate-section")
-        # stored mode selected, target + list prefilled
+        # stored mode selected; each of the three fields prefilled from its own setting
         assert screen.query_one("#mode-skip_known").value is True
         assert screen.query_one("#target-lang", Input).value == "ru"
-        assert screen.query_one("#lang-list", Input).value == "ru, en"
+        assert screen.query_one("#known-langs", Input).value == "ru, en"
+        assert screen.query_one("#unknown-langs", Input).value == "ja"
 
 
 async def test_tui_settings_hides_translate_section_without_translator():
@@ -3991,9 +4010,10 @@ async def test_tui_settings_hides_translate_section_without_translator():
         assert not screen.query("#translate-section")
 
 
-async def test_tui_settings_saves_translate_settings_on_submit():
+async def test_tui_settings_saves_all_three_fields_independently():
+    # the three fields each write their own setting — editing one never clobbers another
     store = FakeSessionStore(["alice"])
-    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": []})
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": ["ja"]})
     app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -4003,10 +4023,14 @@ async def test_tui_settings_saves_translate_settings_on_submit():
         app.push_screen(screen)
         await pilot.pause()
         screen.query_one("#target-lang", Input).value = "ru"
-        screen.query_one("#lang-list", Input).value = "ru, en"
+        screen.query_one("#known-langs", Input).value = "ru, en"
+        screen.query_one("#unknown-langs", Input).value = "ja, ko"
         await screen._save_translate_settings()
+        # the model is applied via _apply_model_change (validate-then-commit), NOT through
+        # set_settings, so it isn't part of this save; max 100 was prefilled on load.
         assert translator.saved[-1] == {
-            "mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": None,
+            "mode": "skip_known", "target": "ru", "known": ["ru", "en"], "unknown": ["ja", "ko"],
+            "model": None, "max_messages": 100,
         }
 
 
@@ -4021,15 +4045,14 @@ async def test_tui_settings_rejects_bad_lang_code_without_saving():
         )
         app.push_screen(screen)
         await pilot.pause()
-        screen.query_one("#lang-list", Input).value = "ru, fr"  # fr unsupported
+        screen.query_one("#known-langs", Input).value = "ru, fr"  # fr unsupported
         await screen._save_translate_settings()
         assert translator.saved == []  # nothing persisted on a bad code
 
 
-async def test_tui_settings_lang_list_stays_tab_reachable_in_every_mode():
-    # regression: in mode "off" the lang-list field was `disabled`, which drops it out of
-    # Textual's focus_chain — Tab cycled past it ("циклит без последнего"). It must stay
-    # focus-reachable (and never disabled) in EVERY mode.
+async def test_tui_settings_all_three_fields_tab_reachable_in_every_mode():
+    # regression (#133): a disabled field drops out of Textual's focus_chain. None of the three
+    # translation fields may ever be disabled — Tab must reach each of them in every mode.
     store = FakeSessionStore(["alice"])
     translator = StubTranslator({"mode": "all_unknown", "target": "ru", "known": ["ru"], "unknown": []})
     app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
@@ -4043,7 +4066,277 @@ async def test_tui_settings_lang_list_stays_tab_reachable_in_every_mode():
         for mode in ("off", "all_unknown", "skip_known", "only_unknown"):
             screen.query_one(f"#mode-{mode}").value = True
             await pilot.pause()
-            field = screen.query_one("#lang-list", Input)
             chain_ids = [getattr(w, "id", None) for w in screen.focus_chain]
-            assert field.disabled is False, f"lang-list disabled in mode {mode}"
-            assert "lang-list" in chain_ids, f"lang-list not Tab-reachable in mode {mode}"
+            for fid in ("target-lang", "known-langs", "unknown-langs"):
+                field = screen.query_one(f"#{fid}", Input)
+                assert field.disabled is False, f"{fid} disabled in mode {mode}"
+                assert fid in chain_ids, f"{fid} not Tab-reachable in mode {mode}"
+
+
+async def test_tui_settings_fields_have_persistent_border_titles():
+    # each field carries a PERSISTENT, fixed border_title caption (visible even with a value typed),
+    # not a placeholder that vanishes on input — the reported "can't tell which field is which".
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": []})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        captions = {
+            "target-lang": "Мой язык (на что переводить)",
+            "known-langs": "Не переводить",
+            "unknown-langs": "Переводить (пусто = всё переводить)",
+        }
+        for fid, caption in captions.items():
+            field = screen.query_one(f"#{fid}", Input)
+            # styled legible (accent + bold), not the default grey blurred border
+            assert field.styles.border_title_color is not None
+            assert "bold" in str(field.styles.border_title_style)
+            assert str(field.border_title) == caption
+        # caption survives a typed value (the core of the fix)
+        target = screen.query_one("#target-lang", Input)
+        target.value = "ru"
+        await pilot.pause()
+        assert str(target.border_title) == "Мой язык (на что переводить)"
+
+
+async def test_tui_settings_model_and_max_fields_present_and_loaded():
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({
+        "mode": "all_unknown", "target": "ru", "model": "openai:glm-5.1", "max_messages": 250,
+    })
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        model_field = screen.query_one("#translate-model", Input)
+        max_field = screen.query_one("#translate-max", Input)
+        assert model_field.value == "openai:glm-5.1"
+        assert max_field.value == "250"
+        assert str(model_field.border_title) == "Модель для перевода"
+        assert str(max_field.border_title) == "Сколько переводить за раз (Ctrl+T)"
+        # both Tab-reachable (never disabled — #133 discipline)
+        chain_ids = [getattr(w, "id", None) for w in screen.focus_chain]
+        assert "translate-model" in chain_ids and "translate-max" in chain_ids
+
+
+async def test_tui_settings_rejects_bad_max_without_saving():
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "all_unknown", "target": "ru"})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        screen.query_one("#translate-max", Input).value = "0"  # < 1
+        await screen._save_translate_settings()
+        assert translator.saved == []  # nothing persisted
+        screen.query_one("#translate-max", Input).value = "abc"  # not a number
+        await screen._save_translate_settings()
+        assert translator.saved == []
+
+
+async def test_tui_translate_all_without_dialog_notifies():
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "all_unknown", "target": "ru"})
+    app = MessengerTUI(
+        client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        notes = []
+        app.notify = lambda msg, **kw: notes.append((msg, kw.get("severity")))
+        app._current = None
+        app.action_translate_all()
+        await pilot.pause()
+        assert any("диалог" in m.lower() for m, _ in notes)
+
+
+async def test_tui_translate_all_without_translator_notifies():
+    store = FakeSessionStore(["alice"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        notes = []
+        app.notify = lambda msg, **kw: notes.append((msg, kw.get("severity")))
+        app._current = 123
+        app._translator = None
+        app.action_translate_all()
+        await pilot.pause()
+        assert any("переводчик" in m.lower() for m, _ in notes)
+
+
+class _BlockingTranslator(StubTranslator):
+    """Holds translate_history until released, so a test can observe the in-progress status line."""
+
+    def __init__(self, settings=None):
+        super().__init__(settings)
+        self.gate = asyncio.Event()
+
+    async def translate_history(self, dialog_id, messages):
+        await self.gate.wait()
+        # mark every inbound message translated so the pass counts as a success
+        return [
+            m.model_copy(update={"translated_text": "ПЕРЕВОД"}) if not m.out else m
+            for m in messages
+        ]
+
+
+async def test_tui_translate_all_shows_status_then_clears():
+    store = FakeSessionStore(["alice"])
+    translator = _BlockingTranslator({"mode": "all_unknown", "target": "ru", "max_messages": 100})
+    app = MessengerTUI(
+        client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        app.action_translate_all()
+        await pilot.pause()
+        # while translate_history is blocked, the labelled status line is mounted
+        status = app.query("#messages .translate-status")
+        assert status, "status line not shown during translation"
+        assert "Идёт перевод" in str(status.first().render())
+        # release the translator → status clears, bubbles appear WITH the translation rendered
+        translator.gate.set()
+        await pilot.pause()
+        await pilot.pause()
+        assert not app.query("#messages .translate-status")
+        bubbles = app.query("MessageBubble")
+        assert bubbles
+        # regression: the re-mounted snapshot must show the TRANSLATED text, not the originals
+        rendered = "\n".join(str(b.render()) for b in bubbles)
+        assert "ПЕРЕВОД" in rendered, "Ctrl+T mounted untranslated bubbles"
+
+
+async def test_tui_failed_model_change_does_not_persist_model_or_clear_cache(monkeypatch, tmp_path):
+    # regression: a bad model must NOT be written to kv (and the cache must NOT be cleared) before
+    # the probe/build succeeds — validate-then-commit.
+    pytest.importorskip("deepagents")
+    from tg_messenger.agent import factory as factory_mod
+    from tg_messenger.agent.translate import (
+        Translator,
+        get_translate_model,
+        get_user_lang,
+        set_translate_model,
+    )
+    from tg_messenger.core.message_store import register_message_store_migrations
+    from tg_messenger.core.storage import Storage
+
+    storage = Storage(tmp_path / "t.db")
+    register_message_store_migrations(storage)
+    await storage.connect()
+    cleared = {"count": 0}
+    try:
+        await set_translate_model(storage, "openai:good")  # the working model already persisted
+
+        async def fake_translate_fn(batch, lang, skip=(), only=()):
+            return {}
+
+        translator = Translator(storage=storage, translate_fn=fake_translate_fn, env={})
+
+        # building the candidate model raises (bad name / missing key)
+        async def boom(_storage, _model):
+            raise RuntimeError("bad model")
+
+        monkeypatch.setattr(factory_mod, "build_translator_with_probe", boom)
+
+        # count cache-clears across the whole save path (every setter calls clear_all_translations)
+        async def counting_clear(_s):
+            cleared["count"] += 1
+
+        monkeypatch.setattr(
+            "tg_messenger.agent.translate.clear_all_translations", counting_clear
+        )
+
+        store = FakeSessionStore(["alice"])
+        app = MessengerTUI(
+            client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = AccountsScreen(
+                profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+            )
+            app.push_screen(screen)
+            await pilot.pause()
+            # fill the other settings too — they must NOT be written when the new model is bad
+            screen.query_one("#target-lang", Input).value = "en"
+            screen.query_one("#known-langs", Input).value = "de"
+            screen.query_one("#translate-model", Input).value = "openai:bad"
+            # the REAL UI save path: a bad changed model must abort BEFORE set_settings, so neither
+            # the cache nor any setting is touched (atomic validate-then-commit).
+            await screen._save_translate_settings()
+            assert await get_translate_model(storage, {}) == "openai:good"  # working model survives
+            assert cleared["count"] == 0  # cache never cleared
+            assert await get_user_lang(storage, {}) is None  # target NOT written
+            # _validate_model is validation-only and returns None on a bad model (no side effects)
+            assert await screen._validate_model("openai:bad") is None
+            assert cleared["count"] == 0  # still no cache clear from the validation call
+    finally:
+        await storage.close()
+
+
+async def test_tui_successful_model_change_commits_model_and_settings(monkeypatch, tmp_path):
+    # happy path: a valid new model persists the model AND the other settings, then dismisses with
+    # the rebuilt translator (atomic commit after validation).
+    pytest.importorskip("deepagents")
+    from tg_messenger.agent import factory as factory_mod
+    from tg_messenger.agent.translate import (
+        Translator,
+        get_translate_model,
+        get_user_lang,
+    )
+    from tg_messenger.core.message_store import register_message_store_migrations
+    from tg_messenger.core.storage import Storage
+
+    storage = Storage(tmp_path / "t.db")
+    register_message_store_migrations(storage)
+    await storage.connect()
+    try:
+        async def fake_translate_fn(batch, lang, skip=(), only=()):
+            return {}
+
+        translator = Translator(storage=storage, translate_fn=fake_translate_fn, env={})
+        new_translator = Translator(storage=storage, translate_fn=fake_translate_fn, env={})
+
+        async def ok_build(_storage, _model):
+            return new_translator
+
+        monkeypatch.setattr(factory_mod, "build_translator_with_probe", ok_build)
+
+        store = FakeSessionStore(["alice"])
+        app = MessengerTUI(
+            client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            dismissed = {}
+            screen = AccountsScreen(
+                profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+            )
+            screen.dismiss = lambda result=None: dismissed.__setitem__("result", result)
+            app.push_screen(screen)
+            await pilot.pause()
+            screen.query_one("#target-lang", Input).value = "en"
+            screen.query_one("#translate-model", Input).value = "openai:new"
+            await screen._save_translate_settings()
+            # both the model and the other settings are persisted; dismissed with the new translator
+            assert await get_translate_model(storage, {}) == "openai:new"
+            assert await get_user_lang(storage, {}) == "en"
+            assert dismissed.get("result") is new_translator
+    finally:
+        await storage.close()
