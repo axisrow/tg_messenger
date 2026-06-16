@@ -1404,6 +1404,14 @@ class MessengerTUI(App):
        so the default 32 width is unchanged. */
     #sidebar { width: 32; max-width: 50%; border-right: solid $primary; }
     #chat { width: 1fr; min-width: 16; }
+    /* #160: the dialog rows must paint their FULL row background. Rich computes Thai/Indic
+       combining marks (Unicode category Mn) as 0-width while the terminal paints them wider, so a
+       row whose background spans only the Rich-computed text width leaves a stray dark patch at the
+       right edge (most visible as a gap in the blue highlight on the selected row). Pinning the row
+       and its inner Static to the full list width makes Textual paint the whole row regardless of
+       the per-glyph width disagreement — without touching the (load-bearing) combining marks. */
+    #dialogs > DialogItem { width: 1fr; }
+    #dialogs > DialogItem > Static { width: 1fr; }
     /* #124: focus indicator — the pane holding focus gets an accent border so "where am I" is
        always visible. :focus-within styles a container while any descendant (search/tabs/list/
        bubble/composer) is focused. Keeps the sidebar's existing right border; the chat's left
@@ -2431,9 +2439,13 @@ class MessengerTUI(App):
             self._restore_draft(peer, text)
             return
         self._clear_compose_state_after_send(peer, text)
-        self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
+            # #160: record the suppression key ONLY when we actually draw the optimistic bubble.
+            # If the user navigated away during the (possibly slow, e.g. outbound LLM) send await,
+            # we draw nothing and must NOT suppress — _drain_outgoing then renders the live echo
+            # when they return, instead of the message staying invisible until a manual reopen.
+            self._remember_sent(peer, msg.id)  # suppress the listen_outgoing() echo we just drew
             pane = self.query_one("#messages", Vertical)
             bubble = self._message_bubble_for(msg, peer)
             await pane.mount(_wrap_bubble(bubble))
@@ -2457,9 +2469,12 @@ class MessengerTUI(App):
             self.notify(f"Send failed: {exc}", severity="error")
             self._restore_draft(peer, source_text)
             return
-        self._remember_sent(peer, msg.id)  # suppress the echo from listen_outgoing()
         await self._touch_dialog_for_message(peer, msg, incoming=False)
         if peer == self._current:  # user may have switched dialogs mid-send
+            # #160: suppress the echo only because we draw the bubble here — see _send_text. A
+            # send whose bubble is skipped (navigated away) must stay un-suppressed so the
+            # _drain_outgoing fallback renders it on return.
+            self._remember_sent(peer, msg.id)  # suppress the listen_outgoing() echo we just drew
             pane = self.query_one("#messages", Vertical)
             bubble = self._message_bubble_for(msg, peer)
             await pane.mount(_wrap_bubble(bubble))
@@ -2717,6 +2732,11 @@ class MessengerTUI(App):
             return
         composer = self.query_one("#composer", Input)
         composer.value = self._pending_suggestion
+        if self._current is not None:
+            # #160: the programmatic value set above doesn't reach on_input_changed (the
+            # stale-value guard early-returns), so persist the accepted draft into the per-dialog
+            # state ourselves — otherwise switching dialogs before Enter silently drops it.
+            self._compose_state_for(self._current).draft = self._pending_suggestion
         self._clear_suggestion()
         composer.focus()
 

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pytest
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
+from textual.css.scalar import Unit
 from textual.widgets import Footer, Input, Label, ListView, LoadingIndicator, Static, Tabs
 
 from tg_messenger.core.client import SendForbiddenError
@@ -345,6 +346,41 @@ async def test_tui_dialog_item_uses_terminal_safe_title_display():
         assert "\u0e31" in rendered  # mai han-akat preserved
         assert "\u0e48" in rendered  # mai ek tone mark preserved
         assert "7วันปั่นลูกหนัง V4" in rendered  # full title intact
+
+
+def test_tui_dialog_rows_pin_full_width_css():
+    # #160: the dialog rows pin width:1fr so the row background paints past Thai/Indic
+    # combining-mark width drift (Rich width 0 vs terminal width >0) — no stray dark patch.
+    assert "#dialogs > DialogItem > Static" in MessengerTUI.CSS
+    assert "#dialogs > DialogItem {" in MessengerTUI.CSS
+
+
+class ThaiDialogClient(TuiStubClient):
+    """A dialog list whose first entry has a Thai title with combining marks (#160)."""
+
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        return [Dialog(id=-100200, title="7วันปั่นลูกหนัง V4", kind="group", unread=1)]
+
+
+async def test_tui_dialog_row_fills_full_row_width_for_thai_title():
+    # #160: a Thai title with combining marks (Rich width 0, terminal width >0) must not leave a
+    # stray unpainted patch — the row's inner Static spans the full list width so Textual paints
+    # the whole row background. The title letters stay intact (see the terminal-safe display test).
+    app = MessengerTUI(client=ThaiDialogClient())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        item = app.query_one(DialogItem)
+        inner = item.query_one(Static)
+        # the inner Static is pinned to a fraction width (1fr) — the fix that fills the whole row
+        assert inner.styles.width is not None
+        assert inner.styles.width.unit == Unit.FRACTION
+        # and it actually spans the full row content width (no short-by-glyph-drift background fill)
+        assert inner.region.width == item.content_region.width
+        # title still intact (the fix must not strip Thai marks)
+        rendered = str(inner.render())
+        assert "ั" in rendered  # mai han-akat preserved
+        assert "7วันปั่นลูกหนัง V4" in rendered
 
 
 class UnreadClient(TuiStubClient):
@@ -2249,6 +2285,52 @@ async def test_tui_own_send_is_not_duplicated_by_outgoing_echo():
         bubbles = [str(b.render()) for b in app.query(MessageBubble)]
         # ровно один пузырёк, эхо не продублировало
         assert bubbles == ["[2] привет"]
+
+
+class OutgoingFallbackClient(TuiStubClient):
+    """listen_outgoing, отдающий эхо нашего отправленного сообщения по сигналу fire.
+
+    Имитирует уход из диалога во время отправки: пузырёк не нарисуется (peer != _current),
+    но эхо ДОЛЖНО появиться через _drain_outgoing при возврате — ключ подавления не записан.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def listen_outgoing(self):
+        await self.fire.wait()
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        # id=2 — ровно то, что вернёт send_text стаба (см. TuiStubClient)
+        yield OutgoingEvent(dialog_id=7, message=Message(
+            id=2, dialog_id=7, sender_id=1, out=True, text="hi", date=date))
+        await asyncio.Event().wait()
+
+
+async def test_tui_send_echo_not_suppressed_when_navigated_away_mid_send():
+    # #160: a send whose optimistic bubble is SKIPPED (the user switched dialogs during the
+    # in-flight send) must NOT be added to _sent_ids — otherwise its listen_outgoing() echo is
+    # suppressed forever and the message stays invisible until the chat is reopened. The
+    # suppression key and the drawn bubble must be consistent.
+    stub = OutgoingFallbackClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _select_dialog(pilot, app, 7)
+        # simulate "navigated away during the send": _current is 8 by the time the bubble would mount
+        app._current = 8
+        await app._send_text(7, "hi")  # peer=7 != _current=8 → bubble skipped
+        await pilot.pause()
+        # the key must NOT be recorded — no bubble was drawn for it
+        assert (7, 2) not in app._sent_ids
+
+        # back in dialog 7, the live echo must now be drawn by _drain_outgoing (the fallback)
+        await _select_dialog(pilot, app, 7)
+        stub.fire.set()
+        await _pause_until(
+            pilot, lambda: any("hi" in str(b.render()) for b in app.query(MessageBubble))
+        )
+        assert any("hi" in str(b.render()) for b in app.query(MessageBubble))
 
 
 class OutgoingSameIdOtherDialogClient(TuiStubClient):
