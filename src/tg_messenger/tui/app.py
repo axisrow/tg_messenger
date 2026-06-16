@@ -972,21 +972,28 @@ class AccountsScreen(ModalScreen[object]):
             self.notify(str(exc), severity="error")
             return
         model = self.query_one("#translate-model", Input).value.strip()
-        # Order matters: set_settings() clears the translation cache (each setter does), so a CHANGED
-        # model must be validated (build+probe) FIRST. Otherwise a typo in the model field would wipe
-        # the cache + write the other settings before the probe fails — irreversibly, while reporting
-        # "model not applied". Validate-then-commit across the WHOLE save, not just the model write.
-        if model != self._applied_model:
-            new_translator = await self._apply_model_change(model)
+        # Validate-then-commit, atomic across the WHOLE save: a CHANGED model is built+probed FIRST
+        # (validation only — no persistence, no cache clear, no translator swap). Only once the model
+        # is proven AND nothing else can fail do we commit everything together (settings + the model
+        # override). This way a bad model never wipes the cache / half-writes settings, and a later
+        # settings failure can't leave a persisted model diverging from the live translator.
+        model_changed = model != self._applied_model
+        new_translator = None
+        if model_changed:
+            new_translator = await self._validate_model(model)
             if new_translator is None:
                 return  # bad model → nothing persisted, cache untouched
-        else:
-            new_translator = None
         try:
+            # commit the other settings; for a changed model also persist it in the SAME block so the
+            # two writes succeed or fail together (no persisted-model-without-settings window).
             await self._translator.set_settings(
                 mode=mode, target=target_code, known=known, unknown=unknown,
                 max_messages=max_messages,
             )
+            if model_changed:
+                from tg_messenger.agent.translate import set_translate_model
+                # blank field → clear the kv override (fall back to env); else persist the model
+                await set_translate_model(self._translator.storage, model or None)
         except ValueError as exc:
             self.notify(str(exc), severity="error")
             return
@@ -995,8 +1002,10 @@ class AccountsScreen(ModalScreen[object]):
             self.notify("Не удалось сохранить настройки перевода", severity="error")
             return
         self._applied_mode = mode
-        if new_translator is not None:
-            # model changed and validated → hand the rebuilt translator back to the app
+        if model_changed:
+            # everything committed → adopt the new translator and hand it back to the app
+            self._translator = new_translator
+            self._applied_model = model
             self.dismiss(new_translator)
             return
         self.notify("Настройки перевода сохранены")
@@ -1014,19 +1023,20 @@ class AccountsScreen(ModalScreen[object]):
             raise ValueError("Сколько переводить: число должно быть ≥ 1")
         return n
 
-    async def _apply_model_change(self, model: str):
-        """Validate a freshly chosen model and rebuild the Translator. Returns the new Translator
-        on success, or None on failure (caller then aborts the save WITHOUT touching any settings).
+    async def _validate_model(self, model: str):
+        """Build+probe a freshly chosen model and return the candidate Translator, or None on failure.
 
-        A blank model falls back to env; an unbuildable model (bad name) is reported and NOT applied.
-        This builds+probes the candidate and persists the model (set_translate_model), but does NOT
-        write the other settings or dismiss — the caller does that only after this succeeds, so a bad
-        model never clears the translation cache or half-applies the other fields.
+        VALIDATION ONLY — no side effects: it does NOT persist the model, clear the cache, swap
+        self._translator, or change _applied_model. The caller commits all of that atomically only
+        after this succeeds, so a bad model leaves storage and the live translator untouched.
+
+        (build_translator_with_probe does cache the per-model structured-output method in kv; that is
+        a harmless detection cache keyed by model name, not the model override or any translation.)
         """
         self.notify("Проверяю модель…")
         try:
             from tg_messenger.agent.factory import build_translator_with_probe
-            from tg_messenger.agent.translate import set_translate_model, translate_model_from_env
+            from tg_messenger.agent.translate import translate_model_from_env
         except ImportError:
             logger.exception("settings: agent extra unavailable for model change")
             self.notify("Переводчик недоступен (нет extra [agent])", severity="error")
@@ -1038,25 +1048,12 @@ class AccountsScreen(ModalScreen[object]):
         # the SQLite Storage the Translator caches into lives on the current translator, NOT on
         # self._store (which is the SessionStore). Reuse it so settings/cache stay in one DB.
         storage = self._translator.storage
-        # validate-then-commit: build+probe the candidate FIRST, persist the model only on success.
-        # A bad name raises here without ever touching kv, so storage keeps pointing at the working
-        # model and the cache isn't wiped on a typo.
         try:
             new_translator = await build_translator_with_probe(storage, target_model)
         except Exception:
             logger.exception("settings: failed to build translator for model %r", target_model)
             self.notify("Не удалось применить модель — проверьте имя/ключ", severity="error")
             return None
-        try:
-            # blank field → clear the kv override (fall back to env); else persist the chosen model
-            await set_translate_model(storage, model or None)
-        except Exception:
-            logger.exception("settings: failed to persist model %r", target_model)
-            self.notify("Не удалось сохранить модель", severity="error")
-            return None
-        self._translator = new_translator
-        self._applied_model = model
-        self.notify("Модель перевода применена")
         return new_translator
 
     def on_input_submitted(self, event: Input.Submitted) -> None:

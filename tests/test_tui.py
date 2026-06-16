@@ -4277,13 +4277,66 @@ async def test_tui_failed_model_change_does_not_persist_model_or_clear_cache(mon
             screen.query_one("#target-lang", Input).value = "en"
             screen.query_one("#known-langs", Input).value = "de"
             screen.query_one("#translate-model", Input).value = "openai:bad"
-            # the REAL UI save path (not _apply_model_change directly): a bad changed model must
-            # abort BEFORE set_settings, so neither the cache nor any setting is touched.
+            # the REAL UI save path: a bad changed model must abort BEFORE set_settings, so neither
+            # the cache nor any setting is touched (atomic validate-then-commit).
             await screen._save_translate_settings()
             assert await get_translate_model(storage, {}) == "openai:good"  # working model survives
             assert cleared["count"] == 0  # cache never cleared
             assert await get_user_lang(storage, {}) is None  # target NOT written
-            # _apply_model_change itself returns None on a bad model
-            assert await screen._apply_model_change("openai:bad") is None
+            # _validate_model is validation-only and returns None on a bad model (no side effects)
+            assert await screen._validate_model("openai:bad") is None
+            assert cleared["count"] == 0  # still no cache clear from the validation call
+    finally:
+        await storage.close()
+
+
+async def test_tui_successful_model_change_commits_model_and_settings(monkeypatch, tmp_path):
+    # happy path: a valid new model persists the model AND the other settings, then dismisses with
+    # the rebuilt translator (atomic commit after validation).
+    pytest.importorskip("deepagents")
+    from tg_messenger.agent import factory as factory_mod
+    from tg_messenger.agent.translate import (
+        Translator,
+        get_translate_model,
+        get_user_lang,
+    )
+    from tg_messenger.core.message_store import register_message_store_migrations
+    from tg_messenger.core.storage import Storage
+
+    storage = Storage(tmp_path / "t.db")
+    register_message_store_migrations(storage)
+    await storage.connect()
+    try:
+        async def fake_translate_fn(batch, lang, skip=(), only=()):
+            return {}
+
+        translator = Translator(storage=storage, translate_fn=fake_translate_fn, env={})
+        new_translator = Translator(storage=storage, translate_fn=fake_translate_fn, env={})
+
+        async def ok_build(_storage, _model):
+            return new_translator
+
+        monkeypatch.setattr(factory_mod, "build_translator_with_probe", ok_build)
+
+        store = FakeSessionStore(["alice"])
+        app = MessengerTUI(
+            client=TuiStubClient(), session_name="alice", session_store=store, translator=translator,
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            dismissed = {}
+            screen = AccountsScreen(
+                profiles=store.list_profiles(), active="alice", store=store, translator=translator,
+            )
+            screen.dismiss = lambda result=None: dismissed.__setitem__("result", result)
+            app.push_screen(screen)
+            await pilot.pause()
+            screen.query_one("#target-lang", Input).value = "en"
+            screen.query_one("#translate-model", Input).value = "openai:new"
+            await screen._save_translate_settings()
+            # both the model and the other settings are persisted; dismissed with the new translator
+            assert await get_translate_model(storage, {}) == "openai:new"
+            assert await get_user_lang(storage, {}) == "en"
+            assert dismissed.get("result") is new_translator
     finally:
         await storage.close()
