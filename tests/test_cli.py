@@ -1489,6 +1489,57 @@ def test_heartbeat_run_without_login_gives_hint(hb_runner):
     assert "tg-messenger login" in result.output
 
 
+def test_heartbeat_run_without_suggester_uses_templates(hb_runner, monkeypatch):
+    # #146: no [agent]/model → no suggester → text_provider=None, loud about templates
+    r, stub, _tp, _seen = hb_runner
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c, **kw: None)
+    captured = {}
+
+    class FakeService:
+        def __init__(self, client, storage, *, text_provider=None):
+            captured["text_provider"] = text_provider
+
+        async def run(self):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("tg_messenger.core.heartbeat.HeartbeatService", FakeService)
+    result = r.invoke(cli_main.cli, ["heartbeat", "run"])
+    assert result.exit_code == 0, result.output
+    assert "using templates" in result.output
+    assert captured["text_provider"] is None
+
+
+def test_heartbeat_run_wires_suggester_text_provider(hb_runner, monkeypatch):
+    # #146: with a suggester, its .suggest becomes the heartbeat text_provider and it's closed
+    r, stub, _tp, _seen = hb_runner
+    closed = {"n": 0}
+
+    class FakeSuggester:
+        async def suggest(self, peer):
+            return f"hi {peer}"
+
+        async def close(self):
+            closed["n"] += 1
+
+    suggester = FakeSuggester()
+    monkeypatch.setattr(cli_main, "make_optional_suggester", lambda c, **kw: suggester)
+    captured = {}
+
+    class FakeService:
+        def __init__(self, client, storage, *, text_provider=None):
+            captured["text_provider"] = text_provider
+
+        async def run(self):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("tg_messenger.core.heartbeat.HeartbeatService", FakeService)
+    result = r.invoke(cli_main.cli, ["heartbeat", "run"])
+    assert result.exit_code == 0, result.output
+    assert "suggester text on" in result.output
+    assert captured["text_provider"] == suggester.suggest
+    assert closed["n"] == 1
+
+
 def test_heartbeat_plan_list_remove_use_global_profile(hb_runner):
     r, _stub, _tp, seen = hb_runner
     add = r.invoke(

@@ -1342,10 +1342,23 @@ class StubSuggester:
         self.draft = draft
         self.calls = []
         self.closed = 0
+        self.settings = {"enabled": True, "history": 30, "model": None}
+        self.saved = []
 
     async def suggest(self, dialog_id):
         self.calls.append(dialog_id)
         return self.draft
+
+    async def get_settings(self):
+        return dict(self.settings)
+
+    async def save_settings(self, *, enabled, history, model):
+        if history < 1:
+            raise ValueError("history must be a positive integer.")
+        if model == "bad:model":
+            raise ValueError("could not initialise model 'bad:model'")
+        self.settings = {"enabled": enabled, "history": history, "model": model}
+        self.saved.append(dict(self.settings))
 
     async def close(self):
         self.closed += 1
@@ -1411,6 +1424,76 @@ async def test_suggest_endpoint_returns_draft(suggest_app):
     assert r.status_code == 200
     assert "suggested reply" in r.text
     assert suggester.calls == [7]
+
+
+# --- #143: suggester settings in web (/settings/suggest) ---
+
+
+async def test_suggest_settings_form_renders_current_values(suggest_app):
+    ac, suggester = suggest_app
+    suggester.settings = {"enabled": True, "history": 25, "model": "openai:gpt-4o"}
+    r = await ac.get("/settings/suggest")
+    assert r.status_code == 200
+    assert 'hx-headers=\'{"x-tg-messenger-csrf": "1"}\'' in r.text
+    assert 'name="history" value="25"' in r.text
+    assert "openai:gpt-4o" in r.text
+    assert "checked" in r.text  # enabled
+
+
+async def test_suggest_settings_post_saves(suggest_app):
+    ac, suggester = suggest_app
+    r = await ac.post(
+        "/settings/suggest",
+        data={"enabled": "1", "history": "12", "model": "openai:gpt-4o"},
+        headers=SUGGEST_HEADERS,
+    )
+    assert r.status_code == 200
+    assert suggester.settings == {"enabled": True, "history": 12, "model": "openai:gpt-4o"}
+
+
+async def test_suggest_settings_post_unchecked_disables(suggest_app):
+    ac, suggester = suggest_app
+    # an unchecked checkbox sends no "enabled" field at all
+    r = await ac.post(
+        "/settings/suggest", data={"history": "30", "model": ""}, headers=SUGGEST_HEADERS
+    )
+    assert r.status_code == 200
+    assert suggester.settings["enabled"] is False
+    assert suggester.settings["model"] is None
+
+
+async def test_suggest_settings_post_invalid_history_returns_400(suggest_app):
+    ac, _ = suggest_app
+    r = await ac.post(
+        "/settings/suggest", data={"enabled": "1", "history": "abc"}, headers=SUGGEST_HEADERS
+    )
+    assert r.status_code == 400
+
+
+async def test_suggest_settings_post_bad_model_returns_400(suggest_app):
+    ac, _ = suggest_app
+    r = await ac.post(
+        "/settings/suggest",
+        data={"enabled": "1", "history": "30", "model": "bad:model"},
+        headers=SUGGEST_HEADERS,
+    )
+    assert r.status_code == 400
+
+
+async def test_suggest_settings_without_csrf_header_is_rejected(suggest_app):
+    ac, _ = suggest_app
+    r = await ac.post("/settings/suggest", data={"enabled": "1", "history": "30"})
+    assert r.status_code == 403
+
+
+async def test_suggest_settings_503_without_suggester():
+    stub = WebStubClient()
+    app = build_app(client=stub)  # no suggester wired
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.get("/settings/suggest")
+    assert r.status_code == 503
 
 
 def test_web_outbound_routes_delegate_to_coordinator_not_manual_fallback():

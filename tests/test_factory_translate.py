@@ -112,3 +112,30 @@ async def test_resolve_translate_method_caches_in_kv(tmp_path):
         assert counter.get("json_schema", 0) == probes_after_first
     finally:
         await storage.close()
+
+
+# --- #143: suggester model-override factory (probe builds a suggest_fn for a model name) ---
+
+
+def test_make_suggest_fn_factory_rejects_empty_name():
+    build = f.make_suggest_fn_factory()
+    with pytest.raises(ValueError):
+        build("")
+
+
+def test_make_suggest_fn_factory_wraps_init_errors(monkeypatch):
+    def boom(name):
+        raise RuntimeError("no such provider")
+
+    monkeypatch.setattr(f, "init_chat_model", boom)
+    build = f.make_suggest_fn_factory()
+    with pytest.raises(ValueError) as exc:
+        build("bogus:model")
+    assert "bogus:model" in str(exc.value)
+
+
+def test_make_suggest_fn_factory_builds_callable(monkeypatch):
+    monkeypatch.setattr(f, "init_chat_model", lambda name: object())
+    build = f.make_suggest_fn_factory()
+    fn = build("openai:gpt-4o")
+    assert callable(fn)

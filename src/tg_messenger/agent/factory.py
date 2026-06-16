@@ -464,13 +464,36 @@ async def build_translator_with_probe(storage, model_name: str) -> Translator:
     )
 
 
+def make_suggest_fn_factory() -> Callable:
+    """Return a callable that builds (and validates) a suggest_fn for a model name.
+
+    This is the single LLM seam for the suggester's live model override (#143):
+    ``init_chat_model`` lives here, never in ``suggest.py``. A bad model name
+    surfaces as a clear ``ValueError`` rather than a raw provider traceback.
+    """
+
+    def build(model_name: str) -> Callable:
+        name = (model_name or "").strip()
+        if not name:
+            raise ValueError("model name is empty")
+        try:
+            model = init_chat_model(name)
+        except Exception as exc:  # provider/parse errors → a clear message for the UI
+            raise ValueError(f"could not initialise model {name!r}: {exc}") from exc
+        return make_suggest_fn(model)
+
+    return build
+
+
 def build_suggester(client, cfg: AgentConfig, storage=None) -> Suggester:
+    factory = make_suggest_fn_factory()
     model = init_chat_model(cfg.model)
     return Suggester(
         client=client,
         suggest_fn=make_suggest_fn(model),
         storage=storage,
         history_limit=cfg.suggest_history_limit,
+        suggest_fn_factory=factory,
     )
 
 

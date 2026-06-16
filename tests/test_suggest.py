@@ -12,9 +12,11 @@ from datetime import datetime, timezone
 import pytest
 
 from tg_messenger.agent.suggest import (
+    DEFAULT_HISTORY_LIMIT,
     StyleProfile,
     Suggester,
     build_style_profile,
+    get_suggest_settings,
     last_read_key,
     load_last_read,
     load_read_at,
@@ -22,6 +24,7 @@ from tg_messenger.agent.suggest import (
     record_last_read,
     register_suggest_migrations,
     save_style_profile,
+    set_suggest_settings,
     should_nudge,
     watch_read_receipts,
 )
@@ -326,6 +329,41 @@ async def test_record_last_read_stamps_read_at(tmp_path):
         await storage.close()
 
 
+# --- #144: suggester_disabled_reason (cheap, side-effect-free diagnostics) ---
+
+
+def test_suggester_disabled_reason_unset_model(monkeypatch):
+    from tg_messenger.agent.suggest import suggester_disabled_reason
+
+    # [agent] extra is installed in this env-job; with no model the reason names TG_AGENT_MODEL
+    pytest.importorskip("langchain")
+    reason = suggester_disabled_reason(env={})
+    assert reason is not None
+    assert "TG_AGENT_MODEL" in reason
+
+
+def test_suggester_disabled_reason_none_when_configured():
+    from tg_messenger.agent.suggest import suggester_disabled_reason
+
+    pytest.importorskip("langchain")
+    reason = suggester_disabled_reason(env={"TG_AGENT_MODEL": "openai:gpt-4o"})
+    assert reason is None
+
+
+# --- #143: live settings (enabled / history / model), persisted in kv ---
+
+
+async def test_suggest_settings_defaults(tmp_path):
+    storage = Storage(tmp_path / "set.db")
+    register_suggest_migrations(storage)
+    await storage.connect()
+    try:
+        settings = await get_suggest_settings(storage)
+        assert settings == {"enabled": True, "history": DEFAULT_HISTORY_LIMIT, "model": None}
+    finally:
+        await storage.close()
+
+
 def test_should_nudge_truth_table():
     def m(mid, out):
         return _msg(mid, out=out, text="x")
@@ -373,6 +411,24 @@ async def test_nudge_candidates_picks_aged_unanswered_dialogs(tmp_path):
         await storage.close()
 
 
+async def test_suggest_settings_roundtrip_and_clear_model(tmp_path):
+    storage = Storage(tmp_path / "set.db")
+    register_suggest_migrations(storage)
+    await storage.connect()
+    try:
+        await set_suggest_settings(storage, enabled=False, history=15, model="openai:gpt-4o")
+        assert await get_suggest_settings(storage) == {
+            "enabled": False, "history": 15, "model": "openai:gpt-4o",
+        }
+        # blank model clears the override (falls back to env/default)
+        await set_suggest_settings(storage, enabled=True, history=10, model=None)
+        assert await get_suggest_settings(storage) == {
+            "enabled": True, "history": 10, "model": None,
+        }
+    finally:
+        await storage.close()
+
+
 async def test_nudge_candidates_requires_storage():
     suggester = Suggester(client=FakeClient([]), suggest_fn=make_suggest_fn()[0])
     with pytest.raises(RuntimeError):
@@ -401,6 +457,37 @@ async def test_nudge_candidates_skips_history_for_ineligible_dialogs(tmp_path):
         assert out == []
         # neither dialog warranted a network read — the local receipt check gated it
         assert client.history_calls == []
+    finally:
+        await storage.close()
+
+
+async def test_set_suggest_settings_rejects_bad_history(tmp_path):
+    storage = Storage(tmp_path / "set.db")
+    register_suggest_migrations(storage)
+    await storage.connect()
+    try:
+        with pytest.raises(ValueError):
+            await set_suggest_settings(storage, enabled=True, history=0, model=None)
+    finally:
+        await storage.close()
+
+
+async def test_suggest_disabled_returns_empty(tmp_path):
+    storage = Storage(tmp_path / "set.db")
+    register_suggest_migrations(storage)
+    await storage.connect()
+    try:
+        client = FakeClient([_msg(1, out=False, text="hi")])
+        fn, calls = make_suggest_fn("DRAFT")
+        suggester = Suggester(client=client, suggest_fn=fn, storage=storage)
+        await set_suggest_settings(storage, enabled=False, history=10, model=None)
+        assert await suggester.suggest(42) == ""
+        # disabled → no LLM call, no history fetch
+        assert calls == []
+        assert client.history_calls == []
+        # re-enabling restores the draft
+        await set_suggest_settings(storage, enabled=True, history=10, model=None)
+        assert await suggester.suggest(42) == "DRAFT"
     finally:
         await storage.close()
 
@@ -436,6 +523,22 @@ async def test_nudge_candidates_clears_receipt_after_reply(tmp_path):
         await storage.close()
 
 
+async def test_stored_history_overrides_constructor(tmp_path):
+    storage = Storage(tmp_path / "set.db")
+    register_suggest_migrations(storage)
+    await storage.connect()
+    try:
+        client = FakeClient([_msg(1, out=False, text="hi")])
+        fn, _ = make_suggest_fn("DRAFT")
+        # constructor says 30, but a stored value wins at runtime
+        suggester = Suggester(client=client, suggest_fn=fn, storage=storage, history_limit=30)
+        await set_suggest_settings(storage, enabled=True, history=7, model=None)
+        await suggester.suggest(42)
+        assert client.history_calls == [(42, 7)]
+    finally:
+        await storage.close()
+
+
 async def test_nudge_candidates_clears_receipt_predating_newer_unread_message(tmp_path):
     # the contact read msg 1 (aged receipt), then we sent a NEWER message (id 3) they
     # haven't read yet — the tail is ours but last_read_id (1) < tail.id (3). should_nudge
@@ -467,3 +570,45 @@ async def test_nudge_candidates_clears_receipt_predating_newer_unread_message(tm
         assert client.history_calls == [(7, 30)]
     finally:
         await storage.close()
+
+
+def test_model_swap_seam():
+    client = FakeClient([])
+    fn, _ = make_suggest_fn("base")
+
+    # without a factory the swap is unsupported and raises a clear error
+    plain = Suggester(client=client, suggest_fn=fn)
+    assert plain.supports_model_swap is False
+    with pytest.raises(RuntimeError):
+        plain.build_suggest_fn("openai:gpt-4o")
+
+    # with a factory, build + set swaps the model contact in place
+    def factory(name):
+        async def built(context, profile):
+            return f"M:{name}"
+        return built
+
+    sug = Suggester(client=client, suggest_fn=fn, suggest_fn_factory=factory)
+    assert sug.supports_model_swap is True
+    sug.set_suggest_fn(sug.build_suggest_fn("openai:gpt-4o"))
+
+
+# --- #143 review: clearing the model override reverts to the default suggest_fn ---
+
+
+def test_reset_suggest_fn_reverts_to_default():
+    client = FakeClient([])
+
+    async def default_fn(ctx, prof):
+        return "DEFAULT"
+
+    def factory(name):
+        async def overridden(ctx, prof):
+            return f"OVERRIDE:{name}"
+        return overridden
+
+    sug = Suggester(client=client, suggest_fn=default_fn, suggest_fn_factory=factory)
+    # swap to an override, then clear → back to the default, not the override
+    sug.set_suggest_fn(sug.build_suggest_fn("openai:gpt-4o"))
+    sug.reset_suggest_fn()
+    assert sug._suggest_fn is default_fn
