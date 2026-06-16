@@ -1,7 +1,7 @@
 import asyncio
 import inspect
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from textual.app import App, ComposeResult
@@ -2378,6 +2378,54 @@ async def test_tui_send_echo_not_suppressed_when_navigated_away_mid_send():
             pilot, lambda: any("hi" in str(b.render()) for b in app.query(MessageBubble))
         )
         assert any("hi" in str(b.render()) for b in app.query(MessageBubble))
+
+
+class LongHistorySendClient(TuiStubClient):
+    """A dialog with enough history that the pane scrolls — so a freshly-sent bubble appended at
+    the bottom is below the viewport unless the scroll reaches the recomputed end (#160 r3)."""
+
+    async def history(self, peer, limit=50, offset_id=0):
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        return [
+            Message(id=i, dialog_id=peer, sender_id=peer, out=(i % 2 == 0),
+                    text=f"history message number {i} with some length to fill the row",
+                    date=date + timedelta(minutes=i))
+            for i in range(1, 29)
+        ]
+
+    async def send_text(self, peer, text, reply_to=None):
+        self.sent.append((peer, text, reply_to))
+        self.sent_event.set()
+        return Message(id=216, dialog_id=peer, sender_id=1, out=True, text=text,
+                       date=datetime(2024, 1, 1, 1, tzinfo=timezone.utc))
+
+
+async def test_tui_sent_bubble_is_scrolled_into_view_in_a_long_chat():
+    # #160 r3 (the REAL "message doesn't show until refresh" bug): the optimistic bubble IS mounted,
+    # but _scroll_messages_to_end ran before Textual recomputed the layout for the new widget, so
+    # the pane stayed scrolled above it and the message was off-screen until a manual reopen.
+    # Assert the new bubble's region is INSIDE the pane viewport — presence in the DOM is not enough.
+    stub = LongHistorySendClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await _select_dialog(pilot, app, 7)
+        for _ in range(8):
+            await pilot.pause()
+        pane = app.query_one("#messages", Vertical)
+        assert pane.max_scroll_y > 0, "history did not fill the pane — test precondition broken"
+        composer = app.query_one("#composer", Input)
+        await app.on_input_submitted(Input.Submitted(composer, "MY NEW MESSAGE"))
+        # the optimistic bubble mounts at the bottom; the pane MUST scroll to the recomputed end so
+        # it is on screen. Presence in the DOM is not enough — assert the scroll reached max.
+        await _pause_until(pilot, lambda: pane.scroll_y == pane.max_scroll_y)
+        b = next(b for b in app.query(MessageBubble) if "MY NEW MESSAGE" in str(b.render()))
+        pr = b.region
+        viewport = pane.region
+        assert viewport.y <= pr.y < viewport.y + viewport.height, (
+            f"sent bubble off-screen: bubble.y={pr.y} viewport={viewport} "
+            f"scroll_y={pane.scroll_y} max_scroll_y={pane.max_scroll_y}"
+        )
 
 
 class OutgoingSameIdOtherDialogClient(TuiStubClient):

@@ -1585,6 +1585,12 @@ class MessengerTUI(App):
                 self.call_later(scroll_once)
 
         scroll_once()
+        # #160 r3: when a SINGLE bubble is appended to an already-tall pane (a send into a long
+        # chat), `max_scroll_y` is still the pre-mount value at scroll_once() time, so the loop
+        # converges to the OLD bottom and the new bubble lands just below the viewport — invisible
+        # until a manual reopen (the reported bug). call_after_refresh fires once Textual has
+        # recomputed the layout, so this final pass sees the real max_scroll_y and reaches it.
+        self.call_after_refresh(scroll_once)
         self.call_later(scroll_once)
 
     def _compose_state_for(self, dialog_id: int) -> ComposeState:
