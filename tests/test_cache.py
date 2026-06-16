@@ -216,3 +216,103 @@ async def test_get_or_fetch_failed_fetch_not_cached_no_deadlock():
         return "ok"
 
     assert await c.get_or_fetch("k", ok) == "ok"
+
+
+# --- #125-A4: invalidation racing an in-flight fetch must not be defeated ---
+
+
+async def test_invalidate_during_fetch_is_not_re_cached():
+    # invalidate(key) runs DURING the await fetch(); the freshly-fetched value must NOT be
+    # cached (the invalidation wins). The caller still gets it; a subsequent get() is a miss.
+    t = {"now": 0.0}
+    c = TTLCache(ttl=10.0, clock=_clock(t))
+    started = asyncio.Event()
+    proceed = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fetch():
+        calls["n"] += 1
+        started.set()
+        await proceed.wait()  # park inside the fetch so we can invalidate mid-flight
+        return "fresh"
+
+    async def racer():
+        await started.wait()
+        c.invalidate("k")  # bumps the key's epoch while the fetch is parked
+        proceed.set()
+
+    result, _ = await asyncio.gather(c.get_or_fetch("k", fetch), racer())
+    assert result == "fresh"  # caller still gets the freshly-fetched value
+    assert calls["n"] == 1
+    sentinel = object()
+    assert c.get("k", sentinel) is sentinel  # NOT cached -> miss
+
+    # a later fetch re-runs (nothing was cached behind the invalidation)
+    async def fetch2():
+        calls["n"] += 1
+        return "second"
+
+    assert await c.get_or_fetch("k", fetch2) == "second"
+    assert calls["n"] == 2
+
+
+async def test_invalidate_if_during_fetch_of_not_yet_stored_key():
+    # the not-yet-stored race: invalidate_if scans while the key is in-flight (absent from
+    # _store). It must still invalidate the in-flight key via _locks/_epochs, so the result
+    # is not cached.
+    t = {"now": 0.0}
+    c = TTLCache(ttl=10.0, clock=_clock(t))
+    started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def fetch():
+        started.set()
+        await proceed.wait()
+        return ["msg"]
+
+    async def racer():
+        await started.wait()
+        c.invalidate_if(lambda k: k[0] == 7)  # matches the in-flight key, not yet in _store
+        proceed.set()
+
+    key = (7, 50, 0)
+    result, _ = await asyncio.gather(c.get_or_fetch(key, fetch), racer())
+    assert result == ["msg"]
+    sentinel = object()
+    assert c.get(key, sentinel) is sentinel  # not cached -> re-fetch next time
+
+
+async def test_invalidate_of_other_key_during_fetch_still_caches():
+    # per-key epoch (not global): invalidating a DIFFERENT key mid-fetch must NOT over-skip —
+    # the in-flight key's value is cached normally. This fails under a global-epoch impl.
+    t = {"now": 0.0}
+    c = TTLCache(ttl=10.0, clock=_clock(t))
+    started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def fetch():
+        started.set()
+        await proceed.wait()
+        return "kept"
+
+    async def racer():
+        await started.wait()
+        c.invalidate("other")  # unrelated key
+        c.invalidate_if(lambda k: k == "another-unrelated")
+        proceed.set()
+
+    result, _ = await asyncio.gather(c.get_or_fetch("k", fetch), racer())
+    assert result == "kept"
+    assert c.get("k") == "kept"  # cached, because only OTHER keys were invalidated
+
+
+def test_epochs_do_not_leak_after_invalidate_and_eviction():
+    # _epochs must stay bounded: a plain invalidate of an absent key, and eviction, both prune.
+    t = {"now": 0.0}
+    c = TTLCache(ttl=10.0, maxsize=2, clock=_clock(t))
+    c.invalidate("never-stored")  # bumps then prunes (not stored, no in-flight)
+    assert "never-stored" not in c._epochs
+    for i in range(5):
+        c.set(i, i)  # evicts oldest beyond maxsize=2
+    # epochs for evicted keys are pruned; at most the 2 live keys could carry one
+    assert set(c._epochs) <= set(c._store)

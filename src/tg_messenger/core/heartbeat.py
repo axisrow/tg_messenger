@@ -72,6 +72,37 @@ class HeartbeatPlan(BaseModel):
             raise ValueError("a heartbeat plan needs at least one template")
         return v
 
+    # #125-A7: fail fast on plausible CLI typos that would silently break scheduling — a
+    # zero/negative interval floods, a <1 max_per_day never pings, an out-of-range quiet hour
+    # collapses the window. Mirrors the fail-fast precedent in moderation.RuleConditions.
+    @field_validator("interval_hours")
+    @classmethod
+    def _interval_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("interval_hours must be > 0")
+        return v
+
+    @field_validator("jitter_minutes")
+    @classmethod
+    def _jitter_non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("jitter_minutes must be >= 0")
+        return v
+
+    @field_validator("max_per_day")
+    @classmethod
+    def _max_per_day_at_least_one(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("max_per_day must be >= 1")
+        return v
+
+    @field_validator("quiet_start", "quiet_end")
+    @classmethod
+    def _quiet_hour_in_range(cls, v: int | None) -> int | None:
+        if v is not None and not (0 <= v <= 23):
+            raise ValueError("quiet hours must be in 0..23")
+        return v
+
 
 # --- storage (#13): планы + журнал ---------------------------------------------------
 
@@ -287,8 +318,14 @@ class HeartbeatService:
             )
             return
         text = await self._choose_text(plan)
-        await self._client.send_text(plan.peer, text)
+        # #125-A8: record the ping intent BEFORE sending. If the record write fails we never
+        # send (the exception propagates to process_plans, which logs and continues) — so
+        # last_ping_at/pings_today can't be left stale after a successful send and re-fire next
+        # tick (a duplicate ping + a missed max_per_day increment). The accepted trade-off is the
+        # opposite, harmless failure mode: a record that persists then a send that fails skips
+        # this interval rather than risking a duplicate.
         await self._record_ping(plan, now=now, text=text)
+        await self._client.send_text(plan.peer, text)
         await self._journal(plan.peer, text)
 
     async def _last_is_ours(self, peer: int) -> bool:

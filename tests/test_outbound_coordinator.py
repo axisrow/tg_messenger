@@ -212,6 +212,27 @@ async def test_send_variant_failure_restores_token_for_retry():
     assert len(attempts) == 2  # one failed, one succeeded
 
 
+async def test_send_variant_cancellation_restores_token_for_retry():
+    # #125-A9: a CancelledError (UI worker cancelled / client disconnect) is a BaseException, not
+    # an Exception. It must STILL restore the token so an immediate retry of the same token is
+    # accepted, not rejected as "outbound send already in progress".
+    coord, _ = _coordinator()
+    ready = await coord.prepare(7, "привет", owner_id="c1")
+
+    async def cancelled(peer, text):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await coord.send_variant(7, ready.token, ready.variants[0], cancelled, owner_id="c1")
+
+    # the token survives the cancellation → a retry can still send (not "already in progress")
+    async def ok(peer, text):
+        return _msg(text=text)
+
+    msg = await coord.send_variant(7, ready.token, ready.variants[0], ok, owner_id="c1")
+    assert msg.id == 100
+
+
 async def test_send_variant_concurrent_double_submit_sends_once():
     coord, _ = _coordinator()
     ready = await coord.prepare(7, "привет", owner_id="c1")

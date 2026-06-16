@@ -157,7 +157,11 @@ class OutboundSendCoordinator:
         )
         try:
             msg = await send_fn(dialog_id, variant_text)
-        except Exception:
+        except BaseException:
+            # #125-A9: catch BaseException (not just Exception) so a CancelledError — raised when
+            # the awaiting UI worker is cancelled (web client disconnect / TUI shutdown) — also
+            # restores the token. Otherwise it stays stuck "sending" and a within-TTL retry of the
+            # same token is rejected ("outbound send already in progress").
             await self._restore_token(token)
             raise
         await self._consume_token(token)

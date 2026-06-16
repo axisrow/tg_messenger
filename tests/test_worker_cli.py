@@ -28,6 +28,24 @@ class StubClient:
         return self.authorized
 
 
+class StubFactory:
+    """Records lifecycle: the worker CLI must close the factory it owns (#125-A6)."""
+
+    last = None
+
+    def __init__(self, **kw):
+        self.closed = False
+        self.entered = False
+        StubFactory.last = self
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *exc):
+        self.closed = True
+
+
 class StubWorker:
     last = None
 
@@ -56,7 +74,7 @@ def _setup(monkeypatch, tmp_path):
         return client
 
     monkeypatch.setattr(cli_main, "make_client", fake_make_client)
-    monkeypatch.setattr(cli_main, "make_factory_client", lambda **kw: object())
+    monkeypatch.setattr(cli_main, "make_factory_client", lambda **kw: StubFactory())
     monkeypatch.setattr("tg_messenger.interop.worker.Worker", StubWorker)
     return client
 
@@ -67,6 +85,20 @@ def test_worker_runs_and_disconnects(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert StubWorker.last.runs == 1
     assert client.connected is False  # disconnect в finally
+    # #125-A6: the factory the CLI owns is closed on exit (no leaked httpx.AsyncClient)
+    assert StubFactory.last.closed is True
+
+
+def test_worker_closes_factory_even_on_run_error(monkeypatch, tmp_path):
+    # #125-A6: a Worker.run() failure must still close the factory (async-with finally).
+    _setup(monkeypatch, tmp_path)
+
+    async def boom_run(self):
+        raise RuntimeError("worker exploded")
+
+    monkeypatch.setattr(StubWorker, "run", boom_run)
+    CliRunner().invoke(cli_main.cli, ["worker", "--factory-url", "http://f"])
+    assert StubFactory.last.closed is True
 
 
 def test_worker_requires_login(monkeypatch, tmp_path):

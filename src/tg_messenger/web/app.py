@@ -756,6 +756,10 @@ def build_app(
     async def send(request: Request, dialog_id: str = Form(""), text: str = Form(""),
                    reply_to: str = Form(""), web_client_id: str = Form(""),
                    outbound_nonce: str = Form("")):
+        # #125-A2: a state-changing write — same-origin guard (custom CSRF header a drive-by
+        # cross-origin <form> POST cannot set), mirroring /suggest, /outbound, /lang.
+        if (csrf_error := _same_origin_error(request)) is not None:
+            return csrf_error
         if not dialog_id.strip().lstrip("-").isdigit():
             return _error_response("Select a dialog first.", 400)
         if not text.strip():
@@ -795,6 +799,9 @@ def build_app(
         emoticon: str = Form(""),
         web_client_id: str = Form(""),
     ):
+        # #125-A2: a state-changing write — same-origin guard (see /send).
+        if (csrf_error := _same_origin_error(request)) is not None:
+            return csrf_error
         if not message_id.strip().isdigit():
             return _error_response("Message id must be a positive integer.", 400)
         emoticon = emoticon.strip()
@@ -821,6 +828,9 @@ def build_app(
         caption: str | None = Form(None),
         web_client_id: str = Form(""),
     ):
+        # #125-A2: a state-changing write — same-origin guard (see /send).
+        if (csrf_error := _same_origin_error(request)) is not None:
+            return csrf_error
         client = request.app.state.client
         # refuse a read-only chat BEFORE streaming the upload to disk
         if (readonly := await _readonly_error(client, dialog_id)) is not None:
@@ -828,17 +838,21 @@ def build_app(
         max_mb = _max_upload_mb()
         max_bytes = max_mb * 1024 * 1024
         suffix = Path(file.filename or "").suffix
-        # stream to the temp file in bounded chunks — the whole upload never
-        # sits in memory; reading stops as soon as the limit is crossed
-        size = 0
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp_path = tmp.name
-            while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
-                size += len(chunk)
-                if size > max_bytes:
-                    break
-                tmp.write(chunk)
+        # #125-A3: create the temp file, then enter the try BEFORE streaming — so a read
+        # exception mid-stream (ClientDisconnect / CancelledError on request cancel) is still
+        # covered by the cleanup finally. delete=False means a leak here is permanent otherwise.
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp_path = tmp.name
         try:
+            # stream to the temp file in bounded chunks — the whole upload never sits in
+            # memory; reading stops as soon as the limit is crossed
+            size = 0
+            with tmp:
+                while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        break
+                    tmp.write(chunk)
             if size > max_bytes:
                 logger.warning("media upload for dialog %s rejected: over %d MB",
                                dialog_id, max_mb)
