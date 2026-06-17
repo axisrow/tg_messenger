@@ -2830,7 +2830,11 @@ async def test_tui_switching_dialogs_clears_pending_suggestion():
 
         assert app._pending_suggestion is None
         assert app._pending_suggestion_dialog is None  # #158: dialog scope cleared too
-        assert str(app.query_one("#suggestion", Static).render()) == ""
+        strip = app.query_one("#suggestion", Static)
+        assert str(strip.render()) == ""
+        # #170: the strip is now bordered, so an EMPTY strip must be hidden — else its empty border
+        # floats above the composer.
+        assert strip.display is False
 
 
 async def test_tui_suggestion_line_not_covered_by_composer():
@@ -5196,6 +5200,38 @@ async def test_tui_suggest_hint_renders_with_suggester():
         rendered = str(app.query_one("#suggestion", Static).render())
         assert rendered == f"{SUGGEST_PREFIX}Привет! Как дела?"
         assert app._pending_suggestion == "Привет! Как дела?"
+        # #170: a draft is non-empty → the strip is shown.
+        assert app.query_one("#suggestion", Static).display is True
+
+
+async def test_tui_multiline_suggestion_renders_as_one_framed_block():
+    # #170: a multi-line draft must read as ONE bordered block, not N prefix-less "bubbles".
+    # We keep the newlines (the user chose the framed look) but verify the strip is bordered and
+    # holds the full draft so it can never degrade back to stacked, unframed rows.
+    from tg_messenger.tui.app import SUGGEST_PREFIX
+
+    draft = "line one\nline two\nline three"
+
+    class MultiLineSuggester:
+        async def suggest(self, dialog_id):
+            return draft
+
+    app = MessengerTUI(client=TuiStubClient(), suggester=MultiLineSuggester())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7  # Ann is a DM (kind="dm")
+        app._maybe_suggest(7)
+        await _pause_until(
+            pilot, lambda: SUGGEST_PREFIX in str(app.query_one("#suggestion", Static).render())
+        )
+        strip = app.query_one("#suggestion", Static)
+        rendered = str(strip.render())
+        # the full multi-line draft is preserved (all three lines present)
+        assert rendered == f"{SUGGEST_PREFIX}{draft}"
+        assert "line two" in rendered and "line three" in rendered
+        # shown, and bordered so the multi-row hint is one framed block (not N bare bubbles)
+        assert strip.display is True
+        assert strip.styles.border.top[0] != ""
 
 
 async def test_tui_suggest_strip_empty_without_suggester():

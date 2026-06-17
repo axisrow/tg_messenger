@@ -1559,7 +1559,10 @@ class MessengerTUI(App):
         text-style: $block-cursor-text-style;
         border: round $accent;
     }
-    #suggestion { color: $text-muted; height: auto; }
+    /* #170: bordered so a multi-line draft reads as ONE framed block, not N prefix-less rows
+       (only the first line carries the 💡 Tab: prefix). Hidden when empty via _set_suggestion_strip
+       so the border doesn't float above the composer. */
+    #suggestion { color: $text-muted; height: auto; border: round $panel; padding: 0 1; }
     #composer { dock: bottom; }
     /* #116: shared modal card — a centered, bordered, width-capped box (was full-width, top-left,
        unframed). Centering (align: center middle) lives on each ModalScreen's DEFAULT_CSS so it is
@@ -2739,7 +2742,7 @@ class MessengerTUI(App):
         # is shown INSTANTLY — no second LLM call, no ⏳ wait. _pending_suggestion is left intact so
         # Tab still accepts it. Otherwise fall through to a fresh call WITH the thinking indicator.
         if self._pending_suggestion and self._pending_suggestion_dialog == self._current:
-            self.query_one("#suggestion", Static).update(f"{SUGGEST_PREFIX}{self._pending_suggestion}")
+            self._set_suggestion_strip(f"{SUGGEST_PREFIX}{self._pending_suggestion}")
             return
         self.run_worker(
             self._suggest(self._current, notify_empty=True, show_thinking=True),
@@ -2801,13 +2804,13 @@ class MessengerTUI(App):
             and not self.query_one("#composer", Input).value
         )
         if thinking_shown:
-            self.query_one("#suggestion", Static).update(SUGGEST_THINKING)
+            self._set_suggestion_strip(SUGGEST_THINKING)
         try:
             draft = await self._suggester.suggest(dialog_id)
         except Exception:
             logger.exception("suggest failed (dialog %s)", dialog_id)
             if thinking_shown and dialog_id == self._current:
-                self.query_one("#suggestion", Static).update("")  # don't leave ⏳ hanging
+                self._set_suggestion_strip("")  # don't leave ⏳ hanging
             return
         # the user may have switched dialogs or started typing while we waited
         if dialog_id != self._current or self.query_one("#composer", Input).value:
@@ -2816,12 +2819,12 @@ class MessengerTUI(App):
         # toast — silence would read as "the key did nothing". The auto-path passes notify_empty=False.
         if not draft and notify_empty:
             if thinking_shown:
-                self.query_one("#suggestion", Static).update("")  # clear ⏳ before the toast
+                self._set_suggestion_strip("")  # clear ⏳ before the toast
             self.notify("Суфлёр не предложил ответ", severity="warning")
             return
         self._pending_suggestion = draft
         self._pending_suggestion_dialog = dialog_id if draft else None
-        self.query_one("#suggestion", Static).update(f"{SUGGEST_PREFIX}{draft}" if draft else "")
+        self._set_suggestion_strip(f"{SUGGEST_PREFIX}{draft}" if draft else "")
 
     def action_accept_suggestion(self) -> None:
         """Tab: accept a pending suggestion into the composer, else fall through to forward
@@ -2840,10 +2843,20 @@ class MessengerTUI(App):
         self._clear_suggestion()
         composer.focus()
 
+    def _set_suggestion_strip(self, text: str) -> None:
+        """Update the #suggestion strip and toggle its visibility (#170).
+
+        One place owns the show/hide: a bordered strip (App.CSS) must be hidden when empty, else its
+        empty border floats above the composer. Non-empty text → shown; "" → hidden.
+        """
+        strip = self.query_one("#suggestion", Static)
+        strip.update(text)
+        strip.display = bool(text)
+
     def _clear_suggestion(self) -> None:
         self._pending_suggestion = None
         self._pending_suggestion_dialog = None  # #158: keep the dialog scope in sync with the draft
-        self.query_one("#suggestion", Static).update("")
+        self._set_suggestion_strip("")
 
     def action_toggle_help(self) -> None:
         """? / F1 — toggle the key-help overlay (#124).
