@@ -197,6 +197,22 @@ def test_flush_tracers_returns_within_deadline_when_flush_blocks(monkeypatch):
     assert elapsed < 2.0, f"flush_tracers blocked for {elapsed:.2f}s past its deadline"
 
 
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "Infinity", "  ", "abc", "0", "-3"])
+def test_flush_timeout_rejects_non_finite_and_non_positive(raw, monkeypatch):
+    # #168 (Codex cleanup): float("nan"/"inf") parse fine and slip past a bare `value <= 0`
+    # guard — join(inf) would restore the very unbounded wait the timeout exists to kill, and
+    # join(nan) is undefined. A non-finite/non-positive/garbage value must fall back to default.
+    from tg_messenger.agent.config import _FLUSH_TIMEOUT_SECONDS, _flush_timeout_seconds
+
+    assert _flush_timeout_seconds({"TG_TRACE_FLUSH_TIMEOUT": raw}) == _FLUSH_TIMEOUT_SECONDS
+
+
+def test_flush_timeout_accepts_a_positive_value():
+    from tg_messenger.agent.config import _flush_timeout_seconds
+
+    assert _flush_timeout_seconds({"TG_TRACE_FLUSH_TIMEOUT": "12.5"}) == 12.5
+
+
 # --- Цикл 22: TG_AGENT_VISION_MODEL ---
 
 

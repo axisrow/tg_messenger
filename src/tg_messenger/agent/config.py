@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -131,8 +132,10 @@ def _flush_timeout_seconds(env: Mapping[str, str] | None = None) -> float:
         logger.warning("TG_TRACE_FLUSH_TIMEOUT=%r is not a number; using %ss",
                        raw, _FLUSH_TIMEOUT_SECONDS)
         return _FLUSH_TIMEOUT_SECONDS
-    if value <= 0:
-        logger.warning("TG_TRACE_FLUSH_TIMEOUT=%r is not positive; using %ss",
+    # reject non-finite too: float("inf")/"nan" parse cleanly and slip past a bare `<= 0`
+    # check — join(inf) would restore the unbounded wait this timeout exists to kill.
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("TG_TRACE_FLUSH_TIMEOUT=%r is not a positive finite number; using %ss",
                        raw, _FLUSH_TIMEOUT_SECONDS)
         return _FLUSH_TIMEOUT_SECONDS
     return value
