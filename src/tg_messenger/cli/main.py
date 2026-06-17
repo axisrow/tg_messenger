@@ -1708,7 +1708,7 @@ def worker(ctx: click.Context, session: str, factory_url: str | None, types: str
         finally:
             await client.disconnect()
 
-    _run_interruptible(_do(), session=session)
+    _run_interruptible(_do(), session=session, flush_traces=True)
 
 
 @cli.command()

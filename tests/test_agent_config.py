@@ -177,6 +177,26 @@ def test_flush_tracers_swallows_errors(monkeypatch):
     flush_tracers()  # не должно бросить
 
 
+def test_flush_tracers_returns_within_deadline_when_flush_blocks(monkeypatch):
+    # #168 (Codex): wait_for_all_tracers → Client.flush(timeout=None) ждёт ВЕЧНО; на shutdown
+    # из finally это вешает Ctrl+C/стоп сервера. flush_tracers ОБЯЗАН вернуться по дедлайну.
+    import threading
+    import time
+
+    release = threading.Event()
+
+    def blocking():
+        release.wait()  # имитируем зависший tracer-воркер / деградацию сети
+
+    _fake_tracer_module(monkeypatch, blocking)
+    monkeypatch.setenv("TG_TRACE_FLUSH_TIMEOUT", "0.2")
+    start = time.monotonic()
+    flush_tracers()  # не должно зависнуть
+    elapsed = time.monotonic() - start
+    release.set()  # отпускаем фоновый поток, чтобы тест не оставлял висящих демонов
+    assert elapsed < 2.0, f"flush_tracers blocked for {elapsed:.2f}s past its deadline"
+
+
 # --- Цикл 22: TG_AGENT_VISION_MODEL ---
 
 
