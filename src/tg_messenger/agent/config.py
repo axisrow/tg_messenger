@@ -7,11 +7,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 SEARCH_PROVIDERS = ("duckduckgo", "tavily", "exa", "brave")
 
@@ -102,6 +105,30 @@ def langsmith_tracing_enabled(env: Mapping[str, str] | None = None) -> bool:
             " add a key from https://smith.langchain.com or disable tracing."
         )
     return True
+
+
+def flush_tracers() -> None:
+    """Block until LangSmith has uploaded any buffered trace events (#168).
+
+    LangSmith batches run events in a background thread; on Ctrl+C or an
+    ``asyncio.timeout`` cancellation the final run-end patch can be lost, leaving
+    the run stuck ``pending`` in the UI. Call this on shutdown so those events
+    are flushed first.
+
+    No-op (debug-logged) when langchain isn't installed — the base ``[dev]``
+    install has no tracer to flush. Any flush error is logged and swallowed: a
+    failed upload must never crash the shutdown path (project "no silent
+    failures" rule — logged, not raised).
+    """
+    try:
+        from langchain_core.tracers.langchain import wait_for_all_tracers
+    except ImportError:
+        logger.debug("flush_tracers: langchain not installed; nothing to flush")
+        return
+    try:
+        wait_for_all_tracers()
+    except Exception:
+        logger.warning("flush_tracers: failed to flush LangSmith traces", exc_info=True)
 
 
 @dataclass(frozen=True)

@@ -455,3 +455,25 @@ def test_agent_is_silent_about_tracing_when_off(agent_cli, monkeypatch):
     result = r.invoke(cli_main.cli, ["agent"])
     assert result.exit_code == 0
     assert "LangSmith" not in result.output
+
+
+# --- #168: traces are flushed on shutdown, including Ctrl+C ---
+
+
+def test_agent_flushes_traces_on_normal_exit(agent_cli, monkeypatch):
+    r, *_ = agent_cli
+    calls = []
+    monkeypatch.setattr(cli_main, "flush_tracers", lambda: calls.append(1))
+    result = r.invoke(cli_main.cli, ["agent"])
+    assert result.exit_code == 0
+    assert calls == [1]
+
+
+def test_agent_flushes_traces_on_ctrl_c(agent_cli, monkeypatch):
+    r, _, stub_runner = agent_cli
+    stub_runner.interrupt = True  # runner raises KeyboardInterrupt mid-run
+    calls = []
+    monkeypatch.setattr(cli_main, "flush_tracers", lambda: calls.append(1))
+    result = r.invoke(cli_main.cli, ["agent"])
+    assert "stopped." in result.output
+    assert calls == [1]  # flush still runs in the finally on Ctrl+C

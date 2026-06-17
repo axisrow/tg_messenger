@@ -1,6 +1,8 @@
 """Цикл 9: AgentConfig.from_env — чтение и валидация настроек агента (stdlib-only)."""
 
 import json
+import sys
+from types import ModuleType
 
 import pytest
 
@@ -8,6 +10,7 @@ from tg_messenger.agent.config import (
     SEARCH_PROVIDERS,
     AgentConfig,
     IntentSpec,
+    flush_tracers,
     langsmith_tracing_enabled,
     load_intents,
 )
@@ -138,6 +141,40 @@ def test_langsmith_tracing_defaults_to_os_environ(monkeypatch):
     monkeypatch.setenv("LANGSMITH_TRACING", "true")
     monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2-key")
     assert langsmith_tracing_enabled() is True
+
+
+# --- #168: flush_tracers — досылаем буфер трейсов LangSmith перед выходом ---
+
+_TRACER_MODULE = "langchain_core.tracers.langchain"
+
+
+def _fake_tracer_module(monkeypatch, fn):
+    """Подменяем langchain_core.tracers.langchain на фейк с шпионом wait_for_all_tracers."""
+    mod = ModuleType(_TRACER_MODULE)
+    mod.wait_for_all_tracers = fn
+    monkeypatch.setitem(sys.modules, _TRACER_MODULE, mod)
+
+
+def test_flush_tracers_calls_wait_for_all_tracers_once(monkeypatch):
+    calls = []
+    _fake_tracer_module(monkeypatch, lambda: calls.append(1))
+    flush_tracers()
+    assert calls == [1]
+
+
+def test_flush_tracers_no_op_when_langchain_absent(monkeypatch):
+    # без [agent]-экстры импорт падает — flush_tracers молча ничего не делает, не падает
+    monkeypatch.setitem(sys.modules, _TRACER_MODULE, None)  # импорт → ImportError
+    flush_tracers()  # не должно бросить
+
+
+def test_flush_tracers_swallows_errors(monkeypatch):
+    # сбой досыла на shutdown не должен ронять процесс — логируем и проглатываем
+    def boom():
+        raise RuntimeError("tracer backend down")
+
+    _fake_tracer_module(monkeypatch, boom)
+    flush_tracers()  # не должно бросить
 
 
 # --- Цикл 22: TG_AGENT_VISION_MODEL ---

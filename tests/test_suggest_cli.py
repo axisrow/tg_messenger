@@ -172,6 +172,45 @@ def test_suggest_nudges_after_hours_to_seconds(suggest_cli):
     assert suggester.nudge_calls[-1][1] == 2 * 3600
 
 
+# --- #168: tracing status + fail-fast shared across the суфлёр CLI commands ---
+
+_SUGGEST_CMDS = [["suggest", "42"], ["suggest-nudges"]]
+
+
+@pytest.mark.parametrize("cmd", _SUGGEST_CMDS)
+def test_suggest_announces_langsmith_tracing(suggest_cli, monkeypatch, cmd):
+    r, *_ = suggest_cli
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2-key")
+    monkeypatch.setenv("LANGSMITH_PROJECT", "tg-messenger")
+    result = r.invoke(cli_main.cli, cmd)
+    assert result.exit_code == 0, result.output
+    assert "LangSmith tracing: on (project=tg-messenger)" in result.output
+
+
+@pytest.mark.parametrize("cmd", _SUGGEST_CMDS)
+def test_suggest_tracing_without_key_fails_fast(suggest_cli, monkeypatch, cmd):
+    r, _, suggester, _ = suggest_cli
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    result = r.invoke(cli_main.cli, cmd)
+    assert result.exit_code != 0
+    assert "LANGSMITH_API_KEY" in result.output
+    assert "Traceback" not in result.output
+    # fail-fast happens before the network/LLM work
+    assert suggester.suggested == []
+    assert suggester.nudge_calls == []
+
+
+@pytest.mark.parametrize("cmd", _SUGGEST_CMDS)
+def test_suggest_silent_about_tracing_when_off(suggest_cli, monkeypatch, cmd):
+    r, *_ = suggest_cli
+    monkeypatch.delenv("LANGSMITH_TRACING", raising=False)
+    result = r.invoke(cli_main.cli, cmd)
+    assert result.exit_code == 0, result.output
+    assert "LangSmith" not in result.output
+
+
 @pytest.mark.asyncio
 async def test_make_optional_suggester_wires_profile_storage(monkeypatch):
     storage = StubStorage()
