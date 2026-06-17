@@ -2742,6 +2742,31 @@ async def test_tui_reaction_not_attached_to_same_id_bubble_of_other_dialog():
     assert app._pending_reactions == {}  # nor was it buffered (the bubble existed, just mismatched)
 
 
+async def test_tui_drain_pending_reactions_skips_same_id_bubble_of_other_dialog():
+    # Defense-in-depth (parity with _apply_reaction, #102/#128): the buffered-reaction REPLAY
+    # path must verify the bubble's own source dialog too. _bubble_index is keyed by bare
+    # message_id (not unique across dialogs); if a stale bubble from a DIFFERENT dialog sits in
+    # the index under a colliding id when the buffer drains, the reaction must NOT attach to it —
+    # exactly the guard _apply_reaction already has, mirrored on the drain path.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        pane = app.query_one("#messages", Vertical)
+        # a bubble whose SOURCE dialog is 9, indexed under colliding id 1
+        stale = MessageBubble("[1] from dialog 9", out=False, message_id=1, dialog_id=9)
+        await pane.mount(stale)
+        app._bubble_index[1] = stale
+        # a reaction for dialog 7 message 1 was buffered while dialog 7's history loaded
+        app._pending_reactions[7] = [(1, "👍")]
+        app._drain_pending_reactions(7)
+        await pilot.pause()
+        rendered = str(stale.render())
+    assert "👍" not in rendered  # the replayed reaction did not land on the other dialog's bubble
+    assert app._pending_reactions == {}  # the buffer was drained (popped), not left dangling
+
+
 async def test_tui_stale_bubble_after_switch_cannot_be_reacted_via_mouse():
     # #128: after a dialog switch, the previous dialog's bubbles linger until the async history
     # worker removes them. A mouse focus + action_react on such a STALE bubble must be rejected

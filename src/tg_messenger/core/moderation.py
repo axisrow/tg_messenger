@@ -46,6 +46,23 @@ class RuleConditions(BaseModel):
                 raise ValueError(f"invalid regex pattern: {exc}") from exc
         return v
 
+    @field_validator("from_new_member_within_sec")
+    @classmethod
+    def _valid_new_member_window(cls, v: int | None) -> int | None:
+        # fail-fast like _valid_mute_duration: a <= 0 window silently never matches.
+        if v is not None and v <= 0:
+            raise ValueError("from_new_member_within_sec must be > 0")
+        return v
+
+    @field_validator("max_messages_per_minute")
+    @classmethod
+    def _valid_rate_limit(cls, v: int | None) -> int | None:
+        # a 0 makes `rate_count >= 0` always true → the rule would act on every message; < 1 is
+        # nonsensical, so reject it rather than silently over-moderate.
+        if v is not None and v < 1:
+            raise ValueError("max_messages_per_minute must be at least 1")
+        return v
+
 
 class RuleActions(BaseModel):
     delete: bool = False

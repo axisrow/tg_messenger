@@ -2405,7 +2405,11 @@ class MessengerTUI(App):
         # snapshot → dropped, not re-buffered, so this can't loop).
         for message_id, emoticon in self._pending_reactions.pop(dialog_id, []):
             bubble = self._bubble_index.get(message_id)
-            if bubble is not None:
+            # verify the bubble's own SOURCE dialog before attaching, mirroring the
+            # _apply_reaction guard (#102/#128): _bubble_index is keyed by bare message_id,
+            # which is not unique across dialogs, so a colliding stale bubble must never get
+            # the replayed reaction.
+            if bubble is not None and bubble.dialog_id == dialog_id:
                 bubble.add_reaction(emoticon)
 
     async def _apply_tlang_command(self, command: tuple[str, str | None]) -> None:
