@@ -57,6 +57,34 @@ def test_invalid_regex_rejected_fail_fast():
         RuleConditions(pattern="(unclosed")
 
 
+@pytest.mark.parametrize(
+    "field, bad",
+    [
+        # from_new_member_within_sec: a <= 0 window silently never matches (disables the rule).
+        ("from_new_member_within_sec", 0),
+        ("from_new_member_within_sec", -1),
+        # max_messages_per_minute: a 0 makes `rate_count >= 0` ALWAYS true → under enforce the
+        # rule would act on EVERY message (mass auto-moderation); negative is equally nonsensical.
+        ("max_messages_per_minute", 0),
+        ("max_messages_per_minute", -1),
+    ],
+)
+def test_numeric_conditions_out_of_range_rejected(field, bad):
+    # fail-fast like the pattern/mute_sec validators — reject at construction, not silently.
+    with pytest.raises(ValidationError, match=field):
+        RuleConditions(**{field: bad})
+
+
+def test_valid_numeric_conditions_accepted():
+    # the positive case: in-range values (and unset None) construct fine
+    cond = RuleConditions(from_new_member_within_sec=60, max_messages_per_minute=5)
+    assert cond.from_new_member_within_sec == 60
+    assert cond.max_messages_per_minute == 5
+    bare = RuleConditions()
+    assert bare.from_new_member_within_sec is None
+    assert bare.max_messages_per_minute is None
+
+
 def test_has_link_condition():
     cond = RuleConditions(has_link=True)
     assert rule_matches(cond, _msg("visit https://example.com now"), is_new_member=False)
