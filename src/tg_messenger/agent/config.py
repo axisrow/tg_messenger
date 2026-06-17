@@ -7,11 +7,22 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import re
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# #168: an upper bound on the shutdown trace flush. wait_for_all_tracers() →
+# Client.flush(timeout=None) waits INDEFINITELY for the queue to drain, so a stuck tracer
+# worker / degraded LangSmith network would hang Ctrl+C or a server stop forever. We run the
+# flush in a daemon thread and stop waiting on it after this many seconds (env-overridable).
+_FLUSH_TIMEOUT_SECONDS = 5.0
 
 SEARCH_PROVIDERS = ("duckduckgo", "tavily", "exa", "brave")
 
@@ -102,6 +113,75 @@ def langsmith_tracing_enabled(env: Mapping[str, str] | None = None) -> bool:
             " add a key from https://smith.langchain.com or disable tracing."
         )
     return True
+
+
+def _flush_timeout_seconds(env: Mapping[str, str] | None = None) -> float:
+    """Resolve the shutdown-flush deadline (env ``TG_TRACE_FLUSH_TIMEOUT``, default 5s).
+
+    A non-positive or unparseable value falls back to the default with a warning — a
+    misconfigured deadline must not silently turn the bounded wait back into an unbounded one.
+    """
+    if env is None:
+        env = os.environ
+    raw = (env.get("TG_TRACE_FLUSH_TIMEOUT") or "").strip()
+    if not raw:
+        return _FLUSH_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("TG_TRACE_FLUSH_TIMEOUT=%r is not a number; using %ss",
+                       raw, _FLUSH_TIMEOUT_SECONDS)
+        return _FLUSH_TIMEOUT_SECONDS
+    # reject non-finite too: float("inf")/"nan" parse cleanly and slip past a bare `<= 0`
+    # check — join(inf) would restore the unbounded wait this timeout exists to kill.
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("TG_TRACE_FLUSH_TIMEOUT=%r is not a positive finite number; using %ss",
+                       raw, _FLUSH_TIMEOUT_SECONDS)
+        return _FLUSH_TIMEOUT_SECONDS
+    return value
+
+
+def flush_tracers() -> None:
+    """Best-effort, time-bounded drain of LangSmith's buffered trace events (#168).
+
+    LangSmith batches run events in a background thread; on Ctrl+C or an
+    ``asyncio.timeout`` cancellation the final run-end patch can be lost, leaving
+    the run stuck ``pending`` in the UI. Call this on shutdown so those events
+    are flushed first.
+
+    ``wait_for_all_tracers()`` delegates to ``Client.flush(timeout=None)``, which waits
+    INDEFINITELY — called from a shutdown ``finally`` that would let a stuck tracer worker or
+    degraded LangSmith network hang Ctrl+C / a server stop forever (Codex #168). So the flush
+    runs in a **daemon** thread joined for at most ``TG_TRACE_FLUSH_TIMEOUT`` seconds; past the
+    deadline we log a warning and return (the daemon never blocks process exit).
+
+    No-op (debug-logged) when langchain isn't installed — the base ``[dev]``
+    install has no tracer to flush. Any flush error is logged and swallowed: a
+    failed upload must never crash the shutdown path (project "no silent
+    failures" rule — logged, not raised).
+    """
+    try:
+        from langchain_core.tracers.langchain import wait_for_all_tracers
+    except ImportError:
+        logger.debug("flush_tracers: langchain not installed; nothing to flush")
+        return
+
+    def _drain() -> None:
+        try:
+            wait_for_all_tracers()
+        except Exception:
+            logger.warning("flush_tracers: failed to flush LangSmith traces", exc_info=True)
+
+    timeout = _flush_timeout_seconds()
+    worker = threading.Thread(target=_drain, name="flush-tracers", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        logger.warning(
+            "flush_tracers: LangSmith flush did not finish within %ss; "
+            "some traces may stay pending (set TG_TRACE_FLUSH_TIMEOUT to adjust)",
+            timeout,
+        )
 
 
 @dataclass(frozen=True)

@@ -1816,6 +1816,38 @@ def test_serve_announces_url(serve_spy, monkeypatch):
     assert "http://127.0.0.1:8090" in result.output
 
 
+# --- #168: serve announces tracing, fails fast on a missing key, flushes on shutdown ---
+
+
+def test_serve_announces_langsmith_tracing(serve_spy, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)  # isolate from a developer .env that may set LANGSMITH_*
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2-key")
+    monkeypatch.setenv("LANGSMITH_PROJECT", "tg-messenger")
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code == 0
+    assert "LangSmith tracing: on (project=tg-messenger)" in result.output
+
+
+def test_serve_tracing_without_key_fails_fast(serve_spy, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)  # a developer .env (LANGSMITH_API_KEY via setdefault) must not leak in
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code != 0
+    assert "LANGSMITH_API_KEY" in result.output
+    assert "Traceback" not in result.output
+    assert serve_spy["uvicorn"] == []  # fail-fast before the server starts
+
+
+def test_serve_flushes_traces_after_shutdown(serve_spy, monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli_main, "flush_tracers", lambda: calls.append(1))
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code == 0
+    assert calls == [1]  # flushed after uvicorn.run returned
+
+
 def test_verbose_flag_sets_debug_level(runner):
     import logging
 
@@ -2467,6 +2499,59 @@ def test_tui_uses_global_profile_as_session(monkeypatch):
     assert captured["client"] is client
     assert captured["suggester"] is suggester
     assert optional_kwargs == {"session": "work"}
+
+
+# --- #168: tui announces tracing to the log (alt-screen), fails fast, flushes on exit ---
+
+
+def _patch_tui_eager(monkeypatch):
+    """Stub make_tui_deps + MessengerTUI so `tui` runs to completion without a real UI."""
+    monkeypatch.setattr(
+        cli_main, "make_tui_deps",
+        lambda profile, **kw: cli_main.TuiDeps(
+            client=StubClient(), session_name=profile, suggester=None,
+            store=None, translator=None, outbound=None, auto_translate=False,
+        ),
+    )
+    _patch_tui(monkeypatch)
+
+
+def test_tui_announces_langsmith_tracing_to_log(monkeypatch, tmp_path, caplog):
+    monkeypatch.chdir(tmp_path)  # isolate from a developer .env
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2-key")
+    monkeypatch.setenv("LANGSMITH_PROJECT", "tg-messenger")
+    _patch_tui_eager(monkeypatch)
+    with caplog.at_level("INFO", logger="tg_messenger.cli.main"):
+        result = CliRunner().invoke(cli_main.cli, ["--profile", "solo", "tui"])
+    assert result.exit_code == 0, result.output
+    # the alt-screen forbids console output — the status goes to the log, not stdout
+    assert "LangSmith tracing: on (project=tg-messenger)" not in result.output
+    assert any("LangSmith tracing: on (project=tg-messenger)" in r.message for r in caplog.records)
+
+
+def test_tui_tracing_without_key_fails_fast(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)  # a developer .env must not leak LANGSMITH_API_KEY in
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    runs = []
+    _patch_tui_eager(monkeypatch)
+    monkeypatch.setattr(cli_main, "make_tui_deps", lambda *a, **kw: runs.append(1))
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "solo", "tui"])
+    assert result.exit_code != 0
+    assert "LANGSMITH_API_KEY" in result.output
+    assert "Traceback" not in result.output
+    assert runs == []  # fail-fast before the UI is built
+
+
+def test_tui_flushes_traces_on_exit(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(cli_main, "flush_tracers", lambda: calls.append(1))
+    _patch_tui_eager(monkeypatch)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "solo", "tui"])
+    assert result.exit_code == 0, result.output
+    assert calls == [1]  # flushed after the TUI run returned
 
 
 # --- #52 point 2: ProfileScreen reachable from the `tui` entrypoint ---

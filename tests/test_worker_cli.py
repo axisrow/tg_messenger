@@ -122,6 +122,34 @@ def test_worker_ctrl_c_says_stopped(monkeypatch, tmp_path):
     assert "stopped." in result.output
 
 
+# --- #168: worker is a long-running LLM command (prompt tasks) — flush traces on shutdown ---
+
+
+def test_worker_flushes_traces_on_normal_exit(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(cli_main, "flush_tracers", lambda: calls.append(1))
+    result = CliRunner().invoke(cli_main.cli, ["worker", "--factory-url", "http://f"])
+    assert result.exit_code == 0, result.output
+    assert calls == [1]
+
+
+def test_worker_flushes_traces_on_ctrl_c(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    orig_init = StubWorker.__init__
+
+    def _init(self, *a, **kw):
+        orig_init(self, *a, **kw)
+        self.interrupt = True
+
+    monkeypatch.setattr(StubWorker, "__init__", _init)
+    calls = []
+    monkeypatch.setattr(cli_main, "flush_tracers", lambda: calls.append(1))
+    result = CliRunner().invoke(cli_main.cli, ["worker", "--factory-url", "http://f"])
+    assert "stopped." in result.output
+    assert calls == [1]  # flush still runs in the finally on Ctrl+C
+
+
 def test_worker_types_filter_passed(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     result = CliRunner().invoke(

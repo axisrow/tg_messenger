@@ -19,7 +19,7 @@ import click
 from click.core import ParameterSource
 from telethon.errors import UnauthorizedError
 
-from tg_messenger.agent.config import langsmith_tracing_enabled
+from tg_messenger.agent.config import flush_tracers, langsmith_tracing_enabled
 from tg_messenger.core.auth import LOGIN_HINT, session_store_from_env, validate_session_string
 from tg_messenger.core.client import (
     MessageDeleteValidationError,
@@ -100,6 +100,24 @@ def _warn_if_send_rate_off() -> None:
             "the account banned; unset TG_SEND_RATE or set TG_SEND_RATE=20 to enable "
             "the safe default cap"
         )
+
+
+def _announce_tracing(echo=click.echo) -> None:
+    """Surface LangSmith tracing status at startup; fail fast on a missing key (#168).
+
+    Every LLM command goes through this (not just `agent`): when tracing is on it
+    announces the project, and when ``LANGSMITH_TRACING=true`` without a key it raises
+    a ``ClickException`` instead of letting langsmith silently spew per-trace errors.
+
+    ``echo`` is injectable so non-CLI front-ends can route the line through a logger
+    (TUI's alt-screen, the web server) instead of stdout.
+    """
+    try:
+        if langsmith_tracing_enabled():
+            project = os.environ.get("LANGSMITH_PROJECT", "default")
+            echo(f"LangSmith tracing: on (project={project})")
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def make_factory_client(*, base_url: str, password: str | None = None):
@@ -528,12 +546,21 @@ async def _with_storage(session, register_fn, fn):
         await storage.close()
 
 
-def _run_interruptible(coro, session: str = "default") -> None:
-    """``_run`` + the long-running commands' Ctrl+C contract (prints "stopped.")."""
+def _run_interruptible(coro, session: str = "default", *, flush_traces: bool = False) -> None:
+    """``_run`` + the long-running commands' Ctrl+C contract (prints "stopped.").
+
+    ``flush_traces`` (set by LLM commands) drains buffered LangSmith traces in the
+    ``finally`` — synchronously, after ``asyncio.run`` has returned, so a Ctrl+C or an
+    ``asyncio.timeout`` cancellation still gets its run-end events uploaded (#168) instead
+    of leaving the run stuck ``pending``.
+    """
     try:
         _run(coro, session=session)
     except KeyboardInterrupt:
         click.echo("stopped.")
+    finally:
+        if flush_traces:
+            flush_tracers()
 
 
 @contextlib.asynccontextmanager
@@ -1351,6 +1378,7 @@ def moderate_rules_remove(ctx: click.Context, chat_id: int, name: str, session: 
 def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
     """Interactive REPL: see incoming and send replies."""
     session = _effective_session(ctx, session)
+    _announce_tracing()  # #168: status + fail-fast (chat traces the inbound/outbound translator)
 
     async def _do():
         client = make_client(session_name=session)
@@ -1591,7 +1619,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                 await store.close()
             await client.disconnect()
 
-    _run_interruptible(_do(), session=session)
+    _run_interruptible(_do(), session=session, flush_traces=True)
 
 
 @cli.command()
@@ -1604,13 +1632,8 @@ def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
     session = _effective_session(ctx, session)
     _warn_if_send_rate_off()  # #50: loud when the global send cap is off
     # langchain/langgraph трассируются в LangSmith сами по LANGSMITH_* env —
-    # здесь только fail-fast (включено без ключа) и видимый статус
-    try:
-        if langsmith_tracing_enabled():
-            project = os.environ.get("LANGSMITH_PROJECT", "default")
-            click.echo(f"LangSmith tracing: on (project={project})")
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    # здесь только fail-fast (включено без ключа) и видимый статус (#168: общий хелпер)
+    _announce_tracing()
 
     async def _do():
         client = make_client(session_name=session)
@@ -1624,7 +1647,7 @@ def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
         finally:
             await client.disconnect()
 
-    _run_interruptible(_do(), session=session)
+    _run_interruptible(_do(), session=session, flush_traces=True)
 
 
 @cli.command()
@@ -1644,6 +1667,7 @@ def worker(ctx: click.Context, session: str, factory_url: str | None, types: str
     """
     session = _effective_session(ctx, session)
     _warn_if_send_rate_off()  # #50: loud when the global send cap is off
+    _announce_tracing()  # #168: status + fail-fast, like every LLM command
     if not factory_url:
         raise click.ClickException(
             "--factory-url is required (or set TG_FACTORY_URL)."
@@ -1684,7 +1708,7 @@ def worker(ctx: click.Context, session: str, factory_url: str | None, types: str
         finally:
             await client.disconnect()
 
-    _run_interruptible(_do(), session=session)
+    _run_interruptible(_do(), session=session, flush_traces=True)
 
 
 @cli.command()
@@ -1702,6 +1726,7 @@ def suggest(ctx: click.Context, dialog_id: int, do_send: bool, do_learn: bool, s
     --learn (re)builds the style profile from this dialog's history.
     """
     session = _effective_session(ctx, session)
+    _announce_tracing()  # #168: status + fail-fast, like every LLM command
 
     async def _do():
         client = make_client(session_name=session)
@@ -1753,6 +1778,7 @@ def suggest_nudges(ctx: click.Context, after_hours: float, session: str) -> None
     import time
 
     session = _effective_session(ctx, session)
+    _announce_tracing()  # #168: status + fail-fast, like every LLM command
 
     async def _do():
         client = make_client(session_name=session)
@@ -1810,6 +1836,7 @@ def ghostwrite(ctx: click.Context, session: str, enforce: bool) -> None:
     from tg_messenger.agent.suggest import register_suggest_migrations
     session = _effective_session(ctx, session)
     _warn_if_send_rate_off()  # #50: loud when the global send cap is off
+    _announce_tracing()  # #168: status + fail-fast, like every LLM command
 
     async def _do():
         client = make_client(session_name=session)
@@ -1840,7 +1867,7 @@ def ghostwrite(ctx: click.Context, session: str, enforce: bool) -> None:
             await client.disconnect()
             await storage.close()
 
-    _run_interruptible(_do(), session=session)
+    _run_interruptible(_do(), session=session, flush_traces=True)
 
 
 @cli.group("ghostwrite-dialogs")
@@ -2068,6 +2095,7 @@ def heartbeat_run(ctx: click.Context, session: str) -> None:
     from tg_messenger.core.heartbeat import HeartbeatService, register_heartbeat_migrations
     session = _effective_session(ctx, session)
     _warn_if_send_rate_off()  # #50: loud when the global send cap is off
+    _announce_tracing()  # #168: status + fail-fast, like every LLM command
 
     async def _do():
         client = make_client(session_name=session)
@@ -2095,7 +2123,7 @@ def heartbeat_run(ctx: click.Context, session: str) -> None:
             await client.disconnect()
             await storage.close()
 
-    _run_interruptible(_do(), session=session)
+    _run_interruptible(_do(), session=session, flush_traces=True)
 
 
 @cli.group()
@@ -2199,25 +2227,29 @@ def serve(ctx: click.Context, host: str, port: int, session: str, insecure: bool
         logger.warning("serving on %s without TG_WEB_PASS (--insecure) — anyone can connect", host)
 
     session = _effective_session(ctx, session)
+    _announce_tracing()  # #168: status + fail-fast (the web app traces the translator/suggester)
     client = make_client(session_name=session)
     suggester = make_optional_suggester(client, session=session)
     translator, outbound, store, _storage = make_translation_deps(client, session=session)
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here
     click.echo(f"Serving on http://{host}:{port} — Ctrl+C to stop.")
-    uvicorn.run(
-        build_app(
-            client=client,
-            session_name=session,
-            suggester=suggester,
-            web_pass=web_pass,
-            store=store,
-            translator=translator,
-            outbound=outbound,
-        ),
-        host=host,
-        port=port,
-        log_config=None,
-    )
+    try:
+        uvicorn.run(
+            build_app(
+                client=client,
+                session_name=session,
+                suggester=suggester,
+                web_pass=web_pass,
+                store=store,
+                translator=translator,
+                outbound=outbound,
+            ),
+            host=host,
+            port=port,
+            log_config=None,
+        )
+    finally:
+        flush_tracers()  # #168: drain buffered LangSmith traces when the server stops
 
 
 @cli.command()
@@ -2237,6 +2269,11 @@ def tui(ctx: click.Context, session: str) -> None:
     ctx.obj["_log_kwargs"] = log_kwargs
     setup_logging(profile=ctx.obj.get("profile"), **log_kwargs)
 
+    # #168: status + fail-fast (the TUI traces the suggester/translator). The status goes
+    # to the file log, NOT click.echo — a console line corrupts the Textual alt-screen; the
+    # no-key fail-fast still surfaces because it raises before the UI starts.
+    _announce_tracing(echo=logger.info)
+
     # #52 point 2: when no profile is fixed up front and >1 exist, defer selection to the
     # in-app ProfileScreen instead of the CLI menu — pass profiles + a deps_factory that
     # builds the whole dependency set (and re-inits per-profile logging) for the pick.
@@ -2244,36 +2281,39 @@ def tui(ctx: click.Context, session: str) -> None:
     explicit_session = (
         ctx.get_parameter_source("session") == ParameterSource.COMMANDLINE
     )
-    if explicit_profile:
-        resolved = explicit_profile
-    elif explicit_session:
-        resolved = session
-    else:
-        profiles = _session_store().list_profiles()
-        if len(profiles) <= 1:
-            resolved = profiles[0] if profiles else session
-        elif not _is_interactive():
-            raise click.ClickException(
-                f"multiple profiles ({', '.join(profiles)}) — pass --profile NAME"
-            )
+    try:
+        if explicit_profile:
+            resolved = explicit_profile
+        elif explicit_session:
+            resolved = session
         else:
-            # >1 profiles + interactive tty → let the TUI's ProfileScreen pick
-            MessengerTUI(
-                profiles=profiles,
-                deps_factory=lambda p: make_tui_deps(p, log_kwargs=log_kwargs),
-            ).run()
-            return
+            profiles = _session_store().list_profiles()
+            if len(profiles) <= 1:
+                resolved = profiles[0] if profiles else session
+            elif not _is_interactive():
+                raise click.ClickException(
+                    f"multiple profiles ({', '.join(profiles)}) — pass --profile NAME"
+                )
+            else:
+                # >1 profiles + interactive tty → let the TUI's ProfileScreen pick
+                MessengerTUI(
+                    profiles=profiles,
+                    deps_factory=lambda p: make_tui_deps(p, log_kwargs=log_kwargs),
+                ).run()
+                return
 
-    deps = make_tui_deps(resolved, log_kwargs=log_kwargs)
-    MessengerTUI(
-        client=deps.client,
-        session_name=deps.session_name,
-        suggester=deps.suggester,
-        store=deps.store,
-        translator=deps.translator,
-        outbound=deps.outbound,
-        auto_translate=deps.auto_translate,
-    ).run()
+        deps = make_tui_deps(resolved, log_kwargs=log_kwargs)
+        MessengerTUI(
+            client=deps.client,
+            session_name=deps.session_name,
+            suggester=deps.suggester,
+            store=deps.store,
+            translator=deps.translator,
+            outbound=deps.outbound,
+            auto_translate=deps.auto_translate,
+        ).run()
+    finally:
+        flush_tracers()  # #168: drain buffered LangSmith traces when the TUI exits
 
 
 if __name__ == "__main__":
