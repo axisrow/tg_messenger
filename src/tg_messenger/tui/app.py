@@ -1271,6 +1271,12 @@ class AccountsScreen(ModalScreen[object]):
         "#accounts-box { width: 60%; max-width: 64; height: auto; max-height: 80%; "
         "padding: 1 2; border: round $primary; background: $surface; } "
         "#profiles-section { height: auto; } "
+        # ListView defaults to height: 1fr; #accounts-box is a VerticalScroll (a scroll VIEWPORT),
+        # which hands a 1fr child the full viewport height (= the 80% cap) even with one profile —
+        # so the modal ballooned to 80% of the screen when no translate/suggest cards sized it.
+        # height: auto sizes the list to its content; overflow is the box's job (its max-height: 80%
+        # is the single scroll region), so no separate per-list cap is needed.
+        "#accounts { height: auto; } "
         "#translate-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
         "#translate-section RadioSet { height: auto; } "
         "#suggest-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "

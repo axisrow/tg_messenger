@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.css.scalar import Unit
 from textual.widgets import Footer, Input, Label, ListView, LoadingIndicator, Static, Tabs
 
@@ -4738,6 +4738,113 @@ async def test_tui_settings_hides_suggest_section_without_suggester():
         app.push_screen(screen)
         await pilot.pause()
         assert not screen.query("#suggest-section")
+
+
+async def test_tui_settings_box_is_compact_with_one_profile():
+    # Regression (screenshot 2026-06-17): with ONLY the profiles card (no [agent] extra → no
+    # translate/suggest cards) a single profile blew the modal up to ~80% of the screen — the
+    # inner ListView (default height: 1fr) ballooned to the box's max-height because #accounts-box
+    # is a VerticalScroll viewport. height: auto on #accounts makes the box hug its content.
+    store = FakeSessionStore(["default"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="default", session_store=store)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="default", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        box = screen.query_one("#accounts-box").region
+        # the whole modal stays well under the 80% cap — a single-profile card is small content
+        assert box.height < int(app.size.height * 0.5), (
+            f"settings box ballooned to {box.height} rows for one profile"
+        )
+
+
+async def test_tui_settings_box_scrolls_when_many_profiles():
+    # the flip side of the compact fix: many profiles must overflow the box's max-height: 80% and
+    # scroll WITHIN the #accounts-box VerticalScroll, not grow the modal unboundedly. (height: auto
+    # on #accounts hands overflow to the box — its single scroll region, no separate per-list cap.)
+    names = [f"profile{i:02d}" for i in range(40)]
+    store = FakeSessionStore(names)
+    app = MessengerTUI(client=TuiStubClient(), session_name="profile00", session_store=store)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="profile00", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        box = screen.query_one("#accounts-box", VerticalScroll)
+        # capped at max-height: 80% (= 32 rows here) → 40 profiles overflow → the box scrolls
+        assert box.region.height <= int(app.size.height * 0.8)
+        assert box.max_scroll_y > 0, "overflowing account list is not scrollable"
+
+
+async def test_tui_settings_sections_are_sized_and_do_not_overlap():
+    # #163/#165 UI/UX regression guard: with all three cards wired the modal must render
+    # every section with a real (>0) height, stacked top-to-bottom with no overlap, and the
+    # whole stack must stay inside the capped, scrollable #accounts-box (height: auto,
+    # max-height: 80%). A zero-height or overlapping section is the regression we watch for.
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": ["ja"]})
+    suggester = StubSuggesterTUI({"enabled": True, "history": 25, "model": "openai:gpt-4o"})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store,
+            translator=translator, suggester=suggester,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.pause()
+
+        box = screen.query_one("#accounts-box").region
+        profiles = screen.query_one("#profiles-section").region
+        translate = screen.query_one("#translate-section").region
+        suggest = screen.query_one("#suggest-section").region
+
+        # 1. the modal is width-capped and centered (not full-screen)
+        assert 0 < box.x and box.width < app.size.width
+        # 2. the box honours max-height: 80% (capped, not ballooned to full height)
+        assert box.height <= int(app.size.height * 0.8)
+        # 3. every section has a real height — none collapsed to 0 rows
+        for name, r in (("profiles", profiles), ("translate", translate), ("suggest", suggest)):
+            assert r.height > 0, f"{name} section collapsed to height {r.height}"
+        # 4. sections stack top→bottom in DOM order with no vertical overlap
+        assert profiles.bottom <= translate.y, "profiles overlaps translate"
+        assert translate.bottom <= suggest.y, "translate overlaps suggest"
+        # 5. the non-adjacent pair doesn't overlap either (the first/last section don't bleed
+        #    across the middle one — the one check step 4's adjacent bounds don't already cover)
+        assert not _regions_overlap(profiles, suggest)
+
+
+async def test_tui_settings_suggest_section_reachable_in_small_terminal():
+    # #153/#163: in a SHORT terminal the three stacked cards exceed the box's max-height,
+    # so #accounts-box (a VerticalScroll) must be scrollable and the suggester section
+    # must be reachable — the regression was the suggester falling off the bottom unreachably.
+    store = FakeSessionStore(["alice"])
+    translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": ["ja"]})
+    suggester = StubSuggesterTUI({"enabled": True, "history": 25, "model": "openai:gpt-4o"})
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test(size=(80, 18)) as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(
+            profiles=store.list_profiles(), active="alice", store=store,
+            translator=translator, suggester=suggester,
+        )
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.pause()
+
+        box = screen.query_one("#accounts-box", VerticalScroll)
+        # the stacked content exceeds the capped box → the container is scrollable
+        assert box.max_scroll_y > 0, "cramped settings box is not scrollable"
+        # the suggester section is in the DOM (not dropped) and can be scrolled into view
+        suggest = screen.query_one("#suggest-section")
+        assert suggest.region.height > 0
+        box.scroll_end(animate=False)
+        await pilot.pause()
+        await pilot.pause()
+        # after scrolling to the bottom, the suggester section overlaps the box viewport
+        assert _regions_overlap(suggest.region, box.region), "suggester not reachable by scroll"
 
 
 async def test_tui_settings_saves_suggest_fields():
