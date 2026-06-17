@@ -2821,7 +2821,7 @@ async def test_tui_switching_dialogs_clears_pending_suggestion():
         await pilot.pause()
         app._pending_suggestion = "draft for Ann"
         app._pending_suggestion_dialog = 7
-        app.query_one("#suggestion", Static).update("Suggest: draft for Ann")
+        app._set_suggestion_strip("Suggest: draft for Ann")  # #170: real show path
         lv = app.query_one("#dialogs", ListView)
         lv.index = 1
         lv.focus()
@@ -2830,7 +2830,11 @@ async def test_tui_switching_dialogs_clears_pending_suggestion():
 
         assert app._pending_suggestion is None
         assert app._pending_suggestion_dialog is None  # #158: dialog scope cleared too
-        assert str(app.query_one("#suggestion", Static).render()) == ""
+        strip = app.query_one("#suggestion", Static)
+        assert str(strip.render()) == ""
+        # #170: the strip is now bordered, so an EMPTY strip must be hidden — else its empty border
+        # floats above the composer.
+        assert strip.display is False
 
 
 async def test_tui_suggestion_line_not_covered_by_composer():
@@ -2839,7 +2843,8 @@ async def test_tui_suggestion_line_not_covered_by_composer():
     app = MessengerTUI(client=TwoDmClient())
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        app.query_one("#suggestion", Static).update("💡 Tab: draft")  # give it a line to render
+        # #170: go through the real show path (the strip starts display:none) so it renders
+        app._set_suggestion_strip("💡 Tab: draft")
         await pilot.pause()
         sug = app.query_one("#suggestion", Static)
         comp = app.query_one("#composer", Input)
@@ -2953,7 +2958,7 @@ async def test_tui_tab_accepts_pending_suggestion_not_focus():
         await pilot.pause()
         app._current = 7
         app._pending_suggestion = "draft reply"
-        app.query_one("#suggestion", Static).update("💡 Tab: draft reply")
+        app._set_suggestion_strip("💡 Tab: draft reply")  # #170: real show path
         app.query_one("#composer", Input).focus()
         await pilot.press("tab")
         await pilot.pause()
@@ -5196,6 +5201,53 @@ async def test_tui_suggest_hint_renders_with_suggester():
         rendered = str(app.query_one("#suggestion", Static).render())
         assert rendered == f"{SUGGEST_PREFIX}Привет! Как дела?"
         assert app._pending_suggestion == "Привет! Как дела?"
+        # #170: a draft is non-empty → the strip is shown.
+        assert app.query_one("#suggestion", Static).display is True
+
+
+async def test_tui_multiline_suggestion_renders_as_one_framed_block():
+    # #170: a multi-line draft must read as ONE bordered block, not N prefix-less "bubbles".
+    # We keep the newlines (the user chose the framed look) but verify the strip is bordered and
+    # holds the full draft so it can never degrade back to stacked, unframed rows.
+    from tg_messenger.tui.app import SUGGEST_PREFIX
+
+    draft = "line one\nline two\nline three"
+
+    class MultiLineSuggester:
+        async def suggest(self, dialog_id):
+            return draft
+
+    app = MessengerTUI(client=TuiStubClient(), suggester=MultiLineSuggester())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7  # Ann is a DM (kind="dm")
+        app._maybe_suggest(7)
+        await _pause_until(
+            pilot, lambda: SUGGEST_PREFIX in str(app.query_one("#suggestion", Static).render())
+        )
+        strip = app.query_one("#suggestion", Static)
+        rendered = str(strip.render())
+        # the full multi-line draft is preserved (all three lines present)
+        assert rendered == f"{SUGGEST_PREFIX}{draft}"
+        assert "line two" in rendered and "line three" in rendered
+        # shown, and bordered so the multi-row hint is one framed block (not N bare bubbles)
+        assert strip.display is True
+        assert strip.styles.border.top[0] != ""
+
+
+async def test_tui_suggestion_strip_hidden_at_startup():
+    # #170 (review): the strip is bordered, so at FRESH startup — before any dialog is opened and
+    # before _set_suggestion_strip ever runs — it must already be hidden (display: none in CSS).
+    # Otherwise the empty border floats above the composer from launch, the exact regression the
+    # toggle exists to prevent (a bordered empty Static does NOT collapse to 0 rows on its own).
+    app = MessengerTUI(client=TuiStubClient(), suggester=None)
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        strip = app.query_one("#suggestion", Static)
+        # no dialog opened yet → still empty and hidden
+        assert app._current is None
+        assert str(strip.render()) == ""
+        assert strip.display is False
 
 
 async def test_tui_suggest_strip_empty_without_suggester():
