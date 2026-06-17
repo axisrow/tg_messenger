@@ -1560,9 +1560,10 @@ class MessengerTUI(App):
         border: round $accent;
     }
     /* #170: bordered so a multi-line draft reads as ONE framed block, not N prefix-less rows
-       (only the first line carries the 💡 Tab: prefix). Hidden when empty via _set_suggestion_strip
-       so the border doesn't float above the composer. */
-    #suggestion { color: $text-muted; height: auto; border: round $panel; padding: 0 1; }
+       (only the first line carries the 💡 Tab: prefix). Starts hidden (display: none) and
+       _set_suggestion_strip flips it on only for non-empty text — else the empty border floats
+       above the composer from launch until the first dialog open (caught in review). */
+    #suggestion { color: $text-muted; height: auto; border: round $panel; padding: 0 1; display: none; }
     #composer { dock: bottom; }
     /* #116: shared modal card — a centered, bordered, width-capped box (was full-width, top-left,
        unframed). Centering (align: center middle) lives on each ModalScreen's DEFAULT_CSS so it is
