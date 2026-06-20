@@ -283,6 +283,31 @@ async def test_invalidate_if_during_fetch_of_not_yet_stored_key():
     assert c.get(key, sentinel) is sentinel  # not cached -> re-fetch next time
 
 
+async def test_invalidate_all_during_first_fetch_of_new_key_is_not_re_cached():
+    # wipe-all (invalidate(None)) racing the FIRST-EVER fetch of a key (no _epochs entry yet,
+    # present only in _locks): the result must NOT be cached, mirroring the per-key path. This
+    # is the production DM/small-group deletion path (_on_deleted wipe-all without chat_id).
+    t = {"now": 0.0}
+    c = TTLCache(ttl=10.0, clock=_clock(t))
+    started = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def fetch():
+        started.set()
+        await proceed.wait()
+        return "fetched-value"
+
+    async def racer():
+        await started.wait()
+        c.invalidate(None)  # wipe-all WHILE the brand-new key's first fetch is in flight
+        proceed.set()
+
+    result, _ = await asyncio.gather(c.get_or_fetch("brand-new-key", fetch), racer())
+    assert result == "fetched-value"  # caller still gets the freshly-fetched value
+    sentinel = object()
+    assert c.get("brand-new-key", sentinel) is sentinel  # NOT cached -> miss
+
+
 async def test_invalidate_of_other_key_during_fetch_still_caches():
     # per-key epoch (not global): invalidating a DIFFERENT key mid-fetch must NOT over-skip —
     # the in-flight key's value is cached normally. This fails under a global-epoch impl.

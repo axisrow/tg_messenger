@@ -100,9 +100,10 @@ class TTLCache(Generic[K, V]):
         in-flight fetch defeats the post-fetch ``set()`` (#125-A4).
         """
         if key is None:
-            # every in-flight fetch (for ANY key) is now stale
-            for k in list(self._epochs):
-                self._epochs[k] += 1
+            # every in-flight fetch (for ANY key) is now stale — including a key present only
+            # as a not-yet-stored fetch (in _locks, no _epochs entry yet), mirroring invalidate_if.
+            for k in set(self._epochs) | set(self._locks):
+                self._bump_epoch(k)
             self._store.clear()
         else:
             self._bump_epoch(key)

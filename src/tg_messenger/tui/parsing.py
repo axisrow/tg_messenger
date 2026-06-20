@@ -72,6 +72,9 @@ def _strip_first_token(s: str) -> str:
     """Return ``s`` with its first shlex token (quoted or not) removed."""
     lexer = shlex.shlex(s, posix=True)
     lexer.whitespace_split = True
+    # '#' is a legitimate filename char — disable commenters so the tail (the caption) survives,
+    # matching the commenter-free shlex.split() pass used for the path in parse_media_command.
+    lexer.commenters = ""
     try:
         lexer.get_token()  # consume the first token
     except ValueError:
