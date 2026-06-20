@@ -38,6 +38,7 @@ from tg_messenger.tui.bubbles import (  # noqa: F401
     _wrap_bubble,
 )
 from tg_messenger.tui.format import (  # noqa: F401
+    _WIDTH_AMBIGUOUS_ZERO_WIDTH,
     _message_author_line,
     _message_body,
     _split_id_prefix,
@@ -69,7 +70,6 @@ from tg_messenger.tui.settings import (  # noqa: F401
     ProfileListCard,
     SuggestSettingsCard,
     TranslateSettingsCard,
-    _make_real_client,
 )
 from tg_messenger.tui.widgets import (  # noqa: F401
     ComposerInput,
@@ -86,6 +86,19 @@ SUGGEST_PREFIX = "💡 Tab: "
 # #158: shown in the suggestion strip while an explicit Ctrl+G LLM call is in flight (~seconds),
 # so the user sees the suggester is working instead of "nothing happening"
 SUGGEST_THINKING = "⏳ Суфлёр думает…"
+
+
+def _make_real_client(session_name: str):
+    """Default real-client factory for MessengerTUI and AccountsScreen, and a test seam.
+
+    #178: this is the ONE canonical binding — both ``MessengerTUI`` (here) and ``AccountsScreen``
+    (which resolves it lazily off this module in its ``__init__``) read it from
+    ``tg_messenger.tui.app``, so ``monkeypatch.setattr(tui_app, "_make_real_client", ...)`` reaches
+    every default factory exactly as it did in the pre-split monolith. ``settings`` re-exports this.
+    """
+    from tg_messenger.core.client import client_from_env
+
+    return client_from_env(session_name=session_name)
 
 
 @dataclass

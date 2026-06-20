@@ -31,9 +31,15 @@ DEFAULT_SUGGEST_HISTORY = 30
 
 
 def _make_real_client(session_name: str):
-    from tg_messenger.core.client import client_from_env
+    """Back-compat shim — the canonical factory lives in ``tg_messenger.tui.app`` (#178).
 
-    return client_from_env(session_name=session_name)
+    Resolved lazily off the ``app`` module so a ``monkeypatch.setattr(tui_app, "_make_real_client",
+    ...)`` is honored here too (and so importing this module never imports ``app`` at load time —
+    that would be a cycle). ``AccountsScreen`` resolves its default through the same path.
+    """
+    from tg_messenger.tui import app as _app
+
+    return _app._make_real_client(session_name)
 
 
 class AccountItem(ListItem):
@@ -449,8 +455,15 @@ class AccountsScreen(ModalScreen[object]):
         self._profiles = list(profiles)
         self._active = sanitize_profile_name(active)
         self._store = store
-        # test seams: build the new-profile client / skip the network login flow
-        self._account_client_factory = account_client_factory or _make_real_client
+        # test seams: build the new-profile client / skip the network login flow.
+        # #178: resolve the default off the `app` module at call time (not the module-local name),
+        # so monkeypatch.setattr(tui_app, "_make_real_client", ...) reaches this default exactly as
+        # it did in the pre-split monolith — the canonical binding lives in tg_messenger.tui.app.
+        if account_client_factory is None:
+            from tg_messenger.tui import app as _app
+
+            account_client_factory = _app._make_real_client
+        self._account_client_factory = account_client_factory
         self._login_session = login_session
         # None means the [agent] extra / model isn't configured — the section's card is then hidden.
         self._translator = translator
