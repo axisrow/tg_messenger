@@ -14,10 +14,8 @@ import logging
 import os
 import secrets
 import tempfile
-import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from hashlib import sha256
 from html import escape
 from pathlib import Path
 
@@ -36,13 +34,40 @@ from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendC
 from tg_messenger.core.auth import (
     LoginError,
     LoginSession,
-    delivery_hint,
     session_store_from_env,
 )
 from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
 from tg_messenger.core.flood import HandledFloodWaitError
-from tg_messenger.core.models import format_author
 from tg_messenger.core.search import filter_dialogs
+
+# #181: the cheap layer (cookies / HTML renderers / sent-state) moved to leaf modules; re-export
+# so the routes (closures inside build_app) keep resolving these names as module globals, and so
+# `from tg_messenger.web.app import _dialog_li, _sign_cookie, ...` (tests/back-compat) still works.
+from tg_messenger.web.cookies import (  # noqa: F401
+    _PUBLIC_PATHS,
+    _WRONG_PASSWORD_DELAY,
+    COOKIE_MAX_AGE,
+    COOKIE_NAME,
+    _login_delay,
+    _sign_cookie,
+    _valid_cookie,
+)
+from tg_messenger.web.render import (  # noqa: F401
+    _dialog_li,
+    _error_response,
+    _message_div,
+    _profile_li,
+    _tg_login_code_fragment,
+    _tg_login_password_fragment,
+    _tg_login_phone_fragment,
+    _wants_html,
+)
+from tg_messenger.web.state import (  # noqa: F401
+    _bounded_client_id,
+    _remember_sent,
+    _remember_sent_reaction,
+    _sent_bucket,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,73 +82,11 @@ OUTBOUND_TIMEOUT_SECONDS = 20
 # flight, excess live translations are skipped (the raw frame is still delivered).
 MAX_INFLIGHT_TRANSLATIONS = 4
 
-# --- web authorization (#24) -------------------------------------------------
-COOKIE_NAME = "tg_session"
-COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 days
-# paths reachable without a valid cookie (the login wizard itself)
-_PUBLIC_PATHS = frozenset({"/login", "/logout"})
-# wrong-password penalty; injected so tests monkeypatch it to a no-op (no real sleep)
-_WRONG_PASSWORD_DELAY = 1.0
-
-
-async def _login_delay(seconds: float) -> None:
-    """Sleep after a failed login. Tests monkeypatch this to a no-op."""
-    await asyncio.sleep(seconds)
-
-
-def _sign_cookie(key: bytes, *, expiry: int | None = None) -> str:
-    """Build a signed cookie value ``"{expiry}:{hmac_hex}"``.
-
-    The HMAC-SHA256 (per-process random ``key``) is taken over the expiry, so a
-    client cannot forge or extend a cookie without the key.
-    """
-    if expiry is None:
-        expiry = int(time.time()) + COOKIE_MAX_AGE
-    mac = hmac.new(key, str(expiry).encode("ascii"), sha256).hexdigest()
-    return f"{expiry}:{mac}"
-
-
-def _valid_cookie(key: bytes, value: str | None) -> bool:
-    """Constant-time validate a cookie: good signature AND not expired."""
-    if not value or ":" not in value:
-        return False
-    expiry_str, _, mac = value.partition(":")
-    try:
-        expiry = int(expiry_str)
-    except ValueError:
-        return False
-    expected = hmac.new(key, str(expiry).encode("ascii"), sha256).hexdigest()
-    if not hmac.compare_digest(mac, expected):
-        return False
-    return expiry > int(time.time())
-
-
-def _wants_html(request: Request) -> bool:
-    return "text/html" in request.headers.get("accept", "")
-
 
 def _make_real_client(session_name: str):
     from tg_messenger.core.client import client_from_env
 
     return client_from_env(session_name=session_name)
-
-
-def _dialog_li(d) -> str:
-    uname = f" @{escape(d.username)}" if d.username else ""
-    unread = f' <span class="unread">{d.unread}</span>' if d.unread else ""
-    # data-can-send drives the composer enable/disable on the client (zero round-trip):
-    # chat.html reads li.dataset.canSend when a dialog opens
-    can_send = "1" if getattr(d, "can_send", True) else "0"
-    # data-dialog / data-title are the exact, unparsed id+title for the cross-dialog reaction
-    # toast (#97): the client matches on data-dialog and reads data-title instead of slicing the
-    # rendered <li> text, so a title containing " @" or trailing digits can no longer be
-    # over-trimmed (Codex review of #103).
-    return (
-        f'<li hx-get="/dialogs/{d.id}/messages" hx-target="#messages" '
-        f'data-dialog="{d.id}" data-kind="{d.kind}" data-can-send="{can_send}" '
-        f'data-title="{escape(d.title)}">'
-        f"{d.id} — {escape(d.title)}{uname}{unread}</li>"
-    )
 
 
 def _session_store():
@@ -156,46 +119,6 @@ def _max_upload_mb() -> int:
                        raw, DEFAULT_MAX_UPLOAD_MB)
         return DEFAULT_MAX_UPLOAD_MB
     return value
-
-
-def _profile_li(name: str, *, active: bool) -> str:
-    cls = ' class="active"' if active else ""
-    marker = " (active)" if active else ""
-    return f'<li{cls} data-profile="{escape(name)}">{escape(name)}{marker}</li>'
-
-
-def _message_div(m, *, show_author: bool = False) -> str:
-    cls = "out" if m.out else "in"
-    body = escape(m.text) if m.text else "&lt;media&gt;"
-    body = f"[{m.id}] {body}"
-    # #108: author line above the text, only in groups/supergroups for incoming messages
-    # (the route decides via dialog kind + out). Escaped — author fields are user-controlled.
-    author = f'<div class="author">{escape(format_author(m))}</div>' if show_author else ""
-    translation = ""
-    if getattr(m, "translated_text", None):
-        translation = f'<div class="translation">↳ {escape(m.translated_text)}</div>'
-    # #48: a reply control referencing this message id; chat.html wires it to the composer
-    reply_btn = (
-        f'<button type="button" class="reply-btn" data-reply="{m.id}" '
-        f'title="Reply">↩</button>'
-    )
-    # #86: a per-message reaction trigger; chat.html toggles a small preset palette under it.
-    react_btn = (
-        f'<button type="button" class="react-btn" data-react="{m.id}" '
-        f'title="React">🙂</button>'
-    )
-    # #95: stamp the bubble's own dialog id so a per-message action (react/reply) targets
-    # the source dialog, not the global #dialog_id — which updates synchronously on a switch
-    # while these bubbles are still briefly live in the DOM (HTMX swaps #messages async).
-    return (
-        f'<div class="msg {cls}" data-id="{m.id}" data-dialog="{m.dialog_id}">'
-        f"{author}{body}{reply_btn}{react_btn}{translation}</div>"
-    )
-
-
-def _error_response(text: str, status_code: int) -> HTMLResponse:
-    """The one escaped error-fragment shape every route returns."""
-    return HTMLResponse(f'<div class="error">{escape(text)}</div>', status_code=status_code)
 
 
 def _same_origin_error(request: Request) -> HTMLResponse | None:
@@ -238,48 +161,8 @@ def _same_origin_json_error(request: Request) -> JSONResponse | None:
     return None
 
 
-def _sent_bucket(sent_ids_by_client: OrderedDict, client_id: str) -> OrderedDict:
-    """Return the bounded sent-message set for one browser client."""
-    client_id = _bounded_client_id(client_id)
-    bucket = sent_ids_by_client.get(client_id)
-    if bucket is None:
-        bucket = OrderedDict()
-        sent_ids_by_client[client_id] = bucket
-    sent_ids_by_client.move_to_end(client_id)
-    while len(sent_ids_by_client) > 100:
-        sent_ids_by_client.popitem(last=False)
-    return bucket
-
-
-def _bounded_client_id(client_id: str) -> str:
-    return client_id[:80]
-
-
 # #73: the outbound token/nonce lifecycle moved into OutboundSendCoordinator (agent
 # layer, UI-agnostic) — the web routes no longer keep local nonce helpers.
-
-
-def _remember_sent(sent_ids: OrderedDict, dialog_id: int, message_id: int) -> None:
-    """Record a sent message key so its outgoing echo isn't re-streamed."""
-    key = (dialog_id, message_id)
-    sent_ids[key] = True
-    sent_ids.move_to_end(key)
-    while len(sent_ids) > 200:  # bounded, like the core caches
-        sent_ids.popitem(last=False)
-
-
-def _remember_sent_reaction(
-    sent_reactions: OrderedDict,
-    dialog_id: int,
-    message_id: int,
-    emoticon: str | None,
-) -> None:
-    """Record a sent reaction key so its live echo isn't re-streamed."""
-    key = (dialog_id, message_id, emoticon)
-    sent_reactions[key] = True
-    sent_reactions.move_to_end(key)
-    while len(sent_reactions) > 200:  # bounded, like the core caches
-        sent_reactions.popitem(last=False)
 
 
 async def sse_event_stream(
@@ -405,82 +288,6 @@ async def sse_event_stream(
     finally:
         for task in pending:
             task.cancel()
-
-
-def _tg_login_phone_fragment(*, error: str) -> str:
-    """HTMX fragment: re-render the phone step with an error (e.g. invalid number)."""
-    return (
-        '<div id="card">'
-        "<h1>Вход в Telegram</h1>"
-        f'<div class="error">{escape(error)}</div>'
-        '<form hx-post="/tg-login/phone" hx-target="#card" hx-swap="outerHTML">'
-        '<label for="phone">Phone</label>'
-        '<input id="phone" type="tel" name="phone" autofocus>'
-        '<button type="submit">Отправить код</button>'
-        "</form>"
-        "</div>"
-    )
-
-
-def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
-    """HTMX fragment: the code-entry step of the /tg-login wizard."""
-    hint = escape(delivery_hint(delivery)) if delivery is not None else ""
-    err = f'<div class="error">{escape(error)}</div>' if error else ""
-    # #49: if Telegram told us when a resend is allowed, disable the button and count
-    # down — spamming resend is a flood risk on the number. No timeout → active as before.
-    timeout = getattr(delivery, "timeout", None) if delivery is not None else None
-    if timeout and timeout > 0:
-        resend_form = (
-            '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
-            f'<button type="submit" id="resend-btn" data-timeout="{int(timeout)}" disabled>'
-            f"Отправить код повторно ({int(timeout)})</button>"
-            "</form>"
-            "<script>(function(){"
-            "var b=document.getElementById('resend-btn');"
-            "if(!b)return;var n=parseInt(b.dataset.timeout,10)||0;"
-            "var t=setInterval(function(){n-=1;"
-            "if(n<=0){clearInterval(t);b.disabled=false;"
-            "b.textContent='Отправить код повторно';}"
-            "else{b.textContent='Отправить код повторно ('+n+')';}},1000);"
-            "})();</script>"
-        )
-    else:
-        resend_form = (
-            '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
-            '<button type="submit">Отправить код повторно</button>'
-            "</form>"
-        )
-    return (
-        '<div id="card">'
-        "<h1>Введите код</h1>"
-        f'<p class="hint">{hint}</p>'
-        f"{err}"
-        '<form hx-post="/tg-login/code" hx-target="#card" hx-swap="outerHTML">'
-        '<label for="code">Code</label>'
-        '<input id="code" type="text" name="code" autofocus inputmode="numeric" '
-        'autocomplete="one-time-code">'
-        '<button type="submit">Войти</button>'
-        "</form>"
-        f"{resend_form}"
-        "</div>"
-    )
-
-
-def _tg_login_password_fragment(*, error: str | None = None) -> str:
-    """HTMX fragment: the 2FA-password step of the /tg-login wizard."""
-    err = f'<div class="error">{escape(error)}</div>' if error else ""
-    return (
-        '<div id="card">'
-        "<h1>Пароль 2FA</h1>"
-        f"{err}"
-        '<form hx-post="/tg-login/password" hx-target="#card" hx-swap="outerHTML">'
-        '<label for="password">2FA password</label>'
-        '<input id="password" type="password" name="password" autofocus '
-        'autocomplete="current-password">'
-        '<button type="submit">Войти</button>'
-        "</form>"
-        "</div>"
-    )
 
 
 async def _mark_read_best_effort(client, dialog_id: int, max_id: int) -> None:
