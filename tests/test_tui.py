@@ -315,6 +315,46 @@ def test_real_tui_client_gets_send_rate(monkeypatch):
     assert captured["send_rate_per_min"] == 20.0
 
 
+def test_accounts_screen_default_factory_honors_app_seam_patch(monkeypatch):
+    # #178 regression: after the app.py split, AccountsScreen's default account-client factory
+    # must still resolve through the documented seam `tg_messenger.tui.app._make_real_client`, so
+    # patching that one name reaches the add-account default exactly as in the pre-split monolith
+    # (a patch that did NOT reach it could hit the real Telegram client during add-account).
+    from tg_messenger.tui import app as tui_app
+
+    sentinel = object()
+    monkeypatch.setattr(tui_app, "_make_real_client", lambda name: sentinel)
+
+    screen = tui_app.AccountsScreen(profiles=[], active="default", store=object())
+
+    assert screen._account_client_factory("default") is sentinel
+
+
+def test_split_preserves_every_moved_symbol_on_the_facade():
+    # #178 regression: the split is "code movement + facade re-export, no behavior change". Every
+    # top-level name the pre-split monolith exposed on `tg_messenger.tui.app` (including private
+    # constants like `_WIDTH_AMBIGUOUS_ZERO_WIDTH`) must still be importable from the facade.
+    from tg_messenger.tui import app as tui_app
+
+    for name in (
+        "MessengerTUI",
+        "ComposeState",
+        "SUGGEST_PREFIX",
+        "SUGGEST_THINKING",
+        "ORIGINAL_SENTINEL",
+        "HELP_TEXT",
+        "REACTION_PRESETS",
+        "DEFAULT_SUGGEST_HISTORY",
+        "_WIDTH_AMBIGUOUS_ZERO_WIDTH",
+        "_make_real_client",
+        "_terminal_safe_display_text",
+        "parse_media_command",
+        "_navigable_bubbles",
+        "_focus_first_bubble_or_composer",
+    ):
+        assert hasattr(tui_app, name), f"{name} no longer importable from tg_messenger.tui.app"
+
+
 async def test_tui_mounts_and_lists_dialogs():
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
