@@ -25,6 +25,7 @@ from textual.widgets import Footer, Input, Label, ListView, LoadingIndicator, St
 
 from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
 from tg_messenger.core.auth import LoginSession, session_store_from_env
+from tg_messenger.core.cache import bounded_remember
 from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
 from tg_messenger.core.search import can_send_in
 
@@ -1027,19 +1028,11 @@ class MessengerTUI(App):
 
     def _remember_sent(self, dialog_id: int, message_id: int) -> None:
         """Record a message we sent so its listen_outgoing() echo isn't drawn twice."""
-        key = (dialog_id, message_id)
-        self._sent_ids[key] = True
-        self._sent_ids.move_to_end(key)
-        while len(self._sent_ids) > 200:  # bounded, like watch.py's caches
-            self._sent_ids.popitem(last=False)
+        bounded_remember(self._sent_ids, (dialog_id, message_id))
 
     def _remember_sent_reaction(self, dialog_id: int, message_id: int, emoticon: str | None) -> None:
         """Record a reaction we sent so its listen_reactions() echo isn't drawn twice."""
-        key = (dialog_id, message_id, emoticon)
-        self._sent_reactions[key] = True
-        self._sent_reactions.move_to_end(key)
-        while len(self._sent_reactions) > 200:  # bounded, like watch.py's caches
-            self._sent_reactions.popitem(last=False)
+        bounded_remember(self._sent_reactions, (dialog_id, message_id, emoticon))
 
     def _apply_reaction(self, dialog_id: int, message_id: int, emoticon: str | None) -> None:
         # #106: attach the reaction UNDER its target message (the translation pattern), not as

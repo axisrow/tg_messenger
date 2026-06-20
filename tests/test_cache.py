@@ -7,10 +7,11 @@ exercised with asyncio.gather + Event, never real time.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 
 import pytest
 
-from tg_messenger.core.cache import TTLCache
+from tg_messenger.core.cache import TTLCache, bounded_remember
 
 
 def _clock(t):
@@ -316,3 +317,36 @@ def test_epochs_do_not_leak_after_invalidate_and_eviction():
         c.set(i, i)  # evicts oldest beyond maxsize=2
     # epochs for evicted keys are pruned; at most the 2 live keys could carry one
     assert set(c._epochs) <= set(c._store)
+
+
+# --- #183: bounded_remember — the shared echo-suppression primitive ---
+
+
+def test_bounded_remember_marks_key_present():
+    od: OrderedDict = OrderedDict()
+    bounded_remember(od, (7, 5))
+    assert (7, 5) in od
+    assert od[(7, 5)] is True  # sentinel True, not None — so a later pop distinguishes a hit
+
+
+def test_bounded_remember_moves_existing_key_to_end():
+    od: OrderedDict = OrderedDict()
+    bounded_remember(od, "a")
+    bounded_remember(od, "b")
+    bounded_remember(od, "a")  # re-touch the older key
+    assert list(od) == ["b", "a"]  # "a" is now most-recent
+
+
+def test_bounded_remember_drops_oldest_past_cap():
+    od: OrderedDict = OrderedDict()
+    for i in range(5):
+        bounded_remember(od, i, cap=3)
+    assert list(od) == [2, 3, 4]  # oldest (0, 1) evicted, newest 3 kept in order
+
+
+def test_bounded_remember_default_cap_is_200():
+    od: OrderedDict = OrderedDict()
+    for i in range(250):
+        bounded_remember(od, i)
+    assert len(od) == 200
+    assert list(od) == list(range(50, 250))  # the 200 most-recent

@@ -20,6 +20,24 @@ V = TypeVar("V")
 
 _MISSING = object()
 
+# default cap for the UIs' echo-suppression caches (web SSE buckets, TUI _sent_ids/_sent_reactions)
+DEFAULT_REMEMBER_CAP = 200
+
+
+def bounded_remember(od: OrderedDict, key: Hashable, *, cap: int = DEFAULT_REMEMBER_CAP) -> None:
+    """Record ``key`` as a recency-ordered membership marker in a bounded ``OrderedDict``.
+
+    The shared echo-suppression primitive: the UIs track keys (a message id, or a
+    ``(dialog, message, emoticon)`` triple) they themselves sent so the ``listen_outgoing()`` /
+    ``listen_reactions()`` echo isn't rendered twice. The newest key moves to the end; once the
+    map exceeds ``cap`` the oldest entries are dropped (same pattern as ``watch.py``'s caches).
+    The value is the sentinel ``True`` so a later ``pop`` can distinguish a hit from a default.
+    """
+    od[key] = True
+    od.move_to_end(key)
+    while len(od) > cap:
+        od.popitem(last=False)
+
 
 class TTLCache(Generic[K, V]):
     def __init__(

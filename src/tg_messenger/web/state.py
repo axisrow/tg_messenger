@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
+from tg_messenger.core.cache import bounded_remember
+
 
 def _sent_bucket(sent_ids_by_client: OrderedDict, client_id: str) -> OrderedDict:
     """Return the bounded sent-message set for one browser client."""
@@ -30,11 +32,7 @@ def _bounded_client_id(client_id: str) -> str:
 
 def _remember_sent(sent_ids: OrderedDict, dialog_id: int, message_id: int) -> None:
     """Record a sent message key so its outgoing echo isn't re-streamed."""
-    key = (dialog_id, message_id)
-    sent_ids[key] = True
-    sent_ids.move_to_end(key)
-    while len(sent_ids) > 200:  # bounded, like the core caches
-        sent_ids.popitem(last=False)
+    bounded_remember(sent_ids, (dialog_id, message_id))
 
 
 def _remember_sent_reaction(
@@ -44,8 +42,4 @@ def _remember_sent_reaction(
     emoticon: str | None,
 ) -> None:
     """Record a sent reaction key so its live echo isn't re-streamed."""
-    key = (dialog_id, message_id, emoticon)
-    sent_reactions[key] = True
-    sent_reactions.move_to_end(key)
-    while len(sent_reactions) > 200:  # bounded, like the core caches
-        sent_reactions.popitem(last=False)
+    bounded_remember(sent_reactions, (dialog_id, message_id, emoticon))
