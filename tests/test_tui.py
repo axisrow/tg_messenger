@@ -105,6 +105,12 @@ def test_parse_media_path_and_caption():
     assert parse_media_command("@/path/x.jpg caption here") == ("/path/x.jpg", "caption here")
 
 
+def test_parse_media_command_caption_after_hash_path():
+    # '#' is a legitimate filename char: the caption after a '#'-containing path must survive.
+    # Both shlex passes (path via shlex.split, caption via _strip_first_token) must agree on '#'.
+    assert parse_media_command("@img#2.png hello world") == ("img#2.png", "hello world")
+
+
 def test_parse_media_non_at_is_none():
     assert parse_media_command("hello world") is None
 

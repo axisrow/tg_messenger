@@ -41,12 +41,14 @@ def _parse_at(at: str):
     """Parse ``HH:MM`` into the next future local datetime (today, or tomorrow if past)."""
     from datetime import datetime, timedelta
 
+    now = datetime.now()
     try:
         hh, mm = (int(p) for p in at.split(":", 1))
+        # .replace() raises ValueError on numeric-but-out-of-range HH:MM (e.g. 24:00, 23:60),
+        # so it stays inside the try to surface as a clean ClickException, not a raw traceback.
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
     except ValueError as exc:
         raise click.ClickException(f"--at must be HH:MM, got {at!r}") from exc
-    now = datetime.now()
-    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
     return target

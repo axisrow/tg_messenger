@@ -4,6 +4,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -1582,6 +1583,15 @@ def test_heartbeat_plan_requires_at_or_interval(hb_runner):
     result = r.invoke(cli_main.cli, ["heartbeat", "plan", "7", "--template", "x"])
     assert result.exit_code != 0
     assert "--at" in result.output or "--interval" in result.output
+
+
+@pytest.mark.parametrize("bad", ["24:00", "23:60", "25:00", "10:99"])
+def test_parse_at_out_of_range_raises_clickexception(bad):
+    # numeric-but-out-of-range HH:MM must surface as a clean ClickException (Click's standalone
+    # runner only handles those), not a raw ValueError traceback from datetime.replace(). 24:00
+    # (midnight) is a realistic input.
+    with pytest.raises(click.ClickException):
+        cli_main._parse_at(bad)
 
 
 def test_heartbeat_run_stops_on_ctrl_c(hb_runner, monkeypatch):
