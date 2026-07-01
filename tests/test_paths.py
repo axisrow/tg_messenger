@@ -8,6 +8,8 @@ attributes and the TG_HOME env — the real home dir is never read or touched.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tg_messenger.core import paths
@@ -34,6 +36,22 @@ def test_tg_home_env_wins(homes, tmp_path, monkeypatch):
     override = tmp_path / "custom-root"
     monkeypatch.setenv("TG_HOME", str(override))
     assert paths.tg_home() == override
+
+
+def test_tg_home_expands_tilde(homes, monkeypatch):
+    # TG_HOME=~/.tg (the value advertised in .env.example, loaded verbatim from a
+    # .env into os.environ) must expand ~, not create a literal ./~ tree under cwd.
+    monkeypatch.setenv("TG_HOME", "~/.tg")
+    resolved = paths.tg_home()
+    assert "~" not in str(resolved)
+    assert resolved == Path.home() / ".tg"
+
+
+def test_tg_home_expands_env_vars(homes, tmp_path, monkeypatch):
+    # $VAR-style roots are also expanded (same os.environ round-trip as ~).
+    monkeypatch.setenv("MY_ROOT", str(tmp_path))
+    monkeypatch.setenv("TG_HOME", "$MY_ROOT/tg")
+    assert paths.tg_home() == tmp_path / "tg"
 
 
 def test_legacy_fallback_only_when_default_absent(homes):
