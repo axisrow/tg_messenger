@@ -147,3 +147,32 @@ def test_default_wins_even_if_only_default_exists(homes):
     default_home, _legacy_home = homes
     default_home.mkdir()
     assert paths.tg_home() == default_home
+
+
+# --- per-process memo: a subdir created AFTER the first resolve must not flip the root ---
+
+def test_root_decision_frozen_against_later_default_creation(homes):
+    # Regression (Codex, cycle 1 of the final review): a legacy user (~/.tg_messenger
+    # present, ~/.tg absent) whose TG_LOG_DIR is under ~/.tg would have setup_logging
+    # mkdir ~/.tg at startup, BEFORE sessions/db resolve. If tg_home() re-checked live
+    # FS state it would then flip to the empty ~/.tg and hide the existing session.
+    # Freezing the decision on the first call keeps every later lookup on legacy.
+    default_home, legacy_home = homes
+    legacy_home.mkdir()
+    assert paths.tg_home() == legacy_home  # first resolve: legacy (honest state)
+    # a later subdir mkdir creates ~/.tg (as setup_logging on TG_LOG_DIR=~/.tg/logs would)
+    (default_home / "logs").mkdir(parents=True)
+    assert default_home.exists()
+    # the frozen decision must NOT flip — sessions/db stay on the legacy root
+    assert paths.tg_home() == legacy_home
+
+
+def test_reset_tg_home_cache_re_resolves(homes):
+    # the cache is per-process; reset lets a test (or a re-config) re-decide
+    default_home, legacy_home = homes
+    legacy_home.mkdir()
+    assert paths.tg_home() == legacy_home
+    default_home.mkdir()
+    paths.reset_tg_home_cache()
+    # after a reset + a now-present ~/.tg, the fresh resolve prefers the default root
+    assert paths.tg_home() == default_home

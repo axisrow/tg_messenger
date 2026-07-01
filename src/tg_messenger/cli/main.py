@@ -44,6 +44,7 @@ from tg_messenger.core.client import (
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.logsetup import log_file_path, setup_logging
 from tg_messenger.core.models import message_line
+from tg_messenger.core.paths import tg_home
 
 logger = logging.getLogger(__name__)
 CHAT_OUTBOUND_TIMEOUT_SECONDS = 20
@@ -618,6 +619,12 @@ def cli(ctx: click.Context, verbose: bool, profile: str | None) -> None:
     ctx.obj["verbose"] = verbose
     ctx.obj["profile"] = profile
     _load_dotenv()
+    # Freeze the data-root decision NOW, before setup_logging() (or any subdir) can
+    # mkdir it. A legacy user (~/.tg_messenger present, ~/.tg absent) with a
+    # TG_LOG_DIR under ~/.tg would otherwise have setup_logging create ~/.tg first,
+    # flipping every later session/db lookup off the legacy root — see tg_home()'s
+    # per-process memo. This first call resolves it from the honest on-disk state.
+    tg_home()
     # the CLI reports its own errors via click — keep its log records off stderr.
     # The final profile may still come from a menu; we remember the logging kwargs so
     # a menu-resolved profile can re-init the log file (#52, see _effective_session).

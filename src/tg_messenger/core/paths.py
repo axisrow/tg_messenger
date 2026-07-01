@@ -14,6 +14,15 @@ The narrower sub-overrides ``TG_SESSION_DIR`` (auth) and ``TG_LOG_DIR``
 same :func:`resolve_env_dir` validator (``~``/``$VAR`` expansion, absolute-path
 fail-closed) so a misconfigured sub-override can't scatter auth state under cwd
 either.
+
+The legacy-vs-default decision is **cached per process** (:func:`tg_home` memoizes
+its first result). Without that, a sub-override that creates ``~/.tg`` as a side
+effect — e.g. ``TG_LOG_DIR=~/.tg/logs`` makes ``setup_logging`` ``mkdir`` it at
+startup, *before* sessions/db are resolved — would flip a legacy user's later
+session/db lookup from ``~/.tg_messenger`` to a fresh empty ``~/.tg`` (they'd look
+logged out). Freezing the decision on first use keeps the whole-root choice stable
+regardless of which subdir gets created first. Tests reset the cache via
+:func:`reset_tg_home_cache` (an autouse conftest fixture does this per test).
 """
 
 from __future__ import annotations
@@ -23,6 +32,20 @@ from pathlib import Path
 
 LEGACY_HOME = Path.home() / ".tg_messenger"
 DEFAULT_HOME = Path.home() / ".tg"
+
+# per-process memo of the resolved root: frozen on first tg_home() call so a later
+# subdir mkdir (e.g. from a TG_LOG_DIR under ~/.tg) can't flip the legacy fallback.
+_ROOT_CACHE: Path | None = None
+
+
+def reset_tg_home_cache() -> None:
+    """Clear the memoized root so the next :func:`tg_home` re-resolves from scratch.
+
+    For tests that monkeypatch ``TG_HOME`` / ``DEFAULT_HOME`` / ``LEGACY_HOME``
+    between cases; production never needs it (the root is stable for a run).
+    """
+    global _ROOT_CACHE
+    _ROOT_CACHE = None
 
 
 def resolve_env_dir(var: str) -> Path | None:
@@ -68,10 +91,23 @@ def tg_home() -> Path:
     dir — so it fails closed with a clear error rather than silently writing
     Telegram auth state to the wrong place. A blank/whitespace-only value is
     treated as unset (falls through to the legacy/default resolution below).
+
+    The resolved root is memoized for the process (see module docstring and
+    :func:`reset_tg_home_cache`) so a subdir created after the first call can't
+    change the answer. A ``TG_HOME`` validation error is raised on every call (not
+    cached), so a misconfigured override never silently resolves to a default.
     """
+    global _ROOT_CACHE
+    if _ROOT_CACHE is not None:
+        return _ROOT_CACHE
+    # resolve_env_dir raises on a bad TG_HOME — deliberately BEFORE touching the
+    # cache, so an invalid override fails loudly on every call rather than once.
     env = resolve_env_dir("TG_HOME")
     if env is not None:
-        return env
-    if not DEFAULT_HOME.exists() and LEGACY_HOME.exists():
-        return LEGACY_HOME
-    return DEFAULT_HOME
+        root = env
+    elif not DEFAULT_HOME.exists() and LEGACY_HOME.exists():
+        root = LEGACY_HOME
+    else:
+        root = DEFAULT_HOME
+    _ROOT_CACHE = root
+    return root
