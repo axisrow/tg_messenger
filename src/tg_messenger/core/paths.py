@@ -10,7 +10,10 @@ is read live each call (and tilde/``$VAR``-expanded); ``DEFAULT_HOME`` /
 attributes (see ``test_paths.py``) rather than ``$HOME``.
 
 The narrower sub-overrides ``TG_SESSION_DIR`` (auth) and ``TG_LOG_DIR``
-(logsetup) still layer on top of whatever root this returns.
+(logsetup) still layer on top of whatever root this returns; they go through the
+same :func:`resolve_env_dir` validator (``~``/``$VAR`` expansion, absolute-path
+fail-closed) so a misconfigured sub-override can't scatter auth state under cwd
+either.
 """
 
 from __future__ import annotations
@@ -20,6 +23,35 @@ from pathlib import Path
 
 LEGACY_HOME = Path.home() / ".tg_messenger"
 DEFAULT_HOME = Path.home() / ".tg"
+
+
+def resolve_env_dir(var: str) -> Path | None:
+    """Resolve a directory-path env override (``TG_HOME``/``TG_SESSION_DIR``/``TG_LOG_DIR``).
+
+    Returns the expanded absolute :class:`Path`, or ``None`` when the var is unset
+    or blank (caller falls back to its default). Expands ``~`` and ``$VAR``, then
+    fails closed with a clear :class:`ValueError` if the result is **not absolute**
+    — a relative value (a plainly relative root, or an unset ``$VAR`` that
+    ``expandvars`` left literal like ``$UNSET/sessions``) would otherwise resolve
+    against the launch cwd and scatter sessions/logs/db (incl. Telegram auth
+    state) there instead of the home dir.
+
+    The check is deliberately just "is it absolute?", not "does it still contain a
+    ``$``?": an unresolved ``$VAR`` and a legitimate literal ``$`` in a directory
+    name are indistinguishable after expansion, so banning every ``$`` would
+    falsely reject a valid absolute path like ``/srv/u$er/.tg``. The dangerous
+    case — writing under cwd — is exactly the non-absolute one, which this catches.
+    """
+    raw = (os.environ.get(var) or "").strip()
+    if not raw:
+        return None
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    if not os.path.isabs(expanded):
+        raise ValueError(
+            f"{var} must be an absolute path (after ~/$VAR expansion); got {raw!r} "
+            f"→ {expanded!r}. Set it to an absolute directory such as ~/.tg."
+        )
+    return Path(expanded)
 
 
 def tg_home() -> Path:
@@ -37,20 +69,9 @@ def tg_home() -> Path:
     Telegram auth state to the wrong place. A blank/whitespace-only value is
     treated as unset (falls through to the legacy/default resolution below).
     """
-    env = (os.environ.get("TG_HOME") or "").strip()
-    if env:
-        # expand ~ / $VARS: TG_HOME is commonly set to "~/.tg" (incl. from a .env,
-        # which is loaded verbatim into os.environ), and Path("~/.tg") would create
-        # a literal ./~ tree under the cwd instead of the user's home.
-        expanded = os.path.expanduser(os.path.expandvars(env))
-        # expandvars leaves an undefined $VAR literal; that (or any relative value)
-        # would resolve against cwd — reject it loudly instead of writing there.
-        if "$" in expanded or not os.path.isabs(expanded):
-            raise ValueError(
-                f"TG_HOME must be an absolute path (after ~/$VAR expansion); got {env!r} "
-                f"→ {expanded!r}. Set it to an absolute directory such as ~/.tg."
-            )
-        return Path(expanded)
+    env = resolve_env_dir("TG_HOME")
+    if env is not None:
+        return env
     if not DEFAULT_HOME.exists() and LEGACY_HOME.exists():
         return LEGACY_HOME
     return DEFAULT_HOME

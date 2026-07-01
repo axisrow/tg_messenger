@@ -17,7 +17,7 @@ from telethon.tl.functions.auth import ResendCodeRequest
 
 from tg_messenger.core.flood import HandledFloodWaitError, run_with_flood_wait_retry
 from tg_messenger.core.names import sanitize_profile_name
-from tg_messenger.core.paths import tg_home
+from tg_messenger.core.paths import resolve_env_dir, tg_home
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ def __getattr__(name: str):
         return default_session_dir()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+
 # single source for the "you need to log in" UX hint, shared by all three UIs
 LOGIN_HINT = "Not logged in. Run: tg-messenger login"
 
@@ -50,9 +51,13 @@ def validate_session_string(session_string: str) -> str:
 
 def session_store_from_env() -> SessionStore:
     """SessionStore from the environment (``TG_SESSION_DIR`` dir override,
-    ``SESSION_ENCRYPTION_KEY`` at-rest encryption) — one definition for CLI/web."""
+    ``SESSION_ENCRYPTION_KEY`` at-rest encryption) — one definition for CLI/web.
+
+    ``TG_SESSION_DIR`` goes through the same ``~``/``$VAR`` expansion and
+    absolute-path fail-closed validation as ``TG_HOME`` — a relative or unset-var
+    override must not scatter session credentials under the launch cwd."""
     return SessionStore(
-        os.environ.get("TG_SESSION_DIR") or default_session_dir(),
+        resolve_env_dir("TG_SESSION_DIR") or default_session_dir(),
         encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
     )
 

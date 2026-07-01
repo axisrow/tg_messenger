@@ -77,6 +77,47 @@ def test_tg_home_blank_is_treated_as_unset(homes, monkeypatch):
     assert paths.tg_home() == default_home
 
 
+def test_tg_home_literal_dollar_in_absolute_path_is_kept(homes, monkeypatch):
+    # a legitimate absolute path with a literal '$' in a dir name (no such env var)
+    # must NOT be rejected — only an UNRESOLVED $VAR reference is. Reject-any-'$'
+    # would be a false positive (flagged by review).
+    monkeypatch.delenv("literal", raising=False)  # ensure $literal stays literal
+    monkeypatch.setenv("TG_HOME", "/tmp/tg-$literal")
+    assert paths.tg_home() == Path("/tmp/tg-$literal")
+
+
+# --- resolve_env_dir: the shared validator used by TG_HOME / TG_SESSION_DIR / TG_LOG_DIR ---
+
+def test_resolve_env_dir_unset_returns_none(monkeypatch):
+    monkeypatch.delenv("TG_SESSION_DIR", raising=False)
+    assert paths.resolve_env_dir("TG_SESSION_DIR") is None
+
+
+def test_resolve_env_dir_blank_returns_none(monkeypatch):
+    monkeypatch.setenv("TG_SESSION_DIR", "  ")
+    assert paths.resolve_env_dir("TG_SESSION_DIR") is None
+
+
+def test_resolve_env_dir_expands_tilde(monkeypatch):
+    monkeypatch.setenv("TG_SESSION_DIR", "~/sess")
+    assert paths.resolve_env_dir("TG_SESSION_DIR") == Path.home() / "sess"
+
+
+def test_resolve_env_dir_rejects_undefined_var(monkeypatch):
+    # the sub-override leak Codex flagged: TG_SESSION_DIR=$UNSET/sessions would
+    # write StringSession creds under cwd — fail closed instead.
+    monkeypatch.delenv("UNSET_ROOT", raising=False)
+    monkeypatch.setenv("TG_SESSION_DIR", "$UNSET_ROOT/sessions")
+    with pytest.raises(ValueError, match="absolute path"):
+        paths.resolve_env_dir("TG_SESSION_DIR")
+
+
+def test_resolve_env_dir_rejects_relative(monkeypatch):
+    monkeypatch.setenv("TG_LOG_DIR", "relative/logs")
+    with pytest.raises(ValueError, match="absolute path"):
+        paths.resolve_env_dir("TG_LOG_DIR")
+
+
 def test_legacy_fallback_only_when_default_absent(homes):
     # ~/.tg absent AND ~/.tg_messenger present → read the legacy root in place
     default_home, legacy_home = homes
