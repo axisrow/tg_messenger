@@ -467,6 +467,13 @@ class FakeTelethonClient:
 def _isolated_log_dir(tmp_path, monkeypatch):
     # the CLI entrypoint calls setup_logging(); tests must never write ~/.tg_messenger/logs
     monkeypatch.setenv("TG_LOG_DIR", str(tmp_path / "logs"))
+    # tg_home() memoizes the resolved root per process; reset it around every test so
+    # one test's TG_HOME / DEFAULT_HOME monkeypatch can't leak into the next via the cache
+    from tg_messenger.core.paths import reset_tg_home_cache
+
+    reset_tg_home_cache()
+    yield
+    reset_tg_home_cache()
 
 
 @pytest.fixture

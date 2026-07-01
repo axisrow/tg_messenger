@@ -17,10 +17,24 @@ from telethon.tl.functions.auth import ResendCodeRequest
 
 from tg_messenger.core.flood import HandledFloodWaitError, run_with_flood_wait_retry
 from tg_messenger.core.names import sanitize_profile_name
+from tg_messenger.core.paths import resolve_env_dir, tg_home
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SESSION_DIR = Path.home() / ".tg_messenger" / "sessions"
+
+def default_session_dir() -> Path:
+    """``<tg_home>/sessions`` — resolved lazily so ``TG_HOME``/legacy state is honored at runtime."""
+    return tg_home() / "sessions"
+
+
+def __getattr__(name: str):
+    # Back-compat: the old module-level ``DEFAULT_SESSION_DIR`` constant is now
+    # lazy. External importers still reading it get a live value (resolved now),
+    # not a stale import-time snapshot.
+    if name == "DEFAULT_SESSION_DIR":
+        return default_session_dir()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # single source for the "you need to log in" UX hint, shared by all three UIs
 LOGIN_HINT = "Not logged in. Run: tg-messenger login"
@@ -37,9 +51,13 @@ def validate_session_string(session_string: str) -> str:
 
 def session_store_from_env() -> SessionStore:
     """SessionStore from the environment (``TG_SESSION_DIR`` dir override,
-    ``SESSION_ENCRYPTION_KEY`` at-rest encryption) — one definition for CLI/web."""
+    ``SESSION_ENCRYPTION_KEY`` at-rest encryption) — one definition for CLI/web.
+
+    ``TG_SESSION_DIR`` goes through the same ``~``/``$VAR`` expansion and
+    absolute-path fail-closed validation as ``TG_HOME`` — a relative or unset-var
+    override must not scatter session credentials under the launch cwd."""
     return SessionStore(
-        os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR,
+        resolve_env_dir("TG_SESSION_DIR") or default_session_dir(),
         encryption_key=os.environ.get("SESSION_ENCRYPTION_KEY") or None,
     )
 
@@ -57,11 +75,12 @@ class SessionStore:
 
     def __init__(
         self,
-        session_dir: Path | str = DEFAULT_SESSION_DIR,
+        session_dir: Path | str | None = None,
         *,
         encryption_key: str | None = None,
     ):
-        self.session_dir = Path(session_dir)
+        # None → resolve lazily so TG_HOME/legacy state is read at call time, not import time
+        self.session_dir = Path(session_dir) if session_dir is not None else default_session_dir()
         self._encryption_key = encryption_key or None  # treat "" as no key
 
     def path_for(self, name: str) -> Path:

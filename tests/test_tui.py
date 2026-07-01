@@ -298,7 +298,8 @@ def test_real_tui_client_gets_session_encryption_key(monkeypatch, tmp_path):
     tui_app._make_real_client("default")
 
     assert captured["session_name"] == "default"
-    assert captured["session_dir"] == str(tmp_path)
+    # resolve_env_dir normalizes TG_SESSION_DIR to an (expanded, absolute) Path
+    assert str(captured["session_dir"]) == str(tmp_path)
     assert captured["encryption_key"] == "shared-secret"
 
 

@@ -2093,7 +2093,8 @@ def test_make_client_uses_tg_session_dir(monkeypatch, tmp_path):
     cli_main.make_client(session_name="work")
 
     assert captured["session_name"] == "work"
-    assert captured["session_dir"] == str(tmp_path)
+    # resolve_env_dir normalizes TG_SESSION_DIR to an (expanded, absolute) Path
+    assert str(captured["session_dir"]) == str(tmp_path)
 
 
 def test_make_translation_deps_returns_four_tuple_in_order(monkeypatch):
