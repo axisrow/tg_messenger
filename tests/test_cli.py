@@ -10,7 +10,7 @@ from click.testing import CliRunner
 
 from tests.conftest import make_sent_code
 from tg_messenger.cli import main as cli_main
-from tg_messenger.core.client import SendForbiddenError
+from tg_messenger.core.client import MissingCredentialsError, SendForbiddenError
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.models import (
     Dialog,
@@ -1820,6 +1820,30 @@ def test_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeypatch):
     # real client build (no make_client stub) so client_from_env runs the validator
     result = CliRunner().invoke(cli_main.cli, ["dialogs"])
     assert result.exit_code != 0
+    assert "my.telegram.org" in result.output
+    assert "TG_API_ID" in result.output and "TG_API_HASH" in result.output
+    assert "~/.tg/.env" in result.output
+    assert "Traceback" not in result.output
+    assert "telethon.rtfd.io" not in result.output
+
+
+def test_serve_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeypatch):
+    # #190 review fix 1: `serve` builds the client OUTSIDE _run, so an empty-creds
+    # MissingCredentialsError would escape as a raw traceback (exactly the UX this PR
+    # kills for every other command). It must surface the friendly hint instead.
+    pytest.importorskip("uvicorn")  # serve imports the web stack before building the client
+    from click.testing import CliRunner
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(tmp_path)  # no .env, no home .env → creds truly absent
+    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    # real client build (no make_client stub) so client_from_env runs the validator
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, MissingCredentialsError)  # converted, not leaked
     assert "my.telegram.org" in result.output
     assert "TG_API_ID" in result.output and "TG_API_HASH" in result.output
     assert "~/.tg/.env" in result.output
