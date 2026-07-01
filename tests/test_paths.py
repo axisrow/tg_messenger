@@ -54,6 +54,29 @@ def test_tg_home_expands_env_vars(homes, tmp_path, monkeypatch):
     assert paths.tg_home() == tmp_path / "tg"
 
 
+def test_tg_home_undefined_var_rejected(homes, monkeypatch):
+    # expandvars leaves an unset $VAR literal → a relative "$UNDEFINED/tg" under
+    # cwd. Fail closed rather than silently write auth state to the wrong place.
+    monkeypatch.delenv("UNDEFINED_ROOT", raising=False)
+    monkeypatch.setenv("TG_HOME", "$UNDEFINED_ROOT/tg")
+    with pytest.raises(ValueError, match="absolute path"):
+        paths.tg_home()
+
+
+def test_tg_home_relative_rejected(homes, monkeypatch):
+    # a plainly relative TG_HOME would resolve against cwd → rejected
+    monkeypatch.setenv("TG_HOME", "relative/tg")
+    with pytest.raises(ValueError, match="absolute path"):
+        paths.tg_home()
+
+
+def test_tg_home_blank_is_treated_as_unset(homes, monkeypatch):
+    # whitespace-only must not create a spaces-named tree; fall through to default
+    default_home, _legacy_home = homes
+    monkeypatch.setenv("TG_HOME", "   ")
+    assert paths.tg_home() == default_home
+
+
 def test_legacy_fallback_only_when_default_absent(homes):
     # ~/.tg absent AND ~/.tg_messenger present → read the legacy root in place
     default_home, legacy_home = homes

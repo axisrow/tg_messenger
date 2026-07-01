@@ -29,13 +29,28 @@ def tg_home() -> Path:
     ``~/.tg`` does not) → ``~/.tg``. Legacy is read in place, never moved: an
     existing ``~/.tg`` always wins so a partial new root can't silently pull
     from the old one.
+
+    ``TG_HOME`` is ``~``/``$VAR``-expanded and must resolve to an absolute path.
+    A misconfigured value (unset ``$VAR`` left literal, or a relative root) would
+    otherwise scatter sessions/logs/db under the launch cwd instead of the home
+    dir — so it fails closed with a clear error rather than silently writing
+    Telegram auth state to the wrong place. A blank/whitespace-only value is
+    treated as unset (falls through to the legacy/default resolution below).
     """
-    env = os.environ.get("TG_HOME")
+    env = (os.environ.get("TG_HOME") or "").strip()
     if env:
         # expand ~ / $VARS: TG_HOME is commonly set to "~/.tg" (incl. from a .env,
         # which is loaded verbatim into os.environ), and Path("~/.tg") would create
         # a literal ./~ tree under the cwd instead of the user's home.
-        return Path(os.path.expanduser(os.path.expandvars(env)))
+        expanded = os.path.expanduser(os.path.expandvars(env))
+        # expandvars leaves an undefined $VAR literal; that (or any relative value)
+        # would resolve against cwd — reject it loudly instead of writing there.
+        if "$" in expanded or not os.path.isabs(expanded):
+            raise ValueError(
+                f"TG_HOME must be an absolute path (after ~/$VAR expansion); got {env!r} "
+                f"→ {expanded!r}. Set it to an absolute directory such as ~/.tg."
+            )
+        return Path(expanded)
     if not DEFAULT_HOME.exists() and LEGACY_HOME.exists():
         return LEGACY_HOME
     return DEFAULT_HOME
