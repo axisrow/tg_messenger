@@ -998,7 +998,12 @@ def client_from_env(**kwargs) -> StandaloneTelegramClient:
     """
     # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
     kwargs.setdefault("encryption_key", os.environ.get("SESSION_ENCRYPTION_KEY") or None)
-    kwargs.setdefault("session_dir", resolve_env_dir("TG_SESSION_DIR") or default_session_dir())
+    # NOT setdefault: its 2nd arg would run even when the caller passed session_dir, and
+    # resolve_env_dir/default_session_dir have side effects — the latter freezes tg_home()'s
+    # cache and both can raise on a bad TG_SESSION_DIR/TG_HOME. Only evaluate them when the
+    # caller did NOT supply an explicit session_dir.
+    if "session_dir" not in kwargs:
+        kwargs["session_dir"] = resolve_env_dir("TG_SESSION_DIR") or default_session_dir()
     # global outgoing rate cap (#25): default 20/min; TG_SEND_RATE=0 explicitly disables.
     kwargs.setdefault("send_rate_per_min", float(os.environ.get("TG_SEND_RATE", "20") or 20))
     return StandaloneTelegramClient(

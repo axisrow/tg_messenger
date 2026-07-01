@@ -2246,3 +2246,28 @@ def test_client_from_env_uses_configured_send_rate(monkeypatch):
     client_module.client_from_env()
 
     assert captured["send_rate_per_min"] == 20.0
+
+
+def test_client_from_env_explicit_session_dir_skips_env_resolution(monkeypatch, tmp_path):
+    # An explicit session_dir must short-circuit the default: client_from_env must NOT
+    # evaluate resolve_env_dir("TG_SESSION_DIR")/default_session_dir() when the caller
+    # supplied one — otherwise a bad TG_SESSION_DIR (or bad TG_HOME) would raise even
+    # though the caller never relies on either. Both are set to invalid RELATIVE values
+    # here to prove neither is touched.
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "hash")
+    monkeypatch.setenv("TG_SESSION_DIR", "relative-bad")  # would raise if evaluated
+    monkeypatch.setenv("TG_HOME", "also-relative-bad")    # would raise via default_session_dir
+    monkeypatch.setattr(client_module, "StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    explicit = tmp_path / "my-sessions"
+    # must not raise despite both bad env values, and must use the passed dir verbatim
+    client_module.client_from_env(session_dir=explicit)
+
+    assert captured["session_dir"] == explicit
