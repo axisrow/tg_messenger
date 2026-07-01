@@ -183,7 +183,9 @@ def test_cached_root_does_not_suppress_a_later_bad_tg_home(homes, tmp_path, monk
     # cache short-circuit — a valid root cached first must NOT mask a later invalid
     # TG_HOME (the memo only freezes the no-TG_HOME fallback decision, never TG_HOME).
     monkeypatch.setenv("TG_HOME", str(tmp_path / "good-root"))
-    assert paths.tg_home() == tmp_path / "good-root"  # cached
+    # a valid TG_HOME returns via the env branch (nothing is memoized here — only
+    # the no-TG_HOME fallback is); the point is the NEXT call re-validates from scratch
+    assert paths.tg_home() == tmp_path / "good-root"
     monkeypatch.setenv("TG_HOME", "relative-bad")
     with pytest.raises(ValueError, match="absolute path"):
         paths.tg_home()
