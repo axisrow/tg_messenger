@@ -176,3 +176,24 @@ def test_reset_tg_home_cache_re_resolves(homes):
     paths.reset_tg_home_cache()
     # after a reset + a now-present ~/.tg, the fresh resolve prefers the default root
     assert paths.tg_home() == default_home
+
+
+def test_cached_root_does_not_suppress_a_later_bad_tg_home(homes, tmp_path, monkeypatch):
+    # Regression (Codex, cycle 2): TG_HOME is validated on EVERY call, before the
+    # cache short-circuit — a valid root cached first must NOT mask a later invalid
+    # TG_HOME (the memo only freezes the no-TG_HOME fallback decision, never TG_HOME).
+    monkeypatch.setenv("TG_HOME", str(tmp_path / "good-root"))
+    assert paths.tg_home() == tmp_path / "good-root"  # cached
+    monkeypatch.setenv("TG_HOME", "relative-bad")
+    with pytest.raises(ValueError, match="absolute path"):
+        paths.tg_home()
+
+
+def test_valid_tg_home_always_wins_over_frozen_fallback(homes, tmp_path, monkeypatch):
+    # freeze a fallback root (no TG_HOME) first, then set a valid TG_HOME: the
+    # explicit override must win on the next call, not the cached fallback.
+    default_home, _legacy_home = homes
+    assert paths.tg_home() == default_home  # frozen fallback
+    override = tmp_path / "explicit-root"
+    monkeypatch.setenv("TG_HOME", str(override))
+    assert paths.tg_home() == override

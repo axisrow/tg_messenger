@@ -92,22 +92,27 @@ def tg_home() -> Path:
     Telegram auth state to the wrong place. A blank/whitespace-only value is
     treated as unset (falls through to the legacy/default resolution below).
 
-    The resolved root is memoized for the process (see module docstring and
-    :func:`reset_tg_home_cache`) so a subdir created after the first call can't
-    change the answer. A ``TG_HOME`` validation error is raised on every call (not
-    cached), so a misconfigured override never silently resolves to a default.
+    Only the *fallback* decision (legacy vs default, which reads live FS state) is
+    memoized for the process — see the module docstring and
+    :func:`reset_tg_home_cache` — so a subdir created after the first call can't
+    change it. ``TG_HOME`` itself is re-read and re-validated on EVERY call (never
+    cached): an explicit override always wins over a frozen fallback, and a
+    misconfigured value fails closed with a :class:`ValueError` every time rather
+    than being masked by a previously-cached root.
     """
     global _ROOT_CACHE
-    if _ROOT_CACHE is not None:
-        return _ROOT_CACHE
-    # resolve_env_dir raises on a bad TG_HOME — deliberately BEFORE touching the
-    # cache, so an invalid override fails loudly on every call rather than once.
+    # Always evaluate TG_HOME first — BEFORE the cache short-circuit. An explicit,
+    # valid override wins on every call; an invalid one raises every call (matching
+    # the fail-closed contract); only its ABSENCE lets the memoized fallback stand.
     env = resolve_env_dir("TG_HOME")
     if env is not None:
-        root = env
-    elif not DEFAULT_HOME.exists() and LEGACY_HOME.exists():
-        root = LEGACY_HOME
+        return env
+    if _ROOT_CACHE is not None:
+        return _ROOT_CACHE
+    # No TG_HOME: freeze the legacy-vs-default choice from the honest on-disk state
+    # now, so a later subdir mkdir (e.g. TG_LOG_DIR under ~/.tg) can't flip it.
+    if not DEFAULT_HOME.exists() and LEGACY_HOME.exists():
+        _ROOT_CACHE = LEGACY_HOME
     else:
-        root = DEFAULT_HOME
-    _ROOT_CACHE = root
-    return root
+        _ROOT_CACHE = DEFAULT_HOME
+    return _ROOT_CACHE
