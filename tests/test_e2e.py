@@ -18,9 +18,12 @@ import httpx
 import pytest
 
 from tg_messenger.cli.main import _parse_dotenv
+from tg_messenger.core.auth import default_session_dir
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SESSION_FILE = Path.home() / ".tg_messenger" / "sessions" / "default.session"
+# resolve the session path the same way the app does (tg_home(): ~/.tg, or the
+# legacy ~/.tg_messenger fallback) rather than hardcoding a root
+SESSION_FILE = default_session_dir() / "default.session"
 
 DOTENV = _parse_dotenv(PROJECT_ROOT / ".env")
 

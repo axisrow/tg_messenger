@@ -7,7 +7,7 @@ Three interfaces (CLI / TUI / Web) over a shared UI-agnostic core, built on Tele
 
 - Runs standalone in its own venv (`tg-messenger ...`).
 - Reusable as an external dependency: `from tg_messenger.core import StandaloneTelegramClient`.
-- Own independent StringSession storage (`~/.tg_messenger/`), with optional injection of an
+- Own independent StringSession storage (`~/.tg/`), with optional injection of an
   externally supplied session string.
 
 See `PLAN.md` for the full design and the TDD build sequence.
@@ -64,8 +64,12 @@ app, not by SMS:
 tg-messenger login --phone +1234567890
 ```
 
-The session is saved under `~/.tg_messenger/sessions/`, so you only log in once. (You can
-also log in interactively from the Web or TUI — see below.)
+The session is saved under `~/.tg/sessions/`, so you only log in once. (You can
+also log in interactively from the Web or TUI — see below.) Everything the app
+persists — sessions, logs and per-profile SQLite — lives under a single root
+`~/.tg/`. Override it with `TG_HOME`; if `~/.tg/` doesn't exist yet but the
+legacy `~/.tg_messenger/` does, that older directory is read in place (no data is
+moved), so an existing login keeps working.
 
 **3. Start an interface** — same core, pick whichever you like:
 
@@ -215,7 +219,7 @@ TG_WEB_PASS=secret tg-messenger serve --host 0.0.0.0
 
 ## Multiple accounts (profiles)
 
-Each saved login is a *profile* (a session file under `~/.tg_messenger/sessions/`).
+Each saved login is a *profile* (a session file under `~/.tg/sessions/`).
 Log in to as many as you like and pick one per run with the global `--profile` flag:
 
 ```bash
@@ -229,12 +233,12 @@ tg-messenger --profile personal serve             # CLI / TUI / web all accept -
 With more than one profile and **no** `--profile`, the CLI and TUI pop a selection
 menu; a non-interactive shell errors instead of guessing. One process serves one
 profile, and each non-default profile gets its own log file
-(`~/.tg_messenger/logs/tg_messenger_<profile>.log`). The web exposes a read-only
+(`~/.tg/logs/tg_messenger_<profile>.log`). The web exposes a read-only
 `GET /profiles` listing saved profiles with the active one flagged.
 
 ## Session encryption & SSO with tg_content_factory
 
-By default sessions live as plaintext `0600` files under `~/.tg_messenger/sessions/`.
+By default sessions live as plaintext `0600` files under `~/.tg/sessions/`.
 Set `SESSION_ENCRYPTION_KEY` (and `pip install 'tg-messenger[crypto]'`) to store them
 encrypted instead — Fernet over a PBKDF2-derived key, format `enc:v2:`, **byte-compatible
 with [tg_content_factory](https://github.com/axisrow/tg_content_factory)**. A plaintext file

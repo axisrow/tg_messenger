@@ -18,9 +18,21 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from tg_messenger.core.names import sanitize_profile_name
+from tg_messenger.core.paths import tg_home
 
-DEFAULT_LOG_DIR = Path.home() / ".tg_messenger" / "logs"
 LOG_FILE_NAME = "tg_messenger.log"
+
+
+def default_log_dir() -> Path:
+    """``<tg_home>/logs`` — resolved lazily so ``TG_HOME``/legacy state is honored at runtime."""
+    return tg_home() / "logs"
+
+
+def __getattr__(name: str):
+    # Back-compat: the old module-level ``DEFAULT_LOG_DIR`` constant is now lazy.
+    if name == "DEFAULT_LOG_DIR":
+        return default_log_dir()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _FILE_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _CONSOLE_FORMAT = "%(levelname)s %(name)s: %(message)s"
@@ -42,7 +54,7 @@ class _ConsoleFormatter(logging.Formatter):
 def _resolve_log_dir(log_dir: Path | str | None) -> Path:
     if log_dir is not None:
         return Path(log_dir)
-    return Path(os.environ.get("TG_LOG_DIR") or DEFAULT_LOG_DIR)
+    return Path(os.environ.get("TG_LOG_DIR") or default_log_dir())
 
 
 def _log_file_name(profile: str | None) -> str:

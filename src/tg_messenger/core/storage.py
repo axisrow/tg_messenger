@@ -20,6 +20,7 @@ import sqlite3
 from pathlib import Path
 
 from tg_messenger.core.names import sanitize_profile_name
+from tg_messenger.core.paths import tg_home
 
 # the kv table is always present; consumer migrations start applying on top of it
 _KV_MIGRATION = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -28,12 +29,25 @@ _SCHEMA_MIGRATIONS = (
     "(id TEXT PRIMARY KEY, statement TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
 )
 
-DEFAULT_DB_DIR = Path.home() / ".tg_messenger"
+def default_db_dir() -> Path:
+    """``<tg_home>`` — resolved lazily so ``TG_HOME``/legacy state is honored at runtime."""
+    return tg_home()
 
 
 def default_db_path(profile: str = "default") -> Path:
-    """``~/.tg_messenger/<safe-profile>.db`` — one DB file per account profile (#11)."""
-    return DEFAULT_DB_DIR / f"{sanitize_profile_name(profile)}.db"
+    """``<tg_home>/<safe-profile>.db`` — one DB file per account profile (#11).
+
+    The root is ``~/.tg/`` (or ``$TG_HOME``, or the legacy ``~/.tg_messenger/``
+    when it exists and ``~/.tg/`` does not) — see :func:`tg_home`.
+    """
+    return default_db_dir() / f"{sanitize_profile_name(profile)}.db"
+
+
+def __getattr__(name: str):
+    # Back-compat: the old module-level ``DEFAULT_DB_DIR`` constant is now lazy.
+    if name == "DEFAULT_DB_DIR":
+        return default_db_dir()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class Storage:

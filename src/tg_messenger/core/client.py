@@ -32,7 +32,7 @@ from telethon.tl.functions.account import CheckUsernameRequest, UpdateUsernameRe
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 
-from tg_messenger.core.auth import DEFAULT_SESSION_DIR, SessionStore
+from tg_messenger.core.auth import SessionStore, default_session_dir
 from tg_messenger.core.cache import TTLCache
 from tg_messenger.core.events import EventBus
 from tg_messenger.core.flood import run_with_flood_wait_retry
@@ -247,7 +247,7 @@ class StandaloneTelegramClient:
         *,
         session_name: str = "default",
         external_session: str | None = None,
-        session_dir: Path | str = DEFAULT_SESSION_DIR,
+        session_dir: Path | str | None = None,  # None → SessionStore resolves tg_home() lazily
         encryption_key: str | None = None,
         client_factory: Callable = _default_factory,
         dialogs_ttl: float = DEFAULT_DIALOGS_TTL_SEC,
@@ -997,7 +997,7 @@ def client_from_env(**kwargs) -> StandaloneTelegramClient:
     """
     # optional at-rest session encryption (shared SESSION_ENCRYPTION_KEY = SSO with the factory)
     kwargs.setdefault("encryption_key", os.environ.get("SESSION_ENCRYPTION_KEY") or None)
-    kwargs.setdefault("session_dir", os.environ.get("TG_SESSION_DIR") or DEFAULT_SESSION_DIR)
+    kwargs.setdefault("session_dir", os.environ.get("TG_SESSION_DIR") or default_session_dir())
     # global outgoing rate cap (#25): default 20/min; TG_SEND_RATE=0 explicitly disables.
     kwargs.setdefault("send_rate_per_min", float(os.environ.get("TG_SEND_RATE", "20") or 20))
     return StandaloneTelegramClient(
