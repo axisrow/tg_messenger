@@ -2305,6 +2305,28 @@ def test_client_from_env_blank_creds_gives_friendly_error(monkeypatch):
     _assert_friendly_creds_hint(str(excinfo.value))
 
 
+@pytest.mark.parametrize("bad_api_id", ["abc", "  ", "12x", "1.5"])
+def test_client_from_env_non_numeric_api_id_gives_friendly_error(monkeypatch, bad_api_id):
+    # #190 review fix 3: a non-numeric/whitespace TG_API_ID must reach the friendly
+    # validator, not crash on int() with a raw ValueError before validate_credentials.
+    monkeypatch.setenv("TG_API_ID", bad_api_id)
+    monkeypatch.setenv("TG_API_HASH", "")
+    with pytest.raises(MissingCredentialsError) as excinfo:
+        client_module.client_from_env()
+    _assert_friendly_creds_hint(str(excinfo.value))
+
+
+def test_client_from_env_non_numeric_api_id_with_hash_still_friendly(monkeypatch):
+    # Even with a real hash, a garbage TG_API_ID coerces to 0 → the friendly hint,
+    # never a raw int() traceback.
+    monkeypatch.setenv("TG_API_ID", "not-a-number")
+    monkeypatch.setenv("TG_API_HASH", "realhash")
+    with pytest.raises(MissingCredentialsError) as excinfo:
+        client_module.client_from_env()
+    _assert_friendly_creds_hint(str(excinfo.value))
+    assert "not-a-number" not in str(excinfo.value)  # never echo the raw value
+
+
 def test_constructor_missing_creds_gives_friendly_error():
     # The library path (someone building the client directly) is guarded too — the
     # friendly ValueError fires before Telethon's own empty-creds error.

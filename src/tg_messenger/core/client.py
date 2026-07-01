@@ -1049,10 +1049,16 @@ def client_from_env(**kwargs) -> StandaloneTelegramClient:
         kwargs["session_dir"] = resolve_env_dir("TG_SESSION_DIR") or default_session_dir()
     # global outgoing rate cap (#25): default 20/min; TG_SEND_RATE=0 explicitly disables.
     kwargs.setdefault("send_rate_per_min", float(os.environ.get("TG_SEND_RATE", "20") or 20))
-    api_id = int(os.environ.get("TG_API_ID", "0") or "0")
+    # #188 Axis B: a non-numeric/whitespace TG_API_ID ("abc", "  ") must reach the
+    # friendly validator, not crash on int() with a raw ValueError. Coerce anything
+    # unparseable to 0 — validate_credentials then surfaces the actionable hint.
+    try:
+        api_id = int((os.environ.get("TG_API_ID") or "0").strip() or "0")
+    except ValueError:
+        api_id = 0
     api_hash = os.environ.get("TG_API_HASH", "")
-    # #188 Axis B: check here too (not just in __init__) so the friendly hint fires
-    # before any client-construction side effects (session dir resolution, etc.).
+    # check here too (not just in __init__) so the friendly hint fires before any
+    # client-construction side effects (session dir resolution, etc.).
     validate_credentials(api_id, api_hash)
     return StandaloneTelegramClient(
         api_id=api_id,
