@@ -46,16 +46,24 @@ LLM stack and the worker's HTTP client are separate installs. `[dev]` pulls
 ## Running it
 
 **1. Set your Telegram API credentials.** Get an `api_id` / `api_hash` from
-<https://my.telegram.org> and put them in a `.env` in the current directory (auto-loaded;
-real environment variables win) — see `.env.example`:
+<https://my.telegram.org> (API development tools) and set `TG_API_ID` / `TG_API_HASH` —
+see `.env.example`:
 
 ```bash
 TG_API_ID=12345678
 TG_API_HASH=abcdef1234567890abcdef1234567890
 ```
 
-Without these the CLI exits with an error — they are required for every command that
-touches Telegram.
+Put them in **`~/.tg/.env`** for a persistent config that's read no matter which
+directory you launch from — so `tg-messenger tui` works from anywhere. A `.env` in the
+**current directory** also works, and is handy for a project-local override. The
+precedence, highest first, is: real environment variables > cwd `.env` > `~/.tg/.env`
+(each layer only fills in what the higher ones didn't set).
+
+Without these the CLI exits with a clear, actionable message telling you exactly where
+to get the keys and where to put them — not a raw Python/telethon stack trace. Your
+credential values are never echoed. They are required for every command that touches
+Telegram.
 
 **2. Log in** (phone → code → optional 2FA password). The code arrives in your Telegram
 app, not by SMS:

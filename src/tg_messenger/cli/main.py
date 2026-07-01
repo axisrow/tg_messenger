@@ -38,6 +38,7 @@ from tg_messenger.cli.parsers import _parse_at, _parse_dotenv, _parse_ids  # noq
 from tg_messenger.core.auth import LOGIN_HINT, session_store_from_env, validate_session_string
 from tg_messenger.core.client import (
     MessageDeleteValidationError,
+    MissingCredentialsError,
     SendForbiddenError,
     client_from_env,
 )
@@ -55,9 +56,17 @@ def _reaction_emoticon(emoticon: str | None) -> str:
 
 
 def _load_dotenv(path: Path | str = ".env") -> None:
-    """Load a .env from cwd into the environment; real env always wins."""
-    for key, value in _parse_dotenv(path).items():
-        os.environ.setdefault(key, value)
+    """Layer .env files into the environment; the real environment always wins.
+
+    Precedence (highest first): real env > cwd ``.env`` > ``~/.tg/.env`` (#188 Axis B).
+    ``setdefault`` never overwrites, so loading cwd FIRST lets a cwd value win over the
+    persistent home one, and both yield to a value already in the real environment. The
+    persistent ``~/.tg/.env`` is what makes ``tg-messenger tui`` work from ANY directory,
+    not just one that happens to hold a ``.env``. Missing files are fine (_parse_dotenv → {}).
+    """
+    for source in (path, tg_home() / ".env"):
+        for key, value in _parse_dotenv(source).items():
+            os.environ.setdefault(key, value)
 
 
 def _session_store():
@@ -498,6 +507,10 @@ def _run(coro, session: str = "default"):
         return asyncio.run(coro)
     except (click.ClickException, click.Abort):
         raise  # already user-friendly
+    except MissingCredentialsError as exc:
+        # #188 Axis B: empty TG_API_ID/TG_API_HASH — surface the friendly hint as-is,
+        # not folded into the generic "Unexpected error" line below.
+        raise click.ClickException(str(exc)) from exc
     except HandledFloodWaitError as exc:
         logger.warning("%s: flood wait %ss", exc.operation, exc.wait_seconds)
         raise click.ClickException(exc.user_message) from exc
@@ -1009,6 +1022,12 @@ def tui(ctx: click.Context, session: str) -> None:
             outbound=deps.outbound,
             auto_translate=deps.auto_translate,
         ).run()
+    except MissingCredentialsError as exc:
+        # #188 Axis B: make_tui_deps builds the client up front (outside _run), so empty
+        # TG_API_ID/TG_API_HASH would otherwise crash `tui` with a raw traceback before the
+        # UI even opens. Surface the friendly hint instead. (The deps_factory branch above
+        # builds the client inside the TUI's own _startup, whose except already shows it.)
+        raise click.ClickException(str(exc)) from exc
     finally:
         flush_tracers()  # #168: drain buffered LangSmith traces when the TUI exits
 

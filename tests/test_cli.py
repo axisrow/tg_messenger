@@ -1749,6 +1749,84 @@ def test_dotenv_does_not_override_real_env(runner, tmp_path, monkeypatch):
     assert os.environ["TG_API_ID"] == "111"
 
 
+# --- #188 Axis B: persistent ~/.tg/.env is layered under cwd .env, both under real env ---
+
+
+def test_home_dotenv_loaded_when_no_cwd_dotenv(runner, tmp_path, monkeypatch):
+    # `tg-messenger` from a directory with NO .env still picks up ~/.tg/.env — the fix for
+    # "tui crashes from any dir but the one holding a .env".
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)  # no .env here
+    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    (home / ".env").write_text('TG_API_ID=77\nTG_API_HASH="homehash"\n', encoding="utf-8")
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert os.environ["TG_API_ID"] == "77"
+    assert os.environ["TG_API_HASH"] == "homehash"
+
+
+def test_cwd_dotenv_beats_home_dotenv(runner, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    (home / ".env").write_text("TG_API_ID=77\nTG_API_HASH=homehash\n", encoding="utf-8")
+    (cwd / ".env").write_text("TG_API_ID=42\n", encoding="utf-8")  # only overrides the id
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert os.environ["TG_API_ID"] == "42"        # cwd wins
+    assert os.environ["TG_API_HASH"] == "homehash"  # home fills the gap
+
+
+def test_real_env_beats_both_dotenvs(runner, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    os.environ["TG_API_ID"] = "999"
+    (home / ".env").write_text("TG_API_ID=77\n", encoding="utf-8")
+    (cwd / ".env").write_text("TG_API_ID=42\n", encoding="utf-8")
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert os.environ["TG_API_ID"] == "999"  # real env wins over both files
+
+
+def test_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeypatch):
+    # End-to-end through the CLI: empty creds surface the friendly hint as a clean
+    # ClickException, not a raw telethon traceback — and never echo a cred value.
+    from click.testing import CliRunner
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(tmp_path)  # no .env, no home .env → creds truly absent
+    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    # real client build (no make_client stub) so client_from_env runs the validator
+    result = CliRunner().invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code != 0
+    assert "my.telegram.org" in result.output
+    assert "TG_API_ID" in result.output and "TG_API_HASH" in result.output
+    assert "~/.tg/.env" in result.output
+    assert "Traceback" not in result.output
+    assert "telethon.rtfd.io" not in result.output
+
+
 def test_unexpected_error_hint_instead_of_traceback(runner, monkeypatch):
     r, stub = runner
 
