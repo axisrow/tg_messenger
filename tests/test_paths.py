@@ -118,10 +118,16 @@ def test_resolve_env_dir_rejects_relative(monkeypatch):
         paths.resolve_env_dir("TG_LOG_DIR")
 
 
+def _populate(home):
+    """Give a root dir some data so it counts as adopted (mirrors a real session file)."""
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "default.session").write_text("s", encoding="utf-8")
+
+
 def test_legacy_fallback_only_when_default_absent(homes):
-    # ~/.tg absent AND ~/.tg_messenger present → read the legacy root in place
+    # ~/.tg absent AND ~/.tg_messenger present-with-data → read the legacy root in place
     default_home, legacy_home = homes
-    legacy_home.mkdir()
+    _populate(legacy_home)
     assert not default_home.exists()
     assert paths.tg_home() == legacy_home
 
@@ -149,6 +155,35 @@ def test_default_wins_even_if_only_default_exists(homes):
     assert paths.tg_home() == default_home
 
 
+# --- empty ~/.tg counts as absent, so a prior process's residue can't strand legacy ---
+
+def test_empty_default_does_not_strand_populated_legacy(homes):
+    # Regression (cross-process footgun): a prior run left an EMPTY ~/.tg (e.g. a
+    # TG_LOG_DIR=~/.tg/logs mkdir that was emptied). The next run must still resolve
+    # to the populated legacy root, not the empty ~/.tg, or the user looks logged out.
+    default_home, legacy_home = homes
+    _populate(legacy_home)          # real session lives here
+    default_home.mkdir()            # empty ~/.tg residue
+    assert not any(default_home.iterdir())
+    assert paths.tg_home() == legacy_home
+
+
+def test_empty_default_and_empty_legacy_pick_default(homes):
+    # both present but empty → default (an empty legacy is no reason to prefer it)
+    default_home, legacy_home = homes
+    default_home.mkdir()
+    legacy_home.mkdir()
+    assert paths.tg_home() == default_home
+
+
+def test_populated_default_beats_populated_legacy(homes):
+    # ~/.tg with data always wins even when legacy also has data (user adopted it)
+    default_home, legacy_home = homes
+    _populate(legacy_home)
+    _populate(default_home)
+    assert paths.tg_home() == default_home
+
+
 # --- per-process memo: a subdir created AFTER the first resolve must not flip the root ---
 
 def test_root_decision_frozen_against_later_default_creation(homes):
@@ -158,7 +193,7 @@ def test_root_decision_frozen_against_later_default_creation(homes):
     # FS state it would then flip to the empty ~/.tg and hide the existing session.
     # Freezing the decision on the first call keeps every later lookup on legacy.
     default_home, legacy_home = homes
-    legacy_home.mkdir()
+    _populate(legacy_home)
     assert paths.tg_home() == legacy_home  # first resolve: legacy (honest state)
     # a later subdir mkdir creates ~/.tg (as setup_logging on TG_LOG_DIR=~/.tg/logs would)
     (default_home / "logs").mkdir(parents=True)
@@ -170,11 +205,11 @@ def test_root_decision_frozen_against_later_default_creation(homes):
 def test_reset_tg_home_cache_re_resolves(homes):
     # the cache is per-process; reset lets a test (or a re-config) re-decide
     default_home, legacy_home = homes
-    legacy_home.mkdir()
+    _populate(legacy_home)
     assert paths.tg_home() == legacy_home
-    default_home.mkdir()
+    _populate(default_home)  # ~/.tg now holds data → it's the adopted root
     paths.reset_tg_home_cache()
-    # after a reset + a now-present ~/.tg, the fresh resolve prefers the default root
+    # after a reset + a now-populated ~/.tg, the fresh resolve prefers the default root
     assert paths.tg_home() == default_home
 
 

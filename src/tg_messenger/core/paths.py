@@ -23,6 +23,13 @@ session/db lookup from ``~/.tg_messenger`` to a fresh empty ``~/.tg`` (they'd lo
 logged out). Freezing the decision on first use keeps the whole-root choice stable
 regardless of which subdir gets created first. Tests reset the cache via
 :func:`reset_tg_home_cache` (an autouse conftest fixture does this per test).
+
+The memo only fixes *same-process* ordering, though. Across separate runs a bare,
+**empty** ``~/.tg`` left behind by a prior process (again, that ``TG_LOG_DIR`` mkdir
+is the usual culprit) would, on the next run, still be picked over a populated
+legacy root. So the legacy-vs-default test treats an empty ``~/.tg`` as absent (see
+:func:`_has_data`): legacy wins when ``~/.tg`` has no data AND ``~/.tg_messenger``
+does. A ``~/.tg`` that actually holds data always wins (the user adopted it).
 """
 
 from __future__ import annotations
@@ -36,6 +43,21 @@ DEFAULT_HOME = Path.home() / ".tg"
 # per-process memo of the resolved root: frozen on first tg_home() call so a later
 # subdir mkdir (e.g. from a TG_LOG_DIR under ~/.tg) can't flip the legacy fallback.
 _ROOT_CACHE: Path | None = None
+
+
+def _has_data(p: Path) -> bool:
+    """Whether ``p`` is a directory that actually holds something.
+
+    Used for the legacy-vs-default decision: a bare/empty ``~/.tg`` (a residue a
+    prior process left behind — e.g. a ``TG_LOG_DIR=~/.tg/logs`` mkdir that was then
+    emptied, or any stray dir) must NOT count as "the user adopted the new root",
+    or it would strand a real session sitting in ``~/.tg_messenger``. A permission
+    error on ``iterdir`` fails safe as "no data" so resolution never crashes.
+    """
+    try:
+        return p.is_dir() and any(p.iterdir())
+    except OSError:
+        return False
 
 
 def reset_tg_home_cache() -> None:
@@ -80,10 +102,12 @@ def resolve_env_dir(var: str) -> Path | None:
 def tg_home() -> Path:
     """Root for sessions/logs/db.
 
-    Order: ``$TG_HOME`` → legacy ``~/.tg_messenger`` (only if it exists AND
-    ``~/.tg`` does not) → ``~/.tg``. Legacy is read in place, never moved: an
-    existing ``~/.tg`` always wins so a partial new root can't silently pull
-    from the old one.
+    Order: ``$TG_HOME`` → legacy ``~/.tg_messenger`` (only if it holds data AND
+    ``~/.tg`` holds none) → ``~/.tg``. Legacy is read in place, never moved: a
+    ``~/.tg`` that actually holds data always wins so a partial new root can't
+    silently pull from the old one. An empty ``~/.tg`` (a residue left by a prior
+    process — see :func:`_has_data` and the module docstring) counts as absent, so
+    it can't strand a real session living in the legacy root.
 
     ``TG_HOME`` is ``~``/``$VAR``-expanded and must resolve to an absolute path.
     A misconfigured value (unset ``$VAR`` left literal, or a relative root) would
@@ -111,7 +135,10 @@ def tg_home() -> Path:
         return _ROOT_CACHE
     # No TG_HOME: freeze the legacy-vs-default choice from the honest on-disk state
     # now, so a later subdir mkdir (e.g. TG_LOG_DIR under ~/.tg) can't flip it.
-    if not DEFAULT_HOME.exists() and LEGACY_HOME.exists():
+    # A bare/EMPTY ~/.tg counts as "absent" here: only a ~/.tg that actually holds
+    # data means the user adopted the new root. Otherwise a prior process's empty
+    # ~/.tg residue would strand a real session living in ~/.tg_messenger.
+    if not _has_data(DEFAULT_HOME) and _has_data(LEGACY_HOME):
         _ROOT_CACHE = LEGACY_HOME
     else:
         _ROOT_CACHE = DEFAULT_HOME
