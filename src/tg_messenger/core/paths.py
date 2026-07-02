@@ -127,9 +127,11 @@ def tg_home() -> Path:
     Order: ``$TG_HOME`` → legacy ``~/.tg_messenger`` (only if it holds data AND
     ``~/.tg`` holds none) → ``~/.tg``. Legacy is read in place, never moved: a
     ``~/.tg`` that actually holds data always wins so a partial new root can't
-    silently pull from the old one. An empty ``~/.tg`` (a residue left by a prior
-    process — see :func:`_has_data` and the module docstring) counts as absent, so
-    it can't strand a real session living in the legacy root.
+    silently pull from the old one. An empty ``~/.tg``, or one holding only a config
+    ``.env`` (a residue left by a prior process, or the ``~/.tg/.env`` the
+    missing-creds hint tells users to create — see :func:`_has_data` and the module
+    docstring), counts as absent, so it can't strand a real session living in the
+    legacy root.
 
     ``TG_HOME`` is ``~``/``$VAR``-expanded and must resolve to an absolute path.
     A misconfigured value (unset ``$VAR`` left literal, or a relative root) would
@@ -157,9 +159,11 @@ def tg_home() -> Path:
         return _ROOT_CACHE
     # No TG_HOME: freeze the legacy-vs-default choice from the honest on-disk state
     # now, so a later subdir mkdir (e.g. TG_LOG_DIR under ~/.tg) can't flip it.
-    # A bare/EMPTY ~/.tg counts as "absent" here: only a ~/.tg that actually holds
-    # data means the user adopted the new root. Otherwise a prior process's empty
-    # ~/.tg residue would strand a real session living in ~/.tg_messenger.
+    # A bare/EMPTY ~/.tg — OR a ~/.tg holding only a config .env — counts as "absent"
+    # here (see :func:`_has_data`): only a ~/.tg that holds actual DATA means the user
+    # adopted the new root. Otherwise a prior process's empty ~/.tg residue, or the
+    # ~/.tg/.env the missing-creds hint tells users to create, would strand a real
+    # session living in ~/.tg_messenger.
     if not _has_data(DEFAULT_HOME) and _has_data(LEGACY_HOME):
         _ROOT_CACHE = LEGACY_HOME
     else:

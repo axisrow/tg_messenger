@@ -35,6 +35,7 @@ from tg_messenger.agent.config import flush_tracers, langsmith_tracing_enabled
 # #179: the pure parsers moved to a leaf module; re-export so `cli.main._parse_dotenv` (test_e2e)
 # and the in-module callers (`_load_dotenv`, forward/delete, heartbeat plan) keep resolving here.
 from tg_messenger.cli.parsers import _parse_at, _parse_dotenv, _parse_ids  # noqa: F401
+from tg_messenger.core import paths as core_paths
 from tg_messenger.core.auth import LOGIN_HINT, session_store_from_env, validate_session_string
 from tg_messenger.core.client import (
     MessageDeleteValidationError,
@@ -58,13 +59,26 @@ def _reaction_emoticon(emoticon: str | None) -> str:
 def _load_dotenv(path: Path | str = ".env") -> None:
     """Layer .env files into the environment; the real environment always wins.
 
-    Precedence (highest first): real env > cwd ``.env`` > ``~/.tg/.env`` (#188 Axis B).
-    ``setdefault`` never overwrites, so loading cwd FIRST lets a cwd value win over the
-    persistent home one, and both yield to a value already in the real environment. The
-    persistent ``~/.tg/.env`` is what makes ``tg-messenger tui`` work from ANY directory,
-    not just one that happens to hold a ``.env``. Missing files are fine (_parse_dotenv → {}).
+    Precedence (highest first): real env > cwd ``.env`` > ``~/.tg/.env`` (the persistent
+    config) > a legacy ``~/.tg_messenger/.env`` (only if the data root fell back there and
+    someone put creds in it). ``setdefault`` never overwrites, so loading cwd FIRST lets a
+    cwd value win over the persistent one, and every file yields to a value already in the
+    real environment. The persistent ``~/.tg/.env`` is what makes ``tg-messenger tui`` work
+    from ANY directory, not just one that happens to hold a ``.env``.
+
+    The fixed ``DEFAULT_HOME/.env`` (= ``~/.tg/.env``) is ALWAYS attempted, decoupled from
+    the data-root decision (#188 Axis B, cycle-2 fix). A legacy user (real session data in
+    ``~/.tg_messenger/``) whose only creds live in ``~/.tg/.env`` has ``tg_home()`` resolve
+    to the legacy root — so reading creds ONLY from ``tg_home()/.env`` would never find the
+    file the missing-creds hint told them to create. We therefore layer BOTH the fixed
+    ``~/.tg/.env`` and ``tg_home()/.env`` (deduped) — cwd first, then ``~/.tg/.env``, then
+    the legacy config if it differs. Missing files are fine (_parse_dotenv → {}).
     """
-    for source in (path, tg_home() / ".env"):
+    sources: list[Path | str] = [path, core_paths.DEFAULT_HOME / ".env"]
+    home_env = tg_home() / ".env"
+    if home_env not in sources:
+        sources.append(home_env)
+    for source in sources:
         for key, value in _parse_dotenv(source).items():
             os.environ.setdefault(key, value)
 

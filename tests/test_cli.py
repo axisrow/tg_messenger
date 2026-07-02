@@ -1752,6 +1752,16 @@ def test_dotenv_does_not_override_real_env(runner, tmp_path, monkeypatch):
 # --- #188 Axis B: persistent ~/.tg/.env is layered under cwd .env, both under real env ---
 
 
+def _point_home_at(monkeypatch, home):
+    """Make BOTH the fixed config path (DEFAULT_HOME/.env) and tg_home() resolve to
+    ``home`` — so a test's ~/.tg/.env is the tmp one, never the developer's real file.
+    """
+    from tg_messenger.core import paths as core_paths
+
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", home)
+    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+
+
 def test_home_dotenv_loaded_when_no_cwd_dotenv(runner, tmp_path, monkeypatch):
     # `tg-messenger` from a directory with NO .env still picks up ~/.tg/.env — the fix for
     # "tui crashes from any dir but the one holding a .env".
@@ -1762,7 +1772,7 @@ def test_home_dotenv_loaded_when_no_cwd_dotenv(runner, tmp_path, monkeypatch):
     monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
                                         if k not in ("TG_API_ID", "TG_API_HASH")})
     monkeypatch.chdir(cwd)  # no .env here
-    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    _point_home_at(monkeypatch, home)
     (home / ".env").write_text('TG_API_ID=77\nTG_API_HASH="homehash"\n', encoding="utf-8")
     r, _ = runner
     result = r.invoke(cli_main.cli, ["dialogs"])
@@ -1779,7 +1789,7 @@ def test_cwd_dotenv_beats_home_dotenv(runner, tmp_path, monkeypatch):
     monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
                                         if k not in ("TG_API_ID", "TG_API_HASH")})
     monkeypatch.chdir(cwd)
-    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    _point_home_at(monkeypatch, home)
     (home / ".env").write_text("TG_API_ID=77\nTG_API_HASH=homehash\n", encoding="utf-8")
     (cwd / ".env").write_text("TG_API_ID=42\n", encoding="utf-8")  # only overrides the id
     r, _ = runner
@@ -1796,7 +1806,7 @@ def test_real_env_beats_both_dotenvs(runner, tmp_path, monkeypatch):
     cwd.mkdir()
     monkeypatch.setattr(os, "environ", dict(os.environ))
     monkeypatch.chdir(cwd)
-    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    _point_home_at(monkeypatch, home)
     os.environ["TG_API_ID"] = "999"
     (home / ".env").write_text("TG_API_ID=77\n", encoding="utf-8")
     (cwd / ".env").write_text("TG_API_ID=42\n", encoding="utf-8")
@@ -1804,6 +1814,69 @@ def test_real_env_beats_both_dotenvs(runner, tmp_path, monkeypatch):
     result = r.invoke(cli_main.cli, ["dialogs"])
     assert result.exit_code == 0, result.output
     assert os.environ["TG_API_ID"] == "999"  # real env wins over both files
+
+
+def test_home_dotenv_read_even_when_data_root_falls_back_to_legacy(runner, tmp_path, monkeypatch):
+    # #190 review cycle-2 fix: a legacy user (real session data in ~/.tg_messenger/) whose
+    # ONLY creds live in ~/.tg/.env must still have them read. tg_home() resolves to the
+    # legacy root for them (cycle-1 fix 2: a config-only ~/.tg no longer "adopts"), so
+    # reading creds ONLY from tg_home()/.env would miss the file the hint told them to make.
+    # _load_dotenv must ALWAYS attempt the fixed ~/.tg/.env, decoupled from the data root.
+    from tg_messenger.core import paths as core_paths
+
+    default_home = tmp_path / ".tg"           # ~/.tg — holds ONLY .env (config, not data)
+    legacy_home = tmp_path / ".tg_messenger"  # real session data lives here
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)  # no cwd .env
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.setattr(core_paths, "LEGACY_HOME", legacy_home)
+    monkeypatch.delenv("TG_HOME", raising=False)
+    # real session data in legacy → tg_home() falls back to legacy (config-only ~/.tg ignored)
+    legacy_home.mkdir()
+    (legacy_home / "default.session").write_text("s", encoding="utf-8")
+    default_home.mkdir()
+    (default_home / ".env").write_text("TG_API_ID=1234567\nTG_API_HASH=abchash\n", encoding="utf-8")
+    # sanity: the data root really did fall back to legacy for this user
+    core_paths.reset_tg_home_cache()
+    assert core_paths.tg_home() == legacy_home
+    core_paths.reset_tg_home_cache()
+
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    # the documented ~/.tg/.env creds ARE read despite the data root being legacy
+    assert os.environ["TG_API_ID"] == "1234567"
+    assert os.environ["TG_API_HASH"] == "abchash"
+
+
+def test_legacy_home_dotenv_read_when_it_is_the_data_root(runner, tmp_path, monkeypatch):
+    # The other half: if creds sit in a legacy ~/.tg_messenger/.env (and that IS the data
+    # root), they're still read — tg_home()/.env is layered in addition to the fixed ~/.tg.
+    from tg_messenger.core import paths as core_paths
+
+    default_home = tmp_path / ".tg"           # absent → no ~/.tg/.env
+    legacy_home = tmp_path / ".tg_messenger"
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.setattr(core_paths, "LEGACY_HOME", legacy_home)
+    monkeypatch.delenv("TG_HOME", raising=False)
+    legacy_home.mkdir()
+    (legacy_home / "default.session").write_text("s", encoding="utf-8")  # data → legacy is root
+    (legacy_home / ".env").write_text("TG_API_ID=55\nTG_API_HASH=legacyhash\n", encoding="utf-8")
+    core_paths.reset_tg_home_cache()
+
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert os.environ["TG_API_ID"] == "55"
+    assert os.environ["TG_API_HASH"] == "legacyhash"
 
 
 def test_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeypatch):
