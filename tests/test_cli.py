@@ -1879,6 +1879,47 @@ def test_legacy_home_dotenv_read_when_it_is_the_data_root(runner, tmp_path, monk
     assert os.environ["TG_API_HASH"] == "legacyhash"
 
 
+def test_explicit_tg_home_dotenv_beats_fixed_default_dotenv(runner, tmp_path, monkeypatch):
+    # #190 review cycle-3 fix: tg_home() is not only the legacy fallback — an explicit
+    # TG_HOME=/custom-root points sessions/db there too. The active root's .env must WIN
+    # over the fixed ~/.tg/.env, or a stale SESSION_ENCRYPTION_KEY in ~/.tg/.env would open
+    # the custom root's encrypted sessions with the WRONG key. So the active root's config
+    # (tg_home()/.env) is layered BEFORE the fixed DEFAULT_HOME/.env fallback.
+    from tg_messenger.core import paths as core_paths
+
+    default_home = tmp_path / ".tg"        # the fixed ~/.tg fallback (stale creds here)
+    custom_root = tmp_path / "custom-root"  # the explicit TG_HOME (authoritative)
+    default_home.mkdir()
+    custom_root.mkdir()
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH",
+                                                     "SESSION_ENCRYPTION_KEY")})
+    monkeypatch.chdir(cwd)  # no cwd .env
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.setenv("TG_HOME", str(custom_root))
+    # both roots hold a .env with CONFLICTING creds + encryption key
+    (default_home / ".env").write_text(
+        "TG_API_ID=111\nTG_API_HASH=defaulthash\nSESSION_ENCRYPTION_KEY=stalekey\n",
+        encoding="utf-8",
+    )
+    (custom_root / ".env").write_text(
+        "TG_API_ID=222\nTG_API_HASH=customhash\nSESSION_ENCRYPTION_KEY=rightkey\n",
+        encoding="utf-8",
+    )
+    core_paths.reset_tg_home_cache()
+
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    # the explicit TG_HOME's config wins over the fixed ~/.tg/.env fallback
+    assert os.environ["TG_API_ID"] == "222"
+    assert os.environ["TG_API_HASH"] == "customhash"
+    # the crux: the encryption key matches the root the sessions actually live under
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "rightkey"
+
+
 def test_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeypatch):
     # End-to-end through the CLI: empty creds surface the friendly hint as a clean
     # ClickException, not a raw telethon traceback — and never echo a cred value.

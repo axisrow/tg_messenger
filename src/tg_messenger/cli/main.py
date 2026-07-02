@@ -59,25 +59,32 @@ def _reaction_emoticon(emoticon: str | None) -> str:
 def _load_dotenv(path: Path | str = ".env") -> None:
     """Layer .env files into the environment; the real environment always wins.
 
-    Precedence (highest first): real env > cwd ``.env`` > ``~/.tg/.env`` (the persistent
-    config) > a legacy ``~/.tg_messenger/.env`` (only if the data root fell back there and
-    someone put creds in it). ``setdefault`` never overwrites, so loading cwd FIRST lets a
-    cwd value win over the persistent one, and every file yields to a value already in the
-    real environment. The persistent ``~/.tg/.env`` is what makes ``tg-messenger tui`` work
-    from ANY directory, not just one that happens to hold a ``.env``.
+    Precedence (highest first): real env > cwd ``.env`` > the ACTIVE root's
+    ``tg_home()/.env`` > the fixed ``~/.tg/.env`` fallback. ``setdefault`` never
+    overwrites, so loading a source EARLIER makes it win; every file yields to a value
+    already in the real environment. The persistent config is what makes
+    ``tg-messenger tui`` work from ANY directory, not just one that happens to hold a ``.env``.
 
-    The fixed ``DEFAULT_HOME/.env`` (= ``~/.tg/.env``) is ALWAYS attempted, decoupled from
-    the data-root decision (#188 Axis B, cycle-2 fix). A legacy user (real session data in
-    ``~/.tg_messenger/``) whose only creds live in ``~/.tg/.env`` has ``tg_home()`` resolve
-    to the legacy root — so reading creds ONLY from ``tg_home()/.env`` would never find the
-    file the missing-creds hint told them to create. We therefore layer BOTH the fixed
-    ``~/.tg/.env`` and ``tg_home()/.env`` (deduped) — cwd first, then ``~/.tg/.env``, then
-    the legacy config if it differs. Missing files are fine (_parse_dotenv → {}).
+    Two config paths are read, deduped, in this order (#188 Axis B):
+
+    1. ``tg_home()/.env`` — the ACTIVE data root. This is ``~/.tg`` normally, but a
+       legacy ``~/.tg_messenger`` on fallback, OR an explicit ``TG_HOME`` override. It
+       must win over the fixed default below: an explicit ``TG_HOME=/custom-root`` points
+       sessions/db there, so a stale ``SESSION_ENCRYPTION_KEY`` in ``~/.tg/.env`` winning
+       would open the custom root's encrypted sessions with the WRONG key (#190 cycle-3).
+    2. ``DEFAULT_HOME/.env`` (= ``~/.tg/.env``) — always attempted as a LAST fallback,
+       decoupled from the data-root decision (#190 cycle-2). A legacy user (real session
+       data in ``~/.tg_messenger/``) whose only creds live in ``~/.tg/.env`` has
+       ``tg_home()`` resolve to the legacy root, so reading ONLY ``tg_home()/.env`` would
+       miss the file the missing-creds hint told them to create — this fallback catches it.
+
+    When ``tg_home()`` already IS ``DEFAULT_HOME`` (the common case), the dedup reads
+    ``~/.tg/.env`` exactly once. Missing files are fine (_parse_dotenv → {}).
     """
-    sources: list[Path | str] = [path, core_paths.DEFAULT_HOME / ".env"]
-    home_env = tg_home() / ".env"
-    if home_env not in sources:
-        sources.append(home_env)
+    sources: list[Path | str] = [path]
+    for candidate in (tg_home() / ".env", core_paths.DEFAULT_HOME / ".env"):
+        if candidate not in sources:
+            sources.append(candidate)
     for source in sources:
         for key, value in _parse_dotenv(source).items():
             os.environ.setdefault(key, value)
