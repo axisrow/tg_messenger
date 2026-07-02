@@ -10,6 +10,7 @@ import os
 import click
 
 from tg_messenger.cli import main as cli_main
+from tg_messenger.core.client import MissingCredentialsError
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,13 @@ def serve(ctx: click.Context, host: str, port: int, session: str, insecure: bool
 
     session = cli_main._effective_session(ctx, session)
     cli_main._announce_tracing()  # #168: status + fail-fast (the web app traces the translator/suggester)
-    client = cli_main.make_client(session_name=session)
+    # #188 Axis B: serve builds the client here, OUTSIDE _run, so an empty-creds
+    # MissingCredentialsError would otherwise escape as a raw traceback. Surface the
+    # friendly hint instead — same pattern as the `tui` command (main.py).
+    try:
+        client = cli_main.make_client(session_name=session)
+    except MissingCredentialsError as exc:
+        raise click.ClickException(str(exc)) from exc
     suggester = cli_main.make_optional_suggester(client, session=session)
     translator, outbound, store, _storage = cli_main.make_translation_deps(client, session=session)
     # uvicorn's own banner goes to the file (log_config=None) — announce the URL here

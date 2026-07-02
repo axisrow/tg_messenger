@@ -184,6 +184,41 @@ def test_populated_default_beats_populated_legacy(homes):
     assert paths.tg_home() == default_home
 
 
+# --- a config-only ~/.tg/.env must NOT count as adoption (#188 Axis B review) ---
+
+
+def test_default_holding_only_dotenv_does_not_strand_legacy(homes):
+    # Regression (Codex, #190 review cycle 1): Axis B tells users to put creds in
+    # ~/.tg/.env. Creating ONLY that file makes ~/.tg non-empty. If a bare .env counted
+    # as "the user adopted ~/.tg", a legacy user with a real session in ~/.tg_messenger
+    # would flip to the empty ~/.tg and look logged out — our own docs manufacturing the
+    # data loss. A ~/.tg holding nothing but .env must still fall back to the legacy root.
+    default_home, legacy_home = homes
+    _populate(legacy_home)  # real session lives in legacy
+    default_home.mkdir()
+    (default_home / ".env").write_text("TG_API_ID=1\nTG_API_HASH=h\n", encoding="utf-8")
+    assert paths.tg_home() == legacy_home
+
+
+def test_default_with_dotenv_and_real_data_still_wins(homes):
+    # The .env exemption is narrow: a ~/.tg that ALSO holds real data (a session, a db,
+    # logs) is a genuinely adopted root and must still win over legacy.
+    default_home, legacy_home = homes
+    _populate(legacy_home)
+    _populate(default_home)  # real session data in ~/.tg …
+    (default_home / ".env").write_text("TG_API_ID=1\n", encoding="utf-8")  # … plus a .env
+    assert paths.tg_home() == default_home
+
+
+def test_default_holding_only_dotenv_still_beats_empty_legacy(homes):
+    # No legacy data at all → the default root is still the answer even if it holds only
+    # .env (there's nothing to strand; a config-only ~/.tg is where a fresh user lands).
+    default_home, _legacy_home = homes
+    default_home.mkdir()
+    (default_home / ".env").write_text("TG_API_ID=1\n", encoding="utf-8")
+    assert paths.tg_home() == default_home
+
+
 # --- per-process memo: a subdir created AFTER the first resolve must not flip the root ---
 
 def test_root_decision_frozen_against_later_default_creation(homes):

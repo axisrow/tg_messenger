@@ -30,6 +30,12 @@ is the usual culprit) would, on the next run, still be picked over a populated
 legacy root. So the legacy-vs-default test treats an empty ``~/.tg`` as absent (see
 :func:`_has_data`): legacy wins when ``~/.tg`` has no data AND ``~/.tg_messenger``
 does. A ``~/.tg`` that actually holds data always wins (the user adopted it).
+
+A ``~/.tg`` holding ONLY ``.env`` counts as absent too (#188 Axis B): the config
+docs tell users to create ``~/.tg/.env`` for their creds, and that lone file making
+the root non-empty would otherwise flip a legacy user off their existing session —
+the docs manufacturing the very data loss they were meant to fix. Real data next to
+the ``.env`` (a ``sessions/`` dir, ``*.db``, ``logs/``) still counts as adoption.
 """
 
 from __future__ import annotations
@@ -45,17 +51,33 @@ DEFAULT_HOME = Path.home() / ".tg"
 _ROOT_CACHE: Path | None = None
 
 
-def _has_data(p: Path) -> bool:
-    """Whether ``p`` is a directory that actually holds something.
+# A config-only ``.env`` does not make a root "adopted" — see _has_data. Axis B
+# (#188) tells users to put creds in ``~/.tg/.env``; that file alone must not flip a
+# legacy user off their real session dir.
+_NON_DATA_NAMES = frozenset({".env"})
 
-    Used for the legacy-vs-default decision: a bare/empty ``~/.tg`` (a residue a
-    prior process left behind — e.g. a ``TG_LOG_DIR=~/.tg/logs`` mkdir that was then
-    emptied, or any stray dir) must NOT count as "the user adopted the new root",
-    or it would strand a real session sitting in ``~/.tg_messenger``. A permission
-    error on ``iterdir`` fails safe as "no data" so resolution never crashes.
+
+def _has_data(p: Path) -> bool:
+    """Whether ``p`` is a directory that holds actual DATA (sessions/logs/db), not
+    just configuration.
+
+    Used for the legacy-vs-default decision:
+
+    - A bare/empty ``~/.tg`` (a residue a prior process left behind — e.g. a
+      ``TG_LOG_DIR=~/.tg/logs`` mkdir that was then emptied, or any stray dir) must
+      NOT count as "the user adopted the new root", or it would strand a real session
+      sitting in ``~/.tg_messenger``.
+    - A ``~/.tg`` holding ONLY ``.env`` doesn't count either (#188 Axis B): the docs
+      tell users to create ``~/.tg/.env`` for their creds, and that lone config file
+      making the root non-empty would flip a legacy user off their existing session —
+      our own instructions manufacturing the data loss. Real data (a ``sessions/``
+      dir, ``*.db``, ``logs/``) alongside the ``.env`` still counts as adoption.
+
+    A permission error on ``iterdir`` fails safe as "no data" so resolution never
+    crashes.
     """
     try:
-        return p.is_dir() and any(p.iterdir())
+        return p.is_dir() and any(child.name not in _NON_DATA_NAMES for child in p.iterdir())
     except OSError:
         return False
 
@@ -105,9 +127,11 @@ def tg_home() -> Path:
     Order: ``$TG_HOME`` → legacy ``~/.tg_messenger`` (only if it holds data AND
     ``~/.tg`` holds none) → ``~/.tg``. Legacy is read in place, never moved: a
     ``~/.tg`` that actually holds data always wins so a partial new root can't
-    silently pull from the old one. An empty ``~/.tg`` (a residue left by a prior
-    process — see :func:`_has_data` and the module docstring) counts as absent, so
-    it can't strand a real session living in the legacy root.
+    silently pull from the old one. An empty ``~/.tg``, or one holding only a config
+    ``.env`` (a residue left by a prior process, or the ``~/.tg/.env`` the
+    missing-creds hint tells users to create — see :func:`_has_data` and the module
+    docstring), counts as absent, so it can't strand a real session living in the
+    legacy root.
 
     ``TG_HOME`` is ``~``/``$VAR``-expanded and must resolve to an absolute path.
     A misconfigured value (unset ``$VAR`` left literal, or a relative root) would
@@ -135,9 +159,11 @@ def tg_home() -> Path:
         return _ROOT_CACHE
     # No TG_HOME: freeze the legacy-vs-default choice from the honest on-disk state
     # now, so a later subdir mkdir (e.g. TG_LOG_DIR under ~/.tg) can't flip it.
-    # A bare/EMPTY ~/.tg counts as "absent" here: only a ~/.tg that actually holds
-    # data means the user adopted the new root. Otherwise a prior process's empty
-    # ~/.tg residue would strand a real session living in ~/.tg_messenger.
+    # A bare/EMPTY ~/.tg — OR a ~/.tg holding only a config .env — counts as "absent"
+    # here (see :func:`_has_data`): only a ~/.tg that holds actual DATA means the user
+    # adopted the new root. Otherwise a prior process's empty ~/.tg residue, or the
+    # ~/.tg/.env the missing-creds hint tells users to create, would strand a real
+    # session living in ~/.tg_messenger.
     if not _has_data(DEFAULT_HOME) and _has_data(LEGACY_HOME):
         _ROOT_CACHE = LEGACY_HOME
     else:

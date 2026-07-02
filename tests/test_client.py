@@ -22,6 +22,7 @@ from tg_messenger.core import client as client_module
 from tg_messenger.core.client import (
     READ_ONLY_MESSAGE,
     MessageDeleteValidationError,
+    MissingCredentialsError,
     SendForbiddenError,
     StandaloneTelegramClient,
     _dialog_kind,
@@ -2271,3 +2272,97 @@ def test_client_from_env_explicit_session_dir_skips_env_resolution(monkeypatch, 
     client_module.client_from_env(session_dir=explicit)
 
     assert captured["session_dir"] == explicit
+
+
+# --- #188 Axis B: friendly error for missing TG_API_ID/TG_API_HASH ---
+
+
+def _assert_friendly_creds_hint(message: str) -> None:
+    """The hint names where to get and put creds, and NEVER leaks a value or raw telethon."""
+    assert "my.telegram.org" in message
+    assert "TG_API_ID" in message and "TG_API_HASH" in message
+    assert "~/.tg/.env" in message  # persistent, works from any dir
+    # not the raw telethon error a user would otherwise see
+    assert "telethon.rtfd.io" not in message
+    assert "cannot be empty" not in message.lower()
+
+
+def test_client_from_env_missing_creds_gives_friendly_error(monkeypatch):
+    monkeypatch.delenv("TG_API_ID", raising=False)
+    monkeypatch.delenv("TG_API_HASH", raising=False)
+    with pytest.raises(MissingCredentialsError) as excinfo:
+        client_module.client_from_env()
+    _assert_friendly_creds_hint(str(excinfo.value))
+
+
+def test_client_from_env_blank_creds_gives_friendly_error(monkeypatch):
+    # An empty `TG_API_ID=` in a .env (not just unset) must not crash on int("") —
+    # it must land in the friendly validator like the unset case.
+    monkeypatch.setenv("TG_API_ID", "")
+    monkeypatch.setenv("TG_API_HASH", "   ")  # whitespace-only hash counts as blank
+    with pytest.raises(MissingCredentialsError) as excinfo:
+        client_module.client_from_env()
+    _assert_friendly_creds_hint(str(excinfo.value))
+
+
+@pytest.mark.parametrize("bad_api_id", ["abc", "  ", "12x", "1.5"])
+def test_client_from_env_non_numeric_api_id_gives_friendly_error(monkeypatch, bad_api_id):
+    # #190 review fix 3: a non-numeric/whitespace TG_API_ID must reach the friendly
+    # validator, not crash on int() with a raw ValueError before validate_credentials.
+    monkeypatch.setenv("TG_API_ID", bad_api_id)
+    monkeypatch.setenv("TG_API_HASH", "")
+    with pytest.raises(MissingCredentialsError) as excinfo:
+        client_module.client_from_env()
+    _assert_friendly_creds_hint(str(excinfo.value))
+
+
+def test_client_from_env_non_numeric_api_id_with_hash_still_friendly(monkeypatch):
+    # Even with a real hash, a garbage TG_API_ID coerces to 0 → the friendly hint,
+    # never a raw int() traceback.
+    monkeypatch.setenv("TG_API_ID", "not-a-number")
+    monkeypatch.setenv("TG_API_HASH", "realhash")
+    with pytest.raises(MissingCredentialsError) as excinfo:
+        client_module.client_from_env()
+    _assert_friendly_creds_hint(str(excinfo.value))
+    assert "not-a-number" not in str(excinfo.value)  # never echo the raw value
+
+
+def test_constructor_missing_creds_gives_friendly_error():
+    # The library path (someone building the client directly) is guarded too — the
+    # friendly ValueError fires before Telethon's own empty-creds error.
+    with pytest.raises(MissingCredentialsError) as excinfo:
+        StandaloneTelegramClient(api_id=0, api_hash="")
+    _assert_friendly_creds_hint(str(excinfo.value))
+
+
+def test_missing_credentials_error_is_a_value_error():
+    # core raises a plain-ValueError subclass so it never has to import click; the
+    # CLI/TUI catch it and re-raise as their own friendly error.
+    assert issubclass(MissingCredentialsError, ValueError)
+
+
+def test_missing_creds_error_never_leaks_the_values(monkeypatch):
+    # a non-empty api_id with an empty hash still triggers, and the message stays generic —
+    # the id must NOT be interpolated into the hint.
+    monkeypatch.setenv("TG_API_ID", "7654321")
+    monkeypatch.setenv("TG_API_HASH", "")
+    with pytest.raises(MissingCredentialsError) as excinfo:
+        client_module.client_from_env()
+    assert "7654321" not in str(excinfo.value)
+
+
+def test_valid_creds_do_not_trigger_the_guard(monkeypatch):
+    captured = {}
+
+    class FakeStandaloneTelegramClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("TG_API_ID", "123")
+    monkeypatch.setenv("TG_API_HASH", "realhash")
+    monkeypatch.setattr(client_module, "StandaloneTelegramClient", FakeStandaloneTelegramClient)
+
+    client_module.client_from_env()  # must not raise
+
+    assert captured["api_id"] == 123
+    assert captured["api_hash"] == "realhash"

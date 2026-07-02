@@ -10,7 +10,7 @@ from click.testing import CliRunner
 
 from tests.conftest import make_sent_code
 from tg_messenger.cli import main as cli_main
-from tg_messenger.core.client import SendForbiddenError
+from tg_messenger.core.client import MissingCredentialsError, SendForbiddenError
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.models import (
     Dialog,
@@ -1747,6 +1747,222 @@ def test_dotenv_does_not_override_real_env(runner, tmp_path, monkeypatch):
     result = r.invoke(cli_main.cli, ["dialogs"])
     assert result.exit_code == 0
     assert os.environ["TG_API_ID"] == "111"
+
+
+# --- #188 Axis B: persistent ~/.tg/.env is layered under cwd .env, both under real env ---
+
+
+def _point_home_at(monkeypatch, home):
+    """Make BOTH the fixed config path (DEFAULT_HOME/.env) and tg_home() resolve to
+    ``home`` — so a test's ~/.tg/.env is the tmp one, never the developer's real file.
+    """
+    from tg_messenger.core import paths as core_paths
+
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", home)
+    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+
+
+def test_home_dotenv_loaded_when_no_cwd_dotenv(runner, tmp_path, monkeypatch):
+    # `tg-messenger` from a directory with NO .env still picks up ~/.tg/.env — the fix for
+    # "tui crashes from any dir but the one holding a .env".
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)  # no .env here
+    _point_home_at(monkeypatch, home)
+    (home / ".env").write_text('TG_API_ID=77\nTG_API_HASH="homehash"\n', encoding="utf-8")
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert os.environ["TG_API_ID"] == "77"
+    assert os.environ["TG_API_HASH"] == "homehash"
+
+
+def test_cwd_dotenv_beats_home_dotenv(runner, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    _point_home_at(monkeypatch, home)
+    (home / ".env").write_text("TG_API_ID=77\nTG_API_HASH=homehash\n", encoding="utf-8")
+    (cwd / ".env").write_text("TG_API_ID=42\n", encoding="utf-8")  # only overrides the id
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert os.environ["TG_API_ID"] == "42"        # cwd wins
+    assert os.environ["TG_API_HASH"] == "homehash"  # home fills the gap
+
+
+def test_real_env_beats_both_dotenvs(runner, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.chdir(cwd)
+    _point_home_at(monkeypatch, home)
+    os.environ["TG_API_ID"] = "999"
+    (home / ".env").write_text("TG_API_ID=77\n", encoding="utf-8")
+    (cwd / ".env").write_text("TG_API_ID=42\n", encoding="utf-8")
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert os.environ["TG_API_ID"] == "999"  # real env wins over both files
+
+
+def test_home_dotenv_read_even_when_data_root_falls_back_to_legacy(runner, tmp_path, monkeypatch):
+    # #190 review cycle-2 fix: a legacy user (real session data in ~/.tg_messenger/) whose
+    # ONLY creds live in ~/.tg/.env must still have them read. tg_home() resolves to the
+    # legacy root for them (cycle-1 fix 2: a config-only ~/.tg no longer "adopts"), so
+    # reading creds ONLY from tg_home()/.env would miss the file the hint told them to make.
+    # _load_dotenv must ALWAYS attempt the fixed ~/.tg/.env, decoupled from the data root.
+    from tg_messenger.core import paths as core_paths
+
+    default_home = tmp_path / ".tg"           # ~/.tg — holds ONLY .env (config, not data)
+    legacy_home = tmp_path / ".tg_messenger"  # real session data lives here
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)  # no cwd .env
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.setattr(core_paths, "LEGACY_HOME", legacy_home)
+    monkeypatch.delenv("TG_HOME", raising=False)
+    # real session data in legacy → tg_home() falls back to legacy (config-only ~/.tg ignored)
+    legacy_home.mkdir()
+    (legacy_home / "default.session").write_text("s", encoding="utf-8")
+    default_home.mkdir()
+    (default_home / ".env").write_text("TG_API_ID=1234567\nTG_API_HASH=abchash\n", encoding="utf-8")
+    # sanity: the data root really did fall back to legacy for this user
+    core_paths.reset_tg_home_cache()
+    assert core_paths.tg_home() == legacy_home
+    core_paths.reset_tg_home_cache()
+
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    # the documented ~/.tg/.env creds ARE read despite the data root being legacy
+    assert os.environ["TG_API_ID"] == "1234567"
+    assert os.environ["TG_API_HASH"] == "abchash"
+
+
+def test_legacy_home_dotenv_read_when_it_is_the_data_root(runner, tmp_path, monkeypatch):
+    # The other half: if creds sit in a legacy ~/.tg_messenger/.env (and that IS the data
+    # root), they're still read — tg_home()/.env is layered in addition to the fixed ~/.tg.
+    from tg_messenger.core import paths as core_paths
+
+    default_home = tmp_path / ".tg"           # absent → no ~/.tg/.env
+    legacy_home = tmp_path / ".tg_messenger"
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.setattr(core_paths, "LEGACY_HOME", legacy_home)
+    monkeypatch.delenv("TG_HOME", raising=False)
+    legacy_home.mkdir()
+    (legacy_home / "default.session").write_text("s", encoding="utf-8")  # data → legacy is root
+    (legacy_home / ".env").write_text("TG_API_ID=55\nTG_API_HASH=legacyhash\n", encoding="utf-8")
+    core_paths.reset_tg_home_cache()
+
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert os.environ["TG_API_ID"] == "55"
+    assert os.environ["TG_API_HASH"] == "legacyhash"
+
+
+def test_explicit_tg_home_dotenv_beats_fixed_default_dotenv(runner, tmp_path, monkeypatch):
+    # #190 review cycle-3 fix: tg_home() is not only the legacy fallback — an explicit
+    # TG_HOME=/custom-root points sessions/db there too. The active root's .env must WIN
+    # over the fixed ~/.tg/.env, or a stale SESSION_ENCRYPTION_KEY in ~/.tg/.env would open
+    # the custom root's encrypted sessions with the WRONG key. So the active root's config
+    # (tg_home()/.env) is layered BEFORE the fixed DEFAULT_HOME/.env fallback.
+    from tg_messenger.core import paths as core_paths
+
+    default_home = tmp_path / ".tg"        # the fixed ~/.tg fallback (stale creds here)
+    custom_root = tmp_path / "custom-root"  # the explicit TG_HOME (authoritative)
+    default_home.mkdir()
+    custom_root.mkdir()
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH",
+                                                     "SESSION_ENCRYPTION_KEY")})
+    monkeypatch.chdir(cwd)  # no cwd .env
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.setenv("TG_HOME", str(custom_root))
+    # both roots hold a .env with CONFLICTING creds + encryption key
+    (default_home / ".env").write_text(
+        "TG_API_ID=111\nTG_API_HASH=defaulthash\nSESSION_ENCRYPTION_KEY=stalekey\n",
+        encoding="utf-8",
+    )
+    (custom_root / ".env").write_text(
+        "TG_API_ID=222\nTG_API_HASH=customhash\nSESSION_ENCRYPTION_KEY=rightkey\n",
+        encoding="utf-8",
+    )
+    core_paths.reset_tg_home_cache()
+
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    # the explicit TG_HOME's config wins over the fixed ~/.tg/.env fallback
+    assert os.environ["TG_API_ID"] == "222"
+    assert os.environ["TG_API_HASH"] == "customhash"
+    # the crux: the encryption key matches the root the sessions actually live under
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "rightkey"
+
+
+def test_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeypatch):
+    # End-to-end through the CLI: empty creds surface the friendly hint as a clean
+    # ClickException, not a raw telethon traceback — and never echo a cred value.
+    from click.testing import CliRunner
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(tmp_path)  # no .env, no home .env → creds truly absent
+    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    # real client build (no make_client stub) so client_from_env runs the validator
+    result = CliRunner().invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code != 0
+    assert "my.telegram.org" in result.output
+    assert "TG_API_ID" in result.output and "TG_API_HASH" in result.output
+    assert "~/.tg/.env" in result.output
+    assert "Traceback" not in result.output
+    assert "telethon.rtfd.io" not in result.output
+
+
+def test_serve_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeypatch):
+    # #190 review fix 1: `serve` builds the client OUTSIDE _run, so an empty-creds
+    # MissingCredentialsError would escape as a raw traceback (exactly the UX this PR
+    # kills for every other command). It must surface the friendly hint instead.
+    pytest.importorskip("uvicorn")  # serve imports the web stack before building the client
+    from click.testing import CliRunner
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(tmp_path)  # no .env, no home .env → creds truly absent
+    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    # real client build (no make_client stub) so client_from_env runs the validator
+    result = CliRunner().invoke(cli_main.cli, ["serve"])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, MissingCredentialsError)  # converted, not leaked
+    assert "my.telegram.org" in result.output
+    assert "TG_API_ID" in result.output and "TG_API_HASH" in result.output
+    assert "~/.tg/.env" in result.output
+    assert "Traceback" not in result.output
+    assert "telethon.rtfd.io" not in result.output
 
 
 def test_unexpected_error_hint_instead_of_traceback(runner, monkeypatch):

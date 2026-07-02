@@ -83,6 +83,45 @@ class SendForbiddenError(ValueError):
     """
 
 
+class MissingCredentialsError(ValueError):
+    """Raised before Telethon sees empty ``TG_API_ID``/``TG_API_HASH`` (#188 Axis B).
+
+    A ``ValueError`` subclass (so it stays catchable as a plain ``ValueError`` and
+    core never has to import click) carrying the friendly, actionable hint below.
+    Without this the missing-creds path bottoms out in Telethon's own
+    ``"Your API ID or Hash cannot be empty..."`` — a raw traceback pointing at
+    telethon.rtfd.io, which tells a tg_messenger user nothing about where to put
+    their keys. Each front-end (CLI, TUI) re-surfaces ``str(exc)`` as its own
+    friendly error. NEVER interpolate the credential values into the message.
+    """
+
+
+# The one place the "no API creds" UX lives, shared by client_from_env and the
+# StandaloneTelegramClient constructor (the library path) so every front-end gets
+# the same actionable hint. Mirrors LOGIN_HINT's tone (auth.py). Names the vars,
+# where to get them, and where to put a persistent ~/.tg/.env (works from any dir).
+MISSING_CREDENTIALS_HINT = (
+    "Telegram API credentials are missing. Set TG_API_ID and TG_API_HASH.\n"
+    "Get them from https://my.telegram.org (API development tools), then put them in\n"
+    "  ~/.tg/.env    (read from any directory), or\n"
+    "  ./.env        (in the current directory), or the real environment.\n"
+    "Example ~/.tg/.env:\n"
+    "  TG_API_ID=1234567\n"
+    "  TG_API_HASH=0123456789abcdef0123456789abcdef"
+)
+
+
+def validate_credentials(api_id: int, api_hash: str) -> None:
+    """Raise :class:`MissingCredentialsError` with the friendly hint when creds are
+    empty — BEFORE Telethon does (its own error points at telethon.rtfd.io, #188).
+
+    Empty means ``api_id == 0`` (the CLI's ``int(TG_API_ID or "0")`` default) or a
+    blank/whitespace-only ``api_hash``. The hint NEVER contains the values.
+    """
+    if not api_id or not (api_hash or "").strip():
+        raise MissingCredentialsError(MISSING_CREDENTIALS_HINT)
+
+
 # The single user-facing read-only message, shared by every UI (Russian per the
 # project's user-communication language). Avoids drift across cli/tui/web.
 READ_ONLY_MESSAGE = "Сюда писать нельзя — чат только для чтения."
@@ -256,6 +295,10 @@ class StandaloneTelegramClient:
         send_rate_per_min: float = 20.0,
         clock: Callable[[], float] = time.monotonic,
     ):
+        # #188 Axis B: fail with the friendly, actionable hint BEFORE Telethon sees
+        # empty creds (its own ValueError points at telethon.rtfd.io — useless to a
+        # tg_messenger user). Guards the library path too, not just client_from_env.
+        validate_credentials(api_id, api_hash)
         self._store = SessionStore(session_dir, encryption_key=encryption_key)
         if external_session is not None:
             session_string = self._store.from_external(external_session)
@@ -1006,8 +1049,19 @@ def client_from_env(**kwargs) -> StandaloneTelegramClient:
         kwargs["session_dir"] = resolve_env_dir("TG_SESSION_DIR") or default_session_dir()
     # global outgoing rate cap (#25): default 20/min; TG_SEND_RATE=0 explicitly disables.
     kwargs.setdefault("send_rate_per_min", float(os.environ.get("TG_SEND_RATE", "20") or 20))
+    # #188 Axis B: a non-numeric/whitespace TG_API_ID ("abc", "  ") must reach the
+    # friendly validator, not crash on int() with a raw ValueError. Coerce anything
+    # unparseable to 0 — validate_credentials then surfaces the actionable hint.
+    try:
+        api_id = int((os.environ.get("TG_API_ID") or "0").strip() or "0")
+    except ValueError:
+        api_id = 0
+    api_hash = os.environ.get("TG_API_HASH", "")
+    # check here too (not just in __init__) so the friendly hint fires before any
+    # client-construction side effects (session dir resolution, etc.).
+    validate_credentials(api_id, api_hash)
     return StandaloneTelegramClient(
-        api_id=int(os.environ.get("TG_API_ID", "0")),
-        api_hash=os.environ.get("TG_API_HASH", ""),
+        api_id=api_id,
+        api_hash=api_hash,
         **kwargs,
     )
