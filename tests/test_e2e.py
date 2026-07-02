@@ -92,7 +92,7 @@ def test_serve_without_creds_fails_with_clear_error(tmp_path):
         proc.kill()
         pytest.fail("server without creds should exit, but kept running")
     assert proc.returncode != 0
-    assert "API ID or Hash cannot be empty" in out
+    assert "Telegram API credentials are missing" in out
 
 
 @pytest.mark.skipif(not HAS_CREDS, reason="нет TG_API_ID/TG_API_HASH (окружение или .env)")
