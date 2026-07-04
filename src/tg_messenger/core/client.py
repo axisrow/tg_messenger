@@ -122,6 +122,23 @@ def validate_credentials(api_id: int, api_hash: str) -> None:
         raise MissingCredentialsError(MISSING_CREDENTIALS_HINT)
 
 
+def credentials_missing_from_env() -> bool:
+    """Whether ``TG_API_ID`` / ``TG_API_HASH`` are absent from the environment (#188 Axis C).
+
+    Parses the env EXACTLY as :func:`client_from_env` does (a non-numeric ``TG_API_ID``
+    counts as missing — coerces to 0). Used by the ``tg-messenger login`` auto-prompt
+    fallback to decide whether to offer to save creds before constructing the client:
+    after ``_load_dotenv`` has layered every ``.env`` into the environment, this is the
+    authoritative "still missing?" check. NEVER reads or returns the values.
+    """
+    try:
+        api_id = int((os.environ.get("TG_API_ID") or "0").strip() or "0")
+    except ValueError:
+        api_id = 0
+    api_hash = os.environ.get("TG_API_HASH", "")
+    return not api_id or not (api_hash or "").strip()
+
+
 # The single user-facing read-only message, shared by every UI (Russian per the
 # project's user-communication language). Avoids drift across cli/tui/web.
 READ_ONLY_MESSAGE = "Сюда писать нельзя — чат только для чтения."

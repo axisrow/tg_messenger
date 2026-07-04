@@ -5,12 +5,45 @@ them. Registered onto the root ``cli`` group from main.py via the ``COMMANDS`` l
 from __future__ import annotations
 
 import logging
+import sys
 
 import click
 
 from tg_messenger.cli import main as cli_main
+from tg_messenger.cli.commands.config import prompt_and_save_api_creds
+from tg_messenger.core.client import credentials_missing_from_env
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_prompt_for_creds() -> None:
+    """Auto-prompt to save creds on ``login`` when they're still missing (#188 Axis C).
+
+    After the root group's ``_load_dotenv`` has layered every ``.env`` into the env,
+    if creds are STILL absent AND stdin is a tty, offer to save them right here so a
+    brand-new user can go from ``tg-messenger login`` straight to logged-in without
+    hand-editing ``~/.tg/.env``. The saved file is read on the NEXT process, so we also
+    fold the just-written values into the live env so THIS login proceeds without a
+    restart.
+
+    Non-interactive (piped/no tty) -> no prompt, no hang: ``make_client`` will raise
+    :class:`MissingCredentialsError` and surface the friendly hint. ``--import-session``
+    never reaches here (it ``return``s upstream) so we don't steal its stdin.
+    """
+    import os
+
+    if not credentials_missing_from_env():
+        return
+    if not sys.stdin.isatty():
+        return
+    click.echo("Telegram API credentials aren't set yet. Let's save them to ~/.tg/.env.")
+    # prompt+validate+write lives in config.py (shared with `config set-api`).
+    path = prompt_and_save_api_creds()
+    # the file is read on next launch; mirror it into THIS process so login continues now
+    from tg_messenger.cli.parsers import _parse_dotenv
+
+    for key, value in _parse_dotenv(path).items():
+        os.environ[key] = value
 
 
 @click.command()
@@ -49,6 +82,11 @@ def login(ctx: click.Context, session: str, phone: str | None,
 
     if not phone:
         phone = click.prompt("Phone number in international format")
+
+    # #188 Axis C: if creds are still missing after _load_dotenv (and stdin is a tty),
+    # offer to save them now so login can continue. Non-interactive -> falls through to
+    # make_client's MissingCredentialsError (no hang). --import-session returns above.
+    _maybe_prompt_for_creds()
 
     async def _do():
         client = cli_main.make_client(session_name=session)
