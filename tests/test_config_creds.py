@@ -214,12 +214,26 @@ def test_config_set_api_bad_api_id_never_echoes_value(isolated_env) -> None:
 
 def test_config_set_api_unicode_digit_rejected(isolated_env) -> None:
     """Regression (Claude finding D): ``isdigit()`` accepted Unicode digits ('²') that
-    crash ``int()`` downstream. Validation now uses ``int()`` directly."""
+    crash ``int()`` downstream. Validation now uses a strict positive ASCII decimal."""
     runner = CliRunner()
     result = runner.invoke(
         cli_main.cli, ["config", "set-api", "--api-id", "²²²", "--api-hash", "ok"]
     )
     assert result.exit_code != 0  # rejected at validation, not coerced to 0 later
+
+
+@pytest.mark.parametrize("bad_id", ["-1", "+1", "0", "²²²", "not-a-number", ""])
+def test_config_set_api_rejects_non_positive_or_non_ascii(isolated_env, bad_id: str) -> None:
+    """Regression (Codex finding G): only a positive ASCII decimal is a valid api_id.
+    ``int()`` alone admitted signed ('-1','+1') and zero values that then persist in
+    ~/.tg/.env and fail opaquely in Telethon; ``isdigit()`` admitted Unicode digits.
+    """
+    runner = CliRunner()
+    args = ["config", "set-api", "--api-hash", "ok"]
+    if bad_id:
+        args[1:1] = ["--api-id", bad_id]
+    result = runner.invoke(cli_main.cli, args)
+    assert result.exit_code != 0
 
 
 # --------------------------------------------------------------------------------------
@@ -272,6 +286,29 @@ def test_maybe_prompt_folds_only_creds_not_other_keys(isolated_env, monkeypatch)
     # only the two creds were folded in
     assert os.environ.get("TG_API_ID") == "1234567"
     assert os.environ.get("TG_API_HASH") == "myhashvalue"
+
+
+def test_maybe_prompt_overwrites_partial_stale_cred_with_prompted_pair(
+    isolated_env, monkeypatch
+) -> None:
+    """Regression (Codex finding F): a partial/malformed cred must not yield a MIXED pair.
+
+    ``_maybe_prompt_for_creds`` fires when EITHER cred is missing/malformed. Suppose a
+    stale api_id lives in the real env while the hash is absent: the prompt collects a
+    full NEW pair, and the fold must OVERWRITE the stale api_id (not setdefault-keep it),
+    or this login would pair the stale id with the freshly entered hash → Telethon reject.
+    """
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setenv("TG_API_ID", "999-stale-but-parseable-trap")  # malformed → missing
+    monkeypatch.delenv("TG_API_HASH", raising=False)
+    answers = iter(["1234567", "freshhash"])
+    monkeypatch.setattr(config_cmd.click, "prompt", lambda *a, **k: next(answers))
+
+    auth_cmd._maybe_prompt_for_creds()
+
+    # the prompted pair is what the live env now holds — not the stale api_id
+    assert os.environ["TG_API_ID"] == "1234567"
+    assert os.environ["TG_API_HASH"] == "freshhash"
 
 
 def test_maybe_prompt_noop_when_creds_present(isolated_env, monkeypatch) -> None:

@@ -13,6 +13,7 @@ drift apart. Credentials are NEVER echoed (success only names the file written).
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -57,17 +58,19 @@ def prompt_and_save_api_creds(
     api_id = (api_id or "").strip()
     api_hash = (api_hash or "").strip()
 
-    # Validate api_id by the SAME conversion client_from_env uses (int()), not isdigit():
-    # isdigit() accepts Unicode digits ('²', '๓') that then crash int() downstream and
-    # coerce to 0 — a confusing "missing creds" after a "passed" check. The error message
-    # is generic on purpose: the supplied value is credential-shaped and must never be
-    # echoed (a swapped-field paste of the hash into the api_id prompt would otherwise
-    # leak it into terminal/CI output).
-    try:
-        int(api_id)
-    except ValueError:
+    # Validate api_id as a STRICT positive ASCII decimal:
+    # - isdigit() alone accepts Unicode digits ('²', '๓') that crash int() downstream
+    #   and coerce to 0 — a confusing "missing creds" after a "passed" check.
+    # - int() alone accepts signed values ('-5', '+1') and '0'; api_id==0 is the CLI's
+    #   "missing" sentinel and negatives are never a real Telegram app id, so reject them
+    #   HERE rather than letting a malformed id persist in ~/.tg/.env and fail later in
+    #   Telethon with an opaque error.
+    # The error message is generic on purpose: the supplied value is credential-shaped
+    # and must never be echoed (a swapped-field paste of the hash into the api_id prompt
+    # would otherwise leak it into terminal/CI output).
+    if not re.fullmatch(r"[0-9]+", api_id) or int(api_id) <= 0:
         raise click.ClickException(
-            f"TG_API_ID must be a number.\n{MISSING_CREDENTIALS_HINT}"
+            f"TG_API_ID must be a positive number.\n{MISSING_CREDENTIALS_HINT}"
         )
     if not api_hash:
         raise click.ClickException(

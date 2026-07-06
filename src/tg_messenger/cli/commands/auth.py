@@ -41,11 +41,17 @@ def _maybe_prompt_for_creds() -> None:
     # the just-validated values so we fold ONLY TG_API_ID/TG_API_HASH into this process —
     # NOT the whole file. Re-importing the whole ~/.tg/.env would clobber unrelated keys
     # the user set in the REAL env / cwd .env (SESSION_ENCRYPTION_KEY, TG_HOME, …) and
-    # break _load_dotenv's documented precedence (real env always wins). We reached here
-    # only because those two were missing, so setdefault fills exactly the gap.
+    # break _load_dotenv's documented precedence (real env always wins) for THOSE keys.
+    #
+    # The two creds, though, are OVERWRITTEN (not setdefault) with the just-prompted pair:
+    # _maybe_prompt_for_creds fires whenever EITHER cred is missing/malformed, so a stale
+    # api_id could already live in the real env while only the hash was absent. setdefault
+    # would keep that stale api_id and pair it with the freshly entered hash → a mixed,
+    # invalid app pair that Telethon rejects. The user just explicitly entered a full
+    # pair, so that pair is what this login must use.
     _path, api_id, api_hash = prompt_and_save_api_creds()
-    os.environ.setdefault("TG_API_ID", api_id)
-    os.environ.setdefault("TG_API_HASH", api_hash)
+    os.environ["TG_API_ID"] = api_id
+    os.environ["TG_API_HASH"] = api_hash
 
 
 @click.command()
