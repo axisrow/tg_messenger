@@ -60,8 +60,18 @@ directory you launch from — so `tg-messenger tui` works from anywhere. A `.env
 precedence, highest first, is: real environment variables > cwd `.env` > `~/.tg/.env`
 (each layer only fills in what the higher ones didn't set).
 
-Without these the CLI exits with a clear, actionable message telling you exactly where
-to get the keys and where to put them — not a raw Python/telethon stack trace. Your
+**You don't have to hand-edit the file.** Save your keys interactively with:
+
+```bash
+tg-messenger config set-api
+# (omit a flag to be prompted for it; the hash is hidden as you type)
+# or pass them: tg-messenger config set-api --api-id 1234567 --api-hash abcd…
+```
+
+They are written to `~/.tg/.env` at `0600` (the directory at `0700`), merging with any
+keys already there (e.g. `SESSION_ENCRYPTION_KEY`, `TG_SEND_RATE`) — never overwritten.
+And if you just run `tg-messenger login` without any creds set yet, you'll be prompted
+to save them right then, so a brand-new install goes straight to logged-in. Your
 credential values are never echoed. They are required for every command that touches
 Telegram.
 

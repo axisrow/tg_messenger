@@ -1058,6 +1058,7 @@ def tui(ctx: click.Context, session: str) -> None:
 # `main` module; register every relocated command/group onto the root `cli`. ---
 from tg_messenger.cli.commands import agent as _agent_cmds  # noqa: E402
 from tg_messenger.cli.commands import auth as _auth_cmds  # noqa: E402
+from tg_messenger.cli.commands import config as _config_cmds  # noqa: E402
 from tg_messenger.cli.commands import ghostwrite as _ghostwrite_cmds  # noqa: E402
 from tg_messenger.cli.commands import heartbeat as _heartbeat_cmds  # noqa: E402
 from tg_messenger.cli.commands import message as _message_cmds  # noqa: E402
@@ -1067,6 +1068,6 @@ from tg_messenger.cli.commands import watch as _watch_cmds  # noqa: E402
 from tg_messenger.cli.commands import worker as _worker_cmds  # noqa: E402
 
 for _mod in (_auth_cmds, _message_cmds, _watch_cmds, _agent_cmds, _ghostwrite_cmds,
-             _heartbeat_cmds, _username_cmds, _worker_cmds, _serve_cmds):
+             _heartbeat_cmds, _username_cmds, _worker_cmds, _serve_cmds, _config_cmds):
     for _cmd in _mod.COMMANDS:
         cli.add_command(_cmd)

@@ -5,12 +5,53 @@ them. Registered onto the root ``cli`` group from main.py via the ``COMMANDS`` l
 from __future__ import annotations
 
 import logging
+import sys
 
 import click
 
 from tg_messenger.cli import main as cli_main
+from tg_messenger.cli.commands.config import prompt_and_save_api_creds
+from tg_messenger.core.client import credentials_missing_from_env
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_prompt_for_creds() -> None:
+    """Auto-prompt to save creds on ``login`` when they're still missing (#188 Axis C).
+
+    After the root group's ``_load_dotenv`` has layered every ``.env`` into the env,
+    if creds are STILL absent AND stdin is a tty, offer to save them right here so a
+    brand-new user can go from ``tg-messenger login`` straight to logged-in without
+    hand-editing ``~/.tg/.env``. The saved file is read on the NEXT process, so we also
+    fold the just-written values into the live env so THIS login proceeds without a
+    restart.
+
+    Non-interactive (piped/no tty) -> no prompt, no hang: ``make_client`` will raise
+    :class:`MissingCredentialsError` and surface the friendly hint. ``--import-session``
+    never reaches here (it ``return``s upstream) so we don't steal its stdin.
+    """
+    import os
+
+    if not credentials_missing_from_env():
+        return
+    if not sys.stdin.isatty():
+        return
+    click.echo("Telegram API credentials aren't set yet. Let's save them to ~/.tg/.env.")
+    # prompt+validate+write lives in config.py (shared with `config set-api`). It returns
+    # the just-validated values so we fold ONLY TG_API_ID/TG_API_HASH into this process —
+    # NOT the whole file. Re-importing the whole ~/.tg/.env would clobber unrelated keys
+    # the user set in the REAL env / cwd .env (SESSION_ENCRYPTION_KEY, TG_HOME, …) and
+    # break _load_dotenv's documented precedence (real env always wins) for THOSE keys.
+    #
+    # The two creds, though, are OVERWRITTEN (not setdefault) with the just-prompted pair:
+    # _maybe_prompt_for_creds fires whenever EITHER cred is missing/malformed, so a stale
+    # api_id could already live in the real env while only the hash was absent. setdefault
+    # would keep that stale api_id and pair it with the freshly entered hash → a mixed,
+    # invalid app pair that Telethon rejects. The user just explicitly entered a full
+    # pair, so that pair is what this login must use.
+    _path, api_id, api_hash = prompt_and_save_api_creds()
+    os.environ["TG_API_ID"] = api_id
+    os.environ["TG_API_HASH"] = api_hash
 
 
 @click.command()
@@ -49,6 +90,11 @@ def login(ctx: click.Context, session: str, phone: str | None,
 
     if not phone:
         phone = click.prompt("Phone number in international format")
+
+    # #188 Axis C: if creds are still missing after _load_dotenv (and stdin is a tty),
+    # offer to save them now so login can continue. Non-interactive -> falls through to
+    # make_client's MissingCredentialsError (no hang). --import-session returns above.
+    _maybe_prompt_for_creds()
 
     async def _do():
         client = cli_main.make_client(session_name=session)
