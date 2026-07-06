@@ -37,13 +37,15 @@ def _maybe_prompt_for_creds() -> None:
     if not sys.stdin.isatty():
         return
     click.echo("Telegram API credentials aren't set yet. Let's save them to ~/.tg/.env.")
-    # prompt+validate+write lives in config.py (shared with `config set-api`).
-    path = prompt_and_save_api_creds()
-    # the file is read on next launch; mirror it into THIS process so login continues now
-    from tg_messenger.cli.parsers import _parse_dotenv
-
-    for key, value in _parse_dotenv(path).items():
-        os.environ[key] = value
+    # prompt+validate+write lives in config.py (shared with `config set-api`). It returns
+    # the just-validated values so we fold ONLY TG_API_ID/TG_API_HASH into this process —
+    # NOT the whole file. Re-importing the whole ~/.tg/.env would clobber unrelated keys
+    # the user set in the REAL env / cwd .env (SESSION_ENCRYPTION_KEY, TG_HOME, …) and
+    # break _load_dotenv's documented precedence (real env always wins). We reached here
+    # only because those two were missing, so setdefault fills exactly the gap.
+    _path, api_id, api_hash = prompt_and_save_api_creds()
+    os.environ.setdefault("TG_API_ID", api_id)
+    os.environ.setdefault("TG_API_HASH", api_hash)
 
 
 @click.command()

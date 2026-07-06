@@ -78,6 +78,46 @@ def test_write_env_values_second_call_updates_in_place(tmp_path: Path) -> None:
     assert pairs["TG_API_HASH"] == "aaa"
 
 
+def test_write_env_values_leaves_no_temp_behind(tmp_path: Path) -> None:
+    """Regression (Codex finding C): atomic write (temp + os.replace) must not leave a
+    leftover .env.<pid>.tmp in the dir on success."""
+    env = tmp_path / ".env"
+    dotenv.write_env_values({"TG_API_ID": "1", "TG_API_HASH": "h"}, path=env)
+    dotenv.write_env_values({"TG_API_ID": "2"}, path=env)
+    names = sorted(p.name for p in env.parent.iterdir())
+    assert names == [".env"]  # no temp fragments
+
+
+def test_write_env_values_partial_write_does_not_corrupt_file(tmp_path: Path) -> None:
+    """Regression (Codex finding C): if the write fails mid-way, the ORIGINAL file and its
+    preserved keys survive (atomic temp+replace never touches the target until success)."""
+    env = tmp_path / ".env"
+    env.parent.mkdir(parents=True, exist_ok=True)
+    env.write_text("SESSION_ENCRYPTION_KEY=keepme\n", encoding="utf-8")
+
+    import pytest as _pytest
+
+    original = env.read_text(encoding="utf-8")
+
+    def _boom(*_a, **_k):
+        raise OSError("simulated disk full mid-replace")
+
+    monkeypatch_global = _pytest.MonkeyPatch()
+    monkeypatch_global.setattr("tg_messenger.core.dotenv.os.replace", _boom)
+    try:
+        with _pytest.raises(OSError):
+            dotenv.write_env_values(
+                {"TG_API_ID": "1234567", "TG_API_HASH": "deadbeef"}, path=env
+            )
+    finally:
+        monkeypatch_global.undo()
+
+    # the real file is intact — preserved key still there, no creds leaked in
+    assert env.read_text(encoding="utf-8") == original
+    # and no temp fragment left behind
+    assert sorted(p.name for p in env.parent.iterdir()) == [".env"]
+
+
 def test_write_env_values_default_target_uses_default_home(tmp_path, monkeypatch) -> None:
     # the default (path=None) writes to DEFAULT_HOME/.env; monkeypatch reaches it live
     monkeypatch.setattr(core_paths, "DEFAULT_HOME", tmp_path)
@@ -156,6 +196,32 @@ def test_config_set_api_blank_api_hash_is_click_exception(isolated_env) -> None:
     assert result.exit_code != 0
 
 
+def test_config_set_api_bad_api_id_never_echoes_value(isolated_env) -> None:
+    """Regression (Codex finding B): a swapped-field paste must not leak in the error.
+
+    If a user pastes their api_hash into the --api-id field, the validation error must
+    NOT echo the supplied value (credential-shaped). The message is generic.
+    """
+    runner = CliRunner()
+    leaked_hash = "abcdef0123456789abcdef0123456789"
+    result = runner.invoke(
+        cli_main.cli, ["config", "set-api", "--api-id", leaked_hash, "--api-hash", "ok"]
+    )
+    assert result.exit_code != 0
+    assert leaked_hash not in result.output
+    assert leaked_hash not in str(result.exception)
+
+
+def test_config_set_api_unicode_digit_rejected(isolated_env) -> None:
+    """Regression (Claude finding D): ``isdigit()`` accepted Unicode digits ('²') that
+    crash ``int()`` downstream. Validation now uses ``int()`` directly."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_main.cli, ["config", "set-api", "--api-id", "²²²", "--api-hash", "ok"]
+    )
+    assert result.exit_code != 0  # rejected at validation, not coerced to 0 later
+
+
 # --------------------------------------------------------------------------------------
 # login auto-prompt fallback
 # --------------------------------------------------------------------------------------
@@ -179,6 +245,31 @@ def test_maybe_prompt_saves_and_folds_into_env_when_missing_and_tty(
     assert pairs["TG_API_ID"] == "1234567"
     assert pairs["TG_API_HASH"] == "myhashvalue"
     # folded into the LIVE process env so login proceeds without a restart
+    assert os.environ.get("TG_API_ID") == "1234567"
+    assert os.environ.get("TG_API_HASH") == "myhashvalue"
+
+
+def test_maybe_prompt_folds_only_creds_not_other_keys(isolated_env, monkeypatch) -> None:
+    """Regression (Codex finding A): the login fold-in must touch ONLY the two creds.
+
+    Re-importing the whole ~/.tg/.env would clobber unrelated keys the user set in the
+    REAL env (SESSION_ENCRYPTION_KEY, TG_HOME …) and break _load_dotenv's precedence
+    (real env always wins). We set a real-env SESSION_ENCRYPTION_KEY + a stale one in the
+    file, then confirm the real-env value survives the fold.
+    """
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setenv("SESSION_ENCRYPTION_KEY", "real-env-key-wins")
+    isolated_env.write_text(
+        "SESSION_ENCRYPTION_KEY=stale-file-key\n", encoding="utf-8"
+    )
+    answers = iter(["1234567", "myhashvalue"])
+    monkeypatch.setattr(config_cmd.click, "prompt", lambda *a, **k: next(answers))
+
+    auth_cmd._maybe_prompt_for_creds()
+
+    # the real-env key was NOT overwritten by the file's stale value
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "real-env-key-wins"
+    # only the two creds were folded in
     assert os.environ.get("TG_API_ID") == "1234567"
     assert os.environ.get("TG_API_HASH") == "myhashvalue"
 

@@ -28,7 +28,7 @@ def prompt_and_save_api_creds(
     api_id: str | None = None,
     api_hash: str | None = None,
     prompt: Callable[..., str] | None = None,
-) -> Path:
+) -> tuple[Path, str, str]:
     """Prompt for (if missing) and persist ``TG_API_ID`` / ``TG_API_HASH`` to ~/.tg/.env.
 
     Shared by ``config set-api`` and the ``login`` auto-prompt fallback so the two
@@ -40,7 +40,10 @@ def prompt_and_save_api_creds(
 
     ``prompt`` defaults to :func:`click.prompt` resolved at CALL time (so a test
     monkeypatching ``click.prompt`` reaches us — a default bound at definition would
-    freeze the pre-patch function). Returns the path written (values never echoed).
+    freeze the pre-patch function). Returns ``(path, api_id, api_hash)``: the path
+    written plus the two validated values, so the ``login`` caller can fold ONLY those
+    into the live env (not the whole file — see auth.py). The values are returned for
+    in-process use; they are NEVER echoed/logged here.
     """
     from tg_messenger.core.client import MISSING_CREDENTIALS_HINT
 
@@ -54,11 +57,17 @@ def prompt_and_save_api_creds(
     api_id = (api_id or "").strip()
     api_hash = (api_hash or "").strip()
 
-    if not api_id.isdigit():
-        # mirror validate_credentials' tone/destination, but for a malformed (not just
-        # empty) id — a non-numeric api_id would blow up Telethon downstream.
+    # Validate api_id by the SAME conversion client_from_env uses (int()), not isdigit():
+    # isdigit() accepts Unicode digits ('²', '๓') that then crash int() downstream and
+    # coerce to 0 — a confusing "missing creds" after a "passed" check. The error message
+    # is generic on purpose: the supplied value is credential-shaped and must never be
+    # echoed (a swapped-field paste of the hash into the api_id prompt would otherwise
+    # leak it into terminal/CI output).
+    try:
+        int(api_id)
+    except ValueError:
         raise click.ClickException(
-            f"TG_API_ID must be a number — got {api_id!r}.\n{MISSING_CREDENTIALS_HINT}"
+            f"TG_API_ID must be a number.\n{MISSING_CREDENTIALS_HINT}"
         )
     if not api_hash:
         raise click.ClickException(
@@ -67,7 +76,7 @@ def prompt_and_save_api_creds(
 
     path = write_env_values({"TG_API_ID": api_id, "TG_API_HASH": api_hash})
     logger.debug("wrote API credentials to %s", path)
-    return path
+    return path, api_id, api_hash
 
 
 @click.group()
@@ -84,7 +93,7 @@ def set_api(api_id: str | None, api_hash: str | None) -> None:
     Omit a flag to be prompted for it interactively (the hash is hidden). Validates
     before writing: a non-numeric api_id or blank api_hash aborts with a helpful hint.
     """
-    path = prompt_and_save_api_creds(api_id=api_id, api_hash=api_hash)
+    path, _, _ = prompt_and_save_api_creds(api_id=api_id, api_hash=api_hash)
     click.echo(
         f"Saved API credentials to {path} (0600). They are read from any directory now."
     )

@@ -59,7 +59,11 @@ def write_env_values(updates: dict[str, str], *, path: Path | None = None) -> Pa
       ``TG_SEND_RATE`` …) is preserved.
     - Re-serializes ``KEY=VALUE`` one per line (sorted for stable diffs).
     - ``mkdir(parents=True, exist_ok=True)`` + ``chmod 0o700`` on the dir;
-      ``write_text`` + ``chmod 0o600`` on the file — mirror :meth:`SessionStore.save`.
+      file at ``0o600`` — mirror :meth:`SessionStore.save`.
+    - Writes ATOMICALLY: serialize to a same-dir temp file at 0600, fsync, then
+      ``os.replace`` over the target. A crash/SIGKILL/disk-full mid-write otherwise
+      truncates ``~/.tg/.env`` and loses EVERY preserved key (SESSION_ENCRYPTION_KEY,
+      TG_SEND_RATE …) — turning a cred save into persistent config loss.
 
     Returns the path written. NEVER logs the values.
     """
@@ -73,7 +77,22 @@ def write_env_values(updates: dict[str, str], *, path: Path | None = None) -> Pa
 
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
-    serialized = "\n".join(f"{key}={value}" for key, value in sorted(merged.items()))
-    path.write_text(serialized + "\n", encoding="utf-8")
-    os.chmod(path, 0o600)
+    serialized = "\n".join(f"{key}={value}" for key, value in sorted(merged.items())) + "\n"
+    # atomic write: temp file in the SAME dir (so os.replace is atomic on the same FS),
+    # 0600 before content, fsync the data, then rename over the target.
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(serialized)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # leave no half-written temp behind on failure (the real file is untouched)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
     return path
