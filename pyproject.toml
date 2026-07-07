@@ -62,6 +62,7 @@ tg-messenger = "tg_messenger.cli.main:cli"
 packages = ["src/tg_messenger"]
 include = [
     "src/tg_messenger/web/templates/*.html",
+    "src/tg_messenger/web/static/*",
     "src/tg_messenger/py.typed",
 ]
 

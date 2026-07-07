@@ -27,6 +27,7 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from telethon.errors import UnauthorizedError
 
@@ -72,6 +73,9 @@ from tg_messenger.web.state import (  # noqa: F401
 logger = logging.getLogger(__name__)
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+# #187: htmx is vendored under static/ and served locally (mounted in build_app) instead of
+# from the unpkg CDN, so the UI still loads offline / behind a strict CSP / on a blocked network.
+STATIC_DIR = Path(__file__).parent / "static"
 SUGGEST_CSRF_HEADER = "x-tg-messenger-csrf"
 # Outbound prepare timeout is owned by OutboundSendCoordinator now (#73); this constant
 # is still used to bound the SSE inbound-translation task (#69).
@@ -367,11 +371,17 @@ def build_app(
     app = FastAPI(lifespan=lifespan)
     # per-process random cookie-signing key — restart invalidates every session.
     app.state.cookie_key = secrets.token_bytes(32)
+    # #187: serve the vendored htmx (and any future asset) locally — the templates reference
+    # /static/htmx.min.js instead of the unpkg CDN, so the UI works offline / under a strict CSP.
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     if web_pass:
         @app.middleware("http")
         async def auth_gate(request: Request, call_next):
-            if request.url.path in _PUBLIC_PATHS:
+            # #187: /static/* (vendored htmx + assets) is non-sensitive and must load before the
+            # user is authenticated — the login page's scripts would otherwise 401. FastAPI HTTP
+            # middleware wraps every route regardless of mount order, so exempt the prefix here.
+            if request.url.path in _PUBLIC_PATHS or request.url.path.startswith("/static/"):
                 return await call_next(request)
             if _valid_cookie(app.state.cookie_key, request.cookies.get(COOKIE_NAME)):
                 return await call_next(request)
@@ -401,7 +411,12 @@ def build_app(
             client_ip = request.client.host if request.client else "?"
             logger.warning("failed web login attempt from %s", client_ip)
             await _login_delay(_WRONG_PASSWORD_DELAY)
-            return _error_response("Wrong password.", 401)
+            # #187: re-render the FULL login page (form + inline role=alert), not a bare 401
+            # fragment — a full-page POST otherwise lands the user on a near-empty page with no
+            # form, forcing a Back press. The 401 status is preserved for API/programmatic callers.
+            return TEMPLATES.TemplateResponse(
+                request, "login.html", {"error": "Wrong password."}, status_code=401
+            )
 
         @app.get("/logout")
         async def logout(request: Request):
