@@ -16,6 +16,7 @@ import logging
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -40,6 +41,7 @@ from tg_messenger.tui.bubbles import (  # noqa: F401
 )
 from tg_messenger.tui.format import (  # noqa: F401
     _WIDTH_AMBIGUOUS_ZERO_WIDTH,
+    _format_timestamp,
     _message_author_line,
     _message_body,
     _split_id_prefix,
@@ -336,6 +338,16 @@ class MessengerTUI(App):
 
     def _build_coordinator(self) -> OutboundSendCoordinator:
         return OutboundSendCoordinator(outbound=self._outbound, store=self._store)
+
+    @staticmethod
+    def _pane_at_bottom(pane) -> bool:
+        """True when the message pane is scrolled to (or past) its last line (#187).
+
+        Used to decide whether a live incoming/outgoing message should auto-scroll: only when the
+        user is already at the bottom, so a message arriving while they read history up-pane doesn't
+        yank the viewport down. ``max_scroll_y == 0`` (nothing to scroll) counts as at-bottom.
+        """
+        return pane.max_scroll_y == 0 or pane.scroll_y >= pane.max_scroll_y
 
     def _scroll_messages_to_end(self, pane=None) -> None:
         pane = pane or self.query_one("#messages", Vertical)
@@ -754,12 +766,18 @@ class MessengerTUI(App):
     def _message_bubble_for(self, message, dialog_id: int) -> MessageBubble:
         """Build and index the one TUI bubble representation for a core message."""
         show_author = (not message.out) and self._kind_for_rendering(dialog_id) == "group"
+        # #187: stamp a compact local-time label; `now` is the real wall clock so "today" is
+        # correct for the viewer (a fixed-date test message renders the DD.MM HH:MM form).
+        timestamp = None
+        if message.date is not None:
+            timestamp = _format_timestamp(message.date, now=datetime.now().astimezone())
         bubble = MessageBubble(
             _message_body(message),
             message.out,
             message_id=message.id,
             dialog_id=dialog_id,
             author=_message_author_line(message, show_author=show_author),
+            timestamp=timestamp,
         )
         # #128: stamp the switch generation this bubble was built under. A later dialog switch
         # bumps _switch_gen, leaving this (now previous-view) bubble's generation older — which
@@ -999,6 +1017,17 @@ class MessengerTUI(App):
                 self._send_media(dialog_id, path, caption, source_text=text),
                 exclusive=False,
             )
+            return
+        # #187: a leading-`/` input matching NO command (/lang, /tlang handled above) is a command
+        # TYPO, not a message. Sending it verbatim to a real contact is an irreversible wrong send
+        # (a user reaching for `/help` would send it to the person). Refuse, surface an error, and
+        # KEEP the draft so it can be fixed or deleted. Checked here — after the recognised commands,
+        # before any send branch. `state.source_text`/`original_confirm_text` are the outbound-flow
+        # continuations of a NORMAL draft, so a leading-`/` can't reach them; the check is safe here.
+        if text.lstrip().startswith("/"):
+            unknown = text.lstrip().split(maxsplit=1)[0]
+            logger.warning("unknown slash-command in dialog %s: %s", dialog_id, unknown)
+            self.notify(f"Неизвестная команда: {unknown}", severity="error")
             return
         if state.source_text is not None:
             source = state.source_text
@@ -1303,6 +1332,10 @@ class MessengerTUI(App):
                 await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=True)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
+                    # #187: capture whether the user is at the bottom BEFORE mounting the new bubble,
+                    # so a message arriving while they read history up-pane doesn't yank the viewport
+                    # to the bottom — auto-scroll only when they were already following the newest.
+                    was_at_bottom = self._pane_at_bottom(pane)
                     bubble = self._message_bubble_for(ev.message, ev.dialog_id)
                     await pane.mount(_wrap_bubble(bubble))
                     if (
@@ -1315,7 +1348,8 @@ class MessengerTUI(App):
                             group="translate-live",
                             exclusive=False,
                         )
-                    self._scroll_messages_to_end(pane)
+                    if was_at_bottom:
+                        self._scroll_messages_to_end(pane)
                     self.run_worker(
                         self._mark_read(ev.dialog_id, ev.message.id),
                         group="mark_read",
@@ -1340,6 +1374,10 @@ class MessengerTUI(App):
                 await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=False)
                 if ev.dialog_id == self._current:
                     pane = self.query_one("#messages", Vertical)
+                    # #187: same as _drain_incoming — a message sent from ANOTHER device shouldn't
+                    # yank the viewport while the user reads history here. Auto-scroll only if they
+                    # were already at the bottom.
+                    was_at_bottom = self._pane_at_bottom(pane)
                     bubble = self._message_bubble_for(ev.message, ev.dialog_id)
                     await pane.mount(_wrap_bubble(bubble))
                     if (
@@ -1352,7 +1390,8 @@ class MessengerTUI(App):
                             group="translate-live",
                             exclusive=False,
                         )
-                    self._scroll_messages_to_end(pane)
+                    if was_at_bottom:
+                        self._scroll_messages_to_end(pane)
         except Exception:
             logger.exception("outgoing listener failed")
             self.notify("Outgoing listener failed — see log.", severity="error")

@@ -39,12 +39,17 @@ class MessageBubble(Static):
     ]
 
     def __init__(self, body: str, out: bool, message_id: int | None = None,
-                 dialog_id: int | None = None, *, author: str | None = None):
+                 dialog_id: int | None = None, *, author: str | None = None,
+                 timestamp: str | None = None):
         # #118: author is a SEPARATE field set only by the caller when it knows the message gets
         # an author line (group, incoming) — NOT re-parsed from the body. So untrusted body text
         # that happens to contain "\n[" is never misread as author/[id] metadata. The rendered
         # CONTENT (author line + "\n" + body) is byte-identical to before (#113 parity).
         self._author = author
+        # #187: a compact dimmed timestamp shown at the end of the id/body line, SEPARATE from the
+        # (deliberate) [id] prefix. None → nothing rendered (bubbles built outside _message_bubble_for
+        # — e.g. tests mounting a MessageBubble directly — stay time-less and unchanged).
+        self._timestamp = timestamp
         self._body = body
         # the message this bubble can be reacted to; None for non-target bubbles.
         self.message_id = message_id
@@ -73,6 +78,10 @@ class MessageBubble(Static):
         if prefix:
             t.append(prefix, style="dim")
         t.append(_terminal_safe_display_text(rest))
+        if self._timestamp is not None:
+            # #187: trailing dim time on the same line as the body, a space in front so it never
+            # abuts the text. Kept off the [id] prefix so the deliberate #113 convention is untouched.
+            t.append(f"  {self._timestamp}", style="dim")
         if self._translation is not None:
             t.append("\n")
             # the translation gets the theme accent so it visibly separates from the white original

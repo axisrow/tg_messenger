@@ -33,11 +33,70 @@ from tg_messenger.tui.app import (
     SuggestSettingsCard,
     TranslateSettingsCard,
     VariantItem,
+    _format_timestamp,
     _terminal_safe_display_text,
     parse_lang_command,
     parse_media_command,
     parse_tlang_command,
 )
+
+
+import re as _re
+
+# #187: bubbles built via _message_bubble_for now carry a trailing compact timestamp
+# ("  HH:MM" today, "  DD.MM HH:MM" older) that is local-time and so not fixed across CI zones.
+# Content-equality assertions strip it so they keep testing author/body, not the wall clock.
+_TS_SUFFIX = _re.compile(r"  (?:\d{2}\.\d{2} )?\d{2}:\d{2}$")
+
+
+def _body_without_ts(rendered: str) -> str:
+    """The bubble's rendered text with the trailing #187 timestamp segment removed (last line)."""
+    head, sep, last = rendered.rpartition("\n")
+    stripped = _TS_SUFFIX.sub("", last)
+    return f"{head}{sep}{stripped}"
+
+
+def test_tui_bubble_timestamp_stripper_helper():
+    # sanity for the test helper itself: it removes the trailing time on the LAST line only.
+    assert _body_without_ts("[1] hi  09:41") == "[1] hi"
+    assert _body_without_ts("9\n[21] hey  01.01 08:00") == "9\n[21] hey"
+    assert _body_without_ts("[1] hi\n↳ tr\n👍") == "[1] hi\n↳ tr\n👍"  # no ts → unchanged
+
+
+def test_tui_format_timestamp_today_and_older():
+    # #187: HH:MM when the message is from today (relative to `now`), else DD.MM HH:MM. Both sides
+    # are compared in the SAME local zone; a fixed `now` makes the today/older split deterministic.
+    tz = timezone(timedelta(hours=3))  # a fixed offset so the test is zone-independent
+    now = datetime(2026, 7, 8, 15, 0, tzinfo=tz)
+    same_day = datetime(2026, 7, 8, 9, 41, tzinfo=tz)
+    older = datetime(2026, 6, 12, 22, 3, tzinfo=tz)
+    assert _format_timestamp(same_day, now=now) == "09:41"
+    assert _format_timestamp(older, now=now) == "12.06 22:03"
+
+
+async def test_tui_bubble_renders_timestamp_dim():
+    # #187: a bubble built via _message_bubble_for carries a compact time, dim, after the body.
+    from rich.text import Text
+
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        msg = Message(id=1, dialog_id=7, sender_id=7, out=False, text="hi",
+                      date=datetime(2024, 1, 1, 10, 30, tzinfo=timezone.utc))
+        bubble = app._message_bubble_for(msg, 7)
+        rendered = str(bubble.render())
+        # the body is intact and a time segment trails it on the same (last) line
+        assert rendered.startswith("[1] hi")
+        assert _TS_SUFFIX.search(rendered.splitlines()[-1]) is not None
+        # the trailing time segment carries the "dim" style (not plain body text)
+        content = bubble._build()
+        assert isinstance(content, Text)
+        dim_segments = [
+            content.plain[s.start:s.end] for s in content.spans if "dim" in str(s.style)
+        ]
+        assert any(":" in seg for seg in dim_segments)  # the HH:MM time is a dim span
+
 
 
 def test_parse_media_simple():
@@ -527,6 +586,43 @@ async def test_tui_submit_in_readonly_channel_does_not_send():
         await app.on_input_submitted(Input.Submitted(composer, "hello"))
         await pilot.pause()
         assert stub.sent == []  # the guard refused before any send worker
+
+
+async def test_tui_unknown_slash_command_is_not_sent_as_text():
+    # #187: a leading-/ input that matches no command (/lang, /tlang) is a command TYPO — it must
+    # NOT be sent verbatim to the contact (an irreversible wrong send). Surface an error and KEEP
+    # the draft so the user can fix or delete it.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    notifications = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.notify = lambda message, **kw: notifications.append((message, kw))  # type: ignore[method-assign]
+        app._current = 7  # a writable DM
+        composer = app.query_one("#composer", Input)
+        composer.value = "/help"
+        await app.on_input_submitted(Input.Submitted(composer, "/help"))
+        await pilot.pause()
+        assert stub.sent == []  # nothing went out to the contact
+        assert composer.value == "/help"  # draft preserved (not optimistically cleared)
+        assert app._compose_state_for(7).draft == "/help"
+        assert notifications and notifications[-1][1].get("severity") == "error"
+
+
+async def test_tui_leading_slash_content_still_reaches_known_commands():
+    # The guard must not swallow the real commands: /lang and /tlang still route to their handlers.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        composer.value = "/tlang en"
+        await app.on_input_submitted(Input.Submitted(composer, "/tlang en"))
+        await pilot.pause()
+        assert stub.sent == []  # a command, not a message
+        # /tlang cleared the composer (optimistic clear on a recognised command)
+        assert composer.value == ""
 
 
 async def test_tui_react_in_readonly_channel_sends():
@@ -1847,7 +1943,7 @@ async def test_tui_group_incoming_appends_bubble_for_open_group_only():
         bubbles = list(app.query(MessageBubble))
         # ЛС-событие не дорисовано (чужой диалог), групповое — да.
         # #108: в группе у входящего сверху строка автора (sender=None → голый userid).
-        assert [str(b.render()) for b in bubbles] == ["9\n[21] из группы"]
+        assert [_body_without_ts(str(b.render())) for b in bubbles] == ["9\n[21] из группы"]
 
 
 class GroupSenderEventClient(TuiStubClient):
@@ -1876,7 +1972,84 @@ async def test_tui_group_incoming_shows_full_author_line():
         stub.fire.set()
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
-    assert [str(b.render()) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
+    assert [_body_without_ts(str(b.render())) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
+
+
+class LongHistoryEventClient(TuiStubClient):
+    """A long history plus a fire-gated incoming event, for the scroll-position tests (#187)."""
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def history(self, peer, limit=50, offset_id=0):
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        return [
+            Message(id=i, dialog_id=peer, sender_id=peer, out=False, text=f"msg {i}", date=date)
+            for i in range(1, 80)
+        ]
+
+    async def listen_all(self):
+        await self.fire.wait()
+        yield IncomingEvent(dialog_id=7, message=Message(
+            id=500, dialog_id=7, sender_id=7, out=False, text="brand new",
+            date=datetime(2024, 1, 2, tzinfo=timezone.utc)))
+        await asyncio.Event().wait()
+
+
+async def _scroll_to_bottom(pilot, pane):
+    for _ in range(6):
+        await pilot.pause()
+        if pane.max_scroll_y > 0 and pane.scroll_y == pane.max_scroll_y:
+            return
+
+
+async def test_tui_incoming_does_not_force_scroll_while_reading_history():
+    # #187: if the user scrolled up to read old messages, a new incoming message must NOT yank the
+    # viewport to the bottom — reading would be impossible. Auto-scroll only when already at bottom.
+    stub = LongHistoryEventClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        pane = app.query_one("#messages")
+        await _scroll_to_bottom(pilot, pane)
+        assert pane.max_scroll_y > 0
+        # user scrolls up to read history
+        pane.scroll_to(y=0, animate=False, force=True)
+        await pilot.pause()
+        assert pane.scroll_y == 0
+        # a new message arrives while reading
+        stub.fire.set()
+        for _ in range(6):
+            await pilot.pause()
+            if any(b.message_id == 500 for b in app.query(MessageBubble)):
+                break
+        # the new bubble is mounted, but the viewport stayed put (not force-scrolled to bottom)
+        assert any(b.message_id == 500 for b in app.query(MessageBubble))
+        assert pane.scroll_y < pane.max_scroll_y  # did NOT jump to the newest
+
+
+async def test_tui_incoming_scrolls_when_user_at_bottom():
+    # The complement: if the user IS at the bottom, a new message DOES auto-scroll (the common case).
+    stub = LongHistoryEventClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        pane = app.query_one("#messages")
+        await _scroll_to_bottom(pilot, pane)
+        assert pane.scroll_y == pane.max_scroll_y  # at the bottom
+        stub.fire.set()
+        for _ in range(8):
+            await pilot.pause()
+            if (any(b.message_id == 500 for b in app.query(MessageBubble))
+                    and pane.scroll_y == pane.max_scroll_y):
+                break
+        assert any(b.message_id == 500 for b in app.query(MessageBubble))
+        assert pane.scroll_y == pane.max_scroll_y  # followed the newest message
 
 
 async def test_tui_group_author_survives_tab_switch_dropping_dialog_from_list():
@@ -1898,7 +2071,7 @@ async def test_tui_group_author_survives_tab_switch_dropping_dialog_from_list():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
     # the author line is still rendered, driven by the captured _current_kind
-    assert [str(b.render()) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
+    assert [_body_without_ts(str(b.render())) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
 
 
 async def test_tui_dm_incoming_has_no_author_line():
@@ -1954,7 +2127,7 @@ async def test_tui_bubble_author_line_is_dim():
         stub.fire.set()
         await pilot.pause()
         content = list(app.query(MessageBubble))[0].render()
-    assert str(content) == "9 @bob Bob Lee\n[21] привет"  # content parity (no behavior change)
+    assert _body_without_ts(str(content)) == "9 @bob Bob Lee\n[21] привет"  # content parity
     assert _has_dim_span(content, 0, len("9 @bob Bob Lee"))  # author line dimmed
 
 
@@ -2205,7 +2378,7 @@ async def test_tui_open_dialog_live_message_stays_read_and_marks_new_id():
         await pilot.pause()
         await pilot.pause()
         rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
-        bubbles = [str(b.render()) for b in app.query(MessageBubble)]
+        bubbles = [_body_without_ts(str(b.render())) for b in app.query(MessageBubble)]
     assert rendered == ["Bob  #8", "Ann  #7", "Devs  #-100200"]
     assert bubbles == ["[22] fresh"]
     assert stub.read_acks == [(8, 22)]
@@ -2261,7 +2434,7 @@ async def test_tui_outgoing_from_another_device_appends_out_bubble_for_open_dial
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
         # своё сообщение в открытый диалог дорисовано (out=True), в чужой — нет
-        assert [str(b.render()) for b in bubbles] == ["[30] с телефона"]
+        assert [_body_without_ts(str(b.render())) for b in bubbles] == ["[30] с телефона"]
         assert all("out" in b.classes for b in bubbles)
 
 
@@ -2332,7 +2505,7 @@ async def test_tui_own_send_is_not_duplicated_by_outgoing_echo():
         await app._send_text(7, "привет")  # оптимистичный пузырёк + запоминание id=2
         stub.fire.set()  # эхо того же id=2 приходит через listen_outgoing()
         await pilot.pause()
-        bubbles = [str(b.render()) for b in app.query(MessageBubble)]
+        bubbles = [_body_without_ts(str(b.render())) for b in app.query(MessageBubble)]
         # ровно один пузырёк, эхо не продублировало
         assert bubbles == ["[2] привет"]
 
@@ -2564,7 +2737,7 @@ async def test_tui_outgoing_does_not_skip_same_message_id_from_other_dialog():
         await app._send_text(9, "other")  # remembers (dialog=9, id=2), no bubble in dialog 7
         stub.fire.set()  # dialog 7 also has id=2; it must still render
         await pilot.pause()
-        bubbles = [str(b.render()) for b in app.query(MessageBubble)]
+        bubbles = [_body_without_ts(str(b.render())) for b in app.query(MessageBubble)]
         assert bubbles == ["[2] same id"]
 
 
