@@ -405,15 +405,49 @@ async def test_dialogs_show_unread_badge(client_app):
     assert '<span class="unread">1</span>' in r.text
 
 
-async def test_opening_messages_marks_read(client_app):
-    # цикл 81: открытие диалога помечает его прочитанным (best-effort)
+async def test_opening_messages_does_not_mark_read_on_the_get(client_app):
+    # #195 round 2 (critical): the history GET must NOT mark-read server-side — a late response
+    # for a dialog the user already switched away from is dropped client-side (beforeSwap), so a
+    # GET-time mark-read would silently mark an UNSEEN dialog read. Reading is now a separate,
+    # client-confirmed POST /dialogs/{id}/read fired only after the swap is accepted + settled.
     ac, stub = client_app
     await ac.get("/dialogs/7/messages")
+    await asyncio.sleep(0)
+    assert stub.read_acks == []  # the GET alone no longer marks read
+
+
+async def test_read_endpoint_marks_read(client_app):
+    # #195 round 2: the client-confirmed read POST marks the dialog read up to the given id.
+    ac, stub = client_app
+    r = await ac.post("/dialogs/7/read", data={"max_id": "1"})
+    assert r.status_code in (200, 204)
     await asyncio.sleep(0)
     assert stub.read_acks == [(7, 1)]
 
 
-async def test_messages_mark_read_does_not_block_response():
+async def test_read_endpoint_requires_csrf_header():
+    # #195 round 2: /read is a state-changing write — same-origin guarded like /send.
+    stub = WebStubClient()
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/dialogs/7/read", data={"max_id": "1"})  # no CSRF header
+    assert r.status_code == 403
+    assert stub.read_acks == []
+
+
+async def test_read_endpoint_rejects_bad_max_id(client_app):
+    # #195 round 2: a non-numeric max_id is a 400, not a crash / silent mark.
+    ac, stub = client_app
+    r = await ac.post("/dialogs/7/read", data={"max_id": "nope"})
+    assert r.status_code == 400
+    await asyncio.sleep(0)
+    assert stub.read_acks == []
+
+
+async def test_read_endpoint_does_not_block_response():
+    # #195 round 2: mark_read stays best-effort/off the response path (moved from GET to /read).
     stub = WebStubClient()
     started = asyncio.Event()
     release = asyncio.Event()
@@ -429,9 +463,8 @@ async def test_messages_mark_read_does_not_block_response():
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://test",
                                      headers={"X-TG-Messenger-CSRF": "1"}) as ac:
-            r = await asyncio.wait_for(ac.get("/dialogs/7/messages"), timeout=1)
-            assert r.status_code == 200
-            assert "hi" in r.text
+            r = await asyncio.wait_for(ac.post("/dialogs/7/read", data={"max_id": "1"}), timeout=1)
+            assert r.status_code in (200, 204)
             await asyncio.wait_for(started.wait(), timeout=1)
             assert stub.read_acks == []
             release.set()
@@ -439,26 +472,8 @@ async def test_messages_mark_read_does_not_block_response():
     assert stub.read_acks == [(7, 1)]
 
 
-async def test_messages_empty_history_does_not_mark_read():
-    stub = WebStubClient()
-
-    async def empty_history(peer, limit=50, offset_id=0):
-        return []
-
-    stub.history = empty_history
-    app = build_app(client=stub)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test",
-                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
-            r = await ac.get("/dialogs/7/messages")
-            await asyncio.sleep(0)
-    assert r.status_code == 200
-    assert stub.read_acks == []
-
-
-async def test_messages_mark_read_failure_does_not_break(caplog):
-    # mark_read best-effort: ошибка логируется, история всё равно отдаётся
+async def test_read_endpoint_failure_does_not_break(caplog):
+    # #195 round 2: mark_read best-effort — a failure is logged, the POST still returns cleanly.
     import logging
 
     stub = WebStubClient()
@@ -473,11 +488,21 @@ async def test_messages_mark_read_failure_does_not_break(caplog):
         async with httpx.AsyncClient(transport=transport, base_url="http://test",
                                      headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             with caplog.at_level(logging.WARNING):
-                r = await ac.get("/dialogs/7/messages")
+                r = await ac.post("/dialogs/7/read", data={"max_id": "1"})
                 await asyncio.sleep(0)
-    assert r.status_code == 200
-    assert "hi" in r.text
+    assert r.status_code in (200, 204)
     assert any("mark_read" in rec.message or "nope" in str(rec.message) for rec in caplog.records)
+
+
+async def test_index_marks_read_client_side_after_accepted_settle(client_app):
+    # #195 round 2: the client fires POST /dialogs/{id}/read only after an ACCEPTED history swap
+    # settles (a stale swap is dropped by beforeSwap and never settles), for the CURRENT dialog.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "/read" in r.text  # the read endpoint is called from the client
+    assert "function markDialogRead(" in r.text  # the helper exists
+    # it's wired off the accepted-history afterSettle path (search swaps early-return before it)
+    assert "markDialogRead(" in r.text
 
 
 async def test_send_reply_to_reaches_client(client_app):

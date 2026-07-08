@@ -88,16 +88,22 @@ function el(id) { if (!ids.has(id)) ids.set(id, new El(id)); return ids.get(id);
 ].forEach(el);
 
 const composer = el('composer');
+// Bubbles currently in #messages, keyed by the selector markDialogRead uses. Tests set this.
+let messageBubbles = [];
 const document_ = {
   getElementById: (id) => (ids.has(id) ? ids.get(id) : el(id)),
   querySelector: () => null,
-  querySelectorAll: () => [],
+  querySelectorAll: (sel) => (sel === '#messages .msg[data-id]' ? messageBubbles : []),
   body: el('__body'),
   createElement: () => new El('__created'),
   addEventListener: () => {},
 };
 // composer.querySelector('button[type=submit]') is used — return a stub button.
 composer.querySelector = () => ({ disabled: false });
+
+// Record every fetch (so we can assert which dialogs got a /read POST).
+const fetchCalls = [];
+class FakeFormData { constructor() { this._d = {}; } append(k, v) { this._d[k] = v; } get(k) { return this._d[k]; } }
 
 const sandbox = {
   document: document_,
@@ -109,7 +115,11 @@ const sandbox = {
   EventSource: class { constructor() {} close() {} },
   setTimeout: (fn) => { return 0; },  // don't actually schedule debounced work
   clearTimeout: () => {},
-  fetch: () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('') }),
+  fetch: (url, opts) => {
+    fetchCalls.push({ url, body: opts && opts.body });
+    return Promise.resolve({ ok: true, status: 204, text: () => Promise.resolve('') });
+  },
+  FormData: FakeFormData,
   CSS: { escape: (s) => String(s) },
   DOMParser: class { parseFromString() { return { body: { textContent: '' } }; } },
   AbortController: class { constructor() { this.signal = {}; } abort() {} },
@@ -199,6 +209,49 @@ vm.runInContext(pageScript, sandbox, { filename: 'chat.html:inline' });
     shouldSwap: true, pathInfo: { requestPath: '/dialogs/7/messages' },
   });
   check('BUG-2: negative-current, other-dialog response dropped', negStale.detail.shouldSwap === false);
+}
+
+// ---- #195 round 2: switch-before-history-response must NOT mark the left dialog read ----------
+{
+  const messages = el('messages');
+  const dialogId = el('dialog_id');
+  Object.defineProperty(messages, 'scrollHeight', { get: () => 1000, configurable: true });
+
+  // Scenario: user opened unread dialog A (=7), then immediately switched to B (=8).
+  // A's slow history response arrives. beforeSwap drops it (shouldSwap=false); htmx runs
+  // afterSettle only inside the shouldSwap block, so afterSettle for A never fires. We assert
+  // the guard drops it AND that even if afterSettle were reached, the request-path dialog guard
+  // stops it from marking B read with A's content.
+  dialogId.value = '8';               // user is now on B
+  messageBubbles = [{ dataset: { id: '42' } }];  // (A's bubbles, if they had swapped)
+
+  const staleA = messages.dispatch('htmx:beforeSwap', {
+    shouldSwap: true, pathInfo: { requestPath: '/dialogs/7/messages' },
+  });
+  check('round2: stale history response for the LEFT dialog is dropped', staleA.detail.shouldSwap === false);
+
+  // Belt-and-suspenders: even if afterSettle fires for A's path while on B, no /read is sent
+  // (request dialog 7 != current 8), so A is NOT marked read and B is not marked read with A.
+  fetchCalls.length = 0;
+  messages.dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs/7/messages' } });
+  const readCallsForA = fetchCalls.filter((c) => String(c.url).includes('/dialogs/7/read'));
+  const readCallsForB = fetchCalls.filter((c) => String(c.url).includes('/dialogs/8/read'));
+  check('round2: no /read POST for the left dialog A', readCallsForA.length === 0);
+  check('round2: no /read POST for B from A’s settle', readCallsForB.length === 0);
+
+  // Positive path: an ACCEPTED history swap for the CURRENT dialog B DOES mark B read with B's max id.
+  fetchCalls.length = 0;
+  dialogId.value = '8';
+  messageBubbles = [{ dataset: { id: '5' } }, { dataset: { id: '9' } }, { dataset: { id: '3' } }];
+  messages.dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs/8/messages' } });
+  const readB = fetchCalls.filter((c) => String(c.url).includes('/dialogs/8/read'));
+  check('round2: accepted history for the open dialog marks it read', readB.length === 1);
+  check('round2: /read carries the highest shown message id', readB.length === 1 && readB[0].body.get('max_id') === '9');
+
+  // A search swap for the open dialog does NOT mark read (search is not "seeing the whole chat").
+  fetchCalls.length = 0;
+  messages.dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs/8/search?q=hi' } });
+  check('round2: a search swap does not mark read', fetchCalls.filter((c) => String(c.url).includes('/read')).length === 0);
 }
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);

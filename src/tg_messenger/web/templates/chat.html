@@ -185,13 +185,29 @@
       const empty = document.getElementById('messages-empty');
       if (empty) empty.remove();
     }
-    // #187: after opening an unread chat we mark it read server-side; clear the sidebar badge
-    // client-side too so the stale count doesn't linger until the next /dialogs fetch.
+    // #187: after an accepted history swap we clear the sidebar badge client-side so the stale
+    // count doesn't linger until the next /dialogs fetch.
     function clearUnreadBadge(dialogId) {
       const li = document.querySelector('#dialogs li[data-dialog="' + CSS.escape(String(dialogId)) + '"]');
       if (!li) return;
       const badge = li.querySelector('.unread');
       if (badge) badge.remove();
+    }
+    // #195 round 2 (critical): the server no longer marks-read on the history GET (a stale GET for
+    // a dialog the user left would have marked it read unseen). Reading now follows the actual
+    // display: after an ACCEPTED history swap settles for the open dialog, POST the highest shown
+    // message id to /dialogs/{id}/read. Best-effort — a failure just leaves the badge for the next
+    // /dialogs fetch, never blocks or throws.
+    function markDialogRead(dialogId) {
+      const bubbles = document.querySelectorAll('#messages .msg[data-id]');
+      let maxId = 0;
+      bubbles.forEach((b) => { const n = parseInt(b.dataset.id, 10); if (n > maxId) maxId = n; });
+      if (!maxId) return;  // empty history — nothing to mark
+      const fd = new FormData();
+      fd.append('max_id', String(maxId));
+      fetch('/dialogs/' + encodeURIComponent(dialogId) + '/read', {
+        method: 'POST', body: fd, headers: { 'X-TG-Messenger-CSRF': '1' },
+      }).catch(() => {});
     }
     // #187: fold the presentation selector U+FE0F so a bare ❤ (from an echo) and ❤️ (from a
     // preset) dedupe as the same reaction instead of showing twice.
@@ -305,19 +321,26 @@
         evt.detail.shouldSwap = false;  // stale response for a dialog the user already left
       }
     });
-    // #187: the #messages history swap just settled — show the newest, drop the empty state,
-    // and clear the just-opened dialog's unread badge (it was marked read server-side). A search
-    // swap only drops the empty state; it neither yanks the view nor clears the unread badge.
-    // #195 review: read the flag off the just-settled request's path, not a global boolean — a
-    // second search racing a first can no longer flip the flag for the wrong response.
+    // #187/#195: the #messages history swap just settled — show the newest, drop the empty state,
+    // and mark the dialog read (server-confirmed + client badge clear). This handler fires ONLY
+    // for an ACCEPTED swap: the beforeSwap guard drops a stale response (shouldSwap=false), and
+    // htmx runs afterSettle inside the shouldSwap block, so a dropped stale swap never reaches
+    // here. A search swap only drops the empty state — it neither yanks the view, clears the
+    // badge, nor marks read. Search-vs-history is read off THIS response's request path.
     document.getElementById('messages').addEventListener('htmx:afterSettle', (evt) => {
       hideMessagesEmptyState();
       const path = evt.detail && evt.detail.pathInfo && evt.detail.pathInfo.requestPath;
       const wasSearch = /\/dialogs\/-?\d+\/search/.test(path || '');
-      if (wasSearch) return;  // a search neither yanks the view nor clears the unread badge
+      if (wasSearch) return;  // a search neither yanks the view, clears the badge, nor marks read
       scrollMessagesToEnd();
+      // #195 round 2: only the dialog whose accepted history this is — belt-and-suspenders on top
+      // of beforeSwap (which already dropped a stale swap), reading the id from the request path.
+      const reqDialog = dialogIdFromRequestPath(path);
       const openId = document.getElementById('dialog_id').value;
-      if (openId) clearUnreadBadge(openId);
+      const target = reqDialog !== null ? reqDialog : openId;
+      if (!target || (reqDialog !== null && reqDialog !== openId)) return;
+      clearUnreadBadge(target);   // #187: clear the sidebar badge client-side
+      markDialogRead(target);     // #195: confirm the read server-side (follows actual display)
     });
     // Track selected dialog id from clicks on the list, wire SSE for incoming.
     let es = null;

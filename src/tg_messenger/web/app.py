@@ -566,13 +566,26 @@ def build_app(
         items = await (store.history(dialog_id, limit=50) if store is not None else client.history(dialog_id, limit=50))
         if translator is not None:
             items = await translator.translate_history(dialog_id, items)
-        # opening a dialog clears its unread counter, but it must never block rendering history
-        if items:
-            _schedule_mark_read(request.app, client, dialog_id, max(m.id for m in items))
+        # #195 round 2 (critical): the history GET no longer marks-read. A late response for a
+        # dialog the user already left is dropped client-side (chat.html beforeSwap guard), so a
+        # GET-time mark-read would silently mark an UNSEEN dialog read. Reading now follows the
+        # actual display: the client POSTs /dialogs/{id}/read after the swap is accepted+settled.
         is_group = await _dialog_kind(client, dialog_id) == "group"  # #108
         return HTMLResponse(
             "".join(_message_div(m, show_author=is_group and not m.out) for m in items)
         )
+
+    @app.post("/dialogs/{dialog_id}/read", response_class=HTMLResponse)
+    async def mark_read(request: Request, dialog_id: int, max_id: str = Form("")):
+        # #195 round 2: client-confirmed read — fired only after an ACCEPTED (non-stale) history
+        # swap settles for the dialog the user is actually viewing. Same-origin guarded like the
+        # other state-changing writes; mark_read stays best-effort/background (never blocks).
+        if (csrf_error := _same_origin_error(request)) is not None:
+            return csrf_error
+        if not max_id.strip().isdigit():
+            return _error_response("max_id must be a positive integer.", 400)
+        _schedule_mark_read(request.app, request.app.state.client, dialog_id, int(max_id))
+        return HTMLResponse("", status_code=204)
 
     @app.post("/send", response_class=HTMLResponse)
     async def send(request: Request, dialog_id: str = Form(""), text: str = Form(""),
