@@ -980,23 +980,34 @@ class MessengerTUI(App):
             return  # this store can't serve older pages — backfill stays disabled
         if dialog_id in self._backfill_exhausted:
             return
-        if self._oldest_message_id is None or dialog_id in self._backfilling:
+        # #202 review: capture the offset NOW, while it still belongs to this dialog —
+        # _oldest_message_id is app-global, and by the time the worker body runs a dialog
+        # switch may have repointed it at ANOTHER dialog's cursor (an out-of-window offset
+        # the store must never page with).
+        offset_id = self._oldest_message_id
+        if offset_id is None or dialog_id in self._backfilling:
             return
         self._backfilling.add(dialog_id)
-        self.run_worker(self._backfill_history(dialog_id), group="history-backfill", exclusive=False)
+        self.run_worker(
+            self._backfill_history(dialog_id, offset_id), group="history-backfill", exclusive=False
+        )
 
-    async def _backfill_history(self, dialog_id: int) -> None:
+    async def _backfill_history(self, dialog_id: int, offset_id: int) -> None:
         """Fetch and PREPEND the next older page of history, preserving the scroll position (#187).
 
-        The offset_id is the oldest currently-loaded message id; the store (production path,
-        #200) or the client returns the page ending just before it (chronological). We mount the
-        older bubbles at the TOP and nudge the scroll so the message the user was reading stays
-        put instead of jumping. An empty page → this dialog has no more history (marked
-        exhausted). Bails if the user switched dialogs mid-fetch; the in-flight guard is released
-        for THIS dialog only (#200), never for a backfill the user started elsewhere meanwhile.
+        ``offset_id`` is the oldest loaded message id, captured by the SCHEDULER (#202 review:
+        the app-global ``_oldest_message_id`` may already belong to another dialog by the time
+        this worker runs — paging dialog A with dialog B's cursor is exactly the out-of-window
+        offset the store must never absorb). The store (production path, #200) or the client
+        returns the page ending just before it (chronological). We mount the older bubbles at
+        the TOP and nudge the scroll so the message the user was reading stays put instead of
+        jumping. An empty page → this dialog has no more history (marked exhausted). Bails if
+        the user switched dialogs — checked BEFORE the fetch too, so a stale worker never pages
+        a chat the user has left; the in-flight guard is released for THIS dialog only (#200).
         """
-        offset_id = self._oldest_message_id
         try:
+            if dialog_id != self._current:
+                return  # switched away before the fetch even started — release the guard only
             try:
                 if self._store is not None:
                     older = await self._store.history(dialog_id, limit=50, offset_id=offset_id)

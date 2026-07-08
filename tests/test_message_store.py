@@ -470,3 +470,64 @@ async def test_message_store_offset_page_without_window_does_not_fabricate_conti
         await store.close()
     assert [m.id for m in older] == list(range(21, 71))
     assert row is None  # no window existed; none was invented
+
+
+async def test_message_store_offset_above_window_fetches_missing_newer_page(tmp_path):
+    # #202 review (BUG-A): an offset ABOVE the window's high edge must fetch — the page just
+    # below the offset is NEWER than the window, so it is NOT in the DB. Serving the stale
+    # window as that page silently loses the high..offset history; the sync row must not move.
+    client = PagingStoreClient(total=120)
+    storage = await _storage(tmp_path)
+    store = MessageStore(client=client, storage=storage)
+    try:
+        await store.history(7, limit=50)  # window (71, 120)
+        # 80 newer messages arrive; the TTL cooldown means the window still ends at 120
+        client.messages = [_msg(i) for i in range(200, 0, -1)]
+        calls_before = len(client.history_calls)
+        page = await store.history(7, limit=50, offset_id=200)
+        row = await storage.fetchone(
+            "SELECT low_id, high_id FROM message_sync WHERE dialog_id = 7", ()
+        )
+    finally:
+        await store.close()
+    assert [m.id for m in page] == list(range(150, 200))  # the REAL page below 200…
+    assert len(client.history_calls) == calls_before + 1  # …fetched, not served stale from DB
+    assert (int(row[0]), int(row[1])) == (71, 120)  # sync window untouched
+
+
+async def test_message_store_offset_below_window_does_not_fabricate_contiguity(tmp_path):
+    # #202 review (BUG-A): an offset BELOW the window's low edge fetches the page but must NOT
+    # absorb it — the offset..low gap was never fetched, and moving low_id across it would serve
+    # the hole as contiguous history forever after.
+    client = PagingStoreClient(total=120)
+    storage = await _storage(tmp_path)
+    store = MessageStore(client=client, storage=storage)
+    try:
+        await store.history(7, limit=50)  # window (71, 120)
+        page = await store.history(7, limit=50, offset_id=60)  # a FULL page below the window
+        row = await storage.fetchone(
+            "SELECT low_id, high_id FROM message_sync WHERE dialog_id = 7", ()
+        )
+    finally:
+        await store.close()
+    assert [m.id for m in page] == list(range(10, 60))  # the correct page is still served
+    assert (int(row[0]), int(row[1])) == (71, 120)  # low NOT moved across the 60..70 hole
+
+
+async def test_message_store_offset_below_window_short_page_keeps_low_edge(tmp_path):
+    # #202 review (BUG-A, the manually-reproduced vector): a SHORT page below the window used to
+    # drop low_id to 0 ("history start") while the offset..low range was never fetched — the DB
+    # then claims complete history with a hole in it. The sync row must stay put.
+    client = PagingStoreClient(total=120)
+    storage = await _storage(tmp_path)
+    store = MessageStore(client=client, storage=storage)
+    try:
+        await store.history(7, limit=50)  # window (71, 120)
+        page = await store.history(7, limit=50, offset_id=10)  # ids 1..9 — short, below window
+        row = await storage.fetchone(
+            "SELECT low_id, high_id FROM message_sync WHERE dialog_id = 7", ()
+        )
+    finally:
+        await store.close()
+    assert [m.id for m in page] == list(range(1, 10))
+    assert (int(row[0]), int(row[1])) == (71, 120)  # NOT (0, 120): ids 10..70 are missing

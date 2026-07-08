@@ -304,29 +304,35 @@ class MessageStore:
     async def _history_before(self, peer: int, limit: int, offset_id: int) -> list[Message]:
         """The page of up to ``limit`` messages strictly older than ``offset_id`` (#200).
 
-        Serves from the DB when the contiguous window already covers ``limit`` rows below
-        ``offset_id`` — or reaches the start of history (``low_id == 0``), where a short page
-        is the honest answer. Otherwise fetches the older page from the client, persists it,
-        and absorbs it into the window's low edge — but only when the page connects to the
-        window (``offset_id`` inside it), so contiguity is never fabricated across a gap.
+        Serves from the DB when the contiguous window covers the request; otherwise fetches
+        the older page from the client and persists it. Both the cached serve and the window's
+        low-edge absorption require the offset to sit INSIDE the window
+        (``low_id <= offset_id <= high_id`` — #202 review): above ``high_id`` the page just
+        below the offset is NEWER than the window (serving the window instead silently loses
+        the high..offset history), and below ``low_id`` absorbing the fetched page would
+        fabricate contiguity across the never-fetched offset..low gap. Out-of-window pages
+        are fetched and stored, but the sync row never moves for them.
         """
         row = await self._sync_row(peer)
+        low_id = high_id = 0
+        in_window = False
         if row is not None:
-            low_id = int(row[0])
-            if low_id == 0 or low_id < offset_id:
-                cached = await self._load_before(peer, limit, offset_id, low_id)
-                if low_id == 0 or len(cached) >= limit:
-                    return cached
+            low_id, high_id = int(row[0]), int(row[1])
+            in_window = low_id <= offset_id <= high_id
+        if in_window:
+            cached = await self._load_before(peer, limit, offset_id, low_id)
+            if low_id == 0 or len(cached) >= limit:
+                return cached
         fetched = await self._client.history(peer, limit=limit, offset_id=offset_id)
         for message in fetched:
             await self._upsert_message(message)
-        if row is not None and offset_id <= int(row[1]):
+        if in_window:
             # The fetched page ends just below offset_id, which is inside the window — the
             # union stays contiguous. A short page means nothing older exists: the window
             # now reaches the start of history (low_id = 0, the _replace_window convention).
             new_low = 0 if len(fetched) < limit else min(int(m.id) for m in fetched)
-            if new_low < int(row[0]):
-                await self._set_sync_row(peer, new_low, int(row[1]))
+            if new_low < low_id:
+                await self._set_sync_row(peer, new_low, high_id)
         return fetched
 
     async def _replace_window(self, peer: int, fetched: list[Message], limit: int) -> tuple[int, int]:

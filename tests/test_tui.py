@@ -820,8 +820,8 @@ async def test_tui_history_backfill_prepends_older_page_on_client_path():
         ids_before = sorted(b.message_id for b in app.query(MessageBubble))
         assert ids_before == list(range(51, 101))  # only the newest window initially
         assert app._oldest_message_id == 51
-        # simulate a scroll-to-top backfill
-        await app._backfill_history(7)
+        # simulate a scroll-to-top backfill (#202: the scheduler captures the offset)
+        await app._backfill_history(7, app._oldest_message_id)
         await pilot.pause()
         ids_after = sorted(b.message_id for b in app.query(MessageBubble))
         assert ids_after == list(range(1, 101))  # the older page is now prepended
@@ -858,10 +858,10 @@ async def test_tui_history_backfill_stops_when_no_older_page():
         await pilot.pause()
         app._current = 7
         await app._show_history(7)
-        await app._backfill_history(7)  # loads ids 1..50 (oldest becomes 1)
+        await app._backfill_history(7, app._oldest_message_id)  # ids 1..50 (oldest becomes 1)
         await pilot.pause()
         assert app._oldest_message_id == 1
-        await app._backfill_history(7)  # offset_id=1 → empty → exhausted, no change
+        await app._backfill_history(7, 1)  # offset_id=1 → empty → exhausted, no change
         await pilot.pause()
         assert 7 in app._backfill_exhausted
         # _maybe_backfill_history is now a no-op (exhausted) — no further history call is scheduled
@@ -906,7 +906,7 @@ async def test_tui_history_backfill_runs_on_store_path():
         await app._show_history(7)
         await pilot.pause()
         assert app._oldest_message_id == 51
-        await app._backfill_history(7)
+        await app._backfill_history(7, app._oldest_message_id)
         await pilot.pause()
         ids_after = sorted(b.message_id for b in app.query(MessageBubble))
         assert ids_after == list(range(1, 101))  # the older page is prepended
@@ -965,10 +965,35 @@ async def test_tui_stale_backfill_worker_does_not_clobber_other_dialogs_guard():
         app._current = 8  # the user switched to dialog B…
         app._backfilling.add(8)  # …whose own backfill is in flight
         app._oldest_message_id = 51
-        await app._backfill_history(7)  # A's stale worker completes after the switch
+        await app._backfill_history(7, 51)  # A's stale worker completes after the switch
         await pilot.pause()
         assert 8 in app._backfilling  # B's in-flight guard survived
         assert 7 not in app._backfilling  # A's guard was released
+
+
+async def test_tui_stale_backfill_never_pages_dialog_a_with_dialog_b_cursor():
+    # #202 review (BUG-B): _oldest_message_id is app-global, but the backfill worker used to read
+    # it INSIDE the worker body — after an A→B dialog switch the stale worker for A paged A's
+    # history with B's cursor, i.e. exactly the out-of-window offset the store must never see
+    # (it corrupts A's sync window — BUG-A's reachable-in-prod path). The offset is captured at
+    # SCHEDULE time, and a stale worker must bail BEFORE any fetch.
+    store = PaginatedHistoryStore()
+    app = MessengerTUI(client=TuiStubClient(), store=store)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        assert app._oldest_message_id == 51
+        app._maybe_backfill_history()  # A's worker scheduled (offset 51 captured here)
+        # before the worker body runs, the user switches to dialog B with its own cursor
+        app._current = 8
+        app._oldest_message_id = 4242  # B's cursor — must never leak into A's fetch
+        await pilot.pause()  # let the scheduled worker run
+        assert all(c != (7, 50, 4242) for c in store.history_calls)  # B's cursor never used on A
+        # stale worker bailed BEFORE fetching: no offset-paging call for dialog A at all
+        assert all(not (c[0] == 7 and c[2]) for c in store.history_calls)
+        assert 7 not in app._backfilling  # and it still released its guard
 
 
 async def test_tui_history_scrolls_to_newest_message():
