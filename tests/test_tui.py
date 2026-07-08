@@ -618,6 +618,46 @@ async def test_tui_unknown_slash_command_is_not_sent_as_text():
         assert notifications and notifications[-1][1].get("severity") == "error"
 
 
+async def test_tui_bot_dialog_slash_command_is_sent_verbatim():
+    # #199: for a BOT dialog the slash IS the payload — /start must go out verbatim. The
+    # unknown-slash typo guard protects against an irreversible wrong send to a HUMAN; a bot
+    # command bypasses it AND the outbound-translate flow (a command is a protocol token,
+    # not prose to translate).
+    stub = TuiStubClient()
+    outbound = RecordingOutbound()
+    app = MessengerTUI(client=stub, outbound=outbound)
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 9  # HelperBot (kind="bot") from the stub dialog list
+        composer = app.query_one("#composer", Input)
+        composer.value = "/start"
+        await app.on_input_submitted(Input.Submitted(composer, "/start"))
+        await stub.wait_sent_count(1)
+        await pilot.pause()
+        assert stub.sent == [(9, "/start", None)]  # the command reached the bot verbatim
+        assert outbound.applies_calls == []  # no translation flow for a bot command
+        assert composer.value == ""  # optimistic clear, like any successful send
+
+
+async def test_tui_human_dialog_slash_typo_still_blocked_with_bot_exemption():
+    # #199 twin: the bot exemption must NOT weaken the human typo guard — an unknown slash
+    # command in a DM (kind="dm") is still refused with the draft preserved.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    notifications = []
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app.notify = lambda message, **kw: notifications.append((message, kw))  # type: ignore[method-assign]
+        app._current = 7  # Ann — a human DM
+        composer = app.query_one("#composer", Input)
+        composer.value = "/starr"
+        await app.on_input_submitted(Input.Submitted(composer, "/starr"))
+        await pilot.pause()
+        assert stub.sent == []  # nothing went out to the human
+        assert composer.value == "/starr"  # draft preserved for fixing
+        assert notifications and notifications[-1][1].get("severity") == "error"
+
+
 async def test_tui_leading_slash_content_still_reaches_known_commands():
     # The guard must not swallow the real commands: /lang and /tlang still route to their handlers.
     stub = TuiStubClient()
@@ -780,8 +820,8 @@ async def test_tui_history_backfill_prepends_older_page_on_client_path():
         ids_before = sorted(b.message_id for b in app.query(MessageBubble))
         assert ids_before == list(range(51, 101))  # only the newest window initially
         assert app._oldest_message_id == 51
-        # simulate a scroll-to-top backfill
-        await app._backfill_history(7)
+        # simulate a scroll-to-top backfill (#202: the scheduler captures the offset)
+        await app._backfill_history(7, app._oldest_message_id)
         await pilot.pause()
         ids_after = sorted(b.message_id for b in app.query(MessageBubble))
         assert ids_after == list(range(1, 101))  # the older page is now prepended
@@ -818,10 +858,10 @@ async def test_tui_history_backfill_stops_when_no_older_page():
         await pilot.pause()
         app._current = 7
         await app._show_history(7)
-        await app._backfill_history(7)  # loads ids 1..50 (oldest becomes 1)
+        await app._backfill_history(7, app._oldest_message_id)  # ids 1..50 (oldest becomes 1)
         await pilot.pause()
         assert app._oldest_message_id == 1
-        await app._backfill_history(7)  # offset_id=1 → empty → exhausted, no change
+        await app._backfill_history(7, 1)  # offset_id=1 → empty → exhausted, no change
         await pilot.pause()
         assert 7 in app._backfill_exhausted
         # _maybe_backfill_history is now a no-op (exhausted) — no further history call is scheduled
@@ -831,9 +871,68 @@ async def test_tui_history_backfill_stops_when_no_older_page():
         assert len(stub.history_calls) == calls_before
 
 
+class PaginatedHistoryStore(TuiSourceStore):
+    """A store with offset_id paging (the #200 core contract): newest 50 (ids 51..100) first,
+    then the older page (ids 1..50) — so the store-backed TUI backfill runs end-to-end."""
+
+    def __init__(self):
+        super().__init__()
+        self.history_calls = []
+
+    async def history(self, peer, limit=50, offset_id=0):
+        self.history_calls.append((peer, limit, offset_id))
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        def page(lo, hi):
+            return [Message(id=i, dialog_id=peer, sender_id=peer, out=False,
+                            text=f"msg {i}", date=date) for i in range(lo, hi)]
+
+        if not offset_id:
+            return page(51, 101)  # newest window: ids 51..100
+        if offset_id == 51:
+            return page(1, 51)  # the older page just before id 51
+        return []
+
+
+async def test_tui_history_backfill_runs_on_store_path():
+    # #200: the production TUI wires a MessageStore, and the store pages older history via
+    # offset_id — the scroll-to-top backfill must run THROUGH the store. (This was dead code:
+    # the old guard disabled backfill whenever ANY store was present, i.e. always in prod.)
+    store = PaginatedHistoryStore()
+    app = MessengerTUI(client=TuiStubClient(), store=store)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        assert app._oldest_message_id == 51
+        await app._backfill_history(7, app._oldest_message_id)
+        await pilot.pause()
+        ids_after = sorted(b.message_id for b in app.query(MessageBubble))
+        assert ids_after == list(range(1, 101))  # the older page is prepended
+        assert (7, 50, 51) in store.history_calls  # paged via the STORE, not the client
+
+
+async def test_tui_scroll_top_schedules_store_backfill():
+    # #200: _maybe_backfill_history no longer bails when a store is wired — a store that supports
+    # offset paging gets the backfill worker scheduled. (Twin of ..._disabled_with_store below,
+    # which keeps guarding stores WITHOUT offset paging.)
+    store = PaginatedHistoryStore()
+    app = MessengerTUI(client=TuiStubClient(), store=store)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        app._maybe_backfill_history()
+        await _pause_until(pilot, lambda: any(c[2] == 51 for c in store.history_calls))
+        assert any(c[2] == 51 for c in store.history_calls)
+
+
 async def test_tui_history_backfill_disabled_with_store():
-    # #187 constraint: MessageStore.history has no offset_id, so backfill is client-only. With a
-    # store wired, _maybe_backfill_history must be a no-op (no attempt to page the store).
+    # #200: a store WITHOUT offset_id paging (a leaner seam object than the core MessageStore)
+    # can't serve older pages — _maybe_backfill_history must stay a no-op for it rather than
+    # crash on an unexpected kwarg.
     store = TuiSourceStore()
     calls = []
     orig = store.history
@@ -852,6 +951,102 @@ async def test_tui_history_backfill_disabled_with_store():
         app._maybe_backfill_history()  # must NOT schedule a store fetch
         await pilot.pause()
         assert len(calls) == calls_before  # store was never paged for backfill
+
+
+async def test_tui_stale_backfill_worker_does_not_clobber_other_dialogs_guard():
+    # #200: the in-flight backfill guard is per-dialog. A stale worker finishing for dialog A
+    # (after the user switched to B) must only release A's guard — the old single boolean was
+    # reset to False, reopening the overlapping-fetch window for B's still-running backfill.
+    stub = PaginatedHistoryClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._backfilling.add(7)  # A's worker was started before the switch
+        app._current = 8  # the user switched to dialog B…
+        app._backfilling.add(8)  # …whose own backfill is in flight
+        app._oldest_message_id = 51
+        await app._backfill_history(7, 51)  # A's stale worker completes after the switch
+        await pilot.pause()
+        assert 8 in app._backfilling  # B's in-flight guard survived
+        assert 7 not in app._backfilling  # A's guard was released
+
+
+async def test_tui_stale_backfill_never_pages_dialog_a_with_dialog_b_cursor():
+    # #202 review (BUG-B): _oldest_message_id is app-global, but the backfill worker used to read
+    # it INSIDE the worker body — after an A→B dialog switch the stale worker for A paged A's
+    # history with B's cursor, i.e. exactly the out-of-window offset the store must never see
+    # (it corrupts A's sync window — BUG-A's reachable-in-prod path). The offset is captured at
+    # SCHEDULE time, and a stale worker must bail BEFORE any fetch.
+    store = PaginatedHistoryStore()
+    app = MessengerTUI(client=TuiStubClient(), store=store)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        assert app._oldest_message_id == 51
+        app._maybe_backfill_history()  # A's worker scheduled (offset 51 captured here)
+        # before the worker body runs, the user switches to dialog B with its own cursor
+        app._current = 8
+        app._oldest_message_id = 4242  # B's cursor — must never leak into A's fetch
+        await pilot.pause()  # let the scheduled worker run
+        assert all(c != (7, 50, 4242) for c in store.history_calls)  # B's cursor never used on A
+        # stale worker bailed BEFORE fetching: no offset-paging call for dialog A at all
+        assert all(not (c[0] == 7 and c[2]) for c in store.history_calls)
+        assert 7 not in app._backfilling  # and it still released its guard
+
+
+class GatedGrowingHistoryStore(TuiSourceStore):
+    """Offset-paging store whose backfill fetch BLOCKS until released, and whose newest window
+    for dialog 7 can grow (new messages arriving while the user is away) — the #202 r3 repro."""
+
+    def __init__(self):
+        super().__init__()
+        self.history_calls = []
+        self.gate = asyncio.Event()
+        self.grew = False  # flip: 5 newer messages arrived in dialog 7
+
+    async def history(self, peer, limit=50, offset_id=0):
+        self.history_calls.append((peer, limit, offset_id))
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        def page(lo, hi):
+            return [Message(id=i, dialog_id=peer, sender_id=peer, out=False,
+                            text=f"msg {i}", date=date) for i in range(lo, hi)]
+
+        if offset_id:
+            await self.gate.wait()  # hold the backfill in flight across the dialog switches
+            return page(max(1, offset_id - 50), offset_id)
+        if peer != 7:
+            return page(201, 202)  # dialog B: a one-message chat
+        return page(56, 106) if self.grew else page(51, 101)
+
+
+async def test_tui_backfill_cancelled_on_switch_leaves_no_history_hole():
+    # #202 r3 (cycle-2 review): the round-2 frozen offset opened an adjacent edge — a backfill
+    # worker for A (offset 51) survives a switch-away; new messages arrive in A; the user
+    # returns and the window reloads as 56..105; the frozen worker then prepends 1..50 → a
+    # PERMANENT 51..55 hole in the DOM. _open_dialog must CANCEL in-flight backfill workers
+    # (the cancelled worker's finally still releases the per-dialog guard — no leak).
+    store = GatedGrowingHistoryStore()
+    app = MessengerTUI(client=TuiStubClient(), store=store)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._open_dialog(7)
+        await _pause_until(pilot, lambda: app._oldest_message_id == 51)  # window 51..100 loaded
+        app._maybe_backfill_history()  # worker scheduled with the frozen offset 51
+        await _pause_until(pilot, lambda: any(c[2] == 51 for c in store.history_calls))
+        app._open_dialog(8)  # the user walks away while the fetch is parked at the gate
+        await _pause_until(pilot, lambda: app._oldest_message_id == 201)
+        store.grew = True  # five newer messages arrive in dialog 7 meanwhile
+        app._open_dialog(7)  # the user comes back; the window reloads as 56..105
+        await _pause_until(pilot, lambda: app._oldest_message_id == 56)
+        store.gate.set()  # release the (stale) fetch
+        await _pause_until(pilot, lambda: 7 not in app._backfilling)  # worker fully finished
+        await pilot.pause()
+        ids = sorted(b.message_id for b in app.query(MessageBubble))
+        assert ids == list(range(56, 106))  # NO stale 1..50 prepend, NO 51..55 hole
+        assert 7 not in app._backfilling  # cancellation released the guard (no leak)
 
 
 async def test_tui_history_scrolls_to_newest_message():
@@ -1514,6 +1709,50 @@ async def test_tui_listener_reconnects_and_clears_banner():
                 break
         assert stub.attempts >= 2  # retried after the first failure
         assert banner.display is False  # a live event flowed post-reconnect → banner cleared
+
+
+class DownIncomingClient(TuiStubClient):
+    """The INCOMING listener dies (and parks in retry); OUTGOING yields one healthy event."""
+
+    def __init__(self):
+        super().__init__()
+        self.outgoing_gate = asyncio.Event()
+
+    async def listen_all(self):
+        raise RuntimeError("incoming feed died")
+        yield  # pragma: no cover
+
+    async def listen_outgoing(self):
+        await self.outgoing_gate.wait()
+        yield OutgoingEvent(dialog_id=7, message=Message(
+            id=77, dialog_id=7, sender_id=1, out=True, text="from phone",
+            date=datetime(2024, 1, 2, tzinfo=timezone.utc)))
+        await asyncio.Event().wait()
+
+
+async def test_tui_healthy_outgoing_event_keeps_banner_while_incoming_down():
+    # #200: listener health is per-listener. With the INCOMING listener down (banner shown), a
+    # healthy OUTGOING event must NOT clear the banner — the degraded state it reports (no live
+    # incoming feed) still holds. The old single-boolean banner was cleared by ANY listener.
+    stub = DownIncomingClient()
+    # a huge retry base parks the dead incoming listener in its backoff sleep for the whole test
+    app = MessengerTUI(client=stub, listener_retry_base=1000.0)
+    marks = []
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        orig_mark = app._mark_connected
+
+        def spy_mark(name):
+            marks.append(name)
+            orig_mark(name)
+
+        app._mark_connected = spy_mark  # type: ignore[method-assign]
+        banner = app.query_one("#connection-status", Static)
+        await _pause_until(pilot, lambda: banner.display)
+        stub.outgoing_gate.set()  # a healthy outgoing event arrives while incoming is down
+        await _pause_until(pilot, lambda: "outgoing" in marks)
+        await pilot.pause()
+        assert banner.display  # incoming is still down → the banner must survive
 
 
 class EagerSensitiveClient(TuiStubClient):
@@ -6010,6 +6249,30 @@ async def test_tui_escape_disarms_after_composer_edit():
         app.action_clear_search()  # a single Escape again → arms, does NOT clear
         await pilot.pause()
         assert composer.value == "draft edited"  # preserved
+
+
+async def test_tui_escape_escape_clears_draft_via_keyboard():
+    # #200: the advertised two-step Escape must be reachable by KEYBOARD. The first Escape moves
+    # focus OFF the composer, so the second arrives with composer.has_focus == False — it used to
+    # fall into the search-clear branch and leave the draft intact (the dead affordance). While
+    # armed, the second Escape must clear the draft regardless of where focus landed.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        composer.focus()
+        await pilot.pause()
+        composer.value = "черновик"
+        await pilot.pause()
+        await pilot.press("escape")  # 1st: arms and moves focus off the composer
+        await pilot.pause()
+        assert composer.value == "черновик"  # draft intact after the first Escape
+        assert not composer.has_focus  # focus moved — the has_focus branch is gone
+        await pilot.press("escape")  # 2nd: must clear the armed draft, not the search box
+        await pilot.pause()
+        assert composer.value == ""  # the advertised second step finally works
+        assert not app._composer_escape_armed
 
 
 async def test_tui_escape_clearing_search_preserves_composer_draft():
