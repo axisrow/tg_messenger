@@ -119,9 +119,20 @@ class ReactionEvent(BaseModel):
 
 
 def message_line(m: Message) -> str:
-    """One-line text rendering shared by text UIs: '← [id] text' (→ for own messages)."""
+    """Text rendering shared by text UIs: '← [id] text' (→ for own messages).
+
+    #187: a multiline body has its continuation lines indented under the text column
+    (a hanging indent the width of the '← [id] ' prefix) so they don't sit flush-left
+    and merge with the next message; a single-line body is rendered exactly as before.
+    """
     who = "→" if m.out else "←"
-    return f"{who} [{m.id}] {m.text or '<media>'}"
+    prefix = f"{who} [{m.id}] "
+    body = m.text or "<media>"
+    if "\n" not in body:
+        return f"{prefix}{body}"
+    indent = " " * len(prefix)
+    head, *rest = body.split("\n")
+    return "\n".join([f"{prefix}{head}", *(f"{indent}{line}" for line in rest)])
 
 
 def format_author(m: Message) -> str:

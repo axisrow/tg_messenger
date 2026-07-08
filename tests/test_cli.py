@@ -113,10 +113,13 @@ class StubClient:
         return Message(id=2, dialog_id=peer, sender_id=1, out=True, text=text,
                        date=datetime(2024, 1, 1, tzinfo=timezone.utc))
 
+    forward_returns = None  # set to a subset of ids to simulate a partial drop
+
     async def forward(self, from_peer, message_ids, to_peer):
         self.forwarded.append((from_peer, list(message_ids), to_peer))
+        returned = self.forward_returns if self.forward_returns is not None else message_ids
         return [Message(id=m, dialog_id=to_peer, sender_id=1, out=True, text="fwd",
-                        date=datetime(2024, 1, 1, tzinfo=timezone.utc)) for m in message_ids]
+                        date=datetime(2024, 1, 1, tzinfo=timezone.utc)) for m in returned]
 
     async def edit_text(self, peer, message_id, text):
         self.edited.append((peer, message_id, text))
@@ -254,7 +257,8 @@ def test_dialogs_lists_dms(runner):
 
 
 def test_dialogs_prints_id_next_to_title(runner):
-    # цикл 63: id виден в выводе рядом с заголовком (id<TAB>title)
+    # цикл 63: id виден в выводе рядом с заголовком (id<TAB>title). #187: the raw tab
+    # format is preserved on stdout (a --porcelain/human split is deferred, see PR body).
     r, _ = runner
     result = r.invoke(cli_main.cli, ["dialogs"])
     assert result.exit_code == 0
@@ -386,7 +390,7 @@ def test_react_command_calls_client(runner):
     result = r.invoke(cli_main.cli, ["react", "7", "10", "👍"])
     assert result.exit_code == 0, result.output
     assert stub.reactions == [(7, 10, "👍")]
-    assert "reacted." in result.output
+    assert "reacted to [id=10]." in result.output  # #187: receipt names the message
 
 
 # --- read-only chat gating (capability) ---
@@ -487,14 +491,14 @@ def test_edit_command_calls_client(runner):
 
 def test_delete_command_revokes_by_default(runner):
     r, stub = runner
-    result = r.invoke(cli_main.cli, ["delete", "7", "1,2"])
+    result = r.invoke(cli_main.cli, ["delete", "7", "1,2", "--yes"])
     assert result.exit_code == 0, result.output
     assert stub.deleted_calls == [(7, [1, 2], True)]
 
 
 def test_delete_command_for_me_keeps_revoke_false(runner):
     r, stub = runner
-    result = r.invoke(cli_main.cli, ["delete", "7", "1", "--for-me"])
+    result = r.invoke(cli_main.cli, ["delete", "7", "1", "--for-me", "--yes"])
     assert result.exit_code == 0, result.output
     assert stub.deleted_calls == [(7, [1], False)]
 
@@ -519,6 +523,133 @@ def test_mark_read_command_marks_read(runner):
     result = r.invoke(cli_main.cli, ["mark-read", "7"])
     assert result.exit_code == 0, result.output
     assert stub.read_acks == [(7, None)]
+
+
+# --- #187: CLI feedback (empty states, id-echo, N-of-M, validation, confirm) ---
+
+
+def test_search_empty_result_prints_empty_state(runner):
+    # #187: an empty search must say so, not print nothing and exit 0
+    r, stub = runner
+    monkey = stub
+    monkey.search_messages = _empty_coro([])
+    result = r.invoke(cli_main.cli, ["search", "7", "zzz"])
+    assert result.exit_code == 0, result.output
+    assert "No matching messages." in result.output
+
+
+def test_read_empty_history_prints_empty_state(runner):
+    # #187: an empty history must say so, not print nothing
+    r, stub = runner
+    stub.history_items = []
+    result = r.invoke(cli_main.cli, ["read", "7"])
+    assert result.exit_code == 0, result.output
+    assert "No messages." in result.output
+
+
+def test_send_without_text_or_file_is_rejected(runner):
+    # #187: `send 7` with no TEXT and no --file must validate, not send "" over the wire
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["send", "7"])
+    assert result.exit_code != 0
+    assert "provide TEXT or --file" in result.output
+    assert stub.sent == []
+
+
+def test_send_echoes_message_id(runner):
+    # #187: a bare `sent.` gives no id to edit/react with — echo the returned id
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["send", "7", "hi"])
+    assert result.exit_code == 0, result.output
+    assert "id=2" in result.output  # StubClient.send_text returns Message(id=2)
+
+
+def test_edit_echoes_message_id(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["edit", "7", "5", "fixed"])
+    assert result.exit_code == 0, result.output
+    assert "id=5" in result.output
+
+
+def test_react_echoes_message_id(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["react", "7", "10", "👍"])
+    assert result.exit_code == 0, result.output
+    assert "10" in result.output  # the reacted-to message id is in the receipt
+
+
+def test_forward_reports_n_of_m(runner):
+    # #187: forward echoes count and peer, not a bare `forwarded.`
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["forward", "7", "1,2", "8"])
+    assert result.exit_code == 0, result.output
+    assert "forwarded 2 of 2 to 8." in result.output
+
+
+def test_forward_partial_drop_is_reported(runner):
+    # #187: Telegram silently dropped id 2 — the CLI must not claim full success
+    r, stub = runner
+    stub.forward_returns = [1]  # only id 1 actually forwarded
+    result = r.invoke(cli_main.cli, ["forward", "7", "1,2", "8"])
+    assert result.exit_code == 0, result.output
+    assert "forwarded 1 of 2 to 8." in result.output
+    assert "2" in result.stderr  # the dropped id is surfaced on stderr
+
+
+def test_delete_echoes_count_and_scope_for_everyone(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["delete", "7", "1,2", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "2 message(s)" in result.output
+    assert "everyone" in result.output
+
+
+def test_delete_echoes_scope_for_me(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["delete", "7", "1", "--for-me", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "for me" in result.output
+
+
+def test_delete_without_yes_aborts_when_declined(runner):
+    # #187: a destructive delete gates on a confirm (like logout/profiles remove)
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["delete", "7", "1,2"], input="n\n")
+    assert result.exit_code != 0  # click.confirm abort
+    assert stub.deleted_calls == []
+
+
+def test_delete_confirm_states_count_peer_scope(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["delete", "7", "1,2"], input="y\n")
+    assert result.exit_code == 0, result.output
+    # the confirmation prompt names count, peer and scope before deleting
+    assert "2" in result.output and "7" in result.output and "everyone" in result.output
+    assert stub.deleted_calls == [(7, [1, 2], True)]
+
+
+def test_dialogs_keeps_raw_tab_format_on_stdout(runner):
+    # #187: the machine-readable id\ttitle stays on stdout (a --porcelain/human split is
+    # deferred to a follow-up); the count strip must NOT pollute the parseable stdout
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert "7\tAnn" in result.stdout
+    assert "dialog(s)" not in result.stdout  # count is on stderr, not stdout
+
+
+def test_dialogs_prints_count_on_stderr(runner):
+    # #187: a total on stderr tells a human the list isn't silently truncated
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert "dialog" in result.stderr
+
+
+def _empty_coro(value):
+    async def _fn(*a, **kw):
+        return value
+    return _fn
 
 
 def test_flood_wait_friendly_message(runner, monkeypatch):
@@ -622,6 +753,88 @@ def test_chat_react_command_does_not_send_text(runner):
     assert result.exit_code == 0, result.output
     assert stub.reactions == [(7, 10, "👍")]
     assert stub.sent == []
+
+
+# --- #187: REPL slash-command discoverability + unknown-command guard (HIGH/MEDIUM) ---
+
+
+def test_chat_prints_command_hint_on_start(runner):
+    # #187: the REPL announces its slash-commands and how to exit, so /react//lang and
+    # the exit aren't a read-the-source feature
+    r, stub = runner
+    stub.listen_interrupt = False
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="")  # immediate EOF
+    assert result.exit_code == 0, result.output
+    assert "/help" in result.output
+
+
+def test_chat_help_command_does_not_send(runner):
+    # #187: a user typing /help to find the exit must NOT send "/help" to the contact
+    r, stub = runner
+    stub.listen_interrupt = False
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="/help\n")
+    assert result.exit_code == 0, result.output
+    assert stub.sent == []
+    assert "/react" in result.output and "/lang" in result.output
+
+
+def test_chat_unknown_slash_command_is_not_sent(runner):
+    # #187 HIGH: a typo like /langs en or /halp must NOT be sent verbatim to a real
+    # person — show an error, keep the loop, send nothing
+    r, stub = runner
+    stub.listen_interrupt = False
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="/langs en\nplain\n")
+    assert result.exit_code == 0, result.output
+    # the unknown command was not sent; a following plain line still sends normally
+    assert (7, "/langs en", None, None) not in stub.sent
+    assert (7, "plain", None, None) in stub.sent
+    assert "unknown command" in result.output.lower()
+
+
+def test_chat_outbound_picker_uses_english_strings(runner, monkeypatch):
+    # #187: the picker prompt/labels are English like the rest of the CLI, not Russian
+    r, stub = runner
+    stub.listen_interrupt = False
+    coord = _patch_coordinator(
+        monkeypatch, _PrepareResult(status="ready", variants=["hi", "hello"], token="tok")
+    )
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n2\n")
+    assert result.exit_code == 0, result.output
+    assert "вариант>" not in result.output
+    assert "variant>" in result.output
+
+
+def test_chat_outbound_error_confirm_english_prompt(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False
+    _patch_coordinator(monkeypatch, _PrepareResult(status="error", error="Translation failed."))
+    # the English confirm still accepts 'y' and sends the original
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\ny\n")
+    assert result.exit_code == 0, result.output
+    assert "send original?" in result.output.lower()
+    assert "отправить оригинал" not in result.output
+    assert (7, "привет", None, None) in stub.sent
+
+
+def test_chat_outbound_expired_token_actionable_english(runner, monkeypatch):
+    # #187 cross-frontend: the expired-token message is English and actionable (not the
+    # bare Russian "Выбор перевода истёк")
+    from tg_messenger.agent.outbound_coordinator import OutboundError
+
+    r, stub = runner
+    stub.listen_interrupt = False
+    coord = _patch_coordinator(
+        monkeypatch, _PrepareResult(status="ready", variants=["hi", "hello"], token="tok")
+    )
+
+    async def _raise(*a, **kw):
+        raise OutboundError("expired")
+
+    coord.send_variant = _raise
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n2\n")
+    assert result.exit_code == 0, result.output
+    assert "Выбор перевода истёк" not in result.output
+    assert "expired" in result.output.lower()
 
 
 def test_chat_send_forbidden_warns_and_keeps_session(runner):
@@ -883,6 +1096,23 @@ def test_chat_outbound_error_confirm_no_skips_send(runner, monkeypatch):
     assert "Translation failed." in result.output
 
 
+def test_chat_outbound_picker_indents_multiline_variant(runner, monkeypatch):
+    # #187: a multiline variant must not break the [idx] column alignment — continuation
+    # lines are indented under the variant text so [1]/[2]/[0] stay column-aligned
+    r, stub = runner
+    stub.listen_interrupt = False
+    _patch_coordinator(
+        monkeypatch, _PrepareResult(status="ready", variants=["line one\nline two"], token="tok")
+    )
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n0\n")
+    assert result.exit_code == 0, result.output
+    lines = result.output.split("\n")
+    # find the "[1] line one" row (a background "> " reprint may precede it on the line)
+    # and assert the continuation "line two" is indented under the text, not flush-left
+    idx = next(i for i, ln in enumerate(lines) if ln.endswith("[1] line one"))
+    assert lines[idx + 1] == "    line two"  # 4-space indent = len("[1] ")
+
+
 def test_dialog_lang_show_set_and_off(monkeypatch, tmp_path):
     from tg_messenger.core.storage import Storage
 
@@ -1001,6 +1231,26 @@ def test_chat_prints_reactions_for_open_dialog(runner, monkeypatch):
     assert "* reaction [10]: 👍" in result.output
     assert "* reaction [12]: <custom>" in result.output
     assert "❤️" not in result.output
+
+
+def test_chat_reprints_prompt_after_background_line(runner, monkeypatch):
+    # #187: a live-feed line printed into the terminal while the user is typing must
+    # reprint the "> " prompt afterwards so the input line isn't left orphaned/corrupted
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    async def incoming():
+        yield IncomingEvent(dialog_id=7, message=Message(
+            id=60, dialog_id=7, sender_id=7, out=False, text="ping",
+            date=datetime(2024, 1, 1, tzinfo=timezone.utc)))
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(stub, "listen", incoming)
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="")
+    assert result.exit_code == 0, result.output
+    assert "← ping" in result.output
+    # the prompt is reprinted after the background line (more than the single initial "> ")
+    assert result.output.count("> ") >= 2
 
 
 def test_chat_does_not_echo_back_our_own_input(runner, monkeypatch):
@@ -1122,6 +1372,8 @@ def test_login_empty_code_resends_via_next_channel(monkeypatch):
     assert result.exit_code == 0
     assert inner.resends == 1
     assert "SMS" in result.output  # resent code went via SMS
+    # #187: a successful resend is distinguishable from the first send ("New code sent")
+    assert "New code sent" in result.output
     assert inner.signed_in[-1]["code"] == "123"
     assert stub.saved is True
 
@@ -1177,6 +1429,9 @@ def test_login_other_resend_errors_show_short_reason(monkeypatch):
     result = CliRunner().invoke(cli_main.cli, ["login"], input="+10000000000\n\n123\n")
     assert result.exit_code == 0
     assert "Could not resend code" in result.output
+    # #187: a human phrase, not the bare exception class name (jargon)
+    assert "confirmation code has expired" in result.output
+    assert "Could not resend code: PhoneCodeExpiredError" not in result.output
     assert stub.saved is True
 
 
@@ -1341,6 +1596,10 @@ def test_moderate_without_admin_warns(mod_runner, tmp_path):
     result = r.invoke(cli_main.cli, ["moderate"])
     assert result.exit_code == 0
     assert "no admin rights" in result.output
+    # #187: the ⚠ glyph carries a U+FE0E text-presentation selector (stable width),
+    # never the bare U+26A0 that defaults to a wide emoji/tofu in some terminals
+    assert "⚠︎" in result.output
+    assert "⚠ " not in result.output  # no bare emoji-presentation warning
 
 
 def test_moderate_without_login_gives_hint(mod_runner):
@@ -1439,6 +1698,21 @@ def test_ghostwrite_enable_star_is_rejected(gw_runner):
     assert "*" in result.output
 
 
+def test_ghostwrite_enable_uses_consistent_dialog_wording(gw_runner):
+    # #187: the same id is DIALOG_ID everywhere — the arg metavar, the error and the
+    # success line all use "dialog", not a mix of PEER/dialog/chat
+    r, _stub, _tp, _seen = gw_runner
+    help_out = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "--help"])
+    assert "DIALOG_ID" in help_out.output
+    assert "PEER" not in help_out.output
+    bad = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "notanid"])
+    assert bad.exit_code != 0
+    assert "DIALOG_ID" in bad.output
+    ok = r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
+    assert ok.exit_code == 0, ok.output
+    assert "dialog 7" in ok.output
+
+
 def test_ghostwrite_pause_all_and_resume(gw_runner):
     r, _stub, _tp, _seen = gw_runner
     r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
@@ -1482,6 +1756,17 @@ def test_ghostwrite_enforce_flag_shown(gw_runner):
     result = r.invoke(cli_main.cli, ["ghostwrite", "--enforce"])
     assert result.exit_code == 0, result.output
     assert "ENFORCING" in result.output
+
+
+def test_ghostwrite_no_dialogs_warning_uses_text_glyph(gw_runner):
+    # #187: with no dialogs enabled ghostwrite warns with ⚠ — it must carry U+FE0E so it
+    # doesn't render as a wide emoji/tofu and break the line width
+    r, _stub, _tp, _seen = gw_runner
+    result = r.invoke(cli_main.cli, ["ghostwrite"])  # nothing enabled
+    assert result.exit_code == 0, result.output
+    assert "no dialogs enabled" in result.output
+    assert "⚠︎" in result.output
+    assert "⚠ " not in result.output
 
 
 def test_ghostwrite_without_login_gives_hint(gw_runner):
@@ -1996,6 +2281,25 @@ def test_unexpected_error_traceback_lands_in_log_file(runner, monkeypatch):
     assert "Traceback" in content
 
 
+def test_unexpected_error_empty_message_falls_back_to_class_name(runner, monkeypatch):
+    # #187: an exception whose str() is empty must not render as
+    # "Unexpected error:  — details logged…" (looks broken); use the class name.
+    r, stub = runner
+
+    class Silent(Exception):
+        pass
+
+    async def boom(dm_only=True):
+        raise Silent()  # str(Silent()) == ""
+
+    monkeypatch.setattr(stub, "dialogs", boom)
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code != 0
+    assert "Unexpected error" in result.output
+    assert "Silent" in result.output  # class name surfaced, not a dangling colon
+    assert "Unexpected error:  —" not in result.output
+
+
 def test_flood_wait_is_logged_to_file(runner, monkeypatch):
     from pathlib import Path
 
@@ -2441,9 +2745,10 @@ def test_profiles_command_lists_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
     result = CliRunner().invoke(cli_main.cli, ["profiles"])
     assert result.exit_code == 0, result.output
-    # #52: valid profiles carry the ✓ marker
-    assert "alice ✓" in result.output
-    assert "bob ✓" in result.output
+    # #52: valid profiles carry the ✓ marker. #187: paired with a word so the status
+    # isn't glyph-only (a screen reader reads "check mark" with no meaning).
+    assert "alice ✓ ok" in result.output
+    assert "bob ✓ ok" in result.output
 
 
 def test_profiles_command_marks_corrupt_profile(monkeypatch, tmp_path):
@@ -2456,8 +2761,8 @@ def test_profiles_command_marks_corrupt_profile(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_main, "_session_store", lambda: SessionStore(tmp_path))
     result = CliRunner().invoke(cli_main.cli, ["profiles"])
     assert result.exit_code == 0, result.output
-    assert "good ✓" in result.output
-    assert "broken ✗" in result.output
+    assert "good ✓ ok" in result.output
+    assert "broken ✗ broken" in result.output  # #187: glyph + word
 
 
 def test_profiles_command_empty_hint_uses_global_profile_position(monkeypatch, tmp_path):
@@ -2553,6 +2858,27 @@ def test_profiles_remove_missing_errors(monkeypatch, tmp_path):
     _profile_store(monkeypatch, tmp_path)
     result = CliRunner().invoke(cli_main.cli, ["profiles", "remove", "ghost", "--yes"])
     assert result.exit_code != 0
+
+
+def test_profiles_remove_prints_recovery_hint(monkeypatch, tmp_path):
+    # #187: after removing a profile, remind that recovery needs a fresh phone login
+    store = _profile_store(monkeypatch, tmp_path, "dead")
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: None)
+    result = CliRunner().invoke(cli_main.cli, ["profiles", "remove", "dead", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "login" in result.output.lower()
+    assert "dead" in result.output
+
+
+def test_logout_prints_recovery_hint(monkeypatch, tmp_path):
+    # #187: after logout, remind that recovery needs a fresh phone login
+    _profile_store(monkeypatch, tmp_path, "work")
+    stub = StubClient()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "logout", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "login" in result.output.lower()
+    assert "work" in result.output
 
 
 def test_explicit_default_session_skips_profile_picker(monkeypatch, tmp_path):
@@ -2944,13 +3270,14 @@ def test_username_suggest_prints_available(runner, monkeypatch):
     stub.occupied = set(cands[:2])
     result = cli.invoke(cli_main.cli, ["username", "suggest", "Ann", "--limit", "5"])
     assert result.exit_code == 0, result.output
-    lines = [ln.strip() for ln in result.output.splitlines() if ln.strip()]
+    # read stdout only — the "Checking…" status line lives on stderr
+    lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
     assert lines, "expected at least one suggested username"
     for ln in lines:
-        # every line carries an availability marker: ✓ (verified free) or ? (unchecked)
-        assert ln.endswith("✓") or ln.endswith("?"), ln
-        name = ln[:-1].strip()
-        if ln.endswith("✓"):
+        # #187: every line carries a glyph+word marker: "✓ free" or "? unchecked"
+        assert ln.endswith("✓ free") or ln.endswith("? unchecked"), ln
+        name = ln.rsplit(" ", 2)[0].strip()
+        if ln.endswith("✓ free"):
             # verified-free names are genuinely not occupied
             assert name not in stub.occupied
 
@@ -2964,16 +3291,31 @@ def test_username_suggest_marks_unchecked_with_question(runner, monkeypatch):
     stub.occupied = set()
     result = cli.invoke(cli_main.cli, ["username", "suggest", "Ann", "--limit", "3"])
     assert result.exit_code == 0, result.output
-    lines = [ln.strip() for ln in result.output.splitlines() if ln.strip()]
-    checked = [ln[:-1].strip() for ln in lines if ln.endswith("✓")]
-    unchecked = [ln[:-1].strip() for ln in lines if ln.endswith("?")]
+    # read stdout only — the "Checking…" status line lives on stderr
+    lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+    checked = [ln.rsplit(" ", 2)[0].strip() for ln in lines if ln.endswith("✓ free")]
+    unchecked = [ln.rsplit(" ", 2)[0].strip() for ln in lines if ln.endswith("? unchecked")]
     assert len(checked) == 3, lines  # stopped at the limit
-    assert unchecked, "expected unchecked candidates past the limit to be marked ?"
+    assert unchecked, "expected unchecked candidates past the limit to be marked ? unchecked"
     # the ✓ block comes entirely before the ? block
-    assert lines[3].endswith("?"), lines
-    assert all(lines[i].endswith("✓") for i in range(3)), lines
+    assert lines[3].endswith("? unchecked"), lines
+    assert all(lines[i].endswith("✓ free") for i in range(3)), lines
     # the two markers partition the printed names, no name appears in both
     assert set(checked).isdisjoint(unchecked)
+
+
+def test_username_suggest_prints_status_on_stderr(runner):
+    # #187: a one-line "checking…" status before the (billed, sequential) probes so the
+    # user can tell it's working, not hung — on stderr so it doesn't pollute the name list
+    cli, stub = runner
+    stub.occupied = set()
+    result = cli.invoke(cli_main.cli, ["username", "suggest", "Ann", "--limit", "2"])
+    assert result.exit_code == 0, result.output
+    assert result.stderr.strip() != ""  # a status line went to stderr
+    # stdout carries only the names+markers, not the status word
+    assert "checking" not in "\n".join(
+        ln for ln in result.output.splitlines() if "✓" in ln or "?" in ln
+    )
 
 
 def test_username_set_confirms(runner):

@@ -128,8 +128,13 @@ def login(ctx: click.Context, session: str, phone: str | None,
                     continue
                 except RPCError as exc:
                     logger.warning("code resend failed: %s", exc)
-                    click.echo(f"Could not resend code: {type(exc).__name__}", err=True)
+                    # #187: a human phrase (the exception's message), not the bare class
+                    # name jargon — matching the adjacent SendCodeUnavailable branch.
+                    click.echo(f"Could not resend code: {exc}", err=True)
                     continue
+                # #187: distinguish a successful resend from the first send so the user knows
+                # it worked, instead of a byte-identical delivery hint.
+                click.echo("New code sent.")
                 click.echo(cli_main._delivery_message(delivery))
             try:
                 await flow.sign_in(code=code)
@@ -158,9 +163,10 @@ def profiles(ctx: click.Context) -> None:
         click.echo("No profiles yet — run: tg-messenger --profile NAME login")
         return
     # #52: mark each profile valid (✓, session file present and parseable) or broken (✗).
-    # Validity is a local check — no network call.
+    # Validity is a local check — no network call. #187: pair the glyph with a word so the
+    # status isn't glyph-only (a screen reader reads "check mark" with no meaning).
     for name in names:
-        marker = "✓" if store.is_valid_profile(name) else "✗"
+        marker = "✓ ok" if store.is_valid_profile(name) else "✗ broken"
         click.echo(f"{name} {marker}")
 
 
@@ -180,6 +186,8 @@ def profiles_remove(name: str, yes: bool) -> None:
         click.confirm(f"Delete the session file for profile {name!r}?", abort=True)
     store.delete(name)
     click.echo(f"profile {name!r} removed.")
+    # #187: remind that recovery needs a fresh phone login (the file is gone locally)
+    click.echo(f"To use it again, log in fresh: tg-messenger --profile {name} login")
 
 
 @click.command()
@@ -216,10 +224,13 @@ def logout(ctx: click.Context, session: str, yes: bool) -> None:
     except Exception as exc:
         # best-effort by design: a dead session must not keep its file alive
         logger.warning("telegram log_out failed for profile %r: %s", session, exc)
-        click.echo(f"⚠ Telegram log_out failed ({exc}) — deleting the local session anyway.",
+        # #187: U+FE0E forces text (not emoji) presentation so the glyph keeps a stable width
+        click.echo(f"⚠︎ Telegram log_out failed ({exc}) — deleting the local session anyway.",
                    err=True)
     store.delete(session)
     click.echo(f"session file removed for profile {session!r}.")
+    # #187: remind that recovery needs a fresh phone login
+    click.echo(f"To use it again, log in fresh: tg-messenger --profile {session} login")
 
 
 COMMANDS = [login, logout, profiles]
