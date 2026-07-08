@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 
@@ -40,13 +41,10 @@ from tg_messenger.tui.app import (
     parse_tlang_command,
 )
 
-
-import re as _re
-
 # #187: bubbles built via _message_bubble_for now carry a trailing compact timestamp
 # ("  HH:MM" today, "  DD.MM HH:MM" older) that is local-time and so not fixed across CI zones.
 # Content-equality assertions strip it so they keep testing author/body, not the wall clock.
-_TS_SUFFIX = _re.compile(r"  (?:\d{2}\.\d{2} )?\d{2}:\d{2}$")
+_TS_SUFFIX = re.compile(r"  (?:\d{2}\.\d{2} )?\d{2}:\d{2}$")
 
 
 def _body_without_ts(rendered: str) -> str:
