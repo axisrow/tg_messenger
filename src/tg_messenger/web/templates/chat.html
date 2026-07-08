@@ -198,9 +198,6 @@
     function normalizeEmoji(e) {
       return (e || '').replace(/\uFE0F/g, '');  // strip U+FE0F variation selector
     }
-    // #187: true only while an in-dialog message-search swap is settling — its results must NOT
-    // be force-scrolled to the bottom or treated as a read (that's the history-load path's job).
-    let messageSearchSwap = false;
     // #187: reveal + reset the in-dialog message search when a chat opens.
     function showMessageSearch() {
       const form = document.getElementById('message-search');
@@ -236,9 +233,8 @@
           const url = q
             ? '/dialogs/' + encodeURIComponent(id) + '/search?q=' + encodeURIComponent(q)
             : '/dialogs/' + encodeURIComponent(id) + '/messages';
-          // #187: mark this swap as a search so afterSettle doesn't yank the view / clear unread.
-          // An empty query reloads the full history — that IS a history load, so don't flag it.
-          messageSearchSwap = !!q;
+          // #195 review: whether a settled swap was a search is derived from its request path in
+          // htmx:afterSettle (per-response), not a global flag a racing second search could flip.
           if (window.htmx) window.htmx.ajax('GET', url, { target: '#messages', swap: 'innerHTML' });
         }, 250);
       });
@@ -292,12 +288,33 @@
     function scrollMessagesToEndIfAtBottom(wasAtBottom) {
       if (wasAtBottom) scrollMessagesToEnd();
     }
+    // #195 review (BUG-2, stale-search race): every #messages swap (a dialog history load OR an
+    // in-dialog search) is bound to the dialog that requested it, encoded in the request path
+    // (/dialogs/{id}/messages | /dialogs/{id}/search). If the user switched dialogs before a slow
+    // response arrived, its dialog no longer matches #dialog_id — drop the swap so dialog A's
+    // history/search results can't overwrite dialog B's pane (and mislead a react/send in B).
+    function dialogIdFromRequestPath(path) {
+      const m = /\/dialogs\/(-?\d+)\/(?:messages|search)/.exec(path || '');
+      return m ? m[1] : null;
+    }
+    document.getElementById('messages').addEventListener('htmx:beforeSwap', (evt) => {
+      const path = evt.detail && evt.detail.pathInfo && evt.detail.pathInfo.requestPath;
+      const reqDialog = dialogIdFromRequestPath(path);
+      // only guard the dialog-scoped routes; a non-matching path (no id) is left alone
+      if (reqDialog !== null && reqDialog !== document.getElementById('dialog_id').value) {
+        evt.detail.shouldSwap = false;  // stale response for a dialog the user already left
+      }
+    });
     // #187: the #messages history swap just settled — show the newest, drop the empty state,
     // and clear the just-opened dialog's unread badge (it was marked read server-side). A search
     // swap only drops the empty state; it neither yanks the view nor clears the unread badge.
-    document.getElementById('messages').addEventListener('htmx:afterSettle', () => {
+    // #195 review: read the flag off the just-settled request's path, not a global boolean — a
+    // second search racing a first can no longer flip the flag for the wrong response.
+    document.getElementById('messages').addEventListener('htmx:afterSettle', (evt) => {
       hideMessagesEmptyState();
-      if (messageSearchSwap) { messageSearchSwap = false; return; }
+      const path = evt.detail && evt.detail.pathInfo && evt.detail.pathInfo.requestPath;
+      const wasSearch = /\/dialogs\/-?\d+\/search/.test(path || '');
+      if (wasSearch) return;  // a search neither yanks the view nor clears the unread badge
       scrollMessagesToEnd();
       const openId = document.getElementById('dialog_id').value;
       if (openId) clearUnreadBadge(openId);
@@ -843,8 +860,21 @@
       const text = (doc.body.textContent || '').trim();
       showComposerError(text || 'Message could not be sent. Please try again.');
     });
+    // #195 review (BUG-1): a NETWORK failure (no HTTP response at all) fires htmx:sendError /
+    // htmx:timeout, NOT htmx:responseError. Surface it in the same slot; the success path is
+    // gated on detail.successful, so the draft and reply target are preserved for a retry.
+    const onComposerNetworkFail = () => {
+      showComposerError('Network error — the message was not sent. Please try again.');
+    };
+    composer.addEventListener('htmx:sendError', onComposerNetworkFail);
+    composer.addEventListener('htmx:timeout', onComposerNetworkFail);
+    // #195 review (BUG-1, data-loss): gate the success path on htmx's own success flag, NOT on
+    // `status < 400`. On a NETWORK failure (drop / timeout / abort) xhr.status is 0, so the old
+    // `0 >= 400` was false and we fell through to composer.reset() — wiping the draft though the
+    // message never left. htmx sets detail.successful=true only for a 2xx; a status-0 send has
+    // successful=false. The sendError/timeout handlers above then surface it and keep the draft.
     composer.addEventListener('htmx:afterRequest', (evt) => {
-      if (evt.detail.xhr && evt.detail.xhr.status >= 400) return;
+      if (!(evt.detail && evt.detail.successful)) return;
       clearComposerError();  // #187: a prior send error clears once a send succeeds
       hideMessagesEmptyState();  // the just-sent bubble means the pane is no longer empty
       hideOutboundIndicator();  // #187: the Translating→ hint is per-attempt — clear it on send

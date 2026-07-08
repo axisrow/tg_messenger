@@ -2314,12 +2314,39 @@ async def test_index_outbound_indicator_and_softened_copy(client_app):
 
 
 async def test_index_search_swap_does_not_force_scroll_or_read(client_app):
-    # #187: an in-dialog search swap must not force-scroll to the bottom or clear the unread
-    # badge — that's the history-load path's job. The afterSettle handler gates on messageSearchSwap.
+    # #187 / #195 review: an in-dialog search swap must not force-scroll to the bottom or clear
+    # the unread badge — that's the history-load path's job. Whether a settled swap was a search
+    # is derived PER-RESPONSE from its request path (not a global flag a racing search could flip).
     ac, _ = client_app
     r = await ac.get("/")
-    assert "messageSearchSwap = !!q" in r.text  # a non-empty query flags the swap as a search
-    assert "if (messageSearchSwap) { messageSearchSwap = false; return; }" in r.text
+    assert "const wasSearch = /\\/dialogs\\/-?\\d+\\/search/.test(path || '')" in r.text
+    assert "if (wasSearch) return;" in r.text
+    assert "messageSearchSwap" not in r.text  # the global race-prone flag is gone
+
+
+async def test_index_send_success_gated_on_htmx_successful_not_status(client_app):
+    # #195 review (BUG-1, data-loss): the composer success path must gate on htmx's detail.successful
+    # (true only on a 2xx), NOT on `status < 400` — a network drop has xhr.status 0, so the old
+    # `0 >= 400` was false and it fell through to composer.reset(), wiping an undelivered draft.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "if (!(evt.detail && evt.detail.successful)) return;" in r.text
+    assert "if (evt.detail.xhr && evt.detail.xhr.status >= 400) return;" not in r.text
+    # a pure network failure (no HTTP response) fires sendError/timeout — surfaced, draft kept
+    assert "addEventListener('htmx:sendError'" in r.text
+    assert "addEventListener('htmx:timeout'" in r.text
+
+
+async def test_index_messages_swap_bound_to_requesting_dialog(client_app):
+    # #195 review (BUG-2, stale-search race): every #messages swap is bound to the dialog that
+    # requested it (from the request path); a response for a dialog the user already left is
+    # dropped so it can't overwrite the current pane.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "addEventListener('htmx:beforeSwap'" in r.text
+    assert "evt.detail.shouldSwap = false" in r.text
+    assert "function dialogIdFromRequestPath(" in r.text
+    assert "document.getElementById('dialog_id').value" in r.text
 
 
 async def test_index_normalizes_fe0f_before_reaction_dedup(client_app):
