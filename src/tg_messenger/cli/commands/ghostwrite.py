@@ -47,7 +47,8 @@ def ghostwrite(ctx: click.Context, session: str, enforce: bool) -> None:
                 click.echo("Ghostwrite enabled for dialogs: "
                            + ", ".join(str(d) for d in enabled))
             else:
-                click.echo("⚠ no dialogs enabled — use 'ghostwrite-dialogs enable PEER'",
+                # #187: U+FE0E text-presentation glyph; DIALOG_ID (not PEER) for consistency
+                click.echo("⚠︎ no dialogs enabled — use 'ghostwrite-dialogs enable DIALOG_ID'",
                            err=True)
             engine = GhostwriteEngine(client, suggester, storage, enforce=enforce)
             mode = "ENFORCING" if enforce else "dry-run"
@@ -69,28 +70,33 @@ def ghostwrite_dialogs() -> None:
 
 
 @ghostwrite_dialogs.command("enable")
-@click.argument("peer")
+@click.argument("dialog_id")
 @click.option("--session", default="default")
 @click.pass_context
-def ghostwrite_dialogs_enable(ctx: click.Context, peer: str, session: str) -> None:
-    """Turn ghostwrite ON for a DM by PEER (numeric id). '*' is rejected by design."""
-    if peer.strip() == "*":
+def ghostwrite_dialogs_enable(ctx: click.Context, dialog_id: str, session: str) -> None:
+    """Turn ghostwrite ON for a DM by DIALOG_ID (numeric). '*' is rejected by design.
+
+    #187: one term (DIALOG_ID) across the arg, the error and the success line.
+    """
+    if dialog_id.strip() == "*":
         raise click.ClickException(
             "'*' (everyone) is not allowed for ghostwrite — enable each dialog explicitly."
         )
     try:
-        dialog_id = int(peer)
+        dialog_id_int = int(dialog_id)
     except ValueError as exc:
-        raise click.ClickException(f"PEER must be a numeric dialog id, got {peer!r}") from exc
+        raise click.ClickException(
+            f"DIALOG_ID must be a numeric dialog id, got {dialog_id!r}"
+        ) from exc
     from tg_messenger.agent.ghostwrite import enable_dialog, register_ghostwrite_migrations
     session = cli_main._effective_session(ctx, session)
 
     cli_main._run(
         cli_main._with_storage(session, register_ghostwrite_migrations,
-                      lambda storage: enable_dialog(storage, dialog_id)),
+                      lambda storage: enable_dialog(storage, dialog_id_int)),
         session=session,
     )
-    click.echo(f"ghostwrite enabled for dialog {dialog_id}.")
+    click.echo(f"ghostwrite enabled for dialog {dialog_id_int}.")
 
 
 @ghostwrite_dialogs.command("disable")

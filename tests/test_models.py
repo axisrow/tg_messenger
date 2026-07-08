@@ -12,6 +12,7 @@ from tg_messenger.core.models import (
     OutgoingEvent,
     User,
     format_author,
+    message_line,
 )
 
 
@@ -217,3 +218,44 @@ def test_format_author_only_userid_when_no_sender():
 def test_format_author_only_userid_when_sender_empty():
     m = _gmsg(User(id=9))  # sender present but no name/username
     assert format_author(m) == "9"
+
+
+# --- #187: message_line rendering (human output shared by read/search/listen) ---
+
+def _msg(text, *, out=False, mid=42):
+    return Message(id=mid, dialog_id=7, sender_id=7, out=out, text=text, date=_now())
+
+
+def test_message_line_single_line_incoming_unchanged():
+    # single-line rendering must stay byte-identical (CLI tests depend on it)
+    assert message_line(_msg("hi")) == "← [42] hi"
+
+
+def test_message_line_single_line_outgoing_unchanged():
+    assert message_line(_msg("hi", out=True)) == "→ [42] hi"
+
+
+def test_message_line_media_placeholder_unchanged():
+    m = Message(id=7, dialog_id=7, sender_id=7, out=False, date=_now())
+    assert message_line(m) == "← [7] <media>"
+
+
+def test_message_line_multiline_indents_continuation():
+    # #187: a multiline message must not leave continuation lines flush-left where
+    # they merge with the next message. They are indented under the text column.
+    rendered = message_line(_msg("line one\nline two\nline three"))
+    lines = rendered.split("\n")
+    assert lines[0] == "← [42] line one"
+    # the prefix "← [42] " is 7 columns wide → continuation lines align under "line one"
+    indent = " " * len("← [42] ")
+    assert lines[1] == f"{indent}line two"
+    assert lines[2] == f"{indent}line three"
+
+
+def test_message_line_multiline_indent_matches_prefix_width():
+    # the id changes the prefix width; the hanging indent tracks it, not a fixed value
+    rendered = message_line(_msg("a\nb", mid=1234567))
+    first, second = rendered.split("\n")
+    prefix_width = len("← [1234567] ")
+    assert first == "← [1234567] a"
+    assert second == " " * prefix_width + "b"

@@ -85,7 +85,8 @@ def moderate(ctx: click.Context, session: str, enforce: bool) -> None:
             rights = await check_admin_rights(client, storage)
             for chat_id, ok in rights.items():
                 if not ok:
-                    click.echo(f"⚠ no admin rights in chat {chat_id} — its rules are disabled",
+                    # #187: U+FE0E forces text (not emoji) presentation for a stable width
+                    click.echo(f"⚠︎ no admin rights in chat {chat_id} — its rules are disabled",
                                err=True)
             engine = ModerationEngine(client, storage, enforce=enforce)
             engine.disable_chats([cid for cid, ok in rights.items() if not ok])

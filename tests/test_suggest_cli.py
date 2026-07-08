@@ -105,6 +105,16 @@ def test_suggest_prints_draft(suggest_cli):
     assert client.sent == []  # без --send только печать
 
 
+def test_suggest_prints_status_on_stderr(suggest_cli):
+    # #187: a one-line status before the (billed) LLM call so the user can tell it's
+    # working, not hung — on stderr so stdout stays just the draft
+    r, client, suggester, _ = suggest_cli
+    result = r.invoke(cli_main.cli, ["suggest", "42"])
+    assert result.exit_code == 0, result.output
+    assert result.stderr.strip() != ""  # a status line went to stderr
+    assert result.stdout.strip() == "draft text"  # stdout carries only the draft
+
+
 def test_suggest_send_sends_via_client(suggest_cli):
     r, client, suggester, _ = suggest_cli
     result = r.invoke(cli_main.cli, ["suggest", "42", "--send"])
