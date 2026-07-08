@@ -2,21 +2,35 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>tg_messenger</title>
-  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <script src="/static/htmx.min.js"></script>
   <style>
     body { font-family: system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
-    #dialogs { width: 300px; border-right: 1px solid #ccc; overflow-y: auto; }
+    /* #187: flex-shrink:0 keeps the sidebar from collapsing below 300px on a narrow window */
+    #dialogs { width: 300px; flex-shrink: 0; border-right: 1px solid #ccc; overflow-y: auto; }
     #tabs { display: flex; border-bottom: 1px solid #ccc; }
     #tabs .tab { flex: 1; padding: 8px; border: none; background: #f7f7f7; cursor: pointer; }
-    #tabs .tab.active { background: #fff; font-weight: bold; border-bottom: 2px solid #2481cc; }
+    #tabs .tab.active, #tabs .tab[aria-selected="true"] { background: #fff; font-weight: bold; border-bottom: 2px solid #2481cc; }
     #dialogs ul { list-style: none; margin: 0; padding: 0; }
-    #dialogs li { padding: 10px; cursor: pointer; border-bottom: 1px solid #eee; }
+    /* #187: a long title truncates to one line instead of pushing the row wide / wrapping */
+    #dialogs li { padding: 10px; cursor: pointer; border-bottom: 1px solid #eee;
+                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #dialogs li:hover { background: #f3f3f3; }
+    /* #187: a visible focus ring so a keyboard user can see which row is selected */
+    #dialogs li:focus { outline: 2px solid #2481cc; outline-offset: -2px; background: #eaf4fb; }
     .unread { background: #2481cc; color: #fff; border-radius: 10px; padding: 0 6px; font-size: 12px; }
-    #chat { flex: 1; display: flex; flex-direction: column; }
+    #chat { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    /* #187: a compact header strip (profile / sse-status / suggest-settings / logout) */
+    #chat-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+                   border-bottom: 1px solid #ccc; font-size: 13px; flex-shrink: 0; }
+    #chat-header .header-spacer { flex: 1; }
+    #sse-status { color: #b06a00; font-size: 12px; }
+    #active-profile { color: #555; }
+    #logout-link { color: #2481cc; text-decoration: none; }
     #messages { flex: 1; overflow-y: auto; padding: 12px; }
-    .msg { max-width: 60%; margin: 4px 0; padding: 8px 12px; border-radius: 12px; }
+    /* #187: long unbroken text (a pasted URL) wraps inside the bubble instead of overflowing */
+    .msg { max-width: 60%; margin: 4px 0; padding: 8px 12px; border-radius: 12px; overflow-wrap: anywhere; }
     .msg.in { background: #eee; }
     .msg.out { background: #cfe9ff; margin-left: auto; }
     /* #108: author line above a group message's text (userid @username First Last) */
@@ -30,8 +44,28 @@
     #composer { display: flex; border-top: 1px solid #ccc; padding: 8px; }
     #composer input { flex: 1; padding: 8px; }
     #suggest-error { color: #b00020; padding: 0 8px; align-self: center; font-size: 12px; }
-    #variant-panel { border-top: 1px solid #ddd; padding: 8px; display: none; }
+    /* #187: send-error slot (role=alert), empty in the layout until a 4xx/5xx surfaces */
+    #composer-error { color: #b00020; padding: 0 10px; font-size: 13px; }
+    #composer-error:empty { display: none; }
+    /* #187: message-search / dialog-lang share the flex column; keep them from eating #messages */
+    #message-search { padding: 6px 10px; border-bottom: 1px solid #eee; flex-shrink: 0; }
+    #message-search input { width: 100%; padding: 6px; box-sizing: border-box; }
+    #outbound-indicator, #reply-banner, #lang-settings { flex-shrink: 0; }
+    #outbound-indicator { padding: 4px 10px; font-size: 12px; color: #2481cc; }
+    .empty-state { color: #999; text-align: center; padding: 24px; font-size: 14px; }
+    /* #187: keep the on-screen text but expose it to assistive tech (direction labels, etc.) */
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+               overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    /* #187: a tall variant panel can't push #messages off — cap it and scroll inside */
+    #variant-panel { border-top: 1px solid #ddd; padding: 8px; display: none;
+                     max-height: 40vh; overflow-y: auto; flex-shrink: 0; }
     .variant-card { display: block; width: 100%; text-align: left; margin: 4px 0; padding: 8px; }
+    /* #187: on a phone stack the sidebar above the chat instead of squeezing it to a sliver */
+    @media (max-width: 600px) {
+      body { flex-direction: column; height: auto; min-height: 100vh; }
+      #dialogs { width: 100%; max-height: 40vh; border-right: none; border-bottom: 1px solid #ccc; }
+      .msg { max-width: 85%; }
+    }
     /* #97: transient confirmation for a reaction that landed in a dialog the user left */
     #reaction-toast {
       position: fixed; right: 16px; bottom: 16px; max-width: 280px; padding: 8px 12px;
@@ -45,11 +79,11 @@
 </head>
 <body>
   <aside id="dialogs">
-    <nav id="tabs">
-      <button class="tab active" hx-get="/dialogs?tab=dm"
+    <nav id="tabs" role="tablist">
+      <button class="tab active" role="tab" aria-selected="true" hx-get="/dialogs?tab=dm"
               hx-target="#dialogs ul" hx-swap="innerHTML"
               hx-on:click="document.getElementById('dialog-search').value=''">DM</button>
-      <button class="tab" hx-get="/dialogs?tab=groups"
+      <button class="tab" role="tab" aria-selected="false" hx-get="/dialogs?tab=groups"
               hx-target="#dialogs ul" hx-swap="innerHTML"
               hx-on:click="document.getElementById('dialog-search').value=''">Группы</button>
     </nav>
@@ -61,14 +95,40 @@
     <ul hx-get="/dialogs" hx-trigger="load" hx-target="#dialogs ul" hx-swap="innerHTML"></ul>
   </aside>
   <main id="chat">
-    <div id="messages"></div>
+    <!-- #187: a compact header — active profile, a visible logout link (web-auth only, wired by
+         JS after probing /logout), and the orphan suggester-settings toggle. -->
+    <header id="chat-header">
+      <span id="active-profile" hx-get="/profiles" hx-trigger="load" hx-swap="innerHTML"
+            title="Active account"></span>
+      <span id="sse-status" role="status" aria-live="polite"></span>
+      <span class="header-spacer"></span>
+      <button type="button" id="suggest-settings-btn" title="Suggester settings"
+              aria-expanded="false">⚙ Suggest</button>
+      <a id="logout-link" href="/logout" style="display:none">Logout</a>
+    </header>
+    <!-- #187: the orphan /settings/suggest form — loaded on demand into this host. -->
+    <div id="suggest-settings-panel" style="display:none"></div>
+    <!-- #187: in-dialog message search — distinct from the sidebar's dialog filter above.
+         JS builds /dialogs/{id}/search?q=… from the open dialog and targets #messages. -->
+    <form id="message-search" style="display:none" onsubmit="return false">
+      <input type="search" id="message-search-input" name="q"
+             placeholder="Поиск в переписке…" autocomplete="off" aria-label="Search messages in this chat">
+    </form>
+    <div id="messages" aria-live="polite">
+      <div id="messages-empty" class="empty-state">Выберите диалог слева</div>
+    </div>
     <div id="reaction-toast" role="status" aria-live="polite"></div>
     <div id="lang-settings" hx-get="/settings/lang" hx-trigger="load" hx-swap="innerHTML"></div>
+    <!-- #187: a persistent "Translating → {lang}" indicator (shown when outbound applies). -->
+    <div id="outbound-indicator" role="status" style="display:none"></div>
     <div id="variant-panel" role="status"></div>
     <div id="reply-banner" style="display:none; padding: 4px 8px; font-size: 12px; color: #555; border-top: 1px solid #eee;">
       <span id="reply-banner-text"></span>
       <button type="button" id="reply-cancel" title="Cancel reply">✕</button>
     </div>
+    <!-- #187: send errors (503 flood-wait / 409 expired token) surface here as role=alert —
+         HTMX doesn't swap 4xx/5xx bodies, so a htmx:responseError handler fills this slot. -->
+    <div id="composer-error" role="alert"></div>
     <form id="composer" hx-post="/send" hx-target="#messages" hx-swap="beforeend"
           hx-headers='{"X-TG-Messenger-CSRF": "1"}'>
       <input type="hidden" name="dialog_id" id="dialog_id" value="">
@@ -99,23 +159,225 @@
     document.getElementById('tabs').addEventListener('click', (e) => {
       const tab = e.target.closest('.tab');
       if (!tab) return;
-      document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', t === tab));
+      document.querySelectorAll('#tabs .tab').forEach(t => {
+        const on = t === tab;
+        t.classList.toggle('active', on);
+        t.setAttribute('aria-selected', on ? 'true' : 'false');  // #187: not color-only
+      });
       const hx = tab.getAttribute('hx-get') || '';
       document.getElementById('current-tab').value = hx.includes('groups') ? 'groups' : 'dm';
     });
+    // #187: small shared UI helpers introduced by the UX pass.
+    function setSseStatus(text) {
+      const el = document.getElementById('sse-status');
+      if (el) el.textContent = text || '';
+    }
+    function clearComposerError() {
+      const el = document.getElementById('composer-error');
+      if (el) el.textContent = '';
+    }
+    function showComposerError(text) {
+      const el = document.getElementById('composer-error');
+      if (el) el.textContent = text || 'Send failed.';
+    }
+    // #187: hide the "select a dialog" empty state once a chat is opened (a bubble is present).
+    function hideMessagesEmptyState() {
+      const empty = document.getElementById('messages-empty');
+      if (empty) empty.remove();
+    }
+    // #187: after an accepted history swap we clear the sidebar badge client-side so the stale
+    // count doesn't linger until the next /dialogs fetch.
+    function clearUnreadBadge(dialogId) {
+      const li = document.querySelector('#dialogs li[data-dialog="' + CSS.escape(String(dialogId)) + '"]');
+      if (!li) return;
+      const badge = li.querySelector('.unread');
+      if (badge) badge.remove();
+    }
+    // #195 round 2 (critical): the server no longer marks-read on the history GET (a stale GET for
+    // a dialog the user left would have marked it read unseen). Reading now follows the actual
+    // display: after an ACCEPTED history swap settles for the open dialog, POST the highest shown
+    // message id to /dialogs/{id}/read. Best-effort — a failure just leaves the badge for the next
+    // /dialogs fetch, never blocks or throws.
+    function markDialogRead(dialogId) {
+      // #195 round 3: compute max id ONLY from bubbles belonging to THIS dialog (data-dialog),
+      // never from every bubble in the pane — during an in-flight switch the DOM can briefly hold
+      // the previous dialog's bubbles, and reading their id would mark the wrong dialog read up to
+      // a foreign message id. The server-rendered bubbles and SSE bubbles both stamp data-dialog.
+      const bubbles = document.querySelectorAll(
+        '#messages .msg[data-id][data-dialog="' + CSS.escape(String(dialogId)) + '"]');
+      let maxId = 0;
+      bubbles.forEach((b) => { const n = parseInt(b.dataset.id, 10); if (n > maxId) maxId = n; });
+      if (!maxId) return;  // no bubbles for this dialog (empty history / mixed DOM) — nothing to mark
+      const fd = new FormData();
+      fd.append('max_id', String(maxId));
+      fetch('/dialogs/' + encodeURIComponent(dialogId) + '/read', {
+        method: 'POST', body: fd, headers: { 'X-TG-Messenger-CSRF': '1' },
+      }).catch(() => {});
+    }
+    // #187: fold the presentation selector U+FE0F so a bare ❤ (from an echo) and ❤️ (from a
+    // preset) dedupe as the same reaction instead of showing twice.
+    function normalizeEmoji(e) {
+      return (e || '').replace(/\uFE0F/g, '');  // strip U+FE0F variation selector
+    }
+    // #187: reveal + reset the in-dialog message search when a chat opens.
+    function showMessageSearch() {
+      const form = document.getElementById('message-search');
+      const input = document.getElementById('message-search-input');
+      if (input) input.value = '';
+      if (form) form.style.display = 'block';
+    }
+    // #187: the persistent "Translating \u2192 {lang}" hint near the composer.
+    function showOutboundIndicator(lang) {
+      const el = document.getElementById('outbound-indicator');
+      if (!el) return;
+      el.textContent = 'Translating \u2192 ' + lang;
+      el.style.display = 'block';
+    }
+    function hideOutboundIndicator() {
+      const el = document.getElementById('outbound-indicator');
+      if (!el) return;
+      el.textContent = '';
+      el.style.display = 'none';
+    }
+    // #187: in-dialog message search \u2014 build /dialogs/{id}/search?q=\u2026 for the OPEN dialog and
+    // swap the results into #messages. Debounced; an empty query reloads the full history.
+    (function wireMessageSearch() {
+      const input = document.getElementById('message-search-input');
+      if (!input) return;
+      let timer = null;
+      input.addEventListener('input', () => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          const id = document.getElementById('dialog_id').value;
+          if (!id) return;
+          const q = input.value.trim();
+          const url = q
+            ? '/dialogs/' + encodeURIComponent(id) + '/search?q=' + encodeURIComponent(q)
+            : '/dialogs/' + encodeURIComponent(id) + '/messages';
+          // #195 review: whether a settled swap was a search is derived from its request path in
+          // htmx:afterSettle (per-response), not a global flag a racing second search could flip.
+          if (window.htmx) window.htmx.ajax('GET', url, { target: '#messages', swap: 'innerHTML' });
+        }, 250);
+      });
+    })();
+    // #187: surface the orphan suggester-settings form on demand (\u2699 Suggest in the header).
+    (function wireSuggestSettings() {
+      const btn = document.getElementById('suggest-settings-btn');
+      const panel = document.getElementById('suggest-settings-panel');
+      if (!btn || !panel) return;
+      btn.addEventListener('click', async () => {
+        const open = panel.style.display !== 'none';
+        if (open) {
+          panel.style.display = 'none';
+          btn.setAttribute('aria-expanded', 'false');
+          return;
+        }
+        try {
+          const resp = await fetch('/settings/suggest', { headers: { 'X-TG-Messenger-CSRF': '1' } });
+          const html = await resp.text();
+          panel.innerHTML = html;
+          if (window.htmx) window.htmx.process(panel);  // activate hx-* on the injected form
+        } catch (err) {
+          panel.textContent = 'Suggester settings unavailable.';
+        }
+        panel.style.display = 'block';
+        btn.setAttribute('aria-expanded', 'true');
+      });
+    })();
+    // #187: a visible logout link, shown only when web-auth is on. The /login page exists only
+    // when a web password is configured \u2014 probe it and reveal the link when it's present.
+    (function wireLogoutLink() {
+      const link = document.getElementById('logout-link');
+      if (!link) return;
+      // The /login route exists only when a web password is configured; a 404 means web-auth is
+      // off (no logout to show). Anything else (200, or a future redirect) means it's on.
+      fetch('/login', { method: 'GET' })
+        .then((resp) => { if (resp.status !== 404) link.style.display = 'inline'; })
+        .catch(() => {});
+    })();
+    // #187: is the message pane scrolled (near) the bottom? Used to decide whether a live
+    // append / history swap should follow to the newest — never yank a user reading history.
+    function isAtBottom(el) {
+      // a small slack so "one line above the fold" still counts as at-bottom
+      return el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    }
+    function scrollMessagesToEnd() {
+      const el = document.getElementById('messages');
+      el.scrollTop = el.scrollHeight;
+    }
+    // #187: scroll to the newest only when the user was already at the bottom before the append.
+    function scrollMessagesToEndIfAtBottom(wasAtBottom) {
+      if (wasAtBottom) scrollMessagesToEnd();
+    }
+    // #195 round 3 (architectural): many different requests swap into the SAME #messages —
+    // a dialog history load (/dialogs/{id}/messages), an in-dialog search (/dialogs/{id}/search),
+    // and a composer send (/send, hx-target=#messages). A single afterSettle handler that doesn't
+    // distinguish them marks/scrolls the WRONG dialog. Classify every #messages request by its
+    // path into an explicit {kind, dialogId} so each handler acts only on the kind it means.
+    //   kind: 'history' (full dialog load) | 'search' (filtered) | 'send' (composer echo) | 'other'
+    function classifyMessagesRequest(path) {
+      const p = path || '';
+      let m = /\/dialogs\/(-?\d+)\/messages(?:$|[?#])/.exec(p);
+      if (m) return { kind: 'history', dialogId: m[1] };
+      m = /\/dialogs\/(-?\d+)\/search(?:$|[?#])/.exec(p);
+      if (m) return { kind: 'search', dialogId: m[1] };
+      if (/(?:^|\/)send(?:$|[?#])/.test(p)) return { kind: 'send', dialogId: null };
+      return { kind: 'other', dialogId: null };
+    }
+    // #195 (BUG-2, stale-swap race): a history/search response for a dialog the user already left
+    // must not overwrite the current pane. Drop the swap when its dialog no longer matches the open
+    // one. Only the dialog-scoped GET routes are guarded here (a /send echo has no dialog in its
+    // path and carries its own data-dialog on the bubble — the #95 machinery already scopes that).
+    document.getElementById('messages').addEventListener('htmx:beforeSwap', (evt) => {
+      const path = evt.detail && evt.detail.pathInfo && evt.detail.pathInfo.requestPath;
+      const req = classifyMessagesRequest(path);
+      if ((req.kind === 'history' || req.kind === 'search') &&
+          req.dialogId !== document.getElementById('dialog_id').value) {
+        evt.detail.shouldSwap = false;  // stale response for a dialog the user already left
+      }
+    });
+    // #187/#195: a #messages swap just settled. Fires ONLY for an ACCEPTED swap (beforeSwap drops a
+    // stale one via shouldSwap=false, and htmx runs afterSettle inside its `if(shouldSwap)` block).
+    // Mark-read / badge-clear / scroll are STRICTLY gated on an accepted HISTORY load for the dialog
+    // the user is actually viewing — never on a /send echo or a /search (round-3 fix: a /send-settle
+    // used to fall through to markDialogRead(openId), marking the wrong dialog read on a fast switch).
+    document.getElementById('messages').addEventListener('htmx:afterSettle', (evt) => {
+      hideMessagesEmptyState();
+      const path = evt.detail && evt.detail.pathInfo && evt.detail.pathInfo.requestPath;
+      const req = classifyMessagesRequest(path);
+      if (req.kind !== 'history') return;  // send / search / other: no mark-read, badge, or scroll
+      // require an accepted history load whose dialog is the one currently open (the beforeSwap
+      // guard already dropped a mismatch; this is defense-in-depth against any path that reaches here)
+      if (req.dialogId === null || req.dialogId !== document.getElementById('dialog_id').value) return;
+      scrollMessagesToEnd();
+      clearUnreadBadge(req.dialogId);   // #187: clear the sidebar badge client-side
+      markDialogRead(req.dialogId);     // #195: confirm the read server-side (follows actual display)
+    });
     // Track selected dialog id from clicks on the list, wire SSE for incoming.
     let es = null;
-    document.body.addEventListener('click', (e) => {
-      const li = e.target.closest('#dialogs li');
-      if (!li) return;
-      const id = li.textContent.trim().split(' ')[0];
+    // #187: open a dialog — shared by a mouse click and a keyboard Enter/Space on the focused
+    // row. Reads the authoritative li.dataset.dialog (never parses the rendered <li> text, which
+    // a row-format change would break). htmx still issues the hx-get on the same click/activation.
+    function openDialog(li) {
+      const id = li.dataset.dialog;
+      if (!id) return;
       saveComposeState();
       restoreComposeState(id);
       setComposerEnabled(li.dataset.canSend !== '0');
+      clearComposerError();  // #187: a stale send error from the previous chat shouldn't linger
+      showMessageSearch();   // #187: reveal + reset the in-dialog search for the newly-open chat
+      hideOutboundIndicator();  // #187: the Translating→ hint is per-dialog; reset on switch
       if (es) es.close();
+      setSseStatus('');  // clear any "reconnecting…" indicator from the previous stream
       es = new EventSource('/stream/' + encodeURIComponent(id) +
                            '?client_id=' + encodeURIComponent(webClientId));
+      // #187: a silent SSE drop looked alive but stopped receiving. Surface a reconnecting hint;
+      // EventSource auto-reconnects, and onmessage clears it once frames flow again.
+      es.onerror = () => setSseStatus('Reconnecting…');
       es.onmessage = (ev) => {
+        setSseStatus('');  // frames are flowing again — drop any reconnecting hint
+        const messagesEl = document.getElementById('messages');
+        const wasAtBottom = isAtBottom(messagesEl);
         const data = JSON.parse(ev.data);
         const div = document.createElement('div');
         if (data.type === 'reaction') {
@@ -155,6 +417,14 @@
           author.textContent = authorLine(data.sender_id, data.sender);
           div.appendChild(author);
         }
+        // #187: direction is signaled by background+alignment only — add an sr-only label so a
+        // screen reader can tell an outgoing from an incoming message (color-only WCAG gap).
+        if (data.out) {
+          const dir = document.createElement('span');
+          dir.className = 'sr-only';
+          dir.textContent = 'You: ';
+          div.appendChild(dir);
+        }
         const bodyLine = document.createElement('span');
         bodyLine.textContent = '[' + data.id + '] ' + (data.text || '<media>');
         div.appendChild(bodyLine);
@@ -165,10 +435,28 @@
         reactBtn.className = 'react-btn';
         reactBtn.dataset.react = data.id;
         reactBtn.title = 'React';
+        reactBtn.setAttribute('aria-label', 'React');  // #187: announce the text-less glyph
         reactBtn.textContent = '🙂';
         div.appendChild(reactBtn);
-        document.getElementById('messages').appendChild(div);
+        messagesEl.appendChild(div);
+        // #187: follow to the newest live message only if the user was at the bottom before it.
+        scrollMessagesToEndIfAtBottom(wasAtBottom);
       };
+    }
+    // A mouse click on a dialog row opens it (htmx also fires its hx-get on this same click).
+    document.body.addEventListener('click', (e) => {
+      const li = e.target.closest('#dialogs li');
+      if (li) openDialog(li);
+    });
+    // #187: keyboard access — Enter/Space on the focused role=button row opens the chat and
+    // triggers htmx's hx-get (which is bound to a click, so synthesize one). preventDefault on
+    // Space stops the page from scrolling.
+    document.getElementById('dialogs').addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const li = e.target.closest('#dialogs li');
+      if (!li) return;
+      e.preventDefault();
+      li.click();  // fires both htmx's hx-get and our click listener → openDialog
     });
     // Attach a file: upload it as media to the open dialog, append the bubble.
     document.getElementById('attach-file').addEventListener('change', async (e) => {
@@ -196,14 +484,19 @@
         // is still on this upload's dialog (otherwise the bubble belongs to another chat,
         // and the visible composer/draft is a later action's, not this upload's).
         if (document.getElementById('dialog_id').value === id) {
+          hideMessagesEmptyState();  // #187: the pane now has content
+          clearComposerError();      // #187: a prior upload error clears on success
           document.getElementById('messages').insertAdjacentHTML('beforeend', html);
+          scrollMessagesToEnd();     // #187: the just-uploaded media is the newest — show it
           document.getElementById('composer-text').value = '';
           // #48: media carries no reply_to, so clear the stale banner — but only if the
           // user hasn't picked a newer target since this upload started (#89 shared helper).
           clearReplyIfConsumed(uploadReplyTo);
         }
       } else {
-        alert(html.replace(/<[^>]+>/g, '').trim() || 'Upload failed');
+        // #187: surface the upload error inline (composer-error slot), matching every other
+        // error in the UI — no blocking native alert() modal.
+        showComposerError(html.replace(/<[^>]+>/g, '').trim() || 'Upload failed');
       }
       e.target.value = '';
     });
@@ -272,11 +565,18 @@
         '.msg[data-dialog="' + CSS.escape(String(dialogId)) + '"]' +
         '[data-id="' + CSS.escape(String(messageId)) + '"]');
       if (!msg) return false;
+      // #187: fold U+FE0F for the DEDUP KEY so a bare ❤ (from an echo) and ❤️ (from a preset)
+      // count as the same reaction and the heart isn't shown twice. The displayed label keeps
+      // its original form. `<custom>` (a deliberate cross-UI marker) is left untouched.
       const label = emoticon || '<custom>';
+      const key = normalizeEmoji(label);
       let line = msg.querySelector('.reactions');
       if (!line) { line = document.createElement('div'); line.className = 'reactions'; msg.appendChild(line); }
       const shown = line.textContent ? line.textContent.split(' ') : [];
-      if (!shown.includes(label)) { shown.push(label); line.textContent = shown.join(' '); }
+      if (!shown.some((s) => normalizeEmoji(s) === key)) {
+        shown.push(label);
+        line.textContent = shown.join(' ');
+      }
       return true;
     }
     function attachReaction(dialogId, messageId, emoticon) {
@@ -339,8 +639,9 @@
       } else {
         const html = await resp.text();
         const doc = new DOMParser().parseFromString(html, 'text/html');
-        document.getElementById('suggest-error').textContent =
-          (doc.body.textContent || '').trim() || 'Reaction failed.';
+        // #187: a reaction failure belongs in the reaction toast (same place success uses),
+        // NOT in #suggest-error next to the 💡 button, where it read as a Suggest failure.
+        showToast((doc.body.textContent || '').trim() || 'Reaction failed.');
       }
     }
     function closeReactionPalettes() {
@@ -380,7 +681,9 @@
       const btn = document.getElementById('suggest-btn');
       const error = document.getElementById('suggest-error');
       btn.disabled = true;
-      error.textContent = '';
+      // #187: the LLM runs for several seconds — write a "thinking…" status synchronously so the
+      // UI doesn't look hung (mirrors the TUI's SUGGEST_THINKING). Cleared on success/failure.
+      error.textContent = 'Thinking…';
       try {
         const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/suggest', {
           method: 'POST',
@@ -391,6 +694,7 @@
           document.getElementById('composer-text').value = text;
           const state = currentState();
           if (state) state.draft = text;
+          error.textContent = '';  // clear the thinking hint once the draft lands
         } else {
           const doc = new DOMParser().parseFromString(text, 'text/html');
           error.textContent = (doc.body.textContent || '').trim() || 'Suggest failed.';
@@ -405,11 +709,27 @@
     const replyToInput = document.getElementById('reply_to');
     const replyBanner = document.getElementById('reply-banner');
     const replyBannerText = document.getElementById('reply-banner-text');
-    function setReply(messageId) {
+    function setReply(messageId, snippet) {
       replyToInput.value = messageId;
-      replyBannerText.textContent = 'Replying to #' + messageId;
+      // #187: quote a short snippet of the target (like Telegram) so the user can verify the
+      // right message was picked, not just a bare id. textContent keeps it XSS-safe.
+      const label = 'Replying to #' + messageId;
+      replyBannerText.textContent = snippet ? (label + ': ' + snippet) : label;
       replyBanner.style.display = 'block';
       document.getElementById('composer-text').focus();
+    }
+    // #187: the visible text of a bubble, trimmed for the reply banner (author/reactions/controls
+    // excluded — only the message body span). Falls back to the whole bubble text if unstructured.
+    function bubbleSnippet(bubble) {
+      if (!bubble) return '';
+      const clone = bubble.cloneNode(true);
+      clone.querySelectorAll('.author, .reactions, .translation, .reply-btn, .react-btn, .reaction-palette, .sr-only')
+        .forEach((n) => n.remove());
+      let text = (clone.textContent || '').trim();
+      // strip the leading "[id] " prefix the server/SSE prepend to the body
+      text = text.replace(/^\[\d+\]\s*/, '');
+      const MAX = 60;
+      return text.length > MAX ? text.slice(0, MAX) + '…' : text;
     }
     function clearReply() {
       replyToInput.value = '';
@@ -430,7 +750,7 @@
       const bubble = btn.closest('.msg');
       const bubbleDialog = bubble ? bubble.dataset.dialog : '';
       if (bubbleDialog && bubbleDialog !== document.getElementById('dialog_id').value) return;
-      setReply(btn.dataset.reply);
+      setReply(btn.dataset.reply, bubbleSnippet(bubble));  // #187: quote a snippet of the target
     });
     document.getElementById('reply-cancel').addEventListener('click', clearReply);
     const composer = document.getElementById('composer');
@@ -530,7 +850,9 @@
       variantPanel.textContent = '';
       variantPanel.style.display = 'block';
       const line = document.createElement('div');
-      line.textContent = message || 'Translation failed.';
+      // #187: softer, action-oriented copy — the message didn't fail catastrophically, we just
+      // couldn't translate it and are offering to send it as written.
+      line.textContent = message || "Couldn't translate — send as written?";
       variantPanel.appendChild(line);
       const original = document.createElement('button');
       original.type = 'button';
@@ -546,6 +868,8 @@
         sendOriginal();
       });
       variantPanel.appendChild(original);
+      // #187: auto-focus the single action so the keyboard user can confirm immediately.
+      original.focus();
     }
 
     composerText.addEventListener('input', () => {
@@ -559,8 +883,35 @@
         clearOutboundState(state);
       }
     });
+    // #187: HTMX doesn't swap 4xx/5xx bodies, so a send that fails (503 flood-wait, 409 expired
+    // outbound token, 403 read-only, 400 validation) left the user with no feedback — the text
+    // stayed, nothing sent, silence. Surface the server's error body into the visible role=alert
+    // slot; the draft is preserved (HTMX doesn't reset() the form on error), so a retry is easy.
+    composer.addEventListener('htmx:responseError', (evt) => {
+      const xhr = evt.detail && evt.detail.xhr;
+      const raw = xhr ? xhr.responseText : '';
+      const doc = new DOMParser().parseFromString(raw || '', 'text/html');
+      const text = (doc.body.textContent || '').trim();
+      showComposerError(text || 'Message could not be sent. Please try again.');
+    });
+    // #195 review (BUG-1): a NETWORK failure (no HTTP response at all) fires htmx:sendError /
+    // htmx:timeout, NOT htmx:responseError. Surface it in the same slot; the success path is
+    // gated on detail.successful, so the draft and reply target are preserved for a retry.
+    const onComposerNetworkFail = () => {
+      showComposerError('Network error — the message was not sent. Please try again.');
+    };
+    composer.addEventListener('htmx:sendError', onComposerNetworkFail);
+    composer.addEventListener('htmx:timeout', onComposerNetworkFail);
+    // #195 review (BUG-1, data-loss): gate the success path on htmx's own success flag, NOT on
+    // `status < 400`. On a NETWORK failure (drop / timeout / abort) xhr.status is 0, so the old
+    // `0 >= 400` was false and we fell through to composer.reset() — wiping the draft though the
+    // message never left. htmx sets detail.successful=true only for a 2xx; a status-0 send has
+    // successful=false. The sendError/timeout handlers above then surface it and keep the draft.
     composer.addEventListener('htmx:afterRequest', (evt) => {
-      if (evt.detail.xhr && evt.detail.xhr.status >= 400) return;
+      if (!(evt.detail && evt.detail.successful)) return;
+      clearComposerError();  // #187: a prior send error clears once a send succeeds
+      hideMessagesEmptyState();  // the just-sent bubble means the pane is no longer empty
+      hideOutboundIndicator();  // #187: the Translating→ hint is per-attempt — clear it on send
       const submittedDialogId = composer.dataset.submittingDialogId || activeDialogId;
       const submittedReplyTo = composer.dataset.submittingReplyTo || '';
       delete composer.dataset.submittingDialogId;
@@ -581,6 +932,9 @@
         if (survivingReply) {
           replyToInput.value = survivingReply;  // re-apply the newer target reset() wiped
         }
+        // #195 round 3: the send was for the dialog the user is still viewing — scroll to the
+        // just-appended bubble. If the user already switched away, do NOT scroll the new dialog.
+        scrollMessagesToEnd();
       } else if (activeDialogId) {
         applyComposeState(stateFor(activeDialogId));
         dialogInput.value = activeDialogId;
@@ -612,7 +966,9 @@
       if (sendBtn) sendBtn.disabled = true;
       if (outboundController) outboundController.abort();
       outboundController = new AbortController();
-      const outboundTimer = setTimeout(() => outboundController.abort(), 15000);
+      // #187: match the server's OUTBOUND_TIMEOUT_SECONDS (20s) — a shorter client abort (15s)
+      // aborted a translation the server was still willing to finish. A small margin over 20s.
+      const outboundTimer = setTimeout(() => outboundController.abort(), 21000);
       try {
         const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/outbound', {
           method: 'POST',
@@ -639,6 +995,8 @@
         }
         variantPanel.textContent = '';
         variantPanel.style.display = 'block';
+        // #187: a persistent hint that outbound translation is active for this dialog.
+        showOutboundIndicator(data.target_lang);
         const title = document.createElement('div');
         title.textContent = 'Translate to ' + data.target_lang;
         variantPanel.appendChild(title);
@@ -674,7 +1032,7 @@
         });
         variantPanel.appendChild(original);
       } catch (err) {
-        showSendOriginal(id, draft, 'Translation failed.', () => {
+        showSendOriginal(id, draft, "Couldn't translate — send as written?", () => {
           markSubmittingDialog(id);
           evt.detail.issueRequest(true);
         });

@@ -220,6 +220,30 @@ async def test_index_serves_html(client_app):
     assert "text/html" in r.headers["content-type"]
 
 
+async def test_index_has_viewport_meta(client_app):
+    # #187: without a viewport meta a phone renders the page at ~980px and scales it down.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert '<meta name="viewport" content="width=device-width, initial-scale=1">' in r.text
+
+
+async def test_index_vendors_htmx_locally_not_from_cdn(client_app):
+    # #187: htmx is served from /static (mounted from the vendored file), never unpkg — the
+    # UI must not depend on a third-party CDN fetch (offline / strict CSP / blocked network).
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert 'src="/static/htmx.min.js"' in r.text
+    assert "unpkg.com" not in r.text
+
+
+async def test_static_htmx_is_served(client_app):
+    # #187: the vendored htmx asset is actually reachable at the referenced path.
+    ac, _ = client_app
+    r = await ac.get("/static/htmx.min.js")
+    assert r.status_code == 200
+    assert 'version:"1.9.12"' in r.text
+
+
 async def test_index_uses_per_tab_web_client_id(client_app):
     ac, _ = client_app
     r = await ac.get("/")
@@ -381,15 +405,49 @@ async def test_dialogs_show_unread_badge(client_app):
     assert '<span class="unread">1</span>' in r.text
 
 
-async def test_opening_messages_marks_read(client_app):
-    # цикл 81: открытие диалога помечает его прочитанным (best-effort)
+async def test_opening_messages_does_not_mark_read_on_the_get(client_app):
+    # #195 round 2 (critical): the history GET must NOT mark-read server-side — a late response
+    # for a dialog the user already switched away from is dropped client-side (beforeSwap), so a
+    # GET-time mark-read would silently mark an UNSEEN dialog read. Reading is now a separate,
+    # client-confirmed POST /dialogs/{id}/read fired only after the swap is accepted + settled.
     ac, stub = client_app
     await ac.get("/dialogs/7/messages")
+    await asyncio.sleep(0)
+    assert stub.read_acks == []  # the GET alone no longer marks read
+
+
+async def test_read_endpoint_marks_read(client_app):
+    # #195 round 2: the client-confirmed read POST marks the dialog read up to the given id.
+    ac, stub = client_app
+    r = await ac.post("/dialogs/7/read", data={"max_id": "1"})
+    assert r.status_code in (200, 204)
     await asyncio.sleep(0)
     assert stub.read_acks == [(7, 1)]
 
 
-async def test_messages_mark_read_does_not_block_response():
+async def test_read_endpoint_requires_csrf_header():
+    # #195 round 2: /read is a state-changing write — same-origin guarded like /send.
+    stub = WebStubClient()
+    app = build_app(client=stub)
+    transport = httpx.ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            r = await ac.post("/dialogs/7/read", data={"max_id": "1"})  # no CSRF header
+    assert r.status_code == 403
+    assert stub.read_acks == []
+
+
+async def test_read_endpoint_rejects_bad_max_id(client_app):
+    # #195 round 2: a non-numeric max_id is a 400, not a crash / silent mark.
+    ac, stub = client_app
+    r = await ac.post("/dialogs/7/read", data={"max_id": "nope"})
+    assert r.status_code == 400
+    await asyncio.sleep(0)
+    assert stub.read_acks == []
+
+
+async def test_read_endpoint_does_not_block_response():
+    # #195 round 2: mark_read stays best-effort/off the response path (moved from GET to /read).
     stub = WebStubClient()
     started = asyncio.Event()
     release = asyncio.Event()
@@ -405,9 +463,8 @@ async def test_messages_mark_read_does_not_block_response():
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url="http://test",
                                      headers={"X-TG-Messenger-CSRF": "1"}) as ac:
-            r = await asyncio.wait_for(ac.get("/dialogs/7/messages"), timeout=1)
-            assert r.status_code == 200
-            assert "hi" in r.text
+            r = await asyncio.wait_for(ac.post("/dialogs/7/read", data={"max_id": "1"}), timeout=1)
+            assert r.status_code in (200, 204)
             await asyncio.wait_for(started.wait(), timeout=1)
             assert stub.read_acks == []
             release.set()
@@ -415,26 +472,8 @@ async def test_messages_mark_read_does_not_block_response():
     assert stub.read_acks == [(7, 1)]
 
 
-async def test_messages_empty_history_does_not_mark_read():
-    stub = WebStubClient()
-
-    async def empty_history(peer, limit=50, offset_id=0):
-        return []
-
-    stub.history = empty_history
-    app = build_app(client=stub)
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test",
-                                     headers={"X-TG-Messenger-CSRF": "1"}) as ac:
-            r = await ac.get("/dialogs/7/messages")
-            await asyncio.sleep(0)
-    assert r.status_code == 200
-    assert stub.read_acks == []
-
-
-async def test_messages_mark_read_failure_does_not_break(caplog):
-    # mark_read best-effort: ошибка логируется, история всё равно отдаётся
+async def test_read_endpoint_failure_does_not_break(caplog):
+    # #195 round 2: mark_read best-effort — a failure is logged, the POST still returns cleanly.
     import logging
 
     stub = WebStubClient()
@@ -449,11 +488,21 @@ async def test_messages_mark_read_failure_does_not_break(caplog):
         async with httpx.AsyncClient(transport=transport, base_url="http://test",
                                      headers={"X-TG-Messenger-CSRF": "1"}) as ac:
             with caplog.at_level(logging.WARNING):
-                r = await ac.get("/dialogs/7/messages")
+                r = await ac.post("/dialogs/7/read", data={"max_id": "1"})
                 await asyncio.sleep(0)
-    assert r.status_code == 200
-    assert "hi" in r.text
+    assert r.status_code in (200, 204)
     assert any("mark_read" in rec.message or "nope" in str(rec.message) for rec in caplog.records)
+
+
+async def test_index_marks_read_client_side_after_accepted_settle(client_app):
+    # #195 round 2: the client fires POST /dialogs/{id}/read only after an ACCEPTED history swap
+    # settles (a stale swap is dropped by beforeSwap and never settles), for the CURRENT dialog.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "/read" in r.text  # the read endpoint is called from the client
+    assert "function markDialogRead(" in r.text  # the helper exists
+    # it's wired off the accepted-history afterSettle path (search swaps early-return before it)
+    assert "markDialogRead(" in r.text
 
 
 async def test_send_reply_to_reaches_client(client_app):
@@ -2020,7 +2069,9 @@ async def test_index_blocks_outbound_errors_until_explicit_send_original(client_
     ac, _ = client_app
     r = await ac.get("/")
     assert "showSendOriginal(id, draft, data.error, () => {" in r.text
-    assert "showSendOriginal(id, draft, 'Translation failed.', () => {" in r.text
+    # #187: softened copy — the failure path still routes through showSendOriginal (blocks until
+    # the user explicitly picks Send original), it just no longer says the alarming "failed".
+    assert "showSendOriginal(id, draft, \"Couldn't translate — send as written?\", () => {" in r.text
     assert "markSubmittingDialog(id);" in r.text
     assert "Translation timed out — sending the original." not in r.text
 
@@ -2174,6 +2225,212 @@ async def test_index_has_cross_dialog_reaction_toast(client_app):
     assert "Реакция отправлена " in r.text  # the neutral fallback form
 
 
+async def test_index_auto_scrolls_to_newest(client_app):
+    # #187: on open the oldest message showed at the top and each live message appended below
+    # the fold, invisible. The history swap (htmx:afterSettle) and every SSE append must scroll
+    # #messages to the bottom — only when the user was already at the bottom (don't yank them
+    # away from history they scrolled up to read).
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "scrollHeight" in r.text  # the scroll-to-bottom primitive
+    assert "function isAtBottom(" in r.text  # the at-bottom guard so we don't yank the user
+    assert "function scrollMessagesToEndIfAtBottom(" in r.text  # the shared helper
+
+
+async def test_index_dialog_rows_keyboard_activatable(client_app):
+    # #187: dialog rows are role=button/tabindex=0 (server-rendered) and Enter/Space must open
+    # the chat — a keyboard/screen-reader user can't rely on click only.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "addEventListener('keydown'" in r.text
+    # Enter or Space activates the focused dialog row
+    assert "'Enter'" in r.text and "' '" in r.text
+
+
+async def test_index_reads_dialog_id_from_dataset(client_app):
+    # #187: opening a chat must read li.dataset.dialog, not split the visible <li> text — the
+    # attribute is authoritative and unaffected by a row-format change.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "li.dataset.dialog" in r.text
+    # the brittle text-splitting parser is gone
+    assert "li.textContent.trim().split(' ')[0]" not in r.text
+
+
+async def test_index_surfaces_send_errors(client_app):
+    # #187: HTMX 1.9 doesn't swap 4xx/5xx bodies — a flood-wait (503) / expired token (409)
+    # returned a meaningful error but nothing appeared. A htmx:responseError handler on the
+    # composer must surface the body into a visible role=alert slot.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert 'id="composer-error"' in r.text  # the visible error slot
+    assert 'role="alert"' in r.text  # announced, not queued as a polite status
+    assert "addEventListener('htmx:responseError'" in r.text  # the handler wiring
+
+
+async def test_index_has_in_dialog_message_search(client_app):
+    # #187: the chat pane must have its own message-search field wired to /dialogs/{id}/search,
+    # distinct from the sidebar dialog filter (which says "Поиск диалогов…").
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert 'id="message-search-input"' in r.text
+    assert "/search?q=" in r.text  # the search route is targeted
+    assert "target: '#messages'" in r.text  # results swap into the message pane
+    # the two search boxes are disambiguated by their placeholders
+    assert "Поиск диалогов…" in r.text and "Поиск в переписке…" in r.text
+
+
+async def test_index_has_empty_and_loading_states(client_app):
+    # #187: a first-paint blank pane can't be told from empty-or-broken — show a hint.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert 'id="messages-empty"' in r.text
+    assert "Выберите диалог" in r.text  # the select-a-conversation hint
+    assert "hideMessagesEmptyState" in r.text  # cleared once a chat opens
+
+
+async def test_index_suggest_shows_thinking_indicator(client_app):
+    # #187: the Suggest LLM runs several seconds — a synchronous "thinking…" status keeps the
+    # UI from looking hung (mirrors the TUI SUGGEST_THINKING).
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "'Thinking…'" in r.text
+
+
+async def test_index_reaction_error_uses_toast_not_suggest_error(client_app):
+    # #187: a reaction failure belongs in the reaction toast (where success already lands), not
+    # in #suggest-error next to the 💡 button (where it read as a Suggest failure).
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "showToast((doc.body.textContent || '').trim() || 'Reaction failed.')" in r.text
+    # the old overload of #suggest-error for reaction errors is gone
+    assert "getElementById('suggest-error').textContent =\n" not in r.text
+
+
+async def test_index_reply_banner_includes_snippet(client_app):
+    # #187: the reply banner quotes a short snippet of the target, not just the bare id.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "function bubbleSnippet(" in r.text
+    assert "setReply(btn.dataset.reply, bubbleSnippet(bubble))" in r.text
+
+
+async def test_index_upload_failure_is_inline_not_alert(client_app):
+    # #187: an upload failure surfaces inline (composer-error slot), never a blocking alert().
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "showComposerError(html.replace(" in r.text
+    assert "alert(html" not in r.text  # the old native-modal call is gone
+
+
+async def test_index_outbound_indicator_and_softened_copy(client_app):
+    # #187: a persistent "Translating → {lang}" indicator + softer send-original copy + a client
+    # abort aligned to (not shorter than) the server's 20s timeout.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert 'id="outbound-indicator"' in r.text
+    assert "showOutboundIndicator(data.target_lang)" in r.text
+    assert "Couldn't translate — send as written?" in r.text
+    assert ", 21000)" in r.text  # >= server OUTBOUND_TIMEOUT_SECONDS (20s), not 15000
+    assert ", 15000)" not in r.text
+    # the indicator is cleared once a send completes (afterRequest), not left dangling until the
+    # next dialog switch
+    assert r.text.count("hideOutboundIndicator()") >= 2  # openDialog + afterRequest
+
+
+async def test_index_search_swap_does_not_force_scroll_or_read(client_app):
+    # #187 / #195 round 3: an in-dialog search swap must not force-scroll, clear the unread badge,
+    # or mark read — that's the history-load path's job. The settled request is classified per-
+    # response by its path (history/search/send/other); only a history load acts.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "if (req.kind !== 'history') return;" in r.text  # search/send/other bail
+    assert "kind: 'search'" in r.text  # the classifier recognizes a search path
+    assert "messageSearchSwap" not in r.text  # the global race-prone flag is gone
+
+
+async def test_index_send_success_gated_on_htmx_successful_not_status(client_app):
+    # #195 review (BUG-1, data-loss): the composer success path must gate on htmx's detail.successful
+    # (true only on a 2xx), NOT on `status < 400` — a network drop has xhr.status 0, so the old
+    # `0 >= 400` was false and it fell through to composer.reset(), wiping an undelivered draft.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "if (!(evt.detail && evt.detail.successful)) return;" in r.text
+    assert "if (evt.detail.xhr && evt.detail.xhr.status >= 400) return;" not in r.text
+    # a pure network failure (no HTTP response) fires sendError/timeout — surfaced, draft kept
+    assert "addEventListener('htmx:sendError'" in r.text
+    assert "addEventListener('htmx:timeout'" in r.text
+
+
+async def test_index_messages_swap_bound_to_requesting_dialog(client_app):
+    # #195 review (BUG-2 / round 3): every #messages request is classified by its path into
+    # history/search/send/other; a history/search response for a dialog the user already left is
+    # dropped so it can't overwrite the current pane.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "addEventListener('htmx:beforeSwap'" in r.text
+    assert "evt.detail.shouldSwap = false" in r.text
+    assert "function classifyMessagesRequest(" in r.text
+    assert "document.getElementById('dialog_id').value" in r.text
+
+
+async def test_index_mark_read_is_history_only_and_dialog_scoped(client_app):
+    # #195 round 3 (critical): mark-read / badge-clear on the shared #messages afterSettle must be
+    # STRICTLY gated on an accepted HISTORY load for the OPEN dialog — never a /send echo or search.
+    # markDialogRead must read max_id only from bubbles of THAT dialog (data-dialog), not all bubbles.
+    ac, _ = client_app
+    r = await ac.get("/")
+    # the afterSettle handler bails on anything that isn't a history load
+    assert "if (req.kind !== 'history') return;" in r.text
+    # markDialogRead scopes its bubble scan to the target dialog
+    assert '.msg[data-id][data-dialog="' in r.text
+    # a /send echo scrolls from the composer's own success path, not the shared #messages handler
+    assert r.text.count("scrollMessagesToEnd()") >= 2
+
+
+async def test_index_normalizes_fe0f_before_reaction_dedup(client_app):
+    # #187: fold U+FE0F so a bare ❤ and ❤️ dedupe as one reaction (not shown twice).
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "function normalizeEmoji(" in r.text
+    assert "normalizeEmoji(s) === key" in r.text  # the dedup compares normalized forms
+
+
+async def test_index_has_direction_sr_label_and_aria_tabs(client_app):
+    # #187: direction is background/alignment only — add an sr-only "You:" label; tabs get
+    # aria-selected (not color-only).
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert "sr-only" in r.text
+    assert "You: " in r.text  # the outgoing-direction label (live SSE bubble)
+    assert 'aria-selected="true"' in r.text  # the initially-active tab
+    assert "setAttribute('aria-selected'" in r.text  # toggled on tab switch
+
+
+async def test_index_has_header_profile_logout_suggest_settings(client_app):
+    # #187: header surfaces the active profile, a logout link (web-auth only), and the orphan
+    # suggester-settings form on demand.
+    ac, _ = client_app
+    r = await ac.get("/")
+    assert 'id="active-profile"' in r.text and 'hx-get="/profiles"' in r.text
+    assert 'id="logout-link"' in r.text and 'href="/logout"' in r.text
+    assert 'id="suggest-settings-btn"' in r.text
+    assert "fetch('/settings/suggest'" in r.text
+
+
+async def test_message_div_outgoing_has_sr_direction_label():
+    # #187: a server-rendered outgoing bubble carries the sr-only "You:" label; an incoming one
+    # does not.
+    from tg_messenger.web.app import _message_div
+
+    out = _message_div(Message(id=1, dialog_id=7, sender_id=1, out=True, text="hi",
+                               date=datetime(2024, 1, 1, tzinfo=timezone.utc)))
+    assert '<span class="sr-only">You: </span>' in out
+    inc = _message_div(Message(id=2, dialog_id=7, sender_id=7, out=False, text="hi",
+                               date=datetime(2024, 1, 1, tzinfo=timezone.utc)))
+    assert "sr-only" not in inc
+
+
 def test_dialog_li_emits_exact_data_title():
     # #103 (Codex review): the cross-dialog reaction toast resolves the title from the <li>'s
     # verbatim data-title attribute, not by parsing rendered text. _dialog_li must therefore
@@ -2189,6 +2446,28 @@ def test_dialog_li_emits_exact_data_title():
     # data-title is HTML-escaped (XSS-safe), like the rendered title
     li = _dialog_li(Dialog(id=7, title='A<b>"&', kind="group"))
     assert 'data-title="A&lt;b&gt;&quot;&amp;"' in li
+
+
+def test_dialog_li_is_keyboard_operable():
+    # #187: a bare <li> is mouse-only — a keyboard/screen-reader user can't open a chat.
+    # The row must expose a button role and be tab-focusable so Enter/Space can activate it.
+    from tg_messenger.web.app import _dialog_li
+
+    li = _dialog_li(Dialog(id=42, title="Ann", kind="dm"))
+    assert 'role="button"' in li
+    assert 'tabindex="0"' in li
+
+
+def test_message_div_reply_react_have_aria_labels():
+    # #187: the per-message ↩/🙂 glyphs are text-less — a screen reader announces nothing.
+    from tg_messenger.web.app import _message_div
+
+    html = _message_div(
+        Message(id=42, dialog_id=7, sender_id=7, out=False, text="hi",
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    )
+    assert 'aria-label="Reply"' in html
+    assert 'aria-label="React"' in html
 
 
 def test_message_div_has_react_button():
@@ -2529,7 +2808,9 @@ async def test_tg_login_form_resumes_code_step_on_reload():
         assert sess.state == "code"  # not restarted
         assert "Введите код" in r.text  # the code card, not the phone form
         assert 'data-timeout="60"' in r.text  # countdown preserved via last_delivery
-        assert "htmx.org" in r.text  # full layout so the hx-post forms work after reload
+        # #187: htmx is vendored locally now — the full layout still ships it so the
+        # hx-post forms work after reload, just not from the unpkg CDN.
+        assert "/static/htmx.min.js" in r.text
 
 
 async def test_tg_login_form_resumes_password_step_on_reload():
@@ -2544,7 +2825,7 @@ async def test_tg_login_form_resumes_password_step_on_reload():
         assert r.status_code == 200
         assert sess.state == "password"
         assert "Пароль 2FA" in r.text  # the password card
-        assert "htmx.org" in r.text
+        assert "/static/htmx.min.js" in r.text  # #187: htmx vendored locally, full layout
 
 
 async def test_tg_login_form_while_sending_shows_phone_not_code_card():

@@ -31,8 +31,12 @@ def _dialog_li(d) -> str:
     # toast (#97): the client matches on data-dialog and reads data-title instead of slicing the
     # rendered <li> text, so a title containing " @" or trailing digits can no longer be
     # over-trimmed (Codex review of #103).
+    # #187: keyboard/screen-reader access — a bare <li> is mouse-only. role="button"
+    # + tabindex="0" make the row focusable and announced as an activatable control;
+    # chat.html wires Enter/Space to the same open-dialog path as a click.
     return (
-        f'<li hx-get="/dialogs/{d.id}/messages" hx-target="#messages" '
+        f'<li role="button" tabindex="0" '
+        f'hx-get="/dialogs/{d.id}/messages" hx-target="#messages" '
         f'data-dialog="{d.id}" data-kind="{d.kind}" data-can-send="{can_send}" '
         f'data-title="{escape(d.title)}">'
         f"{d.id} — {escape(d.title)}{uname}{unread}</li>"
@@ -49,42 +53,52 @@ def _message_div(m, *, show_author: bool = False) -> str:
     cls = "out" if m.out else "in"
     body = escape(m.text) if m.text else "&lt;media&gt;"
     body = f"[{m.id}] {body}"
+    # #187: direction is signaled by background+alignment only — an sr-only "You:" label lets a
+    # screen reader distinguish an outgoing bubble from an incoming one (color-only WCAG gap).
+    direction = '<span class="sr-only">You: </span>' if m.out else ""
     # #108: author line above the text, only in groups/supergroups for incoming messages
     # (the route decides via dialog kind + out). Escaped — author fields are user-controlled.
     author = f'<div class="author">{escape(format_author(m))}</div>' if show_author else ""
     translation = ""
     if getattr(m, "translated_text", None):
         translation = f'<div class="translation">↳ {escape(m.translated_text)}</div>'
-    # #48: a reply control referencing this message id; chat.html wires it to the composer
+    # #48: a reply control referencing this message id; chat.html wires it to the composer.
+    # #187: the glyph carries no text — aria-label makes it announced by a screen reader.
     reply_btn = (
         f'<button type="button" class="reply-btn" data-reply="{m.id}" '
-        f'title="Reply">↩</button>'
+        f'title="Reply" aria-label="Reply">↩</button>'
     )
     # #86: a per-message reaction trigger; chat.html toggles a small preset palette under it.
     react_btn = (
         f'<button type="button" class="react-btn" data-react="{m.id}" '
-        f'title="React">🙂</button>'
+        f'title="React" aria-label="React">🙂</button>'
     )
     # #95: stamp the bubble's own dialog id so a per-message action (react/reply) targets
     # the source dialog, not the global #dialog_id — which updates synchronously on a switch
     # while these bubbles are still briefly live in the DOM (HTMX swaps #messages async).
     return (
         f'<div class="msg {cls}" data-id="{m.id}" data-dialog="{m.dialog_id}">'
-        f"{author}{body}{reply_btn}{react_btn}{translation}</div>"
+        f"{author}{direction}{body}{reply_btn}{react_btn}{translation}</div>"
     )
 
 
 def _error_response(text: str, status_code: int) -> HTMLResponse:
     """The one escaped error-fragment shape every route returns."""
-    return HTMLResponse(f'<div class="error">{escape(text)}</div>', status_code=status_code)
+    # #187: role="alert" — errors are announced immediately by a screen reader (not queued
+    # like the polite live regions the success/hint fragments use).
+    return HTMLResponse(
+        f'<div class="error" role="alert">{escape(text)}</div>', status_code=status_code
+    )
 
 
 def _tg_login_phone_fragment(*, error: str) -> str:
     """HTMX fragment: re-render the phone step with an error (e.g. invalid number)."""
+    # #187: one canonical heading — the template's first render and this error re-render
+    # must not disagree (Войти↔Вход read as two different screens on a phone typo).
     return (
         '<div id="card">'
-        "<h1>Вход в Telegram</h1>"
-        f'<div class="error">{escape(error)}</div>'
+        "<h1>Войти в Telegram</h1>"
+        f'<div class="error" role="alert">{escape(error)}</div>'
         '<form hx-post="/tg-login/phone" hx-target="#card" hx-swap="outerHTML">'
         '<label for="phone">Phone</label>'
         '<input id="phone" type="tel" name="phone" autofocus>'
@@ -97,7 +111,8 @@ def _tg_login_phone_fragment(*, error: str) -> str:
 def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
     """HTMX fragment: the code-entry step of the /tg-login wizard."""
     hint = escape(delivery_hint(delivery)) if delivery is not None else ""
-    err = f'<div class="error">{escape(error)}</div>' if error else ""
+    # #187: errors use role="alert" so a screen reader announces them immediately.
+    err = f'<div class="error" role="alert">{escape(error)}</div>' if error else ""
     # #49: if Telegram told us when a resend is allowed, disable the button and count
     # down — spamming resend is a flood risk on the number. No timeout → active as before.
     timeout = getattr(delivery, "timeout", None) if delivery is not None else None
@@ -140,7 +155,7 @@ def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
 
 def _tg_login_password_fragment(*, error: str | None = None) -> str:
     """HTMX fragment: the 2FA-password step of the /tg-login wizard."""
-    err = f'<div class="error">{escape(error)}</div>' if error else ""
+    err = f'<div class="error" role="alert">{escape(error)}</div>' if error else ""
     return (
         '<div id="card">'
         "<h1>Пароль 2FA</h1>"

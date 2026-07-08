@@ -57,6 +57,15 @@ async def test_sse_without_cookie_is_401(secured_app):
     assert r.status_code == 401
 
 
+async def test_static_assets_are_public(secured_app):
+    # #187: the vendored htmx (and any /static asset) must load WITHOUT a cookie — the auth gate
+    # would otherwise 401 the login page's scripts. Static assets are non-sensitive.
+    ac, _ = secured_app
+    r = await ac.get("/static/htmx.min.js")
+    assert r.status_code == 200
+    assert 'version:"1.9.12"' in r.text
+
+
 # --- цикл 124: логин / логаут -----------------------------------------------
 
 
@@ -84,6 +93,23 @@ async def test_wrong_password_401_delays_and_warns(secured_app, monkeypatch, cap
     assert r.status_code == 401
     assert calls  # injected sleep was called (no real sleep)
     assert any("login" in rec.message.lower() for rec in caplog.records)
+
+
+async def test_wrong_password_rerenders_full_login_with_alert(secured_app, monkeypatch):
+    # #187: a wrong password must re-render the FULL login page (form + inline role=alert),
+    # not a bare 401 fragment that leaves the user on a near-empty page with no form.
+    ac, _ = secured_app
+
+    async def spy_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("tg_messenger.web.app._login_delay", spy_sleep)
+    r = await ac.post("/login", data={"password": "nope"})
+    assert r.status_code == 401
+    assert 'role="alert"' in r.text  # the error is announced
+    assert "Wrong password." in r.text
+    assert 'name="password"' in r.text  # the form is still there — no dead-end
+    assert 'action="/login"' in r.text
 
 
 async def test_non_ascii_password_logs_in(monkeypatch):

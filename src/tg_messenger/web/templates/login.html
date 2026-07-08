@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>tg_messenger — login</title>
   <style>
     body { font-family: system-ui, sans-serif; display: flex; height: 100vh;
@@ -12,11 +13,13 @@
     input[type=password] { padding: 8px; font-size: 15px; }
     button { padding: 8px; background: #2481cc; color: #fff; border: none;
              border-radius: 6px; cursor: pointer; font-size: 15px; }
+    .error { color: #c0392b; font-size: 14px; margin: 0; }
   </style>
 </head>
 <body>
   <form method="post" action="/login">
     <h1>tg_messenger</h1>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
     <label for="password">Password</label>
     <input id="password" type="password" name="password" autofocus autocomplete="current-password">
     <button type="submit">Sign in</button>
