@@ -791,6 +791,55 @@ def test_chat_unknown_slash_command_is_not_sent(runner):
     assert "unknown command" in result.output.lower()
 
 
+# --- #199 (CLI part): a slash IS the payload in a BOT dialog; the human typo-guard stays ---
+
+
+def test_chat_slash_command_reaches_a_bot(runner):
+    # #199: dialog 9 is a bot (FakeClient.dialogs → Dialog(id=9, kind="bot")). A bot command
+    # like /start IS the intended payload, so it must be sent verbatim — the human typo-guard
+    # (which rejects unknown slashes) must NOT fire for a bot dialog.
+    r, stub = runner
+    stub.listen_interrupt = False
+    result = r.invoke(cli_main.cli, ["chat", "9"], input="/start\n")
+    assert result.exit_code == 0, result.output
+    assert (9, "/start", None, None) in stub.sent
+    assert "unknown command" not in result.output.lower()
+
+
+def test_chat_bot_slash_settings_and_cancel_reach_the_bot(runner):
+    # #199: the whole class of bot commands (/settings, /cancel, ...) must pass through, not
+    # just /start — the guard exempts kind == "bot" wholesale.
+    r, stub = runner
+    stub.listen_interrupt = False
+    result = r.invoke(cli_main.cli, ["chat", "9"], input="/settings\n/cancel\n")
+    assert result.exit_code == 0, result.output
+    assert (9, "/settings", None, None) in stub.sent
+    assert (9, "/cancel", None, None) in stub.sent
+
+
+def test_chat_reserved_commands_stay_reserved_even_for_a_bot(runner):
+    # #199: /help//react//lang remain REPL commands for every dialog kind, bot included —
+    # /help must print the hint and NOT be sent to the bot as a payload.
+    r, stub = runner
+    stub.listen_interrupt = False
+    result = r.invoke(cli_main.cli, ["chat", "9"], input="/help\n")
+    assert result.exit_code == 0, result.output
+    assert (9, "/help", None, None) not in stub.sent
+    assert "/react" in result.output and "/lang" in result.output
+
+
+def test_chat_unknown_slash_to_a_human_is_still_not_sent(runner):
+    # #199: the #187 typo-protection stays intact for a HUMAN dialog (id 7 is a DM). A slash
+    # line to a person is rejected locally and NEVER sent, even after the bot exemption.
+    r, stub = runner
+    stub.listen_interrupt = False
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="/start\nplain\n")
+    assert result.exit_code == 0, result.output
+    assert (7, "/start", None, None) not in stub.sent
+    assert (7, "plain", None, None) in stub.sent  # a following plain line still sends
+    assert "unknown command" in result.output.lower()
+
+
 def test_chat_outbound_picker_uses_english_strings(runner, monkeypatch):
     # #187: the picker prompt/labels are English like the rest of the CLI, not Russian
     r, stub = runner
