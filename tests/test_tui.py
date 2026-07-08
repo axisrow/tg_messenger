@@ -996,6 +996,59 @@ async def test_tui_stale_backfill_never_pages_dialog_a_with_dialog_b_cursor():
         assert 7 not in app._backfilling  # and it still released its guard
 
 
+class GatedGrowingHistoryStore(TuiSourceStore):
+    """Offset-paging store whose backfill fetch BLOCKS until released, and whose newest window
+    for dialog 7 can grow (new messages arriving while the user is away) — the #202 r3 repro."""
+
+    def __init__(self):
+        super().__init__()
+        self.history_calls = []
+        self.gate = asyncio.Event()
+        self.grew = False  # flip: 5 newer messages arrived in dialog 7
+
+    async def history(self, peer, limit=50, offset_id=0):
+        self.history_calls.append((peer, limit, offset_id))
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        def page(lo, hi):
+            return [Message(id=i, dialog_id=peer, sender_id=peer, out=False,
+                            text=f"msg {i}", date=date) for i in range(lo, hi)]
+
+        if offset_id:
+            await self.gate.wait()  # hold the backfill in flight across the dialog switches
+            return page(max(1, offset_id - 50), offset_id)
+        if peer != 7:
+            return page(201, 202)  # dialog B: a one-message chat
+        return page(56, 106) if self.grew else page(51, 101)
+
+
+async def test_tui_backfill_cancelled_on_switch_leaves_no_history_hole():
+    # #202 r3 (cycle-2 review): the round-2 frozen offset opened an adjacent edge — a backfill
+    # worker for A (offset 51) survives a switch-away; new messages arrive in A; the user
+    # returns and the window reloads as 56..105; the frozen worker then prepends 1..50 → a
+    # PERMANENT 51..55 hole in the DOM. _open_dialog must CANCEL in-flight backfill workers
+    # (the cancelled worker's finally still releases the per-dialog guard — no leak).
+    store = GatedGrowingHistoryStore()
+    app = MessengerTUI(client=TuiStubClient(), store=store)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._open_dialog(7)
+        await _pause_until(pilot, lambda: app._oldest_message_id == 51)  # window 51..100 loaded
+        app._maybe_backfill_history()  # worker scheduled with the frozen offset 51
+        await _pause_until(pilot, lambda: any(c[2] == 51 for c in store.history_calls))
+        app._open_dialog(8)  # the user walks away while the fetch is parked at the gate
+        await _pause_until(pilot, lambda: app._oldest_message_id == 201)
+        store.grew = True  # five newer messages arrive in dialog 7 meanwhile
+        app._open_dialog(7)  # the user comes back; the window reloads as 56..105
+        await _pause_until(pilot, lambda: app._oldest_message_id == 56)
+        store.gate.set()  # release the (stale) fetch
+        await _pause_until(pilot, lambda: 7 not in app._backfilling)  # worker fully finished
+        await pilot.pause()
+        ids = sorted(b.message_id for b in app.query(MessageBubble))
+        assert ids == list(range(56, 106))  # NO stale 1..50 prepend, NO 51..55 hole
+        assert 7 not in app._backfilling  # cancellation released the guard (no leak)
+
+
 async def test_tui_history_scrolls_to_newest_message():
     app = MessengerTUI(client=LongHistoryClient())
     async with app.run_test(size=(80, 20)) as pilot:

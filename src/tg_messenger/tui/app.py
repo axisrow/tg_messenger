@@ -884,6 +884,12 @@ class MessengerTUI(App):
         # sets are per-dialog (#200) and persist across the switch, so a fully-loaded chat isn't
         # re-paged needlessly and a stale worker can't be double-started).
         self._oldest_message_id = None
+        # #202 r3: cancel any in-flight backfill worker — its frozen offset belongs to the view
+        # being left, and one surviving a switch-away → new-messages → switch-back round trip
+        # would prepend a page fetched below a cursor the reloaded window no longer starts at
+        # (a permanent hole in the visible history). CancelledError still runs the worker's
+        # finally, so the per-dialog _backfilling guard is released, never leaked.
+        self.workers.cancel_group(self, "history-backfill")
         # exclusive group: selecting another dialog cancels a still-loading history
         self.run_worker(self._show_history(dialog_id), group="history", exclusive=True)
 
@@ -988,8 +994,12 @@ class MessengerTUI(App):
         if offset_id is None or dialog_id in self._backfilling:
             return
         self._backfilling.add(dialog_id)
+        # exclusive within the group as belt-and-suspenders (#202 r3): _open_dialog cancels the
+        # group on every switch and the per-dialog guard blocks same-dialog re-entry, so two
+        # live backfill workers should be impossible — but if that invariant ever breaks, the
+        # newer worker wins instead of both mounting.
         self.run_worker(
-            self._backfill_history(dialog_id, offset_id), group="history-backfill", exclusive=False
+            self._backfill_history(dialog_id, offset_id), group="history-backfill", exclusive=True
         )
 
     async def _backfill_history(self, dialog_id: int, offset_id: int) -> None:
