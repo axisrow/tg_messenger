@@ -2339,13 +2339,13 @@ async def test_index_outbound_indicator_and_softened_copy(client_app):
 
 
 async def test_index_search_swap_does_not_force_scroll_or_read(client_app):
-    # #187 / #195 review: an in-dialog search swap must not force-scroll to the bottom or clear
-    # the unread badge — that's the history-load path's job. Whether a settled swap was a search
-    # is derived PER-RESPONSE from its request path (not a global flag a racing search could flip).
+    # #187 / #195 round 3: an in-dialog search swap must not force-scroll, clear the unread badge,
+    # or mark read — that's the history-load path's job. The settled request is classified per-
+    # response by its path (history/search/send/other); only a history load acts.
     ac, _ = client_app
     r = await ac.get("/")
-    assert "const wasSearch = /\\/dialogs\\/-?\\d+\\/search/.test(path || '')" in r.text
-    assert "if (wasSearch) return;" in r.text
+    assert "if (req.kind !== 'history') return;" in r.text  # search/send/other bail
+    assert "kind: 'search'" in r.text  # the classifier recognizes a search path
     assert "messageSearchSwap" not in r.text  # the global race-prone flag is gone
 
 
@@ -2363,15 +2363,29 @@ async def test_index_send_success_gated_on_htmx_successful_not_status(client_app
 
 
 async def test_index_messages_swap_bound_to_requesting_dialog(client_app):
-    # #195 review (BUG-2, stale-search race): every #messages swap is bound to the dialog that
-    # requested it (from the request path); a response for a dialog the user already left is
+    # #195 review (BUG-2 / round 3): every #messages request is classified by its path into
+    # history/search/send/other; a history/search response for a dialog the user already left is
     # dropped so it can't overwrite the current pane.
     ac, _ = client_app
     r = await ac.get("/")
     assert "addEventListener('htmx:beforeSwap'" in r.text
     assert "evt.detail.shouldSwap = false" in r.text
-    assert "function dialogIdFromRequestPath(" in r.text
+    assert "function classifyMessagesRequest(" in r.text
     assert "document.getElementById('dialog_id').value" in r.text
+
+
+async def test_index_mark_read_is_history_only_and_dialog_scoped(client_app):
+    # #195 round 3 (critical): mark-read / badge-clear on the shared #messages afterSettle must be
+    # STRICTLY gated on an accepted HISTORY load for the OPEN dialog — never a /send echo or search.
+    # markDialogRead must read max_id only from bubbles of THAT dialog (data-dialog), not all bubbles.
+    ac, _ = client_app
+    r = await ac.get("/")
+    # the afterSettle handler bails on anything that isn't a history load
+    assert "if (req.kind !== 'history') return;" in r.text
+    # markDialogRead scopes its bubble scan to the target dialog
+    assert '.msg[data-id][data-dialog="' in r.text
+    # a /send echo scrolls from the composer's own success path, not the shared #messages handler
+    assert r.text.count("scrollMessagesToEnd()") >= 2
 
 
 async def test_index_normalizes_fe0f_before_reaction_dedup(client_app):

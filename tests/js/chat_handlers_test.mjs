@@ -88,12 +88,19 @@ function el(id) { if (!ids.has(id)) ids.set(id, new El(id)); return ids.get(id);
 ].forEach(el);
 
 const composer = el('composer');
-// Bubbles currently in #messages, keyed by the selector markDialogRead uses. Tests set this.
+// Bubbles currently in #messages. Each: { dataset: { id, dialog } }. Tests set this to model a
+// mixed DOM during an in-flight dialog switch (bubbles of the previous dialog still present).
 let messageBubbles = [];
 const document_ = {
   getElementById: (id) => (ids.has(id) ? ids.get(id) : el(id)),
   querySelector: () => null,
-  querySelectorAll: (sel) => (sel === '#messages .msg[data-id]' ? messageBubbles : []),
+  querySelectorAll: (sel) => {
+    if (!sel || !sel.startsWith('#messages .msg[data-id]')) return [];
+    // markDialogRead scopes to a specific dialog: '#messages .msg[data-id][data-dialog="<id>"]'
+    const m = /\[data-dialog="([^"]*)"\]/.exec(sel);
+    if (m) return messageBubbles.filter((b) => String(b.dataset.dialog) === m[1]);
+    return messageBubbles;  // unscoped (old form) — return all
+  },
   body: el('__body'),
   createElement: () => new El('__created'),
   addEventListener: () => {},
@@ -223,7 +230,7 @@ vm.runInContext(pageScript, sandbox, { filename: 'chat.html:inline' });
   // the guard drops it AND that even if afterSettle were reached, the request-path dialog guard
   // stops it from marking B read with A's content.
   dialogId.value = '8';               // user is now on B
-  messageBubbles = [{ dataset: { id: '42' } }];  // (A's bubbles, if they had swapped)
+  messageBubbles = [{ dataset: { id: '42', dialog: '7' } }];  // (A's bubbles, if they had swapped)
 
   const staleA = messages.dispatch('htmx:beforeSwap', {
     shouldSwap: true, pathInfo: { requestPath: '/dialogs/7/messages' },
@@ -242,7 +249,11 @@ vm.runInContext(pageScript, sandbox, { filename: 'chat.html:inline' });
   // Positive path: an ACCEPTED history swap for the CURRENT dialog B DOES mark B read with B's max id.
   fetchCalls.length = 0;
   dialogId.value = '8';
-  messageBubbles = [{ dataset: { id: '5' } }, { dataset: { id: '9' } }, { dataset: { id: '3' } }];
+  messageBubbles = [
+    { dataset: { id: '5', dialog: '8' } },
+    { dataset: { id: '9', dialog: '8' } },
+    { dataset: { id: '3', dialog: '8' } },
+  ];
   messages.dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs/8/messages' } });
   const readB = fetchCalls.filter((c) => String(c.url).includes('/dialogs/8/read'));
   check('round2: accepted history for the open dialog marks it read', readB.length === 1);
@@ -252,6 +263,51 @@ vm.runInContext(pageScript, sandbox, { filename: 'chat.html:inline' });
   fetchCalls.length = 0;
   messages.dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs/8/search?q=hi' } });
   check('round2: a search swap does not mark read', fetchCalls.filter((c) => String(c.url).includes('/read')).length === 0);
+}
+
+// ---- #195 round 3: a /send (or /media) settle must NOT mark a dialog read (wrong-dialog race) --
+{
+  const messages = el('messages');
+  const dialogId = el('dialog_id');
+  Object.defineProperty(messages, 'scrollHeight', { get: () => 1000, configurable: true });
+
+  // Scenario: user sends to A (=7), then immediately switches to B (=8) before A's /send response
+  // settles. A's bubbles are still in the DOM (openDialog doesn't clear #messages synchronously).
+  // A late /send afterSettle fires on #messages. It must NOT mark ANY dialog read:
+  //   - /send is not a history load → the shared handler returns early.
+  //   - even if it didn't, markDialogRead(B) would scan only B's bubbles, never A's id.
+  dialogId.value = '8';  // user is now on B
+  // mixed DOM: A's bubble (id 42) still present; no B bubbles yet (B's history not loaded)
+  messageBubbles = [{ dataset: { id: '42', dialog: '7' } }];
+  fetchCalls.length = 0;
+  messages.dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/send' } });
+  const anyRead = fetchCalls.filter((c) => String(c.url).includes('/read'));
+  check('round3: a /send settle marks NO dialog read', anyRead.length === 0);
+
+  // /media is fetch-based (no afterSettle) in the app, but defensively: a /media path is also
+  // classified as non-history, so even if it reached afterSettle it would not mark read.
+  fetchCalls.length = 0;
+  messages.dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs/7/media' } });
+  check('round3: a /media-shaped settle marks NO dialog read',
+        fetchCalls.filter((c) => String(c.url).includes('/read')).length === 0);
+
+  // Even a HISTORY settle for A while on B marks nothing (dialog mismatch) — and crucially, if the
+  // pane holds ONLY A's bubbles, an accepted history for B would still not pick up A's id.
+  fetchCalls.length = 0;
+  dialogId.value = '8';
+  messageBubbles = [{ dataset: { id: '42', dialog: '7' } }];  // only A's bubble present
+  messages.dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs/8/messages' } });
+  const readWrong = fetchCalls.filter((c) => String(c.url).includes('/read'));
+  check('round3: history-settle for B with only A bubbles present marks nothing (no foreign id)',
+        readWrong.length === 0);
+
+  // Positive control: B's history with B's bubbles marks B read by B's own max id.
+  fetchCalls.length = 0;
+  messageBubbles = [{ dataset: { id: '11', dialog: '8' } }, { dataset: { id: '42', dialog: '7' } }];
+  messages.dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs/8/messages' } });
+  const readMixed = fetchCalls.filter((c) => String(c.url).includes('/dialogs/8/read'));
+  check('round3: mixed DOM — B marked read by B’s max id, not A’s',
+        readMixed.length === 1 && readMixed[0].body.get('max_id') === '11');
 }
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);

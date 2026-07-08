@@ -199,10 +199,15 @@
     // message id to /dialogs/{id}/read. Best-effort — a failure just leaves the badge for the next
     // /dialogs fetch, never blocks or throws.
     function markDialogRead(dialogId) {
-      const bubbles = document.querySelectorAll('#messages .msg[data-id]');
+      // #195 round 3: compute max id ONLY from bubbles belonging to THIS dialog (data-dialog),
+      // never from every bubble in the pane — during an in-flight switch the DOM can briefly hold
+      // the previous dialog's bubbles, and reading their id would mark the wrong dialog read up to
+      // a foreign message id. The server-rendered bubbles and SSE bubbles both stamp data-dialog.
+      const bubbles = document.querySelectorAll(
+        '#messages .msg[data-id][data-dialog="' + CSS.escape(String(dialogId)) + '"]');
       let maxId = 0;
       bubbles.forEach((b) => { const n = parseInt(b.dataset.id, 10); if (n > maxId) maxId = n; });
-      if (!maxId) return;  // empty history — nothing to mark
+      if (!maxId) return;  // no bubbles for this dialog (empty history / mixed DOM) — nothing to mark
       const fd = new FormData();
       fd.append('max_id', String(maxId));
       fetch('/dialogs/' + encodeURIComponent(dialogId) + '/read', {
@@ -304,43 +309,49 @@
     function scrollMessagesToEndIfAtBottom(wasAtBottom) {
       if (wasAtBottom) scrollMessagesToEnd();
     }
-    // #195 review (BUG-2, stale-search race): every #messages swap (a dialog history load OR an
-    // in-dialog search) is bound to the dialog that requested it, encoded in the request path
-    // (/dialogs/{id}/messages | /dialogs/{id}/search). If the user switched dialogs before a slow
-    // response arrived, its dialog no longer matches #dialog_id — drop the swap so dialog A's
-    // history/search results can't overwrite dialog B's pane (and mislead a react/send in B).
-    function dialogIdFromRequestPath(path) {
-      const m = /\/dialogs\/(-?\d+)\/(?:messages|search)/.exec(path || '');
-      return m ? m[1] : null;
+    // #195 round 3 (architectural): many different requests swap into the SAME #messages —
+    // a dialog history load (/dialogs/{id}/messages), an in-dialog search (/dialogs/{id}/search),
+    // and a composer send (/send, hx-target=#messages). A single afterSettle handler that doesn't
+    // distinguish them marks/scrolls the WRONG dialog. Classify every #messages request by its
+    // path into an explicit {kind, dialogId} so each handler acts only on the kind it means.
+    //   kind: 'history' (full dialog load) | 'search' (filtered) | 'send' (composer echo) | 'other'
+    function classifyMessagesRequest(path) {
+      const p = path || '';
+      let m = /\/dialogs\/(-?\d+)\/messages(?:$|[?#])/.exec(p);
+      if (m) return { kind: 'history', dialogId: m[1] };
+      m = /\/dialogs\/(-?\d+)\/search(?:$|[?#])/.exec(p);
+      if (m) return { kind: 'search', dialogId: m[1] };
+      if (/(?:^|\/)send(?:$|[?#])/.test(p)) return { kind: 'send', dialogId: null };
+      return { kind: 'other', dialogId: null };
     }
+    // #195 (BUG-2, stale-swap race): a history/search response for a dialog the user already left
+    // must not overwrite the current pane. Drop the swap when its dialog no longer matches the open
+    // one. Only the dialog-scoped GET routes are guarded here (a /send echo has no dialog in its
+    // path and carries its own data-dialog on the bubble — the #95 machinery already scopes that).
     document.getElementById('messages').addEventListener('htmx:beforeSwap', (evt) => {
       const path = evt.detail && evt.detail.pathInfo && evt.detail.pathInfo.requestPath;
-      const reqDialog = dialogIdFromRequestPath(path);
-      // only guard the dialog-scoped routes; a non-matching path (no id) is left alone
-      if (reqDialog !== null && reqDialog !== document.getElementById('dialog_id').value) {
+      const req = classifyMessagesRequest(path);
+      if ((req.kind === 'history' || req.kind === 'search') &&
+          req.dialogId !== document.getElementById('dialog_id').value) {
         evt.detail.shouldSwap = false;  // stale response for a dialog the user already left
       }
     });
-    // #187/#195: the #messages history swap just settled — show the newest, drop the empty state,
-    // and mark the dialog read (server-confirmed + client badge clear). This handler fires ONLY
-    // for an ACCEPTED swap: the beforeSwap guard drops a stale response (shouldSwap=false), and
-    // htmx runs afterSettle inside the shouldSwap block, so a dropped stale swap never reaches
-    // here. A search swap only drops the empty state — it neither yanks the view, clears the
-    // badge, nor marks read. Search-vs-history is read off THIS response's request path.
+    // #187/#195: a #messages swap just settled. Fires ONLY for an ACCEPTED swap (beforeSwap drops a
+    // stale one via shouldSwap=false, and htmx runs afterSettle inside its `if(shouldSwap)` block).
+    // Mark-read / badge-clear / scroll are STRICTLY gated on an accepted HISTORY load for the dialog
+    // the user is actually viewing — never on a /send echo or a /search (round-3 fix: a /send-settle
+    // used to fall through to markDialogRead(openId), marking the wrong dialog read on a fast switch).
     document.getElementById('messages').addEventListener('htmx:afterSettle', (evt) => {
       hideMessagesEmptyState();
       const path = evt.detail && evt.detail.pathInfo && evt.detail.pathInfo.requestPath;
-      const wasSearch = /\/dialogs\/-?\d+\/search/.test(path || '');
-      if (wasSearch) return;  // a search neither yanks the view, clears the badge, nor marks read
+      const req = classifyMessagesRequest(path);
+      if (req.kind !== 'history') return;  // send / search / other: no mark-read, badge, or scroll
+      // require an accepted history load whose dialog is the one currently open (the beforeSwap
+      // guard already dropped a mismatch; this is defense-in-depth against any path that reaches here)
+      if (req.dialogId === null || req.dialogId !== document.getElementById('dialog_id').value) return;
       scrollMessagesToEnd();
-      // #195 round 2: only the dialog whose accepted history this is — belt-and-suspenders on top
-      // of beforeSwap (which already dropped a stale swap), reading the id from the request path.
-      const reqDialog = dialogIdFromRequestPath(path);
-      const openId = document.getElementById('dialog_id').value;
-      const target = reqDialog !== null ? reqDialog : openId;
-      if (!target || (reqDialog !== null && reqDialog !== openId)) return;
-      clearUnreadBadge(target);   // #187: clear the sidebar badge client-side
-      markDialogRead(target);     // #195: confirm the read server-side (follows actual display)
+      clearUnreadBadge(req.dialogId);   // #187: clear the sidebar badge client-side
+      markDialogRead(req.dialogId);     // #195: confirm the read server-side (follows actual display)
     });
     // Track selected dialog id from clicks on the list, wire SSE for incoming.
     let es = null;
@@ -921,6 +932,9 @@
         if (survivingReply) {
           replyToInput.value = survivingReply;  // re-apply the newer target reset() wiped
         }
+        // #195 round 3: the send was for the dialog the user is still viewing — scroll to the
+        // just-appended bubble. If the user already switched away, do NOT scroll the new dialog.
+        scrollMessagesToEnd();
       } else if (activeDialogId) {
         applyComposeState(stateFor(activeDialogId));
         dialogInput.value = activeDialogId;
