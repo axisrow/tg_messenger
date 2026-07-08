@@ -200,9 +200,11 @@ class MessengerTUI(App):
        always visible. :focus-within styles a container while any descendant (search/tabs/list/
        bubble/composer) is focused. Keeps the sidebar's existing right border; the chat's left
        accent is purely additive (it had none) and visually balances the sidebar. The exact
-       focused bubble still gets its own #messages MessageBubble:focus accent below. */
-    #sidebar:focus-within { border-right: solid $accent; }
-    #chat:focus-within { border-left: solid $accent; }
+       focused bubble still gets its own #messages MessageBubble:focus accent below.
+       #187: the focused border is HEAVY (a thicker line style), not just recoloured — a non-color
+       cue so the focused pane is distinguishable in a monochrome / colour-blind theme too. */
+    #sidebar:focus-within { border-right: heavy $accent; }
+    #chat:focus-within { border-left: heavy $accent; }
     #messages {
         overflow-x: hidden;
         overflow-y: auto;
@@ -1353,7 +1355,11 @@ class MessengerTUI(App):
             if dialog_id == self._current:
                 composer.value = text
             if result.status == "error":
-                self.notify("Перевод не удался — Enter отправит оригинал", severity="warning")
+                # #187: distinguish a timeout from a model failure — the coordinator already tells
+                # them apart in result.error ("Translation timed out." vs "Translation failed."), so
+                # relay that instead of one fixed line. Enter still sends the original.
+                reason = "Перевод не успел" if result.error == "Translation timed out." else "Перевод не удался"
+                self.notify(f"{reason} — Enter отправит оригинал", severity="warning")
             return
         picked = await self.push_screen_wait(VariantPickScreen(result.variants, text))
         if picked is None:

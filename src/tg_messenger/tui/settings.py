@@ -124,24 +124,21 @@ class TranslateSettingsCard(Vertical):
         with RadioSet(id="translate-mode"):
             for mode_id, label in self._TRANSLATE_MODE_LABELS:
                 yield RadioButton(label, id=f"mode-{mode_id}")
-        # THREE explicit fields, each with a PERSISTENT border_title caption (visible on
-        # the frame even with a value typed — a placeholder vanishes on input). The two
-        # language lists are always shown so nothing silently changes meaning by mode.
-        target = Input(placeholder="напр. ru", id="target-lang")
-        target.border_title = "Мой язык (на что переводить)"
-        yield target
-        known = Input(placeholder="напр. ru, en", id="known-langs")
-        known.border_title = "Не переводить"
-        yield known
-        unknown = Input(placeholder="напр. en, ja", id="unknown-langs")
-        unknown.border_title = "Переводить (пусто = всё переводить)"
-        yield unknown
-        model_field = Input(placeholder="напр. openai:glm-5.1", id="translate-model")
-        model_field.border_title = "Модель для перевода"
-        yield model_field
-        max_field = Input(placeholder="напр. 100", id="translate-max")
-        max_field.border_title = "Сколько переводить за раз (Ctrl+T)"
-        yield max_field
+        # #187: each field's caption is an ordinary Label ABOVE the Input, not a border_title. The
+        # border_title inherits the (grey, blurred) border colour and the code itself called it
+        # "nearly unreadable"; a plain Label is legible by default and a NEW field added without
+        # per-id CSS still gets a visible caption. The two language lists stay always-shown so
+        # nothing silently changes meaning by mode.
+        yield Label("Мой язык (на что переводить)", classes="field-caption")
+        yield Input(placeholder="напр. ru", id="target-lang")
+        yield Label("Не переводить", classes="field-caption")
+        yield Input(placeholder="напр. ru, en", id="known-langs")
+        yield Label("Переводить (пусто = всё переводить)", classes="field-caption")
+        yield Input(placeholder="напр. en, ja", id="unknown-langs")
+        yield Label("Модель для перевода", classes="field-caption")
+        yield Input(placeholder="напр. openai:glm-5.1", id="translate-model")
+        yield Label("Сколько переводить за раз (Ctrl+T)", classes="field-caption")
+        yield Input(placeholder="напр. 100", id="translate-max")
         yield Label("Enter в поле — сохранить", id="translate-help")
 
     async def _load(self) -> None:
@@ -328,12 +325,12 @@ class SuggestSettingsCard(Vertical):
         with Horizontal(id="suggest-enabled-row"):
             yield Label("Подсказывать ответы")
             yield Switch(value=True, id="suggest-enabled")
-        history_field = Input(placeholder="напр. 30", id="suggest-history")
-        history_field.border_title = "Сколько сообщений контекста"
-        yield history_field
-        suggest_model_field = Input(placeholder="напр. openai:gpt-4o", id="suggest-model")
-        suggest_model_field.border_title = "Модель суфлёра (пусто = по умолчанию)"
-        yield suggest_model_field
+        # #187: captions as ordinary Labels above each Input (see TranslateSettingsCard), not the
+        # nearly-unreadable border_title.
+        yield Label("Сколько сообщений контекста", classes="field-caption")
+        yield Input(placeholder="напр. 30", id="suggest-history")
+        yield Label("Модель суфлёра (пусто = по умолчанию)", classes="field-caption")
+        yield Input(placeholder="напр. openai:gpt-4o", id="suggest-model")
         yield Label("Enter в поле — сохранить", id="suggest-help")
 
     async def _load(self) -> None:
@@ -434,12 +431,12 @@ class AccountsScreen(ModalScreen[object]):
         "#suggest-section { height: auto; margin-top: 1; border-top: solid $primary; padding-top: 1; } "
         "#suggest-enabled-row { height: auto; } "
         "#suggest-enabled-row Label { padding: 1 1 0 0; } "
-        # the field captions live in border_title, which inherits the (grey, blurred) border colour
-        # and is nearly unreadable by default — give the translation inputs a visible border + a
-        # bold accent caption so the labels stay legible whether the field is focused or not.
+        # #187: field captions are ordinary Labels above each Input now — a bold accent line that's
+        # legible without depending on the (grey, blurred) border-title colour. margin-top separates
+        # each caption from the field above it.
+        ".field-caption { color: $accent; text-style: bold; margin-top: 1; } "
         "#target-lang, #known-langs, #unknown-langs, #translate-model, #translate-max, "
-        "#suggest-history, #suggest-model "
-        "{ border: round $primary; border-title-color: $accent; border-title-style: bold; }"
+        "#suggest-history, #suggest-model { border: round $primary; }"
     )
 
     BINDINGS = [

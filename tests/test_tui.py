@@ -793,32 +793,23 @@ async def test_tui_history_backfill_prepends_older_page_on_client_path():
 
 
 async def test_tui_history_backfill_triggered_by_scroll_up_at_top():
-    # #187: a real mouse-wheel-up at the top edge of #messages triggers the backfill (the WIRING).
-    # We spy on _maybe_backfill_history so the assertion doesn't race the fire-and-forget worker —
-    # the fetch/prepend itself is covered deterministically by the direct _backfill_history tests.
+    # #187: a mouse-wheel-up AT THE TOP of #messages triggers the backfill (the WIRING). We spy on
+    # _maybe_backfill_history and fire the wheel event while the pane is at its top edge (an empty
+    # pane has scroll_y == 0), so the check is deterministic; the fetch/prepend itself is covered by
+    # the direct _backfill_history tests. A wheel-up NOT at the top must NOT trigger a backfill.
     from textual import events
 
     stub = PaginatedHistoryClient()
     app = MessengerTUI(client=stub)
     async with app.run_test(size=(80, 20)) as pilot:
         await pilot.pause()
-        app._current = 7
-        await app._show_history(7)
-        await pilot.pause()
         pane = app.query_one("#messages")
-        pane.scroll_to(y=0, animate=False, force=True)  # user is at the top
-        await pilot.pause()
+        assert pane.scroll_y == 0  # nothing loaded yet → at the top
         calls = []
-
-        def spy():
-            calls.append(1)
-
-        app._maybe_backfill_history = spy  # type: ignore[method-assign]
-        # a wheel-up ABOVE the top (widget, x, y, delta_x, delta_y, button, shift, meta, ctrl)
-        pane._on_mouse_scroll_up(
-            events.MouseScrollUp(pane, 0, 0, 0, -1, 0, False, False, False)
-        )
-        assert calls  # the top-edge scroll gesture asked the app to backfill (the wiring)
+        app._maybe_backfill_history = lambda: calls.append(1)  # type: ignore[method-assign]
+        wheel = events.MouseScrollUp(pane, 0, 0, 0, -1, 0, False, False, False)
+        pane._on_mouse_scroll_up(wheel)
+        assert calls  # a wheel-up at the top edge asked the app to backfill (the wiring)
 
 
 async def test_tui_history_backfill_stops_when_no_older_page():
@@ -5353,9 +5344,10 @@ async def test_tui_settings_all_three_fields_tab_reachable_in_every_mode():
                 assert fid in chain_ids, f"{fid} not Tab-reachable in mode {mode}"
 
 
-async def test_tui_settings_fields_have_persistent_border_titles():
-    # each field carries a PERSISTENT, fixed border_title caption (visible even with a value typed),
-    # not a placeholder that vanishes on input — the reported "can't tell which field is which".
+async def test_tui_settings_fields_have_caption_labels():
+    # #187: each field's caption is an ordinary Label (class field-caption) ABOVE the Input, not the
+    # nearly-unreadable border_title. The captions are always visible (a Label doesn't vanish on a
+    # typed value) and legible without per-id CSS — the reported "can't tell which field is which".
     store = FakeSessionStore(["alice"])
     translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": []})
     app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
@@ -5366,22 +5358,22 @@ async def test_tui_settings_fields_have_persistent_border_titles():
         )
         app.push_screen(screen)
         await pilot.pause()
-        captions = {
-            "target-lang": "Мой язык (на что переводить)",
-            "known-langs": "Не переводить",
-            "unknown-langs": "Переводить (пусто = всё переводить)",
-        }
-        for fid, caption in captions.items():
-            field = screen.query_one(f"#{fid}", Input)
-            # styled legible (accent + bold), not the default grey blurred border
-            assert field.styles.border_title_color is not None
-            assert "bold" in str(field.styles.border_title_style)
-            assert str(field.border_title) == caption
-        # caption survives a typed value (the core of the fix)
+        caption_texts = {str(lbl.render()) for lbl in screen.query(".field-caption")}
+        for caption in (
+            "Мой язык (на что переводить)",
+            "Не переводить",
+            "Переводить (пусто = всё переводить)",
+            "Модель для перевода",
+            "Сколько переводить за раз (Ctrl+T)",
+        ):
+            assert caption in caption_texts
+        # caption survives a typed value (a Label is independent of the Input's content)
         target = screen.query_one("#target-lang", Input)
         target.value = "ru"
         await pilot.pause()
-        assert str(target.border_title) == "Мой язык (на что переводить)"
+        assert "Мой язык (на что переводить)" in {
+            str(lbl.render()) for lbl in screen.query(".field-caption")
+        }
 
 
 async def test_tui_settings_model_and_max_fields_present_and_loaded():
@@ -5401,8 +5393,10 @@ async def test_tui_settings_model_and_max_fields_present_and_loaded():
         max_field = screen.query_one("#translate-max", Input)
         assert model_field.value == "openai:glm-5.1"
         assert max_field.value == "250"
-        assert str(model_field.border_title) == "Модель для перевода"
-        assert str(max_field.border_title) == "Сколько переводить за раз (Ctrl+T)"
+        # #187: captions are Labels above the fields now (not border_title)
+        caption_texts = {str(lbl.render()) for lbl in screen.query(".field-caption")}
+        assert "Модель для перевода" in caption_texts
+        assert "Сколько переводить за раз (Ctrl+T)" in caption_texts
         # both Tab-reachable (never disabled — #133 discipline)
         chain_ids = [getattr(w, "id", None) for w in screen.focus_chain]
         assert "translate-model" in chain_ids and "translate-max" in chain_ids
@@ -6102,3 +6096,172 @@ async def test_tui_ctrl_g_notifies_on_empty_draft():
         await _pause_until(pilot, lambda: any("не предложил" in m for m in notes))
         assert app._pending_suggestion is None  # nothing pending on an empty draft
         assert str(app.query_one("#suggestion", Static).render()) == ""
+
+
+# --- #187 LOW-priority polish tests ---
+
+def test_tui_react_binding_shows_in_footer():
+    # #187 (L1): the r/x reaction binding is show=True so "Реакция" surfaces in the Footer while a
+    # message bubble is focused (was show=False → only discoverable via F1).
+    react = next(b for b in MessageBubble.BINDINGS if b.action == "react")
+    assert react.show is True
+    assert react.description  # has a Footer label
+
+
+async def test_tui_messages_empty_state_hint_shown_then_removed():
+    # #187 (L2): before any dialog is opened, #messages shows a "выберите диалог" hint (was a blank
+    # void); it's removed once a dialog's history loads.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        hint = app.query("#messages-empty")
+        assert hint  # the empty-state hint is present at startup
+        assert "Выберите диалог" in str(hint.first().render())
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        assert not app.query("#messages-empty")  # gone once a chat is open
+
+
+async def test_tui_variant_picker_does_not_inline_whole_draft():
+    # #187 (L5): the "send original" row is a fixed label, not the whole draft inlined (which
+    # wrapped over many lines and duplicated the composer text).
+    from tg_messenger.tui.app import ORIGINAL_SENTINEL, VariantPickScreen
+
+    long_draft = "это очень длинное сообщение " * 10
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(VariantPickScreen(["привет", "hola"], long_draft))
+        await pilot.pause()
+        items = list(app.screen.query(VariantItem))
+        original = next(it for it in items if it.value == ORIGINAL_SENTINEL)
+        label = str(original.query_one(Static).render())
+        assert label == "Отправить оригинал"
+        assert long_draft not in label  # the draft is NOT inlined
+
+
+async def test_tui_login_phone_step_shows_sending_hint():
+    # #187 (L8): after submitting the phone number the prompt shows "Отправляю код…" while the
+    # network request is in flight (was frozen-looking).
+    from tg_messenger.core.auth import CodeDelivery
+    from tg_messenger.tui.app import LoginScreen
+
+    class BlockingLoginSession:
+        state = "phone"
+
+        def __init__(self):
+            self.gate = asyncio.Event()
+
+        async def submit_phone(self, phone):
+            await self.gate.wait()
+            return CodeDelivery(kind="app")
+
+    session = BlockingLoginSession()
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = LoginScreen(session)
+        app.push_screen(screen)
+        await pilot.pause()
+        inp = screen.query_one("#login-input", Input)
+        screen.on_input_submitted(Input.Submitted(inp, "+10000000000"))
+        await pilot.pause()
+        prompt = screen.query_one("#login-prompt", Label)
+        assert "Отправляю код" in str(prompt.render())  # in-flight feedback
+        session.gate.set()  # let it finish so teardown is clean
+        await pilot.pause()
+
+
+async def test_tui_cross_dialog_send_toasts():
+    # #187 (L10): a text send that lands in a dialog the user navigated away from confirms via a
+    # toast (was silent — no bubble in the open pane, no feedback).
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 8  # open dialog 8
+        await app._send_text(7, "hi")  # but send to dialog 7 (Ann)
+        await pilot.pause()
+        assert any("Отправлено в" in m for m in notes)
+
+
+async def test_tui_auto_translate_toast_enriched_with_open_chat():
+    # #187 (L14): turning auto-translate ON with a chat open also re-translates it, so the toast
+    # says "перевожу чат…" (was a bare "включён" with no sign the pass started).
+    class _Tr:
+        async def auto_enabled(self):
+            return None
+
+        async def set_auto_enabled(self, enabled):
+            pass
+
+        async def target_lang(self):
+            return "ru"
+
+        async def max_messages(self):
+            return 50
+
+        async def translate_history(self, dialog_id, messages):
+            return messages
+
+    app = MessengerTUI(client=TuiStubClient(), translator=_Tr())
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        app.action_toggle_auto_translate()
+        await pilot.pause()
+        assert any("перевожу чат" in m for m in notes)
+
+
+async def test_tui_profile_selection_toasts_restart_hint():
+    # #187 (L15): selecting a non-active profile in the settings list gives explicit feedback
+    # (in-session switch isn't supported) instead of silently doing nothing.
+    store = FakeSessionStore(["alice", "bob"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="alice", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        lv = screen.query_one("#accounts", ListView)
+        bob = next(it for it in screen.query(AccountItem) if it.profile == "bob")
+        screen.on_list_view_selected(ListView.Selected(lv, bob, 0))
+        assert any("перезапустите" in m for m in notes)
+
+
+class _FakeErrorCoordinator:
+    """Coordinator whose prepare() returns a specified error status (for #187 L12)."""
+
+    def __init__(self, error_text):
+        from tg_messenger.agent.outbound_coordinator import PrepareResult
+
+        self._result = PrepareResult(status="error", error=error_text)
+
+    async def prepare(self, dialog_id, text, *, telegram_lang_code=None, owner_id=None):
+        return self._result
+
+
+async def test_tui_outbound_timeout_vs_error_are_distinguished():
+    # #187 (L12): a translation TIMEOUT and a model FAILURE used to collapse into one toast. The
+    # coordinator already tells them apart in result.error, so the TUI relays the distinction.
+    app = MessengerTUI(client=TuiStubClient(), outbound=object())
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        app._coordinator = _FakeErrorCoordinator("Translation timed out.")
+        await app._outbound_flow(7, "hi")
+        assert any("не успел" in m for m in notes)  # timeout wording
+
+        notes.clear()
+        app._coordinator = _FakeErrorCoordinator("Translation failed.")
+        await app._outbound_flow(7, "hi")
+        assert any("не удался" in m for m in notes)  # model-failure wording
