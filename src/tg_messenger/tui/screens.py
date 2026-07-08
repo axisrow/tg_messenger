@@ -38,6 +38,7 @@ HELP_TEXT = """Навигация (стрелки):
   Ctrl+S    настройки: аккаунты + перевод входящих (режим и языки)
   t         вкл/выкл авто-перевод входящих (вне поля ввода)
   Ctrl+T    перевести весь чат сейчас
+  @путь [подпись]  отправить файл (команда в поле ввода)
   /tlang    язык перевода входящих (команда в поле ввода; иначе спросит)
   /lang     язык перевода ИСХОДЯЩИХ в текущем диалоге (команда в поле ввода)
   ? / F1    эта справка
@@ -130,6 +131,10 @@ class LoginScreen(ModalScreen[bool]):
             self.run_worker(self._do_password(value), exclusive=True)
 
     async def _do_phone(self, phone: str) -> None:
+        # #187: in-flight feedback — after submitting the number the input clears but the network
+        # request can take a moment; without this the screen looked frozen. Show "Отправляю код…"
+        # until the delivery hint (or an error) replaces it.
+        self.query_one("#login-prompt", Label).update("Отправляю код…")
         try:
             delivery = await self._session.submit_phone(phone)
         except Exception as exc:
@@ -193,7 +198,10 @@ class VariantPickScreen(ModalScreen[str | None]):
         with Vertical(id="variant-box"):
             yield Label("Pick translation:")
             rows = [VariantItem(text, text) for text in self._variants]
-            rows.append(VariantItem(f"Original: {self._draft}", ORIGINAL_SENTINEL))
+            # #187: the "send original" row is a fixed label — it must NOT inline the whole draft
+            # (a long message wrapped over many lines and duplicated the text already in the
+            # composer). The draft is right there in the composer; the label just names the choice.
+            rows.append(VariantItem("Отправить оригинал", ORIGINAL_SENTINEL))
             yield ListView(*rows, id="variants")
 
     def on_mount(self) -> None:

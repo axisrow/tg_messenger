@@ -8,6 +8,7 @@ strings, so they stay unit-testable standalone (the project's parsing/format spl
 from __future__ import annotations
 
 import unicodedata
+from datetime import datetime
 
 from tg_messenger.core.models import format_author
 
@@ -37,6 +38,27 @@ def _terminal_safe_display_text(value: str) -> str:
 def _message_body(message) -> str:
     """The bubble body for a message: the ``[id] text`` line (or ``<media>``)."""
     return f"[{message.id}] {message.text or '<media>'}"
+
+
+def _format_timestamp(dt: datetime, *, now: datetime | None = None) -> str:
+    """A compact time label for a message (#187): ``HH:MM`` today, else ``DD.MM HH:MM``.
+
+    ``message.date`` is a tz-aware UTC datetime. The label is rendered in ``now``'s timezone (so the
+    displayed time and the today/older decision use ONE consistent clock); the app passes
+    ``datetime.now().astimezone()`` → the viewer's local zone. ``now`` is injectable so a test can
+    fix both the reference day and the render zone. Without ``now`` we fall back to the machine
+    local zone and always use the full date form (we can't know "today" without a reference clock).
+    A naive ``dt`` (no tzinfo) is treated as already being in the target zone.
+    """
+    if now is None:
+        local = dt.astimezone() if dt.tzinfo is not None else dt
+        return local.strftime("%d.%m %H:%M")
+    zone = now.tzinfo
+    shown = dt.astimezone(zone) if dt.tzinfo is not None else dt.replace(tzinfo=zone)
+    reference = now if now.tzinfo is None else now.astimezone(zone)
+    if shown.date() == reference.date():
+        return shown.strftime("%H:%M")
+    return shown.strftime("%d.%m %H:%M")
 
 
 def _message_author_line(message, *, show_author: bool) -> str | None:

@@ -51,6 +51,18 @@ from tg_messenger.core.paths import tg_home
 logger = logging.getLogger(__name__)
 CHAT_OUTBOUND_TIMEOUT_SECONDS = 20
 
+# #187: --session duplicates the global --profile; document that the global one wins
+# (see _effective_session) instead of leaving the option bare in --help.
+SESSION_OPTION_HELP = "Alias of the global --profile (which wins if both are set)."
+
+# #187: the chat REPL announces its slash-commands and exit on start, and /help reprints
+# them — so /react//lang and "how do I quit?" aren't a read-the-source feature, and a
+# stray /help//langs typo is intercepted instead of being sent to the contact.
+CHAT_REPL_COMMANDS = (
+    "Commands: /react MESSAGE_ID EMOTICON · /lang CODE|auto|on|off · /help · "
+    "Ctrl-D to quit. Anything else is sent to the chat."
+)
+
 
 def _reaction_emoticon(emoticon: str | None) -> str:
     return emoticon if emoticon is not None else "<custom>"
@@ -59,6 +71,21 @@ def _reaction_emoticon(emoticon: str | None) -> str:
 # #193: TG_API_ID / TG_API_HASH must load as ONE atomic pair, never per-key. See
 # ``_load_dotenv``'s docstring for why merging halves across precedence layers is a bug.
 _CREDS_PAIR = ("TG_API_ID", "TG_API_HASH")
+
+
+def _picker_line(marker: str, text: str) -> str:
+    """#187: render one ``[idx] text`` picker row, indenting continuation lines of a
+    multiline variant under the text column so the ``[idx]`` markers stay aligned.
+
+    Variants are NOT truncated (they must be read in full) — only the wrapping cue is
+    fixed. A single-line variant renders exactly as ``[idx] text``.
+    """
+    prefix = f"{marker} "
+    if "\n" not in text:
+        return f"{prefix}{text}"
+    indent = " " * len(prefix)
+    head, *rest = text.split("\n")
+    return "\n".join([f"{prefix}{head}", *(f"{indent}{line}" for line in rest)])
 
 
 def _load_dotenv(path: Path | str = ".env") -> None:
@@ -579,8 +606,11 @@ def _run(coro, session: str = "default"):
         raise click.ClickException(_login_hint(session)) from exc
     except Exception as exc:
         logger.exception("command failed")
+        # #187: an exception whose str() is empty would render as
+        # "Unexpected error:  — details logged…" (looks broken) — fall back to the class name.
+        detail = str(exc) or type(exc).__name__
         raise click.ClickException(
-            f"Unexpected error: {exc} — details logged to {log_file_path()}"
+            f"Unexpected error: {detail} — details logged to {log_file_path()}"
         ) from exc
 
 
@@ -790,7 +820,8 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     if dialog.id == dialog_id:
                         telegram_lang_code = getattr(dialog, "telegram_lang_code", None)
                         if not getattr(dialog, "can_send", True):
-                            click.echo("Чат только для чтения — отправка отключена.", err=True)
+                            # #187: English like the rest of the CLI REPL
+                            click.echo("This chat is read-only — sending is disabled.", err=True)
                         break
             except Exception:
                 logger.warning("failed to read dialogs for the chat REPL", exc_info=True)
@@ -830,6 +861,13 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     click.echo(str(exc), err=True)
                     raise
 
+            def _reprint_prompt() -> None:
+                # #187: a background echo (incoming/outgoing/reaction) prints straight into
+                # the terminal while the user may be mid-line at "> ". We can't read the
+                # in-flight input() buffer, so we can't restore a partial draft — but we
+                # reprint the bare prompt so the cursor isn't left on an orphaned line.
+                click.echo("> ", nl=False)
+
             async def printer():
                 async for ev in client.listen():
                     if ev.dialog_id == dialog_id:
@@ -837,6 +875,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                         click.echo(f"\n← {msg.text or '<media>'}")
                         if msg.translated_text:
                             click.echo(f"  ↳ {msg.translated_text}")
+                        _reprint_prompt()
 
             async def printer_outgoing():
                 # our own messages sent from another device (phone/web/CLI elsewhere)
@@ -846,6 +885,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                         click.echo(f"\n→ {msg.text or '<media>'}")
                         if msg.translated_text:
                             click.echo(f"  ↳ {msg.translated_text}")
+                        _reprint_prompt()
 
             async def printer_reactions():
                 async for ev in client.listen_reactions():
@@ -853,12 +893,14 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                         click.echo(
                             f"\n* reaction [{ev.message_id}]: {_reaction_emoticon(ev.emoticon)}"
                         )
+                        _reprint_prompt()
 
             tasks = [
                 asyncio.create_task(printer()),
                 asyncio.create_task(printer_outgoing()),
                 asyncio.create_task(printer_reactions()),
             ]
+            click.echo(CHAT_REPL_COMMANDS)  # #187: announce slash-commands + exit on start
             try:
                 while True:
                     try:
@@ -866,7 +908,12 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     except EOFError:
                         break
                     if line.strip():
-                        if line.startswith("/react "):
+                        first = line.split(maxsplit=1)[0]
+                        if first == "/help":
+                            # #187: /help must NOT be sent to the contact — print the hint
+                            click.echo(CHAT_REPL_COMMANDS)
+                            continue
+                        if first == "/react":
                             parts = line.split(maxsplit=2)
                             if len(parts) != 3 or not parts[1].isdigit():
                                 click.echo("usage: /react MESSAGE_ID EMOTICON", err=True)
@@ -875,7 +922,15 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 client.send_reaction(dialog_id, int(parts[1]), parts[2])
                             )
                             continue
-                        if line.split(maxsplit=1)[0] == "/lang":
+                        if first != "/lang" and first.startswith("/"):
+                            # #187 HIGH: an unknown /command (a typo like /langs or /halp, or a
+                            # user hunting for the exit) must NOT be sent verbatim to a real
+                            # person. Reject it, keep the draft-less loop alive, send nothing.
+                            click.echo(
+                                f"unknown command: {first} (type /help)", err=True
+                            )
+                            continue
+                        if first == "/lang":
                             parts = line.split(maxsplit=1)
                             if len(parts) != 2 or not parts[1].strip():
                                 click.echo("usage: /lang CODE|auto|on|off", err=True)
@@ -928,11 +983,12 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 # (the coordinator collapses timeout and other failures into "error").
                                 # The "send original?" question lives in the prompt below, not here,
                                 # so the line isn't asked twice.
-                                click.echo(result.error or "перевод не удался", err=True)
+                                click.echo(result.error or "translation failed", err=True)
                                 confirm = await asyncio.to_thread(
-                                    input, "отправить оригинал? [y/N] "
+                                    input, "send original? [y/N] "
                                 )
-                                if confirm.strip().lower() not in {"y", "yes", "д", "да"}:
+                                # the prompt is English [y/N] now, so accept only y/yes
+                                if confirm.strip().lower() not in {"y", "yes"}:
                                     continue
                                 try:
                                     msg = await coordinator.send_original(dialog_id, line, _coord_send)
@@ -943,11 +999,11 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                             # status == "ready": present the REPL picker (the one CLI-specific part)
                             variants = result.variants
                             for idx, variant in enumerate(variants, start=1):
-                                click.echo(f"[{idx}] {variant}")
+                                click.echo(_picker_line(f"[{idx}]", variant))
                             original_idx = len(variants) + 1
-                            click.echo(f"[{original_idx}] original: {line}")
+                            click.echo(_picker_line(f"[{original_idx}] original:", line))
                             click.echo("[0] cancel")
-                            choice = (await asyncio.to_thread(input, "вариант> ")).strip()
+                            choice = (await asyncio.to_thread(input, "variant> ")).strip()
                             if not choice or choice == "0":
                                 continue
                             if choice == str(original_idx):
@@ -979,7 +1035,12 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 logger.warning(
                                     "outbound token rejected in chat REPL (dialog %s)", dialog_id
                                 )
-                                click.echo("Выбор перевода истёк", err=True)
+                                # #187: actionable English, aligned with the TUI's hint (which
+                                # says "expired — pick again") instead of a bare Russian line.
+                                click.echo(
+                                    "Translation choice expired — type the message again to retry.",
+                                    err=True,
+                                )
                                 continue
                             sent_ids.append((dialog_id, msg.id))
                             click.echo(f"  ↳ {line}")  # show the original under the sent variant

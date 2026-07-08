@@ -29,16 +29,20 @@ def username_suggest(base: str, limit: int, session: str) -> None:
     async def _do(client):
         return await find_available_marked(client, base, limit=limit)
 
+    # #187: a one-line status before the (billed, sequential) availability probes — on
+    # stderr so it doesn't pollute the name list a script may parse from stdout.
+    click.echo("Checking username availability…", err=True)
     free, unchecked = cli_main._run(cli_main._with_client(session, _do), session=session)
     if not free and not unchecked:
         click.echo("No available usernames found — try a different base.")
         return
-    # free names are verified available (✓); unchecked candidates are generated but
-    # their availability is unknown (?), so the user can probe them with `username set`
+    # #187: pair each glyph with a word so the status isn't glyph-only (a screen reader
+    # says "check mark"/"question mark" with no meaning). Free names are verified
+    # available (✓ free); unchecked candidates were generated but never probed (? unchecked).
     for name in free:
-        click.echo(f"{name} ✓")
+        click.echo(f"{name} ✓ free")
     for name in unchecked:
-        click.echo(f"{name} ?")
+        click.echo(f"{name} ? unchecked")
 
 
 @username.command("set")

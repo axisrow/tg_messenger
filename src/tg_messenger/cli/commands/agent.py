@@ -68,6 +68,9 @@ def suggest(ctx: click.Context, dialog_id: int, do_send: bool, do_learn: bool, s
             await storage.connect()
             try:
                 await cli_main._ensure_dm_dialog(client, dialog_id)
+                # #187: a status before the (billed) LLM call — to stderr so stdout stays
+                # just the draft/receipt — so the user can tell it's working, not hung.
+                click.echo("Learning style…" if do_learn else "Drafting a reply…", err=True)
                 if do_learn:
                     profile = await suggester.learn(dialog_id)
                     click.echo(
@@ -118,6 +121,8 @@ def suggest_nudges(ctx: click.Context, after_hours: float, session: str) -> None
             await cli_main._ensure_authorized(client, session)
             await storage.connect()
             try:
+                # #187: status before the (billed) scan/LLM pass — to stderr, not stdout
+                click.echo("Scanning dialogs for nudge candidates…", err=True)
                 dms = await client.dialogs(dm_only=True)  # cached list — no per-dialog resolve
                 candidates = await suggester.nudge_candidates(
                     [d.id for d in dms], now=time.time(), after_sec=after_hours * 3600,
