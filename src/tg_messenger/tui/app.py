@@ -84,6 +84,16 @@ from tg_messenger.tui.widgets import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# #187: the writable-composer placeholder. Hints the @file media-send (no button/picker in the
+# TUI — the only way to send a file is the `@path [caption]` magic string), which was previously
+# undocumented anywhere in the UI.
+COMPOSER_PLACEHOLDER = "Сообщение…  (@файл — отправить файл)"
+
+# #187: shown in the persistent #connection-status banner while a drain worker is down and
+# reconnecting with backoff — so a dead live-feed is visible and self-heals instead of silently
+# stopping. Hidden again once the listener yields its next event.
+CONNECTION_LOST_TEXT = "⚠ Соединение потеряно — переподключаюсь…"
+
 # shown before a draft in the suggestion strip; Tab accepts it into the composer
 SUGGEST_PREFIX = "💡 Tab: "
 # #158: shown in the suggestion strip while an explicit Ctrl+G LLM call is in flight (~seconds),
@@ -242,6 +252,9 @@ class MessengerTUI(App):
        _set_suggestion_strip flips it on only for non-empty text — else the empty border floats
        above the composer from launch until the first dialog open (caught in review). */
     #suggestion { color: $text-muted; height: auto; border: round $panel; padding: 0 1; display: none; }
+    /* #187: the persistent "connection lost" banner. Starts hidden; _set_connection_lost flips it
+       on when a listener dies and off once it reconnects. $warning so it reads as a live problem. */
+    #connection-status { color: $warning; height: auto; padding: 0 1; display: none; }
     #composer { dock: bottom; }
     /* #116: shared modal card — a centered, bordered, width-capped box (was full-width, top-left,
        unframed). Centering (align: center middle) lives on each ModalScreen's DEFAULT_CSS so it is
@@ -264,9 +277,14 @@ class MessengerTUI(App):
                  profiles: list[str] | None = None, client_factory=None, deps_factory=None,
                  suggester=None, login_session=None, store=None, translator=None,
                  outbound=None, session_store=None, account_client_factory=None,
-                 auto_translate=False):
+                 auto_translate=False, listener_retry_base=1.0, listener_retry_max=30.0):
         super().__init__()
         self._client = client
+        # #187: reconnect backoff for the live-feed drain workers. A dead listener retries with
+        # exponential backoff (base → max, doubling) instead of dying silently. Injectable so a
+        # test can use a tiny delay and observe the retry without a real wait.
+        self._listener_retry_base = listener_retry_base
+        self._listener_retry_max = listener_retry_max
         self._session_name = session_name
         self._profiles = profiles or []
         # #115: account settings seams — the SessionStore for listing/saving/removing profiles
@@ -320,6 +338,9 @@ class MessengerTUI(App):
         # #126: the messages currently mounted in the open dialog — the source for on-demand
         # #126: re-entrancy guard so a second t/Ctrl+T can't stack a second reading-language modal.
         self._lang_prompt_open = False
+        # #187: the two-step Escape-clears-composer guard. Set on the first Escape over a non-empty
+        # composer (which only moves focus); the second Escape clears. Reset by any composer edit.
+        self._composer_escape_armed = False
         self._pending_suggestion: str | None = None
         # #158: which dialog the pending draft belongs to — so an instant Ctrl+G never shows a
         # draft pre-generated for dialog A while dialog B is open.
@@ -338,6 +359,47 @@ class MessengerTUI(App):
 
     def _build_coordinator(self) -> OutboundSendCoordinator:
         return OutboundSendCoordinator(outbound=self._outbound, store=self._store)
+
+    def _set_connection_lost(self, lost: bool) -> None:
+        """Show/hide the persistent 'connection lost' banner (#187).
+
+        Shown while a live-feed drain is down and reconnecting; hidden once it yields again. Kept
+        defensive: on very early failures the widget may not be mounted yet — swallow the lookup miss.
+        """
+        try:
+            banner = self.query_one("#connection-status", Static)
+        except Exception:
+            return
+        banner.display = lost
+
+    async def _run_listener(self, name: str, drain_once) -> None:
+        """Run a live-feed drain with reconnect-on-failure and exponential backoff (#187).
+
+        ``drain_once`` is an ``async`` callable that consumes the underlying ``async for`` once (it
+        returns only when the stream ends, and raises when it dies). On failure we surface the
+        persistent 'connection lost' banner, back off, and reconnect — instead of the old behavior
+        where one dead worker silently stopped the whole live feed for the rest of the session. The
+        banner is cleared by the drain itself on its first successful event (``_mark_connected``).
+        """
+        delay = self._listener_retry_base
+        while True:
+            try:
+                await drain_once()
+                return  # clean end (streams idle forever in practice; this is the tidy exit)
+            except asyncio.CancelledError:
+                raise  # app shutdown — never swallow
+            except Exception:
+                logger.exception("%s listener failed — reconnecting", name)
+                self._set_connection_lost(True)
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    raise
+                delay = min(delay * 2, self._listener_retry_max)
+
+    def _mark_connected(self) -> None:
+        """A live event arrived → the feed is healthy; drop any 'connection lost' banner (#187)."""
+        self._set_connection_lost(False)
 
     @staticmethod
     def _pane_at_bottom(pane) -> bool:
@@ -450,8 +512,12 @@ class MessengerTUI(App):
                 yield DialogListView(id="dialogs")
             with Vertical(id="chat"):
                 yield Vertical(id="messages")
+                # #187: a persistent "connection lost" banner (hidden until a listener dies). Docked
+                # above the suggestion strip; _set_connection_lost toggles its visibility.
+                yield Static(CONNECTION_LOST_TEXT, id="connection-status", markup=False)
                 yield Static("", id="suggestion", markup=False)
-                yield ComposerInput(placeholder="Message…", id="composer")
+                # #187: the placeholder now hints the (previously undocumented) @file media send.
+                yield ComposerInput(placeholder=COMPOSER_PLACEHOLDER, id="composer")
         # #124-followup: the Footer surfaces the show=True bindings (Справка, Настройки, Выход) —
         # without it the key hints exist but are invisible (the reported "не вижу настроек/?").
         yield Footer()
@@ -935,6 +1001,9 @@ class MessengerTUI(App):
             # newer programmatic composer value may already be present.
             if event.value != event.input.value:
                 return
+            # #187: any composer edit disarms the two-step Escape guard, so a fresh draft always
+            # needs two Escapes again (the first Escape then moves focus rather than clearing).
+            self._composer_escape_armed = False
             # the user is typing their own reply — a stale suggestion must go
             if self._pending_suggestion is not None and event.value != self._pending_suggestion:
                 self._clear_suggestion()
@@ -1327,88 +1396,92 @@ class MessengerTUI(App):
             )
 
     async def _drain_incoming(self) -> None:
-        try:
-            async for ev in self._client.listen_all():  # groups too, not just DMs
-                await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=True)
-                if ev.dialog_id == self._current:
-                    pane = self.query_one("#messages", Vertical)
-                    # #187: capture whether the user is at the bottom BEFORE mounting the new bubble,
-                    # so a message arriving while they read history up-pane doesn't yank the viewport
-                    # to the bottom — auto-scroll only when they were already following the newest.
-                    was_at_bottom = self._pane_at_bottom(pane)
-                    bubble = self._message_bubble_for(ev.message, ev.dialog_id)
-                    await pane.mount(_wrap_bubble(bubble))
-                    if (
-                        not ev.message.translated_text
-                        and self._translator is not None
-                        and self._auto_translate
-                    ):
-                        self.run_worker(
-                            self._translate_bubble(ev.dialog_id, ev.message, bubble),
-                            group="translate-live",
-                            exclusive=False,
-                        )
-                    if was_at_bottom:
-                        self._scroll_messages_to_end(pane)
+        # #187: reconnect-with-backoff wrapper. The per-attempt body is _drain_incoming_once; a
+        # failure surfaces the 'connection lost' banner and retries instead of dying silently.
+        await self._run_listener("incoming", self._drain_incoming_once)
+
+    async def _drain_incoming_once(self) -> None:
+        async for ev in self._client.listen_all():  # groups too, not just DMs
+            self._mark_connected()  # #187: a live event → the feed is healthy; clear any banner
+            await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=True)
+            if ev.dialog_id == self._current:
+                pane = self.query_one("#messages", Vertical)
+                # #187: capture whether the user is at the bottom BEFORE mounting the new bubble,
+                # so a message arriving while they read history up-pane doesn't yank the viewport
+                # to the bottom — auto-scroll only when they were already following the newest.
+                was_at_bottom = self._pane_at_bottom(pane)
+                bubble = self._message_bubble_for(ev.message, ev.dialog_id)
+                await pane.mount(_wrap_bubble(bubble))
+                if (
+                    not ev.message.translated_text
+                    and self._translator is not None
+                    and self._auto_translate
+                ):
                     self.run_worker(
-                        self._mark_read(ev.dialog_id, ev.message.id),
-                        group="mark_read",
-                        exclusive=True,
+                        self._translate_bubble(ev.dialog_id, ev.message, bubble),
+                        group="translate-live",
+                        exclusive=False,
                     )
-                    self._maybe_suggest(ev.dialog_id)
-        except Exception:
-            logger.exception("incoming listener failed")
-            self.notify("Incoming listener failed — see log.", severity="error")
+                if was_at_bottom:
+                    self._scroll_messages_to_end(pane)
+                self.run_worker(
+                    self._mark_read(ev.dialog_id, ev.message.id),
+                    group="mark_read",
+                    exclusive=True,
+                )
+                self._maybe_suggest(ev.dialog_id)
 
     async def _drain_outgoing(self) -> None:
+        # #187: reconnect-with-backoff wrapper — see _drain_incoming.
+        await self._run_listener("outgoing", self._drain_outgoing_once)
+
+    async def _drain_outgoing_once(self) -> None:
         """Render our OWN messages sent from another device (phone/CLI/web).
 
-        Mirrors _drain_incoming but as out=True and with NO suggestion (those are
+        Mirrors _drain_incoming_once but as out=True and with NO suggestion (those are
         for incoming only). Echoes of messages we just sent from this composer are
         in _sent_ids and skipped, so they aren't drawn twice.
         """
-        try:
-            async for ev in self._client.listen_outgoing():  # own messages, any device
-                if (ev.dialog_id, ev.message.id) in self._sent_ids:
-                    continue  # our own optimistic bubble already shows it
-                await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=False)
-                if ev.dialog_id == self._current:
-                    pane = self.query_one("#messages", Vertical)
-                    # #187: same as _drain_incoming — a message sent from ANOTHER device shouldn't
-                    # yank the viewport while the user reads history here. Auto-scroll only if they
-                    # were already at the bottom.
-                    was_at_bottom = self._pane_at_bottom(pane)
-                    bubble = self._message_bubble_for(ev.message, ev.dialog_id)
-                    await pane.mount(_wrap_bubble(bubble))
-                    if (
-                        not ev.message.translated_text
-                        and self._translator is not None
-                        and self._auto_translate
-                    ):
-                        self.run_worker(
-                            self._translate_bubble(ev.dialog_id, ev.message, bubble),
-                            group="translate-live",
-                            exclusive=False,
-                        )
-                    if was_at_bottom:
-                        self._scroll_messages_to_end(pane)
-        except Exception:
-            logger.exception("outgoing listener failed")
-            self.notify("Outgoing listener failed — see log.", severity="error")
+        async for ev in self._client.listen_outgoing():  # own messages, any device
+            self._mark_connected()  # #187
+            if (ev.dialog_id, ev.message.id) in self._sent_ids:
+                continue  # our own optimistic bubble already shows it
+            await self._touch_dialog_for_message(ev.dialog_id, ev.message, incoming=False)
+            if ev.dialog_id == self._current:
+                pane = self.query_one("#messages", Vertical)
+                # #187: same as _drain_incoming — a message sent from ANOTHER device shouldn't
+                # yank the viewport while the user reads history here. Auto-scroll only if they
+                # were already at the bottom.
+                was_at_bottom = self._pane_at_bottom(pane)
+                bubble = self._message_bubble_for(ev.message, ev.dialog_id)
+                await pane.mount(_wrap_bubble(bubble))
+                if (
+                    not ev.message.translated_text
+                    and self._translator is not None
+                    and self._auto_translate
+                ):
+                    self.run_worker(
+                        self._translate_bubble(ev.dialog_id, ev.message, bubble),
+                        group="translate-live",
+                        exclusive=False,
+                    )
+                if was_at_bottom:
+                    self._scroll_messages_to_end(pane)
 
     async def _drain_reactions(self) -> None:
-        try:
-            async for ev in self._client.listen_reactions():
-                key = (ev.dialog_id, ev.message_id, ev.emoticon)
-                if key in self._sent_reactions:
-                    self._sent_reactions.pop(key, None)
-                    continue  # our own optimistic reaction is already shown under the message
-                if ev.dialog_id == self._current:
-                    # #106: other people's reactions attach under the reacted message too.
-                    self._apply_reaction(ev.dialog_id, ev.message_id, ev.emoticon)
-        except Exception:
-            logger.exception("reaction listener failed")
-            self.notify("Reaction listener failed — see log.", severity="error")
+        # #187: reconnect-with-backoff wrapper — see _drain_incoming.
+        await self._run_listener("reaction", self._drain_reactions_once)
+
+    async def _drain_reactions_once(self) -> None:
+        async for ev in self._client.listen_reactions():
+            self._mark_connected()  # #187
+            key = (ev.dialog_id, ev.message_id, ev.emoticon)
+            if key in self._sent_reactions:
+                self._sent_reactions.pop(key, None)
+                continue  # our own optimistic reaction is already shown under the message
+            if ev.dialog_id == self._current:
+                # #106: other people's reactions attach under the reacted message too.
+                self._apply_reaction(ev.dialog_id, ev.message_id, ev.emoticon)
 
     def _maybe_suggest(self, dialog_id: int) -> None:
         """Kick off a reply suggestion for an incoming message in the open dialog.
@@ -1495,7 +1568,7 @@ class MessengerTUI(App):
         composer = self.query_one("#composer", Input)
         can = self._dialog_can_send(dialog_id)
         composer.disabled = not can
-        composer.placeholder = "Message…" if can else "Только чтение"
+        composer.placeholder = COMPOSER_PLACEHOLDER if can else "Только чтение"
 
     def _dialog_telegram_lang_hint(self, dialog_id: int) -> str | None:
         for dialog in self._all_dialogs:
@@ -1588,7 +1661,7 @@ class MessengerTUI(App):
             self.push_screen(HelpScreen())
 
     def action_clear_search(self) -> None:
-        """Escape — clear the FOCUSED input (#155/#156).
+        """Escape — clear the FOCUSED input (#155/#156/#187).
 
         Context-aware so it never destroys an unrelated draft: when the composer is focused,
         Escape clears the composer (so Ctrl+G has a clean field) and the per-dialog draft goes
@@ -1596,11 +1669,31 @@ class MessengerTUI(App):
         avoids the data-loss trap where Escape-to-clear-search would also wipe a reply typed in
         the composer (the draft is persisted via on_input_changed → state.draft, unrecoverable on
         a dialog switch). A no-op when the relevant field is already empty.
+
+        #187: a REFLEXIVE Escape used to wipe a half-written message in one keypress. Now it takes
+        TWO: the first Escape on a non-empty composer only moves focus off it (draft intact) and
+        arms a flag; the second Escape (still armed, no edit in between) clears. Typing disarms
+        (on_input_changed), so the two-step always restarts from a fresh draft.
         """
         composer = self.query_one("#composer", Input)
         if composer.has_focus:
-            if composer.value:
-                composer.value = ""  # explicit: clear the draft so a fresh Ctrl+G / reply is clean
+            if not composer.value:
+                return  # nothing to clear
+            if not self._composer_escape_armed:
+                # first Escape: keep the draft, move focus out, and tell the user how to clear it
+                self._composer_escape_armed = True
+                self.notify("Esc ещё раз — очистить черновик")
+                # leave the composer for the history (last bubble) else the dialog list; both are
+                # safe focus targets that _show_history never removes out from under us.
+                bubbles = _navigable_bubbles(self.screen)
+                if bubbles:
+                    bubbles[-1].focus()
+                else:
+                    self.query_one("#dialogs", ListView).focus()
+                return
+            # second Escape (armed, no edit since): clear the draft — the old one-key behavior
+            composer.value = ""
+            self._composer_escape_armed = False
             return
         search = self.query_one("#search", Input)
         if search.value:

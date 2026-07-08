@@ -572,7 +572,18 @@ async def test_tui_writable_dialog_enables_composer():
         await pilot.pause()
         composer = app.query_one("#composer", Input)
         assert composer.disabled is False
-        assert composer.placeholder == "Message…"
+        # #187: the writable placeholder hints the @file media send (previously undocumented)
+        assert composer.placeholder.startswith("Сообщение")
+        assert "@" in composer.placeholder
+
+
+def test_tui_help_text_documents_media_send():
+    # #187: sending a file (@path [caption]) was undocumented — no button, no picker, nothing in
+    # the help. It must now appear in HELP_TEXT next to /lang and /tlang.
+    from tg_messenger.tui.app import HELP_TEXT
+
+    assert "@путь" in HELP_TEXT
+    assert "отправить файл" in HELP_TEXT
 
 
 async def test_tui_submit_in_readonly_channel_does_not_send():
@@ -1338,13 +1349,59 @@ async def test_tui_listener_failure_logged_app_stays_alive(caplog):
         yield  # pragma: no cover
 
     stub.listen_all = broken_listen
-    app = MessengerTUI(client=stub)
+    # #187: a huge retry base so the wrapper errors once, shows the banner, then parks in sleep for
+    # the whole (short) test — no busy reconnect loop, and the banner stays up to be observed.
+    app = MessengerTUI(client=stub, listener_retry_base=1000.0)
     with caplog.at_level("ERROR", logger="tg_messenger.tui.app"):
         async with app.run_test() as pilot:
+            await _pause_until(pilot, lambda: app._started)
             await pilot.pause()
             assert app.return_code is None  # worker died, app did not
+            # #187: the dead feed is now VISIBLE (persistent banner), not silent
+            banner = app.query_one("#connection-status", Static)
+            await _pause_until(pilot, lambda: banner.display)
+            assert banner.display
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert errors and errors[0].exc_info is not None
+
+
+class FlakyListenerClient(TuiStubClient):
+    """listen_all raises on the FIRST connect, then (on reconnect) yields one event (#187)."""
+
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    async def listen_all(self):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("first connect died")
+        yield IncomingEvent(dialog_id=7, message=Message(
+            id=42, dialog_id=7, sender_id=7, out=False, text="recovered",
+            date=datetime(2024, 1, 2, tzinfo=timezone.utc)))
+        await asyncio.Event().wait()
+
+
+async def test_tui_listener_reconnects_and_clears_banner():
+    # #187: a listener failure surfaces the banner AND auto-retries with backoff; on the successful
+    # reconnect the banner clears and live events flow again — the feed self-heals.
+    #
+    # `banner cleared` alone proves the feed resumed: the banner only turns OFF via _mark_connected,
+    # which fires solely when a live event is actually received. So `attempts >= 2` (reconnected)
+    # + banner cleared is a faithful "resumed" assertion, without a racy dependence on _current /
+    # the bubble mount (the tiny test backoff can deliver the recovery event before _current is set).
+    stub = FlakyListenerClient()
+    app = MessengerTUI(client=stub, listener_retry_base=0.01, listener_retry_max=0.01)
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        banner = app.query_one("#connection-status", Static)
+        for _ in range(50):
+            await asyncio.sleep(0.02)  # let the 0.01s backoff sleep fire and the reconnect run
+            await pilot.pause()
+            if stub.attempts >= 2 and banner.display is False:
+                break
+        assert stub.attempts >= 2  # retried after the first failure
+        assert banner.display is False  # a live event flowed post-reconnect → banner cleared
 
 
 class EagerSensitiveClient(TuiStubClient):
@@ -5789,8 +5846,12 @@ async def test_tui_ctrl_g_blocked_by_nonempty_composer_points_at_escape():
 
 
 async def test_tui_escape_clears_composer_when_composer_focused():
-    # #156: Escape clears the composer when the composer is focused, so Ctrl+G has a clean field.
+    # #156/#187: Escape clears the composer when it's focused, so Ctrl+G has a clean field — but
+    # now in TWO steps (a reflexive single Escape no longer wipes the draft). The first Escape keeps
+    # the text and moves focus off the composer; the second (still focused, unedited) clears.
     app = MessengerTUI(client=TuiStubClient())
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
     async with app.run_test() as pilot:
         await _pause_until(pilot, lambda: app._started)
         app._current = 7
@@ -5798,9 +5859,41 @@ async def test_tui_escape_clears_composer_when_composer_focused():
         composer.value = "черновик"
         composer.focus()
         await pilot.pause()
-        app.action_clear_search()
+        app.action_clear_search()  # 1st Escape
         await pilot.pause()
-        assert composer.value == ""
+        assert composer.value == "черновик"  # draft NOT wiped on the reflexive first Escape
+        assert not composer.has_focus  # focus moved out of the composer
+        assert app._composer_escape_armed
+        assert any("Esc" in m for m in notes)  # told how to clear
+        composer.focus()  # user comes back and presses Escape again
+        await pilot.pause()
+        app.action_clear_search()  # 2nd Escape (armed, unedited)
+        await pilot.pause()
+        assert composer.value == ""  # now cleared
+        assert not app._composer_escape_armed
+
+
+async def test_tui_escape_disarms_after_composer_edit():
+    # #187: typing after the first Escape resets the two-step, so the NEXT single Escape doesn't
+    # clear — it re-arms. Protects a draft edited after a stray first Escape.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        composer.value = "draft"
+        composer.focus()
+        await pilot.pause()
+        app.action_clear_search()  # 1st Escape → armed
+        await pilot.pause()
+        assert app._composer_escape_armed
+        composer.focus()
+        composer.value = "draft edited"  # an edit disarms via on_input_changed
+        await pilot.pause()
+        assert not app._composer_escape_armed
+        app.action_clear_search()  # a single Escape again → arms, does NOT clear
+        await pilot.pause()
+        assert composer.value == "draft edited"  # preserved
 
 
 async def test_tui_escape_clearing_search_preserves_composer_draft():
