@@ -7,7 +7,9 @@ and the dialog row. These wire up the arrow-key focus chain (search ↔ tabs ↔
 from __future__ import annotations
 
 from rich.text import Text
+from textual import events
 from textual.binding import Binding
+from textual.containers import Vertical
 from textual.widgets import Input, ListItem, ListView, Static, Tabs
 
 from tg_messenger.tui.bubbles import (
@@ -15,6 +17,30 @@ from tg_messenger.tui.bubbles import (
     _navigable_bubbles,
 )
 from tg_messenger.tui.format import _terminal_safe_display_text
+
+
+class MessagesPane(Vertical):
+    """The chat message pane (#messages). Fires history backfill when scrolled to the top (#187).
+
+    Opening a dialog loads only the newest 50 messages; older history used to be unreachable (no
+    "load older", no auto-fetch). A USER scroll-up gesture at the very top asks the app to fetch the
+    next older page. The app owns the fetch/guard/scroll-anchor logic (_maybe_backfill_history).
+
+    We key off the real mouse-wheel-up EVENT rather than the reactive ``scroll_y`` value on purpose:
+    ``scroll_y`` also changes on the programmatic scroll-to-end after every mount/send, which would
+    spuriously trigger a backfill (and shift the just-sent message off-screen). A wheel-up at the
+    top edge is an unambiguous "show me older" intent.
+    """
+
+    def _on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        # at (or above) the top edge, a wheel-up is a request for older history — otherwise let the
+        # normal scroll proceed (super() handles the actual scrolling for the non-top case).
+        if self.scroll_y <= 0:
+            app = getattr(self, "app", None)
+            backfill = getattr(app, "_maybe_backfill_history", None)
+            if backfill is not None:
+                backfill()
+        super()._on_mouse_scroll_up(event)
 
 
 class SidebarTabs(Tabs):

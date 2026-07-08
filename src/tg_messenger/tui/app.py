@@ -78,6 +78,7 @@ from tg_messenger.tui.widgets import (  # noqa: F401
     ComposerInput,
     DialogItem,
     DialogListView,
+    MessagesPane,
     SearchInput,
     SidebarTabs,
 )
@@ -341,6 +342,14 @@ class MessengerTUI(App):
         # #187: the two-step Escape-clears-composer guard. Set on the first Escape over a non-empty
         # composer (which only moves focus); the second Escape clears. Reset by any composer edit.
         self._composer_escape_armed = False
+        # #187: incremental history backfill (scroll-to-top). The oldest loaded message id for the
+        # open dialog (the `offset_id` for the next older page), the set of dialogs whose history is
+        # fully loaded (an older page came back empty), and a re-entrancy guard so a scroll storm
+        # can't fire overlapping fetches. Backfill runs ONLY on the client path — MessageStore.history
+        # has no offset_id, so with a store wired the feature is disabled (see _maybe_backfill_history).
+        self._oldest_message_id: int | None = None
+        self._backfill_exhausted: set[int] = set()
+        self._backfilling = False
         self._pending_suggestion: str | None = None
         # #158: which dialog the pending draft belongs to — so an instant Ctrl+G never shows a
         # draft pre-generated for dialog A while dialog B is open.
@@ -511,7 +520,8 @@ class MessengerTUI(App):
                 )
                 yield DialogListView(id="dialogs")
             with Vertical(id="chat"):
-                yield Vertical(id="messages")
+                # #187: MessagesPane (a Vertical) detects scroll-to-top to trigger history backfill.
+                yield MessagesPane(id="messages")
                 # #187: a persistent "connection lost" banner (hidden until a listener dies). Docked
                 # above the suggestion strip; _set_connection_lost toggles its visibility.
                 yield Static(CONNECTION_LOST_TEXT, id="connection-status", markup=False)
@@ -820,6 +830,10 @@ class MessengerTUI(App):
         self._clear_suggestion()
         self._bubble_index.clear()
         self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
+        # #187: reset the backfill cursor/guard for the newly-opened dialog (the exhausted set is
+        # per-dialog and persists across reopens, so a fully-loaded chat isn't re-paged needlessly).
+        self._oldest_message_id = None
+        self._backfilling = False
         # exclusive group: selecting another dialog cancels a still-loading history
         self.run_worker(self._show_history(dialog_id), group="history", exclusive=True)
 
@@ -874,6 +888,15 @@ class MessengerTUI(App):
         for m in messages:
             bubbles.append(self._message_bubble_for(m, dialog_id))
         await pane.mount(*(_wrap_bubble(b) for b in bubbles))  # #118: align via wrapper row
+        # #187: remember the oldest loaded id — the offset_id for the next older page on scroll-to-top.
+        # Messages are chronological (oldest first), so the first is the oldest. A short first page
+        # (< the requested 50) means there IS no older history → mark the dialog exhausted up front.
+        if messages:
+            self._oldest_message_id = messages[0].id
+            if len(messages) < 50:
+                self._backfill_exhausted.add(dialog_id)
+        else:
+            self._backfill_exhausted.add(dialog_id)
         # #106: apply any reactions that arrived while this history was loading.
         self._drain_pending_reactions(dialog_id)
         self._scroll_messages_to_end(pane)
@@ -890,6 +913,71 @@ class MessengerTUI(App):
                 group="mark_read",
                 exclusive=False,
             )
+
+    def _maybe_backfill_history(self) -> None:
+        """Scroll-to-top hook (#187): schedule a fetch of the next older history page, if eligible.
+
+        Guards (all cheap, synchronous): no open dialog; a store is wired (MessageStore.history has
+        no offset_id, so paging isn't possible without a core change — the feature is client-only);
+        this dialog is already fully loaded; a page id isn't known yet; or a fetch is already in
+        flight (a scroll storm mustn't stack overlapping loads). The actual work runs in a worker.
+        """
+        dialog_id = self._current
+        if dialog_id is None:
+            return
+        if self._store is not None:
+            return  # store path can't page older history (no offset_id) — see the note above
+        if dialog_id in self._backfill_exhausted:
+            return
+        if self._oldest_message_id is None or self._backfilling:
+            return
+        self._backfilling = True
+        self.run_worker(self._backfill_history(dialog_id), group="history-backfill", exclusive=False)
+
+    async def _backfill_history(self, dialog_id: int) -> None:
+        """Fetch and PREPEND the next older page of history, preserving the scroll position (#187).
+
+        The offset_id is the oldest currently-loaded message id; the client returns the page ending
+        just before it (chronological). We mount the older bubbles at the TOP and nudge the scroll so
+        the message the user was reading stays put instead of jumping. An empty page → this dialog
+        has no more history (marked exhausted). Bails if the user switched dialogs mid-fetch.
+        """
+        offset_id = self._oldest_message_id
+        try:
+            older = await self._client.history(dialog_id, limit=50, offset_id=offset_id)
+        except Exception:
+            logger.exception("history backfill failed (dialog %s, offset %s)", dialog_id, offset_id)
+            self._backfilling = False
+            return
+        # the user may have switched dialogs during the await — don't mount into the wrong chat
+        if dialog_id != self._current:
+            self._backfilling = False
+            return
+        # only messages OLDER than what's already shown — dedup against the mounted set so an
+        # overlapping page (a real client can return the boundary id again) never double-mounts,
+        # and a page that's entirely already-shown means there's no genuinely-older history.
+        fresh = [m for m in older if m.id not in self._bubble_index]
+        if not fresh:
+            self._backfill_exhausted.add(dialog_id)
+            self._backfilling = False
+            return
+        pane = self.query_one("#messages", Vertical)
+        # anchor: remember where we were so the read position is preserved after prepending.
+        prev_scroll = pane.scroll_y
+        prev_max = pane.max_scroll_y
+        # build oldest-first, then mount BEFORE the existing rows so history grows upward.
+        bubbles = [self._message_bubble_for(m, dialog_id) for m in fresh]
+        existing = list(pane.children)
+        before = existing[0] if existing else None
+        await pane.mount(*(_wrap_bubble(b) for b in bubbles), before=before)
+        # keep the previously-top message in view: shift the viewport down by the height the newly
+        # prepended rows added (max_scroll_y delta), so the read position doesn't jump to the top.
+        added = pane.max_scroll_y - prev_max
+        pane.scroll_to(y=prev_scroll + added, animate=False, force=True)
+        self._oldest_message_id = fresh[0].id
+        if len(older) < 50:
+            self._backfill_exhausted.add(dialog_id)  # a short page → no more history
+        self._backfilling = False
 
     async def _translate_history_bubbles(self, dialog_id: int, messages) -> None:
         try:

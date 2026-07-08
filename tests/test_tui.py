@@ -742,6 +742,127 @@ class LongHistoryClient(TuiStubClient):
         ]
 
 
+class PaginatedHistoryClient(TuiStubClient):
+    """A two-page history: newest 50 (ids 51..100) first, then an older page (ids 1..50) via offset_id.
+
+    Mirrors the real client contract (chronological, oldest-first) so the #187 backfill can be
+    exercised end-to-end: the first _show_history load returns the newest window; a scroll-to-top
+    backfill passes offset_id=<oldest loaded> and gets the page just before it.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.history_calls = []
+
+    async def history(self, peer, limit=50, offset_id=0):
+        self.history_calls.append((peer, limit, offset_id))
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        def page(lo, hi):
+            return [Message(id=i, dialog_id=peer, sender_id=peer, out=False,
+                            text=f"msg {i}", date=date) for i in range(lo, hi)]
+
+        if not offset_id:
+            return page(51, 101)  # newest window: ids 51..100 (50 messages)
+        if offset_id == 51:
+            return page(1, 51)  # the older page just before id 51: ids 1..50 (50 messages)
+        return []  # nothing older than id 1
+
+
+async def test_tui_history_backfill_prepends_older_page_on_client_path():
+    # #187: scrolling to the top fetches the next OLDER page via client.history(offset_id=<oldest>)
+    # and prepends it, so earlier history is reachable (was hard-capped at the newest 50).
+    stub = PaginatedHistoryClient()
+    app = MessengerTUI(client=stub)  # no store → client path, backfill enabled
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        ids_before = sorted(b.message_id for b in app.query(MessageBubble))
+        assert ids_before == list(range(51, 101))  # only the newest window initially
+        assert app._oldest_message_id == 51
+        # simulate a scroll-to-top backfill
+        await app._backfill_history(7)
+        await pilot.pause()
+        ids_after = sorted(b.message_id for b in app.query(MessageBubble))
+        assert ids_after == list(range(1, 101))  # the older page is now prepended
+        assert app._oldest_message_id == 1
+        # the older fetch used the oldest previously-loaded id as offset_id
+        assert (7, 50, 51) in stub.history_calls
+
+
+async def test_tui_history_backfill_triggered_by_scroll_up_at_top():
+    # #187: a real mouse-wheel-up at the top edge of #messages triggers the backfill (the wiring,
+    # not just the coroutine). Uses a MouseScrollUp event on the pane.
+    from textual import events
+
+    stub = PaginatedHistoryClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        pane = app.query_one("#messages")
+        pane.scroll_to(y=0, animate=False, force=True)  # user is at the top
+        await pilot.pause()
+        # synthesize a wheel-up on the pane (widget, x, y, delta_x, delta_y, button, shift, meta, ctrl)
+        pane._on_mouse_scroll_up(
+            events.MouseScrollUp(pane, 0, 0, 0, -1, 0, False, False, False)
+        )
+        for _ in range(10):
+            await pilot.pause()
+            if any(b.message_id == 1 for b in app.query(MessageBubble)):
+                break
+        ids = sorted(b.message_id for b in app.query(MessageBubble))
+        assert ids == list(range(1, 101))  # older page pulled in by the scroll gesture
+
+
+async def test_tui_history_backfill_stops_when_no_older_page():
+    # #187: an empty older page marks the dialog exhausted so we don't keep re-fetching nothing.
+    stub = PaginatedHistoryClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await app._backfill_history(7)  # loads ids 1..50 (oldest becomes 1)
+        await pilot.pause()
+        assert app._oldest_message_id == 1
+        await app._backfill_history(7)  # offset_id=1 → empty → exhausted, no change
+        await pilot.pause()
+        assert 7 in app._backfill_exhausted
+        # _maybe_backfill_history is now a no-op (exhausted) — no further history call is scheduled
+        calls_before = len(stub.history_calls)
+        app._maybe_backfill_history()
+        await pilot.pause()
+        assert len(stub.history_calls) == calls_before
+
+
+async def test_tui_history_backfill_disabled_with_store():
+    # #187 constraint: MessageStore.history has no offset_id, so backfill is client-only. With a
+    # store wired, _maybe_backfill_history must be a no-op (no attempt to page the store).
+    store = TuiSourceStore()
+    calls = []
+    orig = store.history
+
+    async def counting_history(peer, limit=50):
+        calls.append((peer, limit))
+        return await orig(peer, limit=limit)
+
+    store.history = counting_history  # type: ignore[method-assign]
+    app = MessengerTUI(client=TuiStubClient(), store=store)
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        app._oldest_message_id = 1  # pretend a page is loaded
+        calls_before = len(calls)
+        app._maybe_backfill_history()  # must NOT schedule a store fetch
+        await pilot.pause()
+        assert len(calls) == calls_before  # store was never paged for backfill
+
+
 async def test_tui_history_scrolls_to_newest_message():
     app = MessengerTUI(client=LongHistoryClient())
     async with app.run_test(size=(80, 20)) as pilot:
