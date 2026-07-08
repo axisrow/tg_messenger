@@ -795,7 +795,7 @@ def test_chat_outbound_picker_uses_english_strings(runner, monkeypatch):
     # #187: the picker prompt/labels are English like the rest of the CLI, not Russian
     r, stub = runner
     stub.listen_interrupt = False
-    coord = _patch_coordinator(
+    _patch_coordinator(
         monkeypatch, _PrepareResult(status="ready", variants=["hi", "hello"], token="tok")
     )
     result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n2\n")
@@ -2286,17 +2286,17 @@ def test_unexpected_error_empty_message_falls_back_to_class_name(runner, monkeyp
     # "Unexpected error:  — details logged…" (looks broken); use the class name.
     r, stub = runner
 
-    class Silent(Exception):
+    class SilentError(Exception):
         pass
 
     async def boom(dm_only=True):
-        raise Silent()  # str(Silent()) == ""
+        raise SilentError()  # str(SilentError()) == ""
 
     monkeypatch.setattr(stub, "dialogs", boom)
     result = r.invoke(cli_main.cli, ["dialogs"])
     assert result.exit_code != 0
     assert "Unexpected error" in result.output
-    assert "Silent" in result.output  # class name surfaced, not a dangling colon
+    assert "SilentError" in result.output  # class name surfaced, not a dangling colon
     assert "Unexpected error:  —" not in result.output
 
 
@@ -2862,7 +2862,7 @@ def test_profiles_remove_missing_errors(monkeypatch, tmp_path):
 
 def test_profiles_remove_prints_recovery_hint(monkeypatch, tmp_path):
     # #187: after removing a profile, remind that recovery needs a fresh phone login
-    store = _profile_store(monkeypatch, tmp_path, "dead")
+    _profile_store(monkeypatch, tmp_path, "dead")
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: None)
     result = CliRunner().invoke(cli_main.cli, ["profiles", "remove", "dead", "--yes"])
     assert result.exit_code == 0, result.output
