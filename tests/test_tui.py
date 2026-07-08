@@ -793,8 +793,9 @@ async def test_tui_history_backfill_prepends_older_page_on_client_path():
 
 
 async def test_tui_history_backfill_triggered_by_scroll_up_at_top():
-    # #187: a real mouse-wheel-up at the top edge of #messages triggers the backfill (the wiring,
-    # not just the coroutine). Uses a MouseScrollUp event on the pane.
+    # #187: a real mouse-wheel-up at the top edge of #messages triggers the backfill (the WIRING).
+    # We spy on _maybe_backfill_history so the assertion doesn't race the fire-and-forget worker —
+    # the fetch/prepend itself is covered deterministically by the direct _backfill_history tests.
     from textual import events
 
     stub = PaginatedHistoryClient()
@@ -807,16 +808,17 @@ async def test_tui_history_backfill_triggered_by_scroll_up_at_top():
         pane = app.query_one("#messages")
         pane.scroll_to(y=0, animate=False, force=True)  # user is at the top
         await pilot.pause()
-        # synthesize a wheel-up on the pane (widget, x, y, delta_x, delta_y, button, shift, meta, ctrl)
+        calls = []
+
+        def spy():
+            calls.append(1)
+
+        app._maybe_backfill_history = spy  # type: ignore[method-assign]
+        # a wheel-up ABOVE the top (widget, x, y, delta_x, delta_y, button, shift, meta, ctrl)
         pane._on_mouse_scroll_up(
             events.MouseScrollUp(pane, 0, 0, 0, -1, 0, False, False, False)
         )
-        for _ in range(10):
-            await pilot.pause()
-            if any(b.message_id == 1 for b in app.query(MessageBubble)):
-                break
-        ids = sorted(b.message_id for b in app.query(MessageBubble))
-        assert ids == list(range(1, 101))  # older page pulled in by the scroll gesture
+        assert calls  # the top-edge scroll gesture asked the app to backfill (the wiring)
 
 
 async def test_tui_history_backfill_stops_when_no_older_page():
@@ -1735,14 +1737,15 @@ async def test_tui_has_all_tab_active_by_default():
         await pilot.pause()
         tabs = app.query_one(Tabs)
         assert tabs.active == "all"
+        # #187: labels shortened to clip less in the 32-col sidebar (ids unchanged)
         assert [tab.label.plain for tab in tabs.query("Tab")] == [
             "Все",
             "Контакты",
-            "Не контакты",
-            "Группы/супер",
+            "Не конт.",
+            "Группы",
             "Каналы",
             "Боты",
-            "Непрочитанные",
+            "Непроч.",
             "Архив",
         ]
         assert _listed_ids(app) == [7, 8, -100200, -100300, 9]

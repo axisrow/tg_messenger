@@ -277,7 +277,11 @@ class TranslateSettingsCard(Vertical):
         (build_translator_with_probe does cache the per-model structured-output method in kv; that is
         a harmless detection cache keyed by model name, not the model override or any translation.)
         """
-        self.notify("Проверяю модель…")
+        # #187: "Сохраняю модель…", not "Проверяю модель…" — the probe only checks structured-output
+        # SUPPORT, not credentials (an invalid key surfaces on the first real translation). "Проверяю"
+        # over-promised a validation that doesn't happen; the success toast already says to check the
+        # translation in the chat.
+        self.notify("Сохраняю модель…")
         try:
             from tg_messenger.agent.factory import build_translator_with_probe
             from tg_messenger.agent.translate import translate_model_from_env
@@ -488,6 +492,15 @@ class AccountsScreen(ModalScreen[object]):
             self.run_worker(self.query_one(TranslateSettingsCard)._load(), exclusive=False)
         if self._suggester is not None:
             self.run_worker(self.query_one(SuggestSettingsCard)._load(), exclusive=False)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        # #187: selecting a profile in the accounts list looked like it would switch accounts, but
+        # did nothing (a dead end). In-session switching needs a full deps rebuild + reconnect, so
+        # give explicit feedback pointing at the real path (restart) instead of silence. The active
+        # profile is a no-op; add/remove use their own key bindings, not selection.
+        item = event.item
+        if isinstance(item, AccountItem) and item.profile != self._active:
+            self.notify(f"Переключение на «{item.profile}»: перезапустите приложение")
 
     def on_translate_settings_card_model_changed(
         self, event: "TranslateSettingsCard.ModelChanged"

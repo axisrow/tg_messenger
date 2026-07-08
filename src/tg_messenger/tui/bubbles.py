@@ -34,7 +34,9 @@ class MessageBubble(Static):
         # #124-r2: "x" is a synonym for "r" (both open the reaction picker); Space jumps to the
         # last/first message (toggle) — the same edge-jump as the dialog list. Space is NOT a
         # reaction key (Static binds nothing to it by default, so it's free for navigation).
-        Binding("r,x", "react", "React", show=False),
+        # #187: show=True so "React" surfaces in the Footer while a bubble is focused (was hidden,
+        # discoverable only via F1). A contextual binding shows only when its widget holds focus.
+        Binding("r,x", "react", "Реакция", show=True),
         Binding("space", "jump_edge", "Top/bottom", show=False),
     ]
 

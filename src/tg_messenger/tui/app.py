@@ -90,6 +90,10 @@ logger = logging.getLogger(__name__)
 # undocumented anywhere in the UI.
 COMPOSER_PLACEHOLDER = "Сообщение…  (@файл — отправить файл)"
 
+# #187: the empty-state hint shown in #messages before any dialog is opened (was a blank void).
+# Removed on the first _show_history (which clears the pane). The sidebar/Footer hints stay visible.
+EMPTY_MESSAGES_HINT = "Выберите диалог слева · → открыть · F1 справка"
+
 # #187: shown in the persistent #connection-status banner while a drain worker is down and
 # reconnecting with backoff — so a dead live-feed is visible and self-heals instead of silently
 # stopping. Hidden again once the listener yields its next event.
@@ -188,7 +192,10 @@ class MessengerTUI(App):
        and its inner Static to the full list width makes Textual paint the whole row regardless of
        the per-glyph width disagreement — without touching the (load-bearing) combining marks. */
     #dialogs > DialogItem { width: 1fr; }
-    #dialogs > DialogItem > Static { width: 1fr; }
+    /* #187: pin each dialog row to a single line — a long title + marked id used to wrap to 2-3
+       lines and detach the (unread) badge. no-wrap + ellipsis truncates the overflow instead. */
+    #dialogs > DialogItem { height: 1; }
+    #dialogs > DialogItem > Static { width: 1fr; height: 1; text-overflow: ellipsis; }
     /* #124: focus indicator — the pane holding focus gets an accent border so "where am I" is
        always visible. :focus-within styles a container while any descendant (search/tabs/list/
        bubble/composer) is focused. Keeps the sidebar's existing right border; the chat's left
@@ -256,6 +263,8 @@ class MessengerTUI(App):
     /* #187: the persistent "connection lost" banner. Starts hidden; _set_connection_lost flips it
        on when a listener dies and off once it reconnects. $warning so it reads as a live problem. */
     #connection-status { color: $warning; height: auto; padding: 0 1; display: none; }
+    /* #187: the empty-state hint in #messages before a dialog is opened — dim, centered. */
+    #messages-empty { width: 1fr; height: 1fr; color: $text-muted; content-align: center middle; }
     #composer { dock: bottom; }
     /* #116: shared modal card — a centered, bordered, width-capped box (was full-width, top-left,
        unframed). Centering (align: center middle) lives on each ModalScreen's DEFAULT_CSS so it is
@@ -507,21 +516,29 @@ class MessengerTUI(App):
         with Horizontal():
             with Vertical(id="sidebar"):
                 yield SearchInput(placeholder="Поиск…", id="search")
+                # #187: shorter labels so the 8 tabs clip less in the 32-col sidebar ("Группы/супер"
+                # → "Группы", "Не контакты" → "Не конт.", "Непрочитанные" → "Непроч."). The ids are
+                # unchanged (the tab logic keys off ids, not labels).
                 yield SidebarTabs(
                     Tab("Все", id="all"),
                     Tab("Контакты", id="contacts"),
-                    Tab("Не контакты", id="non_contacts"),
-                    Tab("Группы/супер", id="groups"),
+                    Tab("Не конт.", id="non_contacts"),
+                    Tab("Группы", id="groups"),
                     Tab("Каналы", id="channels"),
                     Tab("Боты", id="bots"),
-                    Tab("Непрочитанные", id="unread"),
+                    Tab("Непроч.", id="unread"),
                     Tab("Архив", id="archive"),
                     id="tabs",
                 )
                 yield DialogListView(id="dialogs")
             with Vertical(id="chat"):
                 # #187: MessagesPane (a Vertical) detects scroll-to-top to trigger history backfill.
-                yield MessagesPane(id="messages")
+                # It opens with an empty-state hint (removed on the first _show_history) so the pane
+                # isn't a blank void before a dialog is picked.
+                yield MessagesPane(
+                    Static(EMPTY_MESSAGES_HINT, id="messages-empty", markup=False),
+                    id="messages",
+                )
                 # #187: a persistent "connection lost" banner (hidden until a listener dies). Docked
                 # above the suggestion strip; _set_connection_lost toggles its visibility.
                 yield Static(CONNECTION_LOST_TEXT, id="connection-status", markup=False)
@@ -1411,6 +1428,16 @@ class MessengerTUI(App):
             # live echo is rendered by the `_drain_outgoing` fallback on return, instead of the
             # message staying invisible until a manual reopen.
             self._sent_ids.pop((peer, msg.id), None)
+            self._notify_sent_elsewhere(peer)  # #187: confirm the cross-dialog send (parity w/ reactions)
+
+    def _notify_sent_elsewhere(self, peer: int) -> None:
+        """Confirm a send that landed in a dialog the user has navigated away from (#187).
+
+        Mirrors the cross-dialog REACTION toast (#105): without a bubble in the open pane there was
+        no feedback that the message went out. Title is best-effort from the loaded list.
+        """
+        title = self._dialog_title(peer)
+        self.notify(f"Отправлено в {title}" if title else "Сообщение отправлено")
 
     async def _send_media(
         self, peer: int, path: str, caption: str | None, source_text: str | None = None,
@@ -1441,6 +1468,7 @@ class MessengerTUI(App):
         else:
             # #160: navigated away → no bubble; un-arm so `_drain_outgoing` renders the live echo.
             self._sent_ids.pop((peer, msg.id), None)
+            self._notify_sent_elsewhere(peer)  # #187: confirm the cross-dialog media send
 
     async def _react_from_bubble(self, peer: int, message_id: int) -> None:
         # #93: the "r" hotkey path — open the 4-emoji picker, then send. No composer text
@@ -1818,7 +1846,13 @@ class MessengerTUI(App):
             self.notify("Переводчик не настроен", severity="warning")
             return
         self._auto_translate = not self._auto_translate
-        self.notify(f"Авто-перевод {'включён' if self._auto_translate else 'выключен'}")
+        # #187: when turning ON with a chat open we ALSO re-translate that chat below, so say so —
+        # the bare "включён" gave no sign the visible pass was starting. Turning off / no open chat
+        # keeps the plain toast.
+        if self._auto_translate and self._current is not None:
+            self.notify("Авто-перевод включён — перевожу чат…")
+        else:
+            self.notify(f"Авто-перевод {'включён' if self._auto_translate else 'выключен'}")
         self.run_worker(
             self._persist_auto_translate(self._auto_translate),
             group="translate-pref",
