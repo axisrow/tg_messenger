@@ -46,6 +46,13 @@ MESSAGE_STORE_MIGRATIONS = [
 ]
 MESSAGE_STORE_PEER_STATE_MAX = 1000
 
+# the column order _row_to_message expects; shared by every message SELECT
+_SELECT_MESSAGE = (
+    "SELECT dialog_id, id, sender_id, out, date, text, media, reply_to_id, "
+    "is_forward, translated_text, sender_username, sender_first_name, sender_last_name "
+    "FROM messages"
+)
+
 
 def register_message_store_migrations(storage) -> None:
     """Register message-cache tables on ``storage`` before ``connect()``."""
@@ -90,12 +97,21 @@ class MessageStore:
                 await self._storage.close()
                 self._connected = False
 
-    async def history(self, peer: int, limit: int = 50) -> list[Message]:
-        """Sync newer messages when stale, then serve the contiguous DB window."""
+    async def history(self, peer: int, limit: int = 50, offset_id: int = 0) -> list[Message]:
+        """Sync newer messages when stale, then serve the contiguous DB window.
+
+        ``offset_id`` (#200) switches to older-page mode: return up to ``limit`` messages
+        strictly older than that id (chronological), fetching from the client only when the
+        contiguous window doesn't already cover them — the store-backed TUI backfill path.
+        """
         await self.connect()
         peer = int(peer)
         limit = int(limit)
+        offset_id = int(offset_id)
         lock = self._peer_lock(peer)
+        if offset_id > 0:
+            async with lock:
+                return await self._history_before(peer, limit, offset_id)
         async with lock:
             row = await self._sync_row(peer)
             if (
@@ -285,6 +301,34 @@ class MessageStore:
         await self._replace_window(peer, fetched, limit)
         self._remember_sync(peer)
 
+    async def _history_before(self, peer: int, limit: int, offset_id: int) -> list[Message]:
+        """The page of up to ``limit`` messages strictly older than ``offset_id`` (#200).
+
+        Serves from the DB when the contiguous window already covers ``limit`` rows below
+        ``offset_id`` — or reaches the start of history (``low_id == 0``), where a short page
+        is the honest answer. Otherwise fetches the older page from the client, persists it,
+        and absorbs it into the window's low edge — but only when the page connects to the
+        window (``offset_id`` inside it), so contiguity is never fabricated across a gap.
+        """
+        row = await self._sync_row(peer)
+        if row is not None:
+            low_id = int(row[0])
+            if low_id == 0 or low_id < offset_id:
+                cached = await self._load_before(peer, limit, offset_id, low_id)
+                if low_id == 0 or len(cached) >= limit:
+                    return cached
+        fetched = await self._client.history(peer, limit=limit, offset_id=offset_id)
+        for message in fetched:
+            await self._upsert_message(message)
+        if row is not None and offset_id <= int(row[1]):
+            # The fetched page ends just below offset_id, which is inside the window — the
+            # union stays contiguous. A short page means nothing older exists: the window
+            # now reaches the start of history (low_id = 0, the _replace_window convention).
+            new_low = 0 if len(fetched) < limit else min(int(m.id) for m in fetched)
+            if new_low < int(row[0]):
+                await self._set_sync_row(peer, new_low, int(row[1]))
+        return fetched
+
     async def _replace_window(self, peer: int, fetched: list[Message], limit: int) -> tuple[int, int]:
         if not fetched:
             await self._storage.execute("DELETE FROM messages WHERE dialog_id = ?", (int(peer),))
@@ -334,10 +378,18 @@ class MessageStore:
             return []
         low_id, high_id = int(row[0]), int(row[1])
         rows = await self._storage.fetchall(
-            "SELECT dialog_id, id, sender_id, out, date, text, media, reply_to_id, "
-            "is_forward, translated_text, sender_username, sender_first_name, sender_last_name "
-            "FROM messages WHERE dialog_id = ? AND id >= ? AND id <= ? ORDER BY id DESC LIMIT ?",
+            f"{_SELECT_MESSAGE} WHERE dialog_id = ? AND id >= ? AND id <= ? "
+            "ORDER BY id DESC LIMIT ?",
             (int(peer), low_id, high_id, int(limit)),
+        )
+        return [self._row_to_message(r) for r in reversed(rows)]
+
+    async def _load_before(self, peer: int, limit: int, offset_id: int, low_id: int) -> list[Message]:
+        """The newest ``limit`` stored rows below ``offset_id``, bounded by the window's low edge."""
+        rows = await self._storage.fetchall(
+            f"{_SELECT_MESSAGE} WHERE dialog_id = ? AND id >= ? AND id < ? "
+            "ORDER BY id DESC LIMIT ?",
+            (int(peer), int(low_id), int(offset_id), int(limit)),
         )
         return [self._row_to_message(r) for r in reversed(rows)]
 
