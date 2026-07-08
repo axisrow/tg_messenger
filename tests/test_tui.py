@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 
@@ -33,11 +34,67 @@ from tg_messenger.tui.app import (
     SuggestSettingsCard,
     TranslateSettingsCard,
     VariantItem,
+    _format_timestamp,
     _terminal_safe_display_text,
     parse_lang_command,
     parse_media_command,
     parse_tlang_command,
 )
+
+# #187: bubbles built via _message_bubble_for now carry a trailing compact timestamp
+# ("  HH:MM" today, "  DD.MM HH:MM" older) that is local-time and so not fixed across CI zones.
+# Content-equality assertions strip it so they keep testing author/body, not the wall clock.
+_TS_SUFFIX = re.compile(r"  (?:\d{2}\.\d{2} )?\d{2}:\d{2}$")
+
+
+def _body_without_ts(rendered: str) -> str:
+    """The bubble's rendered text with the trailing #187 timestamp segment removed (last line)."""
+    head, sep, last = rendered.rpartition("\n")
+    stripped = _TS_SUFFIX.sub("", last)
+    return f"{head}{sep}{stripped}"
+
+
+def test_tui_bubble_timestamp_stripper_helper():
+    # sanity for the test helper itself: it removes the trailing time on the LAST line only.
+    assert _body_without_ts("[1] hi  09:41") == "[1] hi"
+    assert _body_without_ts("9\n[21] hey  01.01 08:00") == "9\n[21] hey"
+    assert _body_without_ts("[1] hi\n↳ tr\n👍") == "[1] hi\n↳ tr\n👍"  # no ts → unchanged
+
+
+def test_tui_format_timestamp_today_and_older():
+    # #187: HH:MM when the message is from today (relative to `now`), else DD.MM HH:MM. Both sides
+    # are compared in the SAME local zone; a fixed `now` makes the today/older split deterministic.
+    tz = timezone(timedelta(hours=3))  # a fixed offset so the test is zone-independent
+    now = datetime(2026, 7, 8, 15, 0, tzinfo=tz)
+    same_day = datetime(2026, 7, 8, 9, 41, tzinfo=tz)
+    older = datetime(2026, 6, 12, 22, 3, tzinfo=tz)
+    assert _format_timestamp(same_day, now=now) == "09:41"
+    assert _format_timestamp(older, now=now) == "12.06 22:03"
+
+
+async def test_tui_bubble_renders_timestamp_dim():
+    # #187: a bubble built via _message_bubble_for carries a compact time, dim, after the body.
+    from rich.text import Text
+
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        msg = Message(id=1, dialog_id=7, sender_id=7, out=False, text="hi",
+                      date=datetime(2024, 1, 1, 10, 30, tzinfo=timezone.utc))
+        bubble = app._message_bubble_for(msg, 7)
+        rendered = str(bubble.render())
+        # the body is intact and a time segment trails it on the same (last) line
+        assert rendered.startswith("[1] hi")
+        assert _TS_SUFFIX.search(rendered.splitlines()[-1]) is not None
+        # the trailing time segment carries the "dim" style (not plain body text)
+        content = bubble._build()
+        assert isinstance(content, Text)
+        dim_segments = [
+            content.plain[s.start:s.end] for s in content.spans if "dim" in str(s.style)
+        ]
+        assert any(":" in seg for seg in dim_segments)  # the HH:MM time is a dim span
+
 
 
 def test_parse_media_simple():
@@ -513,7 +570,18 @@ async def test_tui_writable_dialog_enables_composer():
         await pilot.pause()
         composer = app.query_one("#composer", Input)
         assert composer.disabled is False
-        assert composer.placeholder == "Message…"
+        # #187: the writable placeholder hints the @file media send (previously undocumented)
+        assert composer.placeholder.startswith("Сообщение")
+        assert "@" in composer.placeholder
+
+
+def test_tui_help_text_documents_media_send():
+    # #187: sending a file (@path [caption]) was undocumented — no button, no picker, nothing in
+    # the help. It must now appear in HELP_TEXT next to /lang and /tlang.
+    from tg_messenger.tui.app import HELP_TEXT
+
+    assert "@путь" in HELP_TEXT
+    assert "отправить файл" in HELP_TEXT
 
 
 async def test_tui_submit_in_readonly_channel_does_not_send():
@@ -527,6 +595,43 @@ async def test_tui_submit_in_readonly_channel_does_not_send():
         await app.on_input_submitted(Input.Submitted(composer, "hello"))
         await pilot.pause()
         assert stub.sent == []  # the guard refused before any send worker
+
+
+async def test_tui_unknown_slash_command_is_not_sent_as_text():
+    # #187: a leading-/ input that matches no command (/lang, /tlang) is a command TYPO — it must
+    # NOT be sent verbatim to the contact (an irreversible wrong send). Surface an error and KEEP
+    # the draft so the user can fix or delete it.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    notifications = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.notify = lambda message, **kw: notifications.append((message, kw))  # type: ignore[method-assign]
+        app._current = 7  # a writable DM
+        composer = app.query_one("#composer", Input)
+        composer.value = "/help"
+        await app.on_input_submitted(Input.Submitted(composer, "/help"))
+        await pilot.pause()
+        assert stub.sent == []  # nothing went out to the contact
+        assert composer.value == "/help"  # draft preserved (not optimistically cleared)
+        assert app._compose_state_for(7).draft == "/help"
+        assert notifications and notifications[-1][1].get("severity") == "error"
+
+
+async def test_tui_leading_slash_content_still_reaches_known_commands():
+    # The guard must not swallow the real commands: /lang and /tlang still route to their handlers.
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        composer.value = "/tlang en"
+        await app.on_input_submitted(Input.Submitted(composer, "/tlang en"))
+        await pilot.pause()
+        assert stub.sent == []  # a command, not a message
+        # /tlang cleared the composer (optimistic clear on a recognised command)
+        assert composer.value == ""
 
 
 async def test_tui_react_in_readonly_channel_sends():
@@ -633,6 +738,120 @@ class LongHistoryClient(TuiStubClient):
             Message(id=i, dialog_id=peer, sender_id=peer, out=False, text=f"msg {i}", date=date)
             for i in range(1, 80)
         ]
+
+
+class PaginatedHistoryClient(TuiStubClient):
+    """A two-page history: newest 50 (ids 51..100) first, then an older page (ids 1..50) via offset_id.
+
+    Mirrors the real client contract (chronological, oldest-first) so the #187 backfill can be
+    exercised end-to-end: the first _show_history load returns the newest window; a scroll-to-top
+    backfill passes offset_id=<oldest loaded> and gets the page just before it.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.history_calls = []
+
+    async def history(self, peer, limit=50, offset_id=0):
+        self.history_calls.append((peer, limit, offset_id))
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        def page(lo, hi):
+            return [Message(id=i, dialog_id=peer, sender_id=peer, out=False,
+                            text=f"msg {i}", date=date) for i in range(lo, hi)]
+
+        if not offset_id:
+            return page(51, 101)  # newest window: ids 51..100 (50 messages)
+        if offset_id == 51:
+            return page(1, 51)  # the older page just before id 51: ids 1..50 (50 messages)
+        return []  # nothing older than id 1
+
+
+async def test_tui_history_backfill_prepends_older_page_on_client_path():
+    # #187: scrolling to the top fetches the next OLDER page via client.history(offset_id=<oldest>)
+    # and prepends it, so earlier history is reachable (was hard-capped at the newest 50).
+    stub = PaginatedHistoryClient()
+    app = MessengerTUI(client=stub)  # no store → client path, backfill enabled
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        ids_before = sorted(b.message_id for b in app.query(MessageBubble))
+        assert ids_before == list(range(51, 101))  # only the newest window initially
+        assert app._oldest_message_id == 51
+        # simulate a scroll-to-top backfill
+        await app._backfill_history(7)
+        await pilot.pause()
+        ids_after = sorted(b.message_id for b in app.query(MessageBubble))
+        assert ids_after == list(range(1, 101))  # the older page is now prepended
+        assert app._oldest_message_id == 1
+        # the older fetch used the oldest previously-loaded id as offset_id
+        assert (7, 50, 51) in stub.history_calls
+
+
+async def test_tui_history_backfill_triggered_by_scroll_up_at_top():
+    # #187: a mouse-wheel-up AT THE TOP of #messages triggers the backfill (the WIRING). We spy on
+    # _maybe_backfill_history and fire the wheel event while the pane is at its top edge (an empty
+    # pane has scroll_y == 0), so the check is deterministic; the fetch/prepend itself is covered by
+    # the direct _backfill_history tests. A wheel-up NOT at the top must NOT trigger a backfill.
+    from textual import events
+
+    stub = PaginatedHistoryClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        pane = app.query_one("#messages")
+        assert pane.scroll_y == 0  # nothing loaded yet → at the top
+        calls = []
+        app._maybe_backfill_history = lambda: calls.append(1)  # type: ignore[method-assign]
+        wheel = events.MouseScrollUp(pane, 0, 0, 0, -1, 0, False, False, False)
+        pane._on_mouse_scroll_up(wheel)
+        assert calls  # a wheel-up at the top edge asked the app to backfill (the wiring)
+
+
+async def test_tui_history_backfill_stops_when_no_older_page():
+    # #187: an empty older page marks the dialog exhausted so we don't keep re-fetching nothing.
+    stub = PaginatedHistoryClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        await app._backfill_history(7)  # loads ids 1..50 (oldest becomes 1)
+        await pilot.pause()
+        assert app._oldest_message_id == 1
+        await app._backfill_history(7)  # offset_id=1 → empty → exhausted, no change
+        await pilot.pause()
+        assert 7 in app._backfill_exhausted
+        # _maybe_backfill_history is now a no-op (exhausted) — no further history call is scheduled
+        calls_before = len(stub.history_calls)
+        app._maybe_backfill_history()
+        await pilot.pause()
+        assert len(stub.history_calls) == calls_before
+
+
+async def test_tui_history_backfill_disabled_with_store():
+    # #187 constraint: MessageStore.history has no offset_id, so backfill is client-only. With a
+    # store wired, _maybe_backfill_history must be a no-op (no attempt to page the store).
+    store = TuiSourceStore()
+    calls = []
+    orig = store.history
+
+    async def counting_history(peer, limit=50):
+        calls.append((peer, limit))
+        return await orig(peer, limit=limit)
+
+    store.history = counting_history  # type: ignore[method-assign]
+    app = MessengerTUI(client=TuiStubClient(), store=store)
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        app._oldest_message_id = 1  # pretend a page is loaded
+        calls_before = len(calls)
+        app._maybe_backfill_history()  # must NOT schedule a store fetch
+        await pilot.pause()
+        assert len(calls) == calls_before  # store was never paged for backfill
 
 
 async def test_tui_history_scrolls_to_newest_message():
@@ -1242,13 +1461,59 @@ async def test_tui_listener_failure_logged_app_stays_alive(caplog):
         yield  # pragma: no cover
 
     stub.listen_all = broken_listen
-    app = MessengerTUI(client=stub)
+    # #187: a huge retry base so the wrapper errors once, shows the banner, then parks in sleep for
+    # the whole (short) test — no busy reconnect loop, and the banner stays up to be observed.
+    app = MessengerTUI(client=stub, listener_retry_base=1000.0)
     with caplog.at_level("ERROR", logger="tg_messenger.tui.app"):
         async with app.run_test() as pilot:
+            await _pause_until(pilot, lambda: app._started)
             await pilot.pause()
             assert app.return_code is None  # worker died, app did not
+            # #187: the dead feed is now VISIBLE (persistent banner), not silent
+            banner = app.query_one("#connection-status", Static)
+            await _pause_until(pilot, lambda: banner.display)
+            assert banner.display
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert errors and errors[0].exc_info is not None
+
+
+class FlakyListenerClient(TuiStubClient):
+    """listen_all raises on the FIRST connect, then (on reconnect) yields one event (#187)."""
+
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    async def listen_all(self):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("first connect died")
+        yield IncomingEvent(dialog_id=7, message=Message(
+            id=42, dialog_id=7, sender_id=7, out=False, text="recovered",
+            date=datetime(2024, 1, 2, tzinfo=timezone.utc)))
+        await asyncio.Event().wait()
+
+
+async def test_tui_listener_reconnects_and_clears_banner():
+    # #187: a listener failure surfaces the banner AND auto-retries with backoff; on the successful
+    # reconnect the banner clears and live events flow again — the feed self-heals.
+    #
+    # `banner cleared` alone proves the feed resumed: the banner only turns OFF via _mark_connected,
+    # which fires solely when a live event is actually received. So `attempts >= 2` (reconnected)
+    # + banner cleared is a faithful "resumed" assertion, without a racy dependence on _current /
+    # the bubble mount (the tiny test backoff can deliver the recovery event before _current is set).
+    stub = FlakyListenerClient()
+    app = MessengerTUI(client=stub, listener_retry_base=0.01, listener_retry_max=0.01)
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        banner = app.query_one("#connection-status", Static)
+        for _ in range(50):
+            await asyncio.sleep(0.02)  # let the 0.01s backoff sleep fire and the reconnect run
+            await pilot.pause()
+            if stub.attempts >= 2 and banner.display is False:
+                break
+        assert stub.attempts >= 2  # retried after the first failure
+        assert banner.display is False  # a live event flowed post-reconnect → banner cleared
 
 
 class EagerSensitiveClient(TuiStubClient):
@@ -1461,14 +1726,15 @@ async def test_tui_has_all_tab_active_by_default():
         await pilot.pause()
         tabs = app.query_one(Tabs)
         assert tabs.active == "all"
+        # #187: labels shortened to clip less in the 32-col sidebar (ids unchanged)
         assert [tab.label.plain for tab in tabs.query("Tab")] == [
             "Все",
             "Контакты",
-            "Не контакты",
-            "Группы/супер",
+            "Не конт.",
+            "Группы",
             "Каналы",
             "Боты",
-            "Непрочитанные",
+            "Непроч.",
             "Архив",
         ]
         assert _listed_ids(app) == [7, 8, -100200, -100300, 9]
@@ -1847,7 +2113,7 @@ async def test_tui_group_incoming_appends_bubble_for_open_group_only():
         bubbles = list(app.query(MessageBubble))
         # ЛС-событие не дорисовано (чужой диалог), групповое — да.
         # #108: в группе у входящего сверху строка автора (sender=None → голый userid).
-        assert [str(b.render()) for b in bubbles] == ["9\n[21] из группы"]
+        assert [_body_without_ts(str(b.render())) for b in bubbles] == ["9\n[21] из группы"]
 
 
 class GroupSenderEventClient(TuiStubClient):
@@ -1876,7 +2142,84 @@ async def test_tui_group_incoming_shows_full_author_line():
         stub.fire.set()
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
-    assert [str(b.render()) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
+    assert [_body_without_ts(str(b.render())) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
+
+
+class LongHistoryEventClient(TuiStubClient):
+    """A long history plus a fire-gated incoming event, for the scroll-position tests (#187)."""
+
+    def __init__(self):
+        super().__init__()
+        self.fire = asyncio.Event()
+
+    async def history(self, peer, limit=50, offset_id=0):
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        return [
+            Message(id=i, dialog_id=peer, sender_id=peer, out=False, text=f"msg {i}", date=date)
+            for i in range(1, 80)
+        ]
+
+    async def listen_all(self):
+        await self.fire.wait()
+        yield IncomingEvent(dialog_id=7, message=Message(
+            id=500, dialog_id=7, sender_id=7, out=False, text="brand new",
+            date=datetime(2024, 1, 2, tzinfo=timezone.utc)))
+        await asyncio.Event().wait()
+
+
+async def _scroll_to_bottom(pilot, pane):
+    for _ in range(6):
+        await pilot.pause()
+        if pane.max_scroll_y > 0 and pane.scroll_y == pane.max_scroll_y:
+            return
+
+
+async def test_tui_incoming_does_not_force_scroll_while_reading_history():
+    # #187: if the user scrolled up to read old messages, a new incoming message must NOT yank the
+    # viewport to the bottom — reading would be impossible. Auto-scroll only when already at bottom.
+    stub = LongHistoryEventClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        pane = app.query_one("#messages")
+        await _scroll_to_bottom(pilot, pane)
+        assert pane.max_scroll_y > 0
+        # user scrolls up to read history
+        pane.scroll_to(y=0, animate=False, force=True)
+        await pilot.pause()
+        assert pane.scroll_y == 0
+        # a new message arrives while reading
+        stub.fire.set()
+        for _ in range(6):
+            await pilot.pause()
+            if any(b.message_id == 500 for b in app.query(MessageBubble)):
+                break
+        # the new bubble is mounted, but the viewport stayed put (not force-scrolled to bottom)
+        assert any(b.message_id == 500 for b in app.query(MessageBubble))
+        assert pane.scroll_y < pane.max_scroll_y  # did NOT jump to the newest
+
+
+async def test_tui_incoming_scrolls_when_user_at_bottom():
+    # The complement: if the user IS at the bottom, a new message DOES auto-scroll (the common case).
+    stub = LongHistoryEventClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await pilot.pause()
+        app._current = 7
+        await app._show_history(7)
+        pane = app.query_one("#messages")
+        await _scroll_to_bottom(pilot, pane)
+        assert pane.scroll_y == pane.max_scroll_y  # at the bottom
+        stub.fire.set()
+        for _ in range(8):
+            await pilot.pause()
+            if (any(b.message_id == 500 for b in app.query(MessageBubble))
+                    and pane.scroll_y == pane.max_scroll_y):
+                break
+        assert any(b.message_id == 500 for b in app.query(MessageBubble))
+        assert pane.scroll_y == pane.max_scroll_y  # followed the newest message
 
 
 async def test_tui_group_author_survives_tab_switch_dropping_dialog_from_list():
@@ -1898,7 +2241,7 @@ async def test_tui_group_author_survives_tab_switch_dropping_dialog_from_list():
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
     # the author line is still rendered, driven by the captured _current_kind
-    assert [str(b.render()) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
+    assert [_body_without_ts(str(b.render())) for b in bubbles] == ["9 @bob Bob Lee\n[21] привет"]
 
 
 async def test_tui_dm_incoming_has_no_author_line():
@@ -1954,7 +2297,7 @@ async def test_tui_bubble_author_line_is_dim():
         stub.fire.set()
         await pilot.pause()
         content = list(app.query(MessageBubble))[0].render()
-    assert str(content) == "9 @bob Bob Lee\n[21] привет"  # content parity (no behavior change)
+    assert _body_without_ts(str(content)) == "9 @bob Bob Lee\n[21] привет"  # content parity
     assert _has_dim_span(content, 0, len("9 @bob Bob Lee"))  # author line dimmed
 
 
@@ -2205,7 +2548,7 @@ async def test_tui_open_dialog_live_message_stays_read_and_marks_new_id():
         await pilot.pause()
         await pilot.pause()
         rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
-        bubbles = [str(b.render()) for b in app.query(MessageBubble)]
+        bubbles = [_body_without_ts(str(b.render())) for b in app.query(MessageBubble)]
     assert rendered == ["Bob  #8", "Ann  #7", "Devs  #-100200"]
     assert bubbles == ["[22] fresh"]
     assert stub.read_acks == [(8, 22)]
@@ -2261,7 +2604,7 @@ async def test_tui_outgoing_from_another_device_appends_out_bubble_for_open_dial
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
         # своё сообщение в открытый диалог дорисовано (out=True), в чужой — нет
-        assert [str(b.render()) for b in bubbles] == ["[30] с телефона"]
+        assert [_body_without_ts(str(b.render())) for b in bubbles] == ["[30] с телефона"]
         assert all("out" in b.classes for b in bubbles)
 
 
@@ -2332,7 +2675,7 @@ async def test_tui_own_send_is_not_duplicated_by_outgoing_echo():
         await app._send_text(7, "привет")  # оптимистичный пузырёк + запоминание id=2
         stub.fire.set()  # эхо того же id=2 приходит через listen_outgoing()
         await pilot.pause()
-        bubbles = [str(b.render()) for b in app.query(MessageBubble)]
+        bubbles = [_body_without_ts(str(b.render())) for b in app.query(MessageBubble)]
         # ровно один пузырёк, эхо не продублировало
         assert bubbles == ["[2] привет"]
 
@@ -2564,7 +2907,7 @@ async def test_tui_outgoing_does_not_skip_same_message_id_from_other_dialog():
         await app._send_text(9, "other")  # remembers (dialog=9, id=2), no bubble in dialog 7
         stub.fire.set()  # dialog 7 also has id=2; it must still render
         await pilot.pause()
-        bubbles = [str(b.render()) for b in app.query(MessageBubble)]
+        bubbles = [_body_without_ts(str(b.render())) for b in app.query(MessageBubble)]
         assert bubbles == ["[2] same id"]
 
 
@@ -4999,9 +5342,10 @@ async def test_tui_settings_all_three_fields_tab_reachable_in_every_mode():
                 assert fid in chain_ids, f"{fid} not Tab-reachable in mode {mode}"
 
 
-async def test_tui_settings_fields_have_persistent_border_titles():
-    # each field carries a PERSISTENT, fixed border_title caption (visible even with a value typed),
-    # not a placeholder that vanishes on input — the reported "can't tell which field is which".
+async def test_tui_settings_fields_have_caption_labels():
+    # #187: each field's caption is an ordinary Label (class field-caption) ABOVE the Input, not the
+    # nearly-unreadable border_title. The captions are always visible (a Label doesn't vanish on a
+    # typed value) and legible without per-id CSS — the reported "can't tell which field is which".
     store = FakeSessionStore(["alice"])
     translator = StubTranslator({"mode": "skip_known", "target": "ru", "known": ["en"], "unknown": []})
     app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
@@ -5012,22 +5356,22 @@ async def test_tui_settings_fields_have_persistent_border_titles():
         )
         app.push_screen(screen)
         await pilot.pause()
-        captions = {
-            "target-lang": "Мой язык (на что переводить)",
-            "known-langs": "Не переводить",
-            "unknown-langs": "Переводить (пусто = всё переводить)",
-        }
-        for fid, caption in captions.items():
-            field = screen.query_one(f"#{fid}", Input)
-            # styled legible (accent + bold), not the default grey blurred border
-            assert field.styles.border_title_color is not None
-            assert "bold" in str(field.styles.border_title_style)
-            assert str(field.border_title) == caption
-        # caption survives a typed value (the core of the fix)
+        caption_texts = {str(lbl.render()) for lbl in screen.query(".field-caption")}
+        for caption in (
+            "Мой язык (на что переводить)",
+            "Не переводить",
+            "Переводить (пусто = всё переводить)",
+            "Модель для перевода",
+            "Сколько переводить за раз (Ctrl+T)",
+        ):
+            assert caption in caption_texts
+        # caption survives a typed value (a Label is independent of the Input's content)
         target = screen.query_one("#target-lang", Input)
         target.value = "ru"
         await pilot.pause()
-        assert str(target.border_title) == "Мой язык (на что переводить)"
+        assert "Мой язык (на что переводить)" in {
+            str(lbl.render()) for lbl in screen.query(".field-caption")
+        }
 
 
 async def test_tui_settings_model_and_max_fields_present_and_loaded():
@@ -5047,8 +5391,10 @@ async def test_tui_settings_model_and_max_fields_present_and_loaded():
         max_field = screen.query_one("#translate-max", Input)
         assert model_field.value == "openai:glm-5.1"
         assert max_field.value == "250"
-        assert str(model_field.border_title) == "Модель для перевода"
-        assert str(max_field.border_title) == "Сколько переводить за раз (Ctrl+T)"
+        # #187: captions are Labels above the fields now (not border_title)
+        caption_texts = {str(lbl.render()) for lbl in screen.query(".field-caption")}
+        assert "Модель для перевода" in caption_texts
+        assert "Сколько переводить за раз (Ctrl+T)" in caption_texts
         # both Tab-reachable (never disabled — #133 discipline)
         chain_ids = [getattr(w, "id", None) for w in screen.focus_chain]
         assert "translate-model" in chain_ids and "translate-max" in chain_ids
@@ -5616,8 +5962,12 @@ async def test_tui_ctrl_g_blocked_by_nonempty_composer_points_at_escape():
 
 
 async def test_tui_escape_clears_composer_when_composer_focused():
-    # #156: Escape clears the composer when the composer is focused, so Ctrl+G has a clean field.
+    # #156/#187: Escape clears the composer when it's focused, so Ctrl+G has a clean field — but
+    # now in TWO steps (a reflexive single Escape no longer wipes the draft). The first Escape keeps
+    # the text and moves focus off the composer; the second (still focused, unedited) clears.
     app = MessengerTUI(client=TuiStubClient())
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
     async with app.run_test() as pilot:
         await _pause_until(pilot, lambda: app._started)
         app._current = 7
@@ -5625,9 +5975,41 @@ async def test_tui_escape_clears_composer_when_composer_focused():
         composer.value = "черновик"
         composer.focus()
         await pilot.pause()
-        app.action_clear_search()
+        app.action_clear_search()  # 1st Escape
         await pilot.pause()
-        assert composer.value == ""
+        assert composer.value == "черновик"  # draft NOT wiped on the reflexive first Escape
+        assert not composer.has_focus  # focus moved out of the composer
+        assert app._composer_escape_armed
+        assert any("Esc" in m for m in notes)  # told how to clear
+        composer.focus()  # user comes back and presses Escape again
+        await pilot.pause()
+        app.action_clear_search()  # 2nd Escape (armed, unedited)
+        await pilot.pause()
+        assert composer.value == ""  # now cleared
+        assert not app._composer_escape_armed
+
+
+async def test_tui_escape_disarms_after_composer_edit():
+    # #187: typing after the first Escape resets the two-step, so the NEXT single Escape doesn't
+    # clear — it re-arms. Protects a draft edited after a stray first Escape.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        app._current = 7
+        composer = app.query_one("#composer", Input)
+        composer.value = "draft"
+        composer.focus()
+        await pilot.pause()
+        app.action_clear_search()  # 1st Escape → armed
+        await pilot.pause()
+        assert app._composer_escape_armed
+        composer.focus()
+        composer.value = "draft edited"  # an edit disarms via on_input_changed
+        await pilot.pause()
+        assert not app._composer_escape_armed
+        app.action_clear_search()  # a single Escape again → arms, does NOT clear
+        await pilot.pause()
+        assert composer.value == "draft edited"  # preserved
 
 
 async def test_tui_escape_clearing_search_preserves_composer_draft():
@@ -5712,3 +6094,172 @@ async def test_tui_ctrl_g_notifies_on_empty_draft():
         await _pause_until(pilot, lambda: any("не предложил" in m for m in notes))
         assert app._pending_suggestion is None  # nothing pending on an empty draft
         assert str(app.query_one("#suggestion", Static).render()) == ""
+
+
+# --- #187 LOW-priority polish tests ---
+
+def test_tui_react_binding_shows_in_footer():
+    # #187 (L1): the r/x reaction binding is show=True so "Реакция" surfaces in the Footer while a
+    # message bubble is focused (was show=False → only discoverable via F1).
+    react = next(b for b in MessageBubble.BINDINGS if b.action == "react")
+    assert react.show is True
+    assert react.description  # has a Footer label
+
+
+async def test_tui_messages_empty_state_hint_shown_then_removed():
+    # #187 (L2): before any dialog is opened, #messages shows a "выберите диалог" hint (was a blank
+    # void); it's removed once a dialog's history loads.
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        hint = app.query("#messages-empty")
+        assert hint  # the empty-state hint is present at startup
+        assert "Выберите диалог" in str(hint.first().render())
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        assert not app.query("#messages-empty")  # gone once a chat is open
+
+
+async def test_tui_variant_picker_does_not_inline_whole_draft():
+    # #187 (L5): the "send original" row is a fixed label, not the whole draft inlined (which
+    # wrapped over many lines and duplicated the composer text).
+    from tg_messenger.tui.app import ORIGINAL_SENTINEL, VariantPickScreen
+
+    long_draft = "это очень длинное сообщение " * 10
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(VariantPickScreen(["привет", "hola"], long_draft))
+        await pilot.pause()
+        items = list(app.screen.query(VariantItem))
+        original = next(it for it in items if it.value == ORIGINAL_SENTINEL)
+        label = str(original.query_one(Static).render())
+        assert label == "Отправить оригинал"
+        assert long_draft not in label  # the draft is NOT inlined
+
+
+async def test_tui_login_phone_step_shows_sending_hint():
+    # #187 (L8): after submitting the phone number the prompt shows "Отправляю код…" while the
+    # network request is in flight (was frozen-looking).
+    from tg_messenger.core.auth import CodeDelivery
+    from tg_messenger.tui.app import LoginScreen
+
+    class BlockingLoginSession:
+        state = "phone"
+
+        def __init__(self):
+            self.gate = asyncio.Event()
+
+        async def submit_phone(self, phone):
+            await self.gate.wait()
+            return CodeDelivery(kind="app")
+
+    session = BlockingLoginSession()
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = LoginScreen(session)
+        app.push_screen(screen)
+        await pilot.pause()
+        inp = screen.query_one("#login-input", Input)
+        screen.on_input_submitted(Input.Submitted(inp, "+10000000000"))
+        await pilot.pause()
+        prompt = screen.query_one("#login-prompt", Label)
+        assert "Отправляю код" in str(prompt.render())  # in-flight feedback
+        session.gate.set()  # let it finish so teardown is clean
+        await pilot.pause()
+
+
+async def test_tui_cross_dialog_send_toasts():
+    # #187 (L10): a text send that lands in a dialog the user navigated away from confirms via a
+    # toast (was silent — no bubble in the open pane, no feedback).
+    stub = TuiStubClient()
+    app = MessengerTUI(client=stub)
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 8  # open dialog 8
+        await app._send_text(7, "hi")  # but send to dialog 7 (Ann)
+        await pilot.pause()
+        assert any("Отправлено в" in m for m in notes)
+
+
+async def test_tui_auto_translate_toast_enriched_with_open_chat():
+    # #187 (L14): turning auto-translate ON with a chat open also re-translates it, so the toast
+    # says "перевожу чат…" (was a bare "включён" with no sign the pass started).
+    class _Tr:
+        async def auto_enabled(self):
+            return None
+
+        async def set_auto_enabled(self, enabled):
+            pass
+
+        async def target_lang(self):
+            return "ru"
+
+        async def max_messages(self):
+            return 50
+
+        async def translate_history(self, dialog_id, messages):
+            return messages
+
+    app = MessengerTUI(client=TuiStubClient(), translator=_Tr())
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        app.action_toggle_auto_translate()
+        await pilot.pause()
+        assert any("перевожу чат" in m for m in notes)
+
+
+async def test_tui_profile_selection_toasts_restart_hint():
+    # #187 (L15): selecting a non-active profile in the settings list gives explicit feedback
+    # (in-session switch isn't supported) instead of silently doing nothing.
+    store = FakeSessionStore(["alice", "bob"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="alice", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        lv = screen.query_one("#accounts", ListView)
+        bob = next(it for it in screen.query(AccountItem) if it.profile == "bob")
+        screen.on_list_view_selected(ListView.Selected(lv, bob, 0))
+        assert any("перезапустите" in m for m in notes)
+
+
+class _FakeErrorCoordinator:
+    """Coordinator whose prepare() returns a specified error status (for #187 L12)."""
+
+    def __init__(self, error_text):
+        from tg_messenger.agent.outbound_coordinator import PrepareResult
+
+        self._result = PrepareResult(status="error", error=error_text)
+
+    async def prepare(self, dialog_id, text, *, telegram_lang_code=None, owner_id=None):
+        return self._result
+
+
+async def test_tui_outbound_timeout_vs_error_are_distinguished():
+    # #187 (L12): a translation TIMEOUT and a model FAILURE used to collapse into one toast. The
+    # coordinator already tells them apart in result.error, so the TUI relays the distinction.
+    app = MessengerTUI(client=TuiStubClient(), outbound=object())
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._current = 7
+        app._coordinator = _FakeErrorCoordinator("Translation timed out.")
+        await app._outbound_flow(7, "hi")
+        assert any("не успел" in m for m in notes)  # timeout wording
+
+        notes.clear()
+        app._coordinator = _FakeErrorCoordinator("Translation failed.")
+        await app._outbound_flow(7, "hi")
+        assert any("не удался" in m for m in notes)  # model-failure wording
