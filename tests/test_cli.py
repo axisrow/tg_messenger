@@ -2067,6 +2067,8 @@ def test_home_dotenv_loaded_when_no_cwd_dotenv(runner, tmp_path, monkeypatch):
 
 
 def test_cwd_dotenv_beats_home_dotenv(runner, tmp_path, monkeypatch):
+    # A cwd .env with the FULL pair wins over a home .env with the full pair — the pair
+    # comes wholly from cwd, never half-cwd/half-home (#193: the pair is atomic).
     home = tmp_path / "home"
     home.mkdir()
     cwd = tmp_path / "proj"
@@ -2076,12 +2078,33 @@ def test_cwd_dotenv_beats_home_dotenv(runner, tmp_path, monkeypatch):
     monkeypatch.chdir(cwd)
     _point_home_at(monkeypatch, home)
     (home / ".env").write_text("TG_API_ID=77\nTG_API_HASH=homehash\n", encoding="utf-8")
-    (cwd / ".env").write_text("TG_API_ID=42\n", encoding="utf-8")  # only overrides the id
+    (cwd / ".env").write_text("TG_API_ID=42\nTG_API_HASH=cwdhash\n", encoding="utf-8")
     r, _ = runner
     result = r.invoke(cli_main.cli, ["dialogs"])
     assert result.exit_code == 0, result.output
-    assert os.environ["TG_API_ID"] == "42"        # cwd wins
-    assert os.environ["TG_API_HASH"] == "homehash"  # home fills the gap
+    assert os.environ["TG_API_ID"] == "42"          # cwd wins — both halves from cwd
+    assert os.environ["TG_API_HASH"] == "cwdhash"   # NOT "homehash": no cross-source merge
+
+
+def test_cwd_dotenv_half_pair_does_not_merge_with_home_full_pair(runner, tmp_path, monkeypatch):
+    # #193: a cwd .env with ONLY the id must not pair its id with the home .env's hash.
+    # Since cwd contributes neither half, the home .env's FULL pair wins intact — no
+    # mixed 42+homehash pair from two different my.telegram.org apps.
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    _point_home_at(monkeypatch, home)
+    (home / ".env").write_text("TG_API_ID=77\nTG_API_HASH=homehash\n", encoding="utf-8")
+    (cwd / ".env").write_text("TG_API_ID=42\n", encoding="utf-8")  # only the id — an incomplete pair
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert os.environ["TG_API_ID"] == "77"          # the home FULL pair wins as a unit
+    assert os.environ["TG_API_HASH"] == "homehash"  # never 42+homehash
 
 
 def test_real_env_beats_both_dotenvs(runner, tmp_path, monkeypatch):
@@ -2205,6 +2228,210 @@ def test_explicit_tg_home_dotenv_beats_fixed_default_dotenv(runner, tmp_path, mo
     assert os.environ["SESSION_ENCRYPTION_KEY"] == "rightkey"
 
 
+# --- #193: TG_API_ID/TG_API_HASH are an ATOMIC PAIR across dotenv precedence layers ---
+# A source contributes the pair ONLY if it supplies BOTH halves. A source with only one
+# half must not "fill a gap" from a lower-precedence source — that silently merges two
+# different my.telegram.org apps into a complete-looking but INVALID pair, which
+# credentials_missing_from_env() then waves through and Telethon rejects with an opaque error.
+
+
+def test_mixed_pair_id_real_env_hash_home_dotenv_not_merged(tmp_path, monkeypatch):
+    # The canonical bug: TG_API_ID in the REAL env, TG_API_HASH only in ~/.tg/.env.
+    # The old per-key setdefault paired the real-env id with the home hash → a mixed pair.
+    # Option A: the home .env has only the hash, so it contributes NEITHER half; the id
+    # stays (real env), the hash stays ABSENT, and the missing-creds gate still fires.
+    from tg_messenger.core.client import credentials_missing_from_env
+
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)  # no cwd .env
+    _point_home_at(monkeypatch, home)
+    os.environ["TG_API_ID"] = "111"  # real env holds ONLY the id
+    (home / ".env").write_text('TG_API_HASH="homehash"\n', encoding="utf-8")  # only the hash
+    cli_main._load_dotenv()
+    assert os.environ["TG_API_ID"] == "111"          # real-env id untouched
+    assert "TG_API_HASH" not in os.environ            # the lone home hash did NOT slip in
+    assert credentials_missing_from_env() is True     # gate still reports missing → login prompts
+
+
+def test_mixed_pair_hash_real_env_id_home_dotenv_not_merged(tmp_path, monkeypatch):
+    # The mirror: TG_API_HASH in the real env, TG_API_ID only in ~/.tg/.env.
+    from tg_messenger.core.client import credentials_missing_from_env
+
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    _point_home_at(monkeypatch, home)
+    os.environ["TG_API_HASH"] = "realhash"  # real env holds ONLY the hash
+    (home / ".env").write_text("TG_API_ID=77\n", encoding="utf-8")  # only the id
+    cli_main._load_dotenv()
+    assert os.environ["TG_API_HASH"] == "realhash"
+    assert "TG_API_ID" not in os.environ
+    assert credentials_missing_from_env() is True
+
+
+def test_real_env_half_blocks_a_full_pair_file_from_completing_it(tmp_path, monkeypatch):
+    # #193 subtlety: the real env holds ONLY the id; a cwd .env holds a FULL pair. The file's
+    # pair must NOT be applied — that would leave the real-env id (111) paired with the file's
+    # hash (cwdhash) as a mixed pair. Instead the lone real-env id stays, the hash stays absent,
+    # and the missing-creds gate fires. (Real-env single halves win their key; nothing merges.)
+    from tg_messenger.core.client import credentials_missing_from_env
+
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    _point_home_at(monkeypatch, home)
+    os.environ["TG_API_ID"] = "111"  # real env holds ONLY the id
+    (cwd / ".env").write_text("TG_API_ID=42\nTG_API_HASH=cwdhash\n", encoding="utf-8")
+    cli_main._load_dotenv()
+    assert os.environ["TG_API_ID"] == "111"       # real-env id untouched (never overwritten to 42)
+    assert "TG_API_HASH" not in os.environ         # NOT paired with cwdhash → no mixed pair
+    assert credentials_missing_from_env() is True
+
+
+def test_full_pair_from_a_single_source_still_loads(tmp_path, monkeypatch):
+    # Guard the happy path: when ONE source supplies both halves and the env has neither, the
+    # atomic-pair logic still loads them (the fix must not accidentally block valid creds).
+    from tg_messenger.core.client import credentials_missing_from_env
+
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    _point_home_at(monkeypatch, home)
+    (cwd / ".env").write_text("TG_API_ID=42\nTG_API_HASH=cwdhash\n", encoding="utf-8")
+    cli_main._load_dotenv()
+    assert os.environ["TG_API_ID"] == "42"
+    assert os.environ["TG_API_HASH"] == "cwdhash"
+    assert credentials_missing_from_env() is False
+
+
+def test_empty_half_in_dotenv_counts_as_absent_no_merge(tmp_path, monkeypatch):
+    # #193: a source with an EMPTY half (e.g. `TG_API_HASH=`) does NOT count as supplying it —
+    # it contributes NEITHER key, so a full pair in a lower-precedence file wins intact rather
+    # than the id from the empty-half file pairing with the lower file's hash.
+    from tg_messenger.core.client import credentials_missing_from_env
+
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    _point_home_at(monkeypatch, home)
+    (cwd / ".env").write_text("TG_API_ID=42\nTG_API_HASH=\n", encoding="utf-8")  # empty half
+    (home / ".env").write_text("TG_API_ID=77\nTG_API_HASH=homehash\n", encoding="utf-8")
+    cli_main._load_dotenv()
+    assert os.environ["TG_API_ID"] == "77"          # the home FULL pair wins, not cwd's 42
+    assert os.environ["TG_API_HASH"] == "homehash"
+    assert credentials_missing_from_env() is False
+
+
+def test_pair_split_across_tg_home_and_fixed_default_not_merged(runner, tmp_path, monkeypatch):
+    # #193 across the two config paths _load_dotenv reads: an explicit TG_HOME/.env holds
+    # ONLY the hash, the fixed ~/.tg/.env holds ONLY the id. Neither source is complete, so
+    # NOTHING is contributed — a stale hash from one app must not pair with an id from another.
+    from tg_messenger.core import paths as core_paths
+    from tg_messenger.core.client import credentials_missing_from_env
+
+    default_home = tmp_path / ".tg"          # the fixed ~/.tg fallback
+    custom_root = tmp_path / "custom-root"    # the explicit TG_HOME
+    default_home.mkdir()
+    custom_root.mkdir()
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)  # no cwd .env
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.setenv("TG_HOME", str(custom_root))
+    (custom_root / ".env").write_text("TG_API_HASH=customhash\n", encoding="utf-8")  # half
+    (default_home / ".env").write_text("TG_API_ID=111\n", encoding="utf-8")           # other half
+    core_paths.reset_tg_home_cache()
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    # neither half slipped in: no 111+customhash mixed pair across the two config files
+    assert "TG_API_ID" not in os.environ
+    assert "TG_API_HASH" not in os.environ
+    assert credentials_missing_from_env() is True
+
+
+def test_full_pair_in_fixed_default_wins_when_tg_home_has_only_half(runner, tmp_path, monkeypatch):
+    # The complement: the explicit TG_HOME/.env has only a half (an incomplete pair), but the
+    # fixed ~/.tg/.env has a FULL pair. tg_home()/.env is read FIRST (higher precedence) but
+    # contributes nothing (incomplete), so the fixed default's complete pair wins as a unit.
+    from tg_messenger.core import paths as core_paths
+
+    default_home = tmp_path / ".tg"
+    custom_root = tmp_path / "custom-root"
+    default_home.mkdir()
+    custom_root.mkdir()
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.setenv("TG_HOME", str(custom_root))
+    (custom_root / ".env").write_text("TG_API_ID=42\n", encoding="utf-8")  # half only
+    (default_home / ".env").write_text("TG_API_ID=77\nTG_API_HASH=fixedhash\n", encoding="utf-8")
+    core_paths.reset_tg_home_cache()
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert os.environ["TG_API_ID"] == "77"          # NOT 42: the half from TG_HOME is ignored
+    assert os.environ["TG_API_HASH"] == "fixedhash"
+
+
+def test_pair_split_across_legacy_and_fixed_default_not_merged(runner, tmp_path, monkeypatch):
+    # #193 on the legacy branch: a legacy ~/.tg_messenger/.env (the active data root) holds
+    # ONLY the id, the fixed ~/.tg/.env holds ONLY the hash. Neither is complete → no merge.
+    from tg_messenger.core import paths as core_paths
+    from tg_messenger.core.client import credentials_missing_from_env
+
+    default_home = tmp_path / ".tg"
+    legacy_home = tmp_path / ".tg_messenger"
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH")})
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.setattr(core_paths, "LEGACY_HOME", legacy_home)
+    monkeypatch.delenv("TG_HOME", raising=False)
+    legacy_home.mkdir()
+    (legacy_home / "default.session").write_text("s", encoding="utf-8")  # data → legacy is root
+    (legacy_home / ".env").write_text("TG_API_ID=55\n", encoding="utf-8")  # half
+    default_home.mkdir()
+    (default_home / ".env").write_text("TG_API_HASH=fixedhash\n", encoding="utf-8")  # other half
+    core_paths.reset_tg_home_cache()
+    assert core_paths.tg_home() == legacy_home
+    core_paths.reset_tg_home_cache()
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["dialogs"])
+    assert result.exit_code == 0, result.output
+    assert "TG_API_ID" not in os.environ
+    assert "TG_API_HASH" not in os.environ
+    assert credentials_missing_from_env() is True
+
+
 def test_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeypatch):
     # End-to-end through the CLI: empty creds surface the friendly hint as a clean
     # ClickException, not a raw telethon traceback — and never echo a cred value.
@@ -2215,7 +2442,10 @@ def test_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
                                         if k not in ("TG_API_ID", "TG_API_HASH")})
     monkeypatch.chdir(tmp_path)  # no .env, no home .env → creds truly absent
-    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    # #193: point BOTH tg_home() AND the fixed DEFAULT_HOME/.env at the empty tmp home, or
+    # _load_dotenv's fixed ~/.tg/.env fallback would read the developer's REAL creds and this
+    # "truly absent" test would spuriously pass creds through (and even hit the network).
+    _point_home_at(monkeypatch, home)
     # real client build (no make_client stub) so client_from_env runs the validator
     result = CliRunner().invoke(cli_main.cli, ["dialogs"])
     assert result.exit_code != 0
@@ -2238,7 +2468,9 @@ def test_serve_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeyp
     monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
                                         if k not in ("TG_API_ID", "TG_API_HASH")})
     monkeypatch.chdir(tmp_path)  # no .env, no home .env → creds truly absent
-    monkeypatch.setattr(cli_main, "tg_home", lambda: home)
+    # #193: point BOTH tg_home() AND the fixed DEFAULT_HOME/.env at the empty tmp home (see
+    # test_missing_creds_gives_friendly_hint_not_traceback) so the real ~/.tg/.env can't leak in.
+    _point_home_at(monkeypatch, home)
     # real client build (no make_client stub) so client_from_env runs the validator
     result = CliRunner().invoke(cli_main.cli, ["serve"])
     assert result.exit_code != 0

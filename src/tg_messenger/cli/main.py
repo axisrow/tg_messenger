@@ -68,6 +68,11 @@ def _reaction_emoticon(emoticon: str | None) -> str:
     return emoticon if emoticon is not None else "<custom>"
 
 
+# #193: TG_API_ID / TG_API_HASH must load as ONE atomic pair, never per-key. See
+# ``_load_dotenv``'s docstring for why merging halves across precedence layers is a bug.
+_CREDS_PAIR = ("TG_API_ID", "TG_API_HASH")
+
+
 def _picker_line(marker: str, text: str) -> str:
     """#187: render one ``[idx] text`` picker row, indenting continuation lines of a
     multiline variant under the text column so the ``[idx]`` markers stay aligned.
@@ -92,6 +97,18 @@ def _load_dotenv(path: Path | str = ".env") -> None:
     already in the real environment. The persistent config is what makes
     ``tg-messenger tui`` work from ANY directory, not just one that happens to hold a ``.env``.
 
+    #193 — ``TG_API_ID`` / ``TG_API_HASH`` are treated as an ATOMIC PAIR, NOT per-key.
+    Per-key ``setdefault`` let the winning id and hash come from DIFFERENT sources: e.g. an
+    id in the real env paired with a hash from ``~/.tg/.env``. That produces a
+    complete-LOOKING but MIXED pair from two different my.telegram.org apps —
+    ``credentials_missing_from_env`` then sees both present, skips the login auto-prompt, and
+    Telethon rejects the invalid pair with an opaque error. So a precedence source contributes
+    the pair ONLY if it supplies BOTH halves AND the env has neither yet; a source holding only
+    one half contributes neither. Real-env values already present still win (an env with both
+    halves is left untouched; an env with just one half blocks every file from completing it,
+    keeping the pair honestly incomplete so the missing-creds gate fires). All OTHER keys keep
+    the plain per-key ``setdefault`` behaviour.
+
     Two config paths are read, deduped, in this order (#188 Axis B):
 
     1. ``tg_home()/.env`` — the ACTIVE data root. This is ``~/.tg`` normally, but a
@@ -113,7 +130,23 @@ def _load_dotenv(path: Path | str = ".env") -> None:
         if candidate not in sources:
             sources.append(candidate)
     for source in sources:
-        for key, value in _parse_dotenv(source).items():
+        parsed = _parse_dotenv(source)
+        # #193: the creds pair is atomic — this source completes it ONLY if it holds BOTH
+        # NON-EMPTY halves and neither is already set (real env or an earlier, higher-precedence
+        # file). A source with just one half (or an empty half, e.g. ``TG_API_HASH=``) is skipped
+        # for BOTH keys, so halves from two different sources never merge into a mixed pair.
+        source_has_pair = all((parsed.get(k) or "").strip() for k in _CREDS_PAIR)
+        # Asymmetry is deliberate (fail-closed): source_has_pair treats an empty/whitespace half
+        # as ABSENT (.strip()), but env_pair_empty treats any present key as SET (k in os.environ).
+        # So a real-env var exported empty (TG_API_ID="") counts as present and blocks completing
+        # the pair from a file — no mixed pair is built, and the missing-creds gate still fires.
+        env_pair_empty = all(k not in os.environ for k in _CREDS_PAIR)
+        if env_pair_empty and source_has_pair:
+            for key in _CREDS_PAIR:
+                os.environ[key] = parsed[key]
+        for key, value in parsed.items():
+            if key in _CREDS_PAIR:
+                continue  # handled atomically above; never per-key setdefault
             os.environ.setdefault(key, value)
 
 

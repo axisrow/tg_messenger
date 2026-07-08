@@ -85,6 +85,11 @@ def _stop(proc: subprocess.Popen) -> str:
 def test_serve_without_creds_fails_with_clear_error(tmp_path):
     """Без TG_API_ID/TG_API_HASH (и без .env в cwd) сервер падает с внятной ошибкой."""
     env = {k: v for k, v in os.environ.items() if k not in ("TG_API_ID", "TG_API_HASH")}
+    # #193: the child's _load_dotenv also reads the fixed ~/.tg/.env (and legacy
+    # ~/.tg_messenger). Point HOME at an empty tmp dir so the developer's REAL creds there
+    # can't leak into this "no creds" subprocess and keep the server alive.
+    env["HOME"] = str(tmp_path / "empty-home")
+    (tmp_path / "empty-home").mkdir()
     proc = _serve(_free_port(), env, cwd=tmp_path)
     try:
         out, _ = proc.communicate(timeout=20)
