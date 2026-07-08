@@ -109,6 +109,10 @@ def _load_dotenv(path: Path | str = ".env") -> None:
         # file). A source with just one half (or an empty half, e.g. ``TG_API_HASH=``) is skipped
         # for BOTH keys, so halves from two different sources never merge into a mixed pair.
         source_has_pair = all((parsed.get(k) or "").strip() for k in _CREDS_PAIR)
+        # Asymmetry is deliberate (fail-closed): source_has_pair treats an empty/whitespace half
+        # as ABSENT (.strip()), but env_pair_empty treats any present key as SET (k in os.environ).
+        # So a real-env var exported empty (TG_API_ID="") counts as present and blocks completing
+        # the pair from a file — no mixed pair is built, and the missing-creds gate still fires.
         env_pair_empty = all(k not in os.environ for k in _CREDS_PAIR)
         if env_pair_empty and source_has_pair:
             for key in _CREDS_PAIR:
