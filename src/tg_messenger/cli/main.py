@@ -814,10 +814,17 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             from tg_messenger.agent.outbound_coordinator import OutboundError
 
             telegram_lang_code = None
-            # read the dialog once: telegram_lang_code (outbound) AND can_send (read-only gate)
+            # #199: whether this peer is a BOT. In a bot dialog the slash IS the payload
+            # (/start, /settings, /cancel …), so the #187 unknown-slash guard below must not
+            # fire — it only protects irreversible sends to a real person. Unknown until the
+            # one-time dialog read resolves it (fail-safe: treated as non-bot / guard active).
+            dialog_kind = None
+            # read the dialog once: kind (#199 bot-slash), telegram_lang_code (outbound) AND
+            # can_send (read-only gate)
             try:
                 for dialog in await client.dialogs(dm_only=False):
                     if dialog.id == dialog_id:
+                        dialog_kind = getattr(dialog, "kind", None)
                         telegram_lang_code = getattr(dialog, "telegram_lang_code", None)
                         if not getattr(dialog, "can_send", True):
                             # #187: English like the rest of the CLI REPL
@@ -922,10 +929,17 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 client.send_reaction(dialog_id, int(parts[1]), parts[2])
                             )
                             continue
-                        if first != "/lang" and first.startswith("/"):
+                        if (
+                            first != "/lang"
+                            and first.startswith("/")
+                            and dialog_kind != "bot"
+                        ):
                             # #187 HIGH: an unknown /command (a typo like /langs or /halp, or a
                             # user hunting for the exit) must NOT be sent verbatim to a real
                             # person. Reject it, keep the draft-less loop alive, send nothing.
+                            # #199: a BOT dialog is exempt — there the slash IS the payload
+                            # (/start, /settings, /cancel …), so it falls through to be sent.
+                            # /help//react//lang stay reserved for every kind (handled above).
                             click.echo(
                                 f"unknown command: {first} (type /help)", err=True
                             )
