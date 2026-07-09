@@ -2321,6 +2321,213 @@ def test_tg_home_set_inside_cwd_dotenv_steers_active_root_dotenv(runner, tmp_pat
     assert os.environ["TG_HOME"] == str(custom_root)
 
 
+# --- #208: TG_HOME set inside a HOME .env (the sibling entrance of the #197 sink) ---
+
+
+def _isolate_dotenv_roots(tmp_path, monkeypatch, extra_removed=()):
+    """Common #208 scaffolding: scrub creds/key/TG_HOME from the env copy, chdir into an
+    empty cwd (no cwd .env), and point BOTH fallback roots (DEFAULT_HOME and LEGACY_HOME)
+    at tmp dirs — the legacy one especially, or a real ~/.tg_messenger holding data would
+    steal the pre-redirect fallback resolution. Returns (default_home, legacy_home, cwd);
+    roots are NOT created (tests mkdir what each case needs).
+    """
+    from tg_messenger.core import paths as core_paths
+
+    default_home = tmp_path / ".tg"
+    legacy_home = tmp_path / ".tg_messenger"
+    cwd = tmp_path / "elsewhere"
+    cwd.mkdir()
+    removed = ("TG_API_ID", "TG_API_HASH", "SESSION_ENCRYPTION_KEY", "TG_HOME", *extra_removed)
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in removed})
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.setattr(core_paths, "LEGACY_HOME", legacy_home)
+    core_paths.reset_tg_home_cache()
+    return default_home, legacy_home, cwd
+
+
+def test_tg_home_set_inside_default_home_dotenv_steers_active_root_dotenv(tmp_path, monkeypatch):
+    # #208, the verified repro: TG_HOME lives INSIDE ~/.tg/.env (no real-env, no cwd .env).
+    # Pre-fix, pass 2's source list was already built against the old root when the home
+    # .env's TG_HOME landed — AND the home .env's stale key was already setdefault'ed — so
+    # sessions/db ran under <custom-root> while SESSION_ENCRYPTION_KEY stayed the ~/.tg one
+    # (a wrong-key open, the #190 cycle-3 class). TG_HOME must be extracted as a
+    # root-SELECTING key first, so the custom root's own .env wins its contract slot.
+    from tg_messenger.core import paths as core_paths
+
+    default_home, _, _ = _isolate_dotenv_roots(tmp_path, monkeypatch)
+    custom_root = tmp_path / "custom-root"
+    default_home.mkdir()
+    custom_root.mkdir()
+    (default_home / ".env").write_text(
+        f"TG_HOME={custom_root}\n"
+        "TG_API_ID=111\nTG_API_HASH=defaulthash\nSESSION_ENCRYPTION_KEY=stalekey\n",
+        encoding="utf-8",
+    )
+    (custom_root / ".env").write_text(
+        "TG_API_ID=999\nTG_API_HASH=customhash\nSESSION_ENCRYPTION_KEY=rightkey\n",
+        encoding="utf-8",
+    )
+
+    cli_main._load_dotenv()
+    # config and data root AGREE: the key/creds match where the sessions actually live
+    assert core_paths.tg_home() == custom_root
+    assert os.environ["TG_HOME"] == str(custom_root)
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "rightkey"
+    assert os.environ["TG_API_ID"] == "999"
+    assert os.environ["TG_API_HASH"] == "customhash"
+
+
+def test_tg_home_set_inside_legacy_home_dotenv_steers_active_root_dotenv(tmp_path, monkeypatch):
+    # #208 on the legacy branch: the active root resolves to ~/.tg_messenger (real data
+    # there), and ITS .env carries the TG_HOME redirect. The redirect target's .env must
+    # win for key/creds; the fixed ~/.tg/.env stays the last fallback and must NOT win.
+    from tg_messenger.core import paths as core_paths
+
+    default_home, legacy_home, _ = _isolate_dotenv_roots(tmp_path, monkeypatch)
+    custom_root = tmp_path / "custom-root"
+    custom_root.mkdir()
+    legacy_home.mkdir()
+    (legacy_home / "default.session").write_text("s", encoding="utf-8")  # data → legacy is root
+    (legacy_home / ".env").write_text(f"TG_HOME={custom_root}\n", encoding="utf-8")
+    (custom_root / ".env").write_text(
+        "TG_API_ID=999\nTG_API_HASH=customhash\nSESSION_ENCRYPTION_KEY=rightkey\n",
+        encoding="utf-8",
+    )
+    default_home.mkdir()
+    (default_home / ".env").write_text(
+        "TG_API_ID=111\nTG_API_HASH=defaulthash\nSESSION_ENCRYPTION_KEY=stalekey\n",
+        encoding="utf-8",
+    )
+
+    cli_main._load_dotenv()
+    assert core_paths.tg_home() == custom_root
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "rightkey"
+    assert os.environ["TG_API_ID"] == "999"
+    assert os.environ["TG_API_HASH"] == "customhash"
+
+
+def test_real_env_tg_home_beats_home_dotenv_tg_home(tmp_path, monkeypatch):
+    # Precedence guard: a real-env TG_HOME wins over a TG_HOME inside ~/.tg/.env — the
+    # extraction must never demote the real environment (it only fills an ABSENT key).
+    from tg_messenger.core import paths as core_paths
+
+    default_home, _, _ = _isolate_dotenv_roots(tmp_path, monkeypatch)
+    env_root = tmp_path / "env-root"
+    file_root = tmp_path / "file-root"
+    default_home.mkdir()
+    env_root.mkdir()
+    file_root.mkdir()
+    monkeypatch.setenv("TG_HOME", str(env_root))
+    (default_home / ".env").write_text(
+        f"TG_HOME={file_root}\nSESSION_ENCRYPTION_KEY=stalekey\n", encoding="utf-8"
+    )
+    (env_root / ".env").write_text("SESSION_ENCRYPTION_KEY=envrootkey\n", encoding="utf-8")
+    (file_root / ".env").write_text("SESSION_ENCRYPTION_KEY=filerootkey\n", encoding="utf-8")
+    core_paths.reset_tg_home_cache()
+
+    cli_main._load_dotenv()
+    assert core_paths.tg_home() == env_root
+    assert os.environ["TG_HOME"] == str(env_root)          # never overwritten by the file
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "envrootkey"
+
+
+def test_cwd_dotenv_tg_home_beats_home_dotenv_tg_home(tmp_path, monkeypatch):
+    # Precedence guard: the #197 cwd .env TG_HOME stays the winner when a home .env ALSO
+    # carries a (different) TG_HOME — the home redirect never takes effect (write-once).
+    from tg_messenger.core import paths as core_paths
+
+    default_home, _, cwd = _isolate_dotenv_roots(tmp_path, monkeypatch)
+    cwd_root = tmp_path / "cwd-root"
+    file_root = tmp_path / "file-root"
+    default_home.mkdir()
+    cwd_root.mkdir()
+    file_root.mkdir()
+    (cwd / ".env").write_text(f"TG_HOME={cwd_root}\n", encoding="utf-8")
+    (default_home / ".env").write_text(
+        f"TG_HOME={file_root}\nSESSION_ENCRYPTION_KEY=stalekey\n", encoding="utf-8"
+    )
+    (cwd_root / ".env").write_text("SESSION_ENCRYPTION_KEY=cwdrootkey\n", encoding="utf-8")
+    (file_root / ".env").write_text("SESSION_ENCRYPTION_KEY=filerootkey\n", encoding="utf-8")
+
+    cli_main._load_dotenv()
+    assert core_paths.tg_home() == cwd_root
+    assert os.environ["TG_HOME"] == str(cwd_root)
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "cwdrootkey"
+
+
+def test_home_dotenv_tg_home_redirect_chain_does_not_cascade(tmp_path, monkeypatch):
+    # Boundedness: TG_HOME is write-once, so a redirect TARGET's own TG_HOME never takes
+    # effect — one hop max, mutual-redirect cycles impossible. ~/.tg/.env → hop1; hop1's
+    # .env points at hop2 (which even points BACK at ~/.tg — the cycle case): the root
+    # stays hop1 and hop1's key wins.
+    from tg_messenger.core import paths as core_paths
+
+    default_home, _, _ = _isolate_dotenv_roots(tmp_path, monkeypatch)
+    hop1 = tmp_path / "hop1"
+    hop2 = tmp_path / "hop2"
+    default_home.mkdir()
+    hop1.mkdir()
+    hop2.mkdir()
+    (default_home / ".env").write_text(f"TG_HOME={hop1}\n", encoding="utf-8")
+    (hop1 / ".env").write_text(
+        f"TG_HOME={hop2}\nSESSION_ENCRYPTION_KEY=hop1key\n", encoding="utf-8"
+    )
+    (hop2 / ".env").write_text(
+        f"TG_HOME={default_home}\nSESSION_ENCRYPTION_KEY=hop2key\n", encoding="utf-8"
+    )
+
+    cli_main._load_dotenv()
+    assert core_paths.tg_home() == hop1                    # one hop, not chased to hop2
+    assert os.environ["TG_HOME"] == str(hop1)
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "hop1key"
+
+
+def test_atomic_pair_stays_atomic_across_home_dotenv_redirect(tmp_path, monkeypatch):
+    # #193 × #208: the redirect target's .env holds only HALF the creds pair — it must
+    # contribute NEITHER half, and the redirecting ~/.tg/.env's FULL pair wins as a unit
+    # (it remains the fixed last fallback). Per-key values still follow per-key precedence:
+    # the target root's SESSION_ENCRYPTION_KEY wins.
+    from tg_messenger.core import paths as core_paths
+
+    default_home, _, _ = _isolate_dotenv_roots(tmp_path, monkeypatch)
+    custom_root = tmp_path / "custom-root"
+    default_home.mkdir()
+    custom_root.mkdir()
+    (default_home / ".env").write_text(
+        f"TG_HOME={custom_root}\n"
+        "TG_API_ID=111\nTG_API_HASH=defaulthash\nSESSION_ENCRYPTION_KEY=stalekey\n",
+        encoding="utf-8",
+    )
+    (custom_root / ".env").write_text(
+        "TG_API_ID=999\nSESSION_ENCRYPTION_KEY=rightkey\n", encoding="utf-8"  # half a pair
+    )
+
+    cli_main._load_dotenv()
+    assert core_paths.tg_home() == custom_root
+    assert os.environ["TG_API_ID"] == "111"          # full pair from ONE source, no 999+defaulthash mix
+    assert os.environ["TG_API_HASH"] == "defaulthash"
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "rightkey"  # per-key: active root wins
+
+
+def test_blank_tg_home_in_home_dotenv_keeps_default_root(tmp_path, monkeypatch):
+    # A blank `TG_HOME=` in ~/.tg/.env claims the key (write-once, mirroring setdefault)
+    # but selects no root — resolution falls through to the default, values load normally,
+    # and no crash. Guards the resolve_env_dir blank-is-unset contract through extraction.
+    from tg_messenger.core import paths as core_paths
+
+    default_home, _, _ = _isolate_dotenv_roots(tmp_path, monkeypatch)
+    default_home.mkdir()
+    (default_home / ".env").write_text(
+        "TG_HOME=\nSESSION_ENCRYPTION_KEY=defaultkey\n", encoding="utf-8"
+    )
+
+    cli_main._load_dotenv()
+    assert core_paths.tg_home() == default_home
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "defaultkey"
+
+
 # --- #193: TG_API_ID/TG_API_HASH are an ATOMIC PAIR across dotenv precedence layers ---
 # A source contributes the pair ONLY if it supplies BOTH halves. A source with only one
 # half must not "fill a gap" from a lower-precedence source — that silently merges two
