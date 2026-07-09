@@ -371,14 +371,21 @@ class MessengerTUI(App):
         # composer (which only moves focus); the second Escape clears. Reset by any composer edit.
         self._composer_escape_armed = False
         # #187: incremental history backfill (scroll-to-top). The oldest loaded message id for the
-        # open dialog (the `offset_id` for the next older page), the set of dialogs whose history is
-        # fully loaded (an older page came back empty), and a PER-DIALOG re-entrancy guard so a
-        # scroll storm can't fire overlapping fetches (#200: per-dialog, so a stale worker finishing
-        # for a previous dialog can't clobber the current one's in-flight state). Runs through the
-        # store when it pages (MessageStore.history has offset_id since #200), else via the client;
-        # only a store WITHOUT offset paging disables the feature (see _maybe_backfill_history).
+        # open dialog (the `offset_id` for the next older page), a map of dialogs whose history is
+        # fully loaded to the oldest-id cursor that PROVED it exhausted, and a PER-DIALOG re-entrancy
+        # guard so a scroll storm can't fire overlapping fetches (#200: per-dialog, so a stale worker
+        # finishing for a previous dialog can't clobber the current one's in-flight state). Runs
+        # through the store when it pages (MessageStore.history has offset_id since #200), else via
+        # the client; only a store WITHOUT offset paging disables the feature (see
+        # _maybe_backfill_history).
         self._oldest_message_id: int | None = None
-        self._backfill_exhausted: set[int] = set()
+        # #204: keyed by the oldest-id the exhaustion was observed at, NOT the dialog alone.
+        # "Exhausted" means "no history older than THIS cursor" — a verdict that only holds while the
+        # window still starts there. When new messages arrive and _show_history reloads a window that
+        # shifted UP, _oldest_message_id moves, the gate below no longer matches, and the older range
+        # that fell out is reachable again — without needlessly re-paging an unchanged full window
+        # (whose cursor, and thus verdict, is identical on reopen).
+        self._backfill_exhausted: dict[int, int] = {}
         self._backfilling: set[int] = set()
         # #200: live-feed listeners whose last attempt failed (by name: incoming/outgoing/reaction).
         # The 'connection lost' banner shows while ANY of them is down — a healthy event on one
@@ -881,8 +888,10 @@ class MessengerTUI(App):
         self._bubble_index.clear()
         self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
         # #187: reset the backfill cursor for the newly-opened dialog (the exhausted and in-flight
-        # sets are per-dialog (#200) and persist across the switch, so a fully-loaded chat isn't
-        # re-paged needlessly and a stale worker can't be double-started).
+        # sets are per-dialog (#200) and persist across the switch, so a stale worker can't be
+        # double-started). The exhausted flag is no longer permanent, though: #204 has _show_history
+        # revalidate it on reload (discard, then re-arm only if THIS fresh window's first page is
+        # short), so a chat that gained new messages while closed can page its older history again.
         self._oldest_message_id = None
         # #202 r3: cancel any in-flight backfill worker — its frozen offset belongs to the view
         # being left, and one surviving a switch-away → new-messages → switch-back round trip
@@ -947,12 +956,21 @@ class MessengerTUI(App):
         # #187: remember the oldest loaded id — the offset_id for the next older page on scroll-to-top.
         # Messages are chronological (oldest first), so the first is the oldest. A short first page
         # (< the requested 50) means there IS no older history → mark the dialog exhausted up front.
+        # #204: exhaustion is keyed by the current oldest-id, so a reopened window that shifted up
+        # (new messages) no longer matches the gate and can page again; an unchanged full window
+        # keeps the same cursor and stays exhausted (no needless re-page).
         if messages:
             self._oldest_message_id = messages[0].id
             if len(messages) < 50:
-                self._backfill_exhausted.add(dialog_id)
+                self._backfill_exhausted[dialog_id] = self._oldest_message_id
+            # A full first page: leave any recorded exhaustion in place — the gate keys on the
+            # cursor, so if the window is unchanged (same oldest id) it stays exhausted (no needless
+            # empty re-page), and if it shifted up (new oldest id) the gate no longer matches and
+            # paging re-opens on its own. No discard needed.
         else:
-            self._backfill_exhausted.add(dialog_id)
+            # empty reload: no cursor to page from; _maybe_backfill_history bails on
+            # `offset_id is None` anyway, so no backfill is scheduled either way.
+            self._oldest_message_id = None
         # #106: apply any reactions that arrived while this history was loading.
         self._drain_pending_reactions(dialog_id)
         self._scroll_messages_to_end(pane)
@@ -984,7 +1002,11 @@ class MessengerTUI(App):
             return
         if self._store is not None and not _history_supports_offset(self._store):
             return  # this store can't serve older pages — backfill stays disabled
-        if dialog_id in self._backfill_exhausted:
+        # #204: exhausted ONLY while the window still starts at the cursor the exhaustion was proven
+        # at. A reopen that shifted the window up (new messages) moves _oldest_message_id, so this
+        # no longer matches and the now-reachable older range can page again; an unchanged full
+        # window keeps the same cursor and stays gated (no needless empty re-page).
+        if self._backfill_exhausted.get(dialog_id) == self._oldest_message_id:
             return
         # #202 review: capture the offset NOW, while it still belongs to this dialog —
         # _oldest_message_id is app-global, and by the time the worker body runs a dialog
@@ -1034,7 +1056,10 @@ class MessengerTUI(App):
             # and a page that's entirely already-shown means there's no genuinely-older history.
             fresh = [m for m in older if m.id not in self._bubble_index]
             if not fresh:
-                self._backfill_exhausted.add(dialog_id)
+                # #204: exhausted at the CURRENT cursor (unchanged — fresh was empty, so
+                # _oldest_message_id still points here); keying by it lets a later window shift
+                # re-open paging.
+                self._backfill_exhausted[dialog_id] = self._oldest_message_id
                 return
             pane = self.query_one("#messages", Vertical)
             # anchor: remember where we were so the read position is preserved after prepending.
@@ -1052,7 +1077,8 @@ class MessengerTUI(App):
             pane.scroll_to(y=prev_scroll + added, animate=False, force=True)
             self._oldest_message_id = fresh[0].id
             if len(older) < 50:
-                self._backfill_exhausted.add(dialog_id)  # a short page → no more history
+                # #204: a short page → no more history; key by the just-advanced cursor.
+                self._backfill_exhausted[dialog_id] = self._oldest_message_id
         finally:
             self._backfilling.discard(dialog_id)
 
