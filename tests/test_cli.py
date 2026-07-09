@@ -2408,6 +2408,45 @@ def test_tg_home_set_inside_legacy_home_dotenv_steers_active_root_dotenv(tmp_pat
     assert os.environ["TG_API_HASH"] == "customhash"
 
 
+def test_legacy_redirecting_dotenv_keeps_value_slot_when_target_lacks_key(tmp_path, monkeypatch):
+    # #208 review fix: the REDIRECTING home .env must keep a value slot in the pass-2
+    # layering. Legacy root's .env names TG_HOME AND carries the right key; the redirect
+    # TARGET's .env has creds but NO key. Dropping the redirecting file from the value
+    # pass (it is no longer the active root) would let the stale ~/.tg/.env fallback win
+    # SESSION_ENCRYPTION_KEY — a wrong-key open under the custom root, the very class
+    # #208 closes. The redirecting file slots BELOW the final active root's .env and
+    # ABOVE the fixed DEFAULT_HOME fallback.
+    from tg_messenger.core import paths as core_paths
+
+    default_home, legacy_home, _ = _isolate_dotenv_roots(tmp_path, monkeypatch)
+    custom_root = tmp_path / "custom-root"
+    custom_root.mkdir()
+    legacy_home.mkdir()
+    (legacy_home / "sessions").mkdir()  # data → legacy is the pre-redirect active root
+    (legacy_home / ".env").write_text(
+        f"TG_HOME={custom_root}\nSESSION_ENCRYPTION_KEY=rightkey\n"
+        "TG_API_ID=555\nTG_API_HASH=legacyhash\n",
+        encoding="utf-8",
+    )
+    # the redirect target holds its own FULL creds pair but NO encryption key
+    (custom_root / ".env").write_text(
+        "TG_API_ID=999\nTG_API_HASH=customhash\n", encoding="utf-8"
+    )
+    default_home.mkdir()
+    (default_home / ".env").write_text(
+        "TG_API_ID=111\nTG_API_HASH=defaulthash\nSESSION_ENCRYPTION_KEY=stalekey\n",
+        encoding="utf-8",
+    )
+
+    cli_main._load_dotenv()
+    assert core_paths.tg_home() == custom_root
+    # the crux: the redirecting legacy .env's key wins over the stale ~/.tg fallback
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "rightkey"
+    # the ACTIVE root's full pair still outranks the redirecting file's pair
+    assert os.environ["TG_API_ID"] == "999"
+    assert os.environ["TG_API_HASH"] == "customhash"
+
+
 def test_real_env_tg_home_beats_home_dotenv_tg_home(tmp_path, monkeypatch):
     # Precedence guard: a real-env TG_HOME wins over a TG_HOME inside ~/.tg/.env — the
     # extraction must never demote the real environment (it only fills an ABSENT key).
