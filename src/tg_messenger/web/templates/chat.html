@@ -335,6 +335,19 @@
           req.dialogId !== document.getElementById('dialog_id').value) {
         evt.detail.shouldSwap = false;  // stale response for a dialog the user already left
       }
+      // #203 (visual-only stale-swap, same shared-#messages race): a /send echo carries no dialogId
+      // in its path, so the history/search guard above never covers it — it would always beforeend-
+      // append. If the user switched dialogs before the POST returned, that late echo appends A's
+      // bubble into B's open pane. Scope it by the submitting dialog: markSubmittingDialog() stamps
+      // composer.dataset.submittingDialogId in htmx:confirm (BEFORE the POST) and afterRequest deletes
+      // it AFTER the swap, so it is still live here at beforeSwap. Drop the swap when it no longer
+      // matches the open #dialog_id (which restoreComposeState already updated on the switch).
+      if (req.kind === 'send') {
+        const submitted = document.getElementById('composer').dataset.submittingDialogId;
+        if (submitted && submitted !== document.getElementById('dialog_id').value) {
+          evt.detail.shouldSwap = false;
+        }
+      }
     });
     // #187/#195: a #messages swap just settled. Fires ONLY for an ACCEPTED swap (beforeSwap drops a
     // stale one via shouldSwap=false, and htmx runs afterSettle inside its `if(shouldSwap)` block).

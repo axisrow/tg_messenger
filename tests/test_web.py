@@ -2374,6 +2374,27 @@ async def test_index_messages_swap_bound_to_requesting_dialog(client_app):
     assert "document.getElementById('dialog_id').value" in r.text
 
 
+async def test_index_send_echo_guarded_against_stale_cross_dialog_swap(client_app):
+    # #203 (visual-only stale-swap): a /send echo carries no dialogId in its path, so the
+    # history/search beforeSwap guard never covered it and it always beforeend-appended. If the user
+    # switched dialogs before the POST returned, the late echo dropped A's bubble into B's open pane.
+    # The beforeSwap handler now scopes the send by the submitting dialog: markSubmittingDialog stamps
+    # composer.dataset.submittingDialogId (set in htmx:confirm before the POST, deleted in
+    # htmx:afterRequest after the swap — still live at beforeSwap) and the swap is dropped when it no
+    # longer matches the open #dialog_id.
+    ac, _ = client_app
+    r = await ac.get("/")
+    # the beforeSwap handler has a dedicated send branch
+    assert "req.kind === 'send'" in r.text
+    # it reads the dialog captured before the POST and compares it to the currently-open dialog
+    assert "dataset.submittingDialogId" in r.text
+    assert (
+        "submitted !== document.getElementById('dialog_id').value" in r.text
+    )
+    # a mismatch drops the swap so A's echo can't land in B's pane
+    assert "evt.detail.shouldSwap = false" in r.text
+
+
 async def test_index_mark_read_is_history_only_and_dialog_scoped(client_app):
     # #195 round 3 (critical): mark-read / badge-clear on the shared #messages afterSettle must be
     # STRICTLY gated on an accepted HISTORY load for the OPEN dialog — never a /send echo or search.

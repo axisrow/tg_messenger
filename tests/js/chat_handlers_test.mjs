@@ -218,6 +218,41 @@ vm.runInContext(pageScript, sandbox, { filename: 'chat.html:inline' });
   check('BUG-2: negative-current, other-dialog response dropped', negStale.detail.shouldSwap === false);
 }
 
+// ---- #203: a stale /send echo for a left dialog is dropped (behavioral, not grep) -------------
+// The /send path carries no dialogId, so the history/search guard above never covered it; the
+// send branch scopes the swap by composer.dataset.submittingDialogId (stamped in htmx:confirm,
+// live at beforeSwap). This drives the real handler so a regression where the send branch stopped
+// setting shouldSwap=false (or read the wrong field) would fail here — unlike the grep test.
+{
+  const messages = el('messages');
+  const dialogId = el('dialog_id');
+
+  // User sent in A (=7), then switched to B (=8) before A's /send POST returned.
+  dialogId.value = '8';
+  composer.dataset.submittingDialogId = '7';
+  const staleSend = messages.dispatch('htmx:beforeSwap', {
+    shouldSwap: true,
+    pathInfo: { requestPath: '/send' },
+  });
+  check("#203: stale /send echo for the left dialog is dropped", staleSend.detail.shouldSwap === false);
+
+  // The normal case: send in the dialog the user is still viewing → the echo swaps in.
+  composer.dataset.submittingDialogId = '8';
+  const liveSend = messages.dispatch('htmx:beforeSwap', {
+    shouldSwap: true,
+    pathInfo: { requestPath: '/send' },
+  });
+  check("#203: same-dialog /send echo is allowed to swap", liveSend.detail.shouldSwap === true);
+
+  // Missing submittingDialogId (no send in flight through the composer) must not drop a swap.
+  delete composer.dataset.submittingDialogId;
+  const noStamp = messages.dispatch('htmx:beforeSwap', {
+    shouldSwap: true,
+    pathInfo: { requestPath: '/send' },
+  });
+  check("#203: /send with no submitting dialog stamped is not dropped", noStamp.detail.shouldSwap === true);
+}
+
 // ---- #195 round 2: switch-before-history-response must NOT mark the left dialog read ----------
 {
   const messages = el('messages');
