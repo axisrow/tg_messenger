@@ -982,42 +982,59 @@ async def test_tui_backfill_exhausted_revalidated_on_reopen_after_new_messages()
         assert ids_final == list(range(26, 126))  # older ids that fell out are reachable again
 
 
+class SingleFullPageStore(TuiSourceStore):
+    """A store holding EXACTLY one full page (ids 1..50) with no older history (#204 review).
+
+    The newest window is always the same 50 ids and any older fetch (offset_id set) is empty, so
+    the window never shifts on reopen — the case where a plain per-reopen discard would fire one
+    wasted empty backfill every time. The cursor-keyed gate must block instead.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.history_calls = []
+
+    async def history(self, peer, limit=50, offset_id=0):
+        self.history_calls.append((peer, limit, offset_id))
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        if not offset_id:
+            return [Message(id=i, dialog_id=peer, sender_id=peer, out=False,
+                            text=f"msg {i}", date=date) for i in range(1, 51)]  # ids 1..50
+        return []  # nothing older than the window
+
+
 async def test_tui_backfill_exhausted_full_window_not_repaged_on_reopen():
     # #204 review (Codex): the cursor-keyed exhaustion must ALSO avoid needlessly re-paging an
-    # UNCHANGED full window. A dialog with exactly one full page (ids 51..100) and no older history
-    # is exhausted after one empty older fetch. Reopening it (no new messages → identical window,
-    # same oldest id 51) must NOT schedule another empty backfill: the recorded cursor still matches
-    # the current oldest id, so the gate blocks. This is the case a plain per-reopen discard would
-    # regress (discard → one wasted empty fetch every reopen).
-    store = ReopenShiftsWindowStore()  # before bump(): window 51..100, older 1..50, then empty
+    # UNCHANGED full window. A dialog with exactly one full page (ids 1..50) and no older history is
+    # exhausted after one empty older fetch (recorded at cursor == the first-page oldest, id 1).
+    # Reopening it (no new messages → identical window, oldest id 1 again) must block IMMEDIATELY on
+    # the first scroll-to-top: the recorded cursor equals the current oldest id, so zero fetches are
+    # issued. A plain per-reopen discard would regress this (one wasted empty fetch every reopen).
+    store = SingleFullPageStore()
     app = MessengerTUI(client=TuiStubClient(), store=store)
     async with app.run_test(size=(80, 20)) as pilot:
         await _pause_until(pilot, lambda: app._started)
-        # exhaust: load window (51..100), page older once (1..50), then an empty older page
+        # exhaust: load the full window (1..50), then one empty older fetch marks it exhausted at 1
         app._current = 7
         await app._show_history(7)
-        await app._backfill_history(7, app._oldest_message_id)  # 51 → 1..50 (oldest becomes 1)
-        await pilot.pause()
+        assert app._oldest_message_id == 1
         await app._backfill_history(7, 1)  # offset_id=1 → empty → exhausted at cursor 1
         await pilot.pause()
         assert app._backfill_exhausted.get(7) == app._oldest_message_id == 1
 
-        # reopen WITHOUT any new messages: same window reloads, oldest id is 51 again
+        # reopen WITHOUT any new messages: the same window reloads, oldest id is 1 again
+        calls_after_setup = len(store.history_calls)
         app._current = 7
         await app._show_history(7)
         await pilot.pause()
-        assert app._oldest_message_id == 51
-        # the earlier exhaustion was recorded at cursor 1, not 51, so scroll-to-top DOES page the
-        # 1..50 range that _show_history's 50-window dropped — but paging it returns the already-seen
-        # ids and re-exhausts at 1, WITHOUT looping. Drive one scroll and confirm it converges:
-        app._maybe_backfill_history()
-        await _pause_until(pilot, lambda: app._oldest_message_id == 1)
-        # now exhausted at cursor 1 again; a SECOND scroll-to-top must be a no-op (gate matches) —
-        # no further store call is issued.
-        calls_at_reexhaust = len(store.history_calls)
+        assert app._oldest_message_id == 1
+        # DIRECT anti-regression: the recorded exhaustion cursor (1) equals the reopened oldest (1),
+        # so scroll-to-top is gated immediately — NOT a single extra store fetch is issued.
+        show_history_calls = len(store.history_calls)  # includes only the reopen's _show_history load
         app._maybe_backfill_history()
         await pilot.pause()
-        assert len(store.history_calls) == calls_at_reexhaust  # gate blocked the needless re-page
+        assert len(store.history_calls) == show_history_calls  # gate blocked; zero backfill fetches
+        assert show_history_calls == calls_after_setup + 1  # only the reopen load, no paging
 
 
 async def test_tui_history_backfill_runs_on_store_path():
