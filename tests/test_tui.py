@@ -894,6 +894,88 @@ class PaginatedHistoryStore(TuiSourceStore):
         return []
 
 
+class ReopenShiftsWindowStore(TuiSourceStore):
+    """A store whose newest window SHIFTS UP once new messages arrive (#204).
+
+    Before ``bump()``: newest window ids 51..100, older page 1..50, then nothing —
+    scroll-to-top eventually exhausts the dialog. After ``bump()`` (new messages 101..125
+    arrived while the dialog was closed): the newest-50 window is now 76..125, so ids 51..75
+    have fallen OUT of the reloaded window but are still reachable as an older page
+    (offset_id=76 → 26..75). The first page stays a full 50 in both states, so _show_history
+    never re-arms the exhausted flag on its own — only #204's revalidate discard can clear it.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.history_calls = []
+        self._bumped = False
+
+    def bump(self):
+        self._bumped = True
+
+    async def history(self, peer, limit=50, offset_id=0):
+        self.history_calls.append((peer, limit, offset_id))
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        def page(lo, hi):
+            return [Message(id=i, dialog_id=peer, sender_id=peer, out=False,
+                            text=f"msg {i}", date=date) for i in range(lo, hi)]
+
+        if not self._bumped:
+            if not offset_id:
+                return page(51, 101)  # newest window: ids 51..100
+            if offset_id == 51:
+                return page(1, 51)  # older page just before id 51
+            return []
+        # after new messages arrived the window shifted UP to ids 76..125
+        if not offset_id:
+            return page(76, 126)  # newest window: ids 76..125 (still a full 50)
+        if offset_id == 76:
+            return page(26, 76)  # older page just before id 76 → 26..75 (still reachable)
+        return []
+
+
+async def test_tui_backfill_exhausted_revalidated_on_reopen_after_new_messages():
+    # #204: _backfill_exhausted was keyed by dialog alone and never cleared on reopen, so once a
+    # dialog scrolled to its very top the flag pinned it "exhausted" for the whole session. When
+    # new messages later shifted the newest-50 window UP, the older ids that fell out of the
+    # reloaded window became permanently unreachable. _show_history must now DISCARD the stale flag
+    # before re-arming, so a reopened dialog with a fresh full page can page its older history again.
+    store = ReopenShiftsWindowStore()
+    app = MessengerTUI(client=TuiStubClient(), store=store)
+    async with app.run_test(size=(80, 20)) as pilot:
+        await _pause_until(pilot, lambda: app._started)
+        # 1) open dialog 7 and scroll to the very top → exhaust it
+        app._current = 7
+        await app._show_history(7)
+        await app._backfill_history(7, app._oldest_message_id)  # 51 → older page 1..50
+        await pilot.pause()
+        assert app._oldest_message_id == 1
+        await app._backfill_history(7, 1)  # offset_id=1 → empty → exhausted
+        await pilot.pause()
+        assert 7 in app._backfill_exhausted  # the pre-#204 permanent-block condition
+
+        # 2) new messages arrive while the dialog is closed → the newest window shifts up
+        store.bump()
+
+        # 3) reopen the dialog: _show_history reloads the shifted full window (first page == 50)
+        app._current = 7
+        await app._show_history(7)
+        await pilot.pause()
+        ids_after_reopen = sorted(b.message_id for b in app.query(MessageBubble))
+        assert ids_after_reopen == list(range(76, 126))  # the shifted-up newest window
+        assert app._oldest_message_id == 76
+        # the stale flag was revalidated away — a full first page means older history may exist
+        assert 7 not in app._backfill_exhausted
+
+        # 4) scroll-to-top now schedules a backfill again (the older 26..75 range is reachable)
+        app._maybe_backfill_history()
+        await _pause_until(pilot, lambda: any(c[2] == 76 for c in store.history_calls))
+        assert any(c[2] == 76 for c in store.history_calls)
+        ids_final = sorted(b.message_id for b in app.query(MessageBubble))
+        assert ids_final == list(range(26, 126))  # older ids that fell out are reachable again
+
+
 async def test_tui_history_backfill_runs_on_store_path():
     # #200: the production TUI wires a MessageStore, and the store pages older history via
     # offset_id — the scroll-to-top backfill must run THROUGH the store. (This was dead code:

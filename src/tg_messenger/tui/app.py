@@ -881,8 +881,10 @@ class MessengerTUI(App):
         self._bubble_index.clear()
         self._pending_reactions.clear()  # #106: drop any buffered reactions from the prior dialog
         # #187: reset the backfill cursor for the newly-opened dialog (the exhausted and in-flight
-        # sets are per-dialog (#200) and persist across the switch, so a fully-loaded chat isn't
-        # re-paged needlessly and a stale worker can't be double-started).
+        # sets are per-dialog (#200) and persist across the switch, so a stale worker can't be
+        # double-started). The exhausted flag is no longer permanent, though: #204 has _show_history
+        # revalidate it on reload (discard, then re-arm only if THIS fresh window's first page is
+        # short), so a chat that gained new messages while closed can page its older history again.
         self._oldest_message_id = None
         # #202 r3: cancel any in-flight backfill worker — its frozen offset belongs to the view
         # being left, and one surviving a switch-away → new-messages → switch-back round trip
@@ -944,6 +946,11 @@ class MessengerTUI(App):
         for m in messages:
             bubbles.append(self._message_bubble_for(m, dialog_id))
         await pane.mount(*(_wrap_bubble(b) for b in bubbles))  # #118: align via wrapper row
+        # #204: _show_history reloads the newest-N window from scratch on every (re)open. The old
+        # exhausted flag was recorded against a PREVIOUS window; new messages may have shifted the
+        # window up and dropped older ones back into reach. Drop the stale flag here — it re-arms
+        # just below only if THIS fresh first page is genuinely short (< 50 → no older history).
+        self._backfill_exhausted.discard(dialog_id)
         # #187: remember the oldest loaded id — the offset_id for the next older page on scroll-to-top.
         # Messages are chronological (oldest first), so the first is the oldest. A short first page
         # (< the requested 50) means there IS no older history → mark the dialog exhausted up front.
