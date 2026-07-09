@@ -88,14 +88,12 @@ def _picker_line(marker: str, text: str) -> str:
     return "\n".join([f"{prefix}{head}", *(f"{indent}{line}" for line in rest)])
 
 
-def _load_dotenv(path: Path | str = ".env") -> None:
-    """Layer .env files into the environment; the real environment always wins.
+def _apply_dotenv_source(source: Path | str) -> None:
+    """Layer ONE ``.env`` source into ``os.environ``; the real environment always wins.
 
-    Precedence (highest first): real env > cwd ``.env`` > the ACTIVE root's
-    ``tg_home()/.env`` > the fixed ``~/.tg/.env`` fallback. ``setdefault`` never
-    overwrites, so loading a source EARLIER makes it win; every file yields to a value
-    already in the real environment. The persistent config is what makes
-    ``tg-messenger tui`` work from ANY directory, not just one that happens to hold a ``.env``.
+    Applied in precedence order by the caller: applying a source EARLIER makes it win,
+    because every value uses ``setdefault``/atomic-pair semantics that never overwrite
+    what is already set. A missing file is fine (``_parse_dotenv`` → ``{}``).
 
     #193 — ``TG_API_ID`` / ``TG_API_HASH`` are treated as an ATOMIC PAIR, NOT per-key.
     Per-key ``setdefault`` let the winning id and hash come from DIFFERENT sources: e.g. an
@@ -108,8 +106,49 @@ def _load_dotenv(path: Path | str = ".env") -> None:
     halves is left untouched; an env with just one half blocks every file from completing it,
     keeping the pair honestly incomplete so the missing-creds gate fires). All OTHER keys keep
     the plain per-key ``setdefault`` behaviour.
+    """
+    parsed = _parse_dotenv(source)
+    # #193: the creds pair is atomic — this source completes it ONLY if it holds BOTH
+    # NON-EMPTY halves and neither is already set (real env or an earlier, higher-precedence
+    # file). A source with just one half (or an empty half, e.g. ``TG_API_HASH=``) is skipped
+    # for BOTH keys, so halves from two different sources never merge into a mixed pair.
+    source_has_pair = all((parsed.get(k) or "").strip() for k in _CREDS_PAIR)
+    # Asymmetry is deliberate (fail-closed): source_has_pair treats an empty/whitespace half
+    # as ABSENT (.strip()), but env_pair_empty treats any present key as SET (k in os.environ).
+    # So a real-env var exported empty (TG_API_ID="") counts as present and blocks completing
+    # the pair from a file — no mixed pair is built, and the missing-creds gate still fires.
+    env_pair_empty = all(k not in os.environ for k in _CREDS_PAIR)
+    if env_pair_empty and source_has_pair:
+        for key in _CREDS_PAIR:
+            os.environ[key] = parsed[key]
+    for key, value in parsed.items():
+        if key in _CREDS_PAIR:
+            continue  # handled atomically above; never per-key setdefault
+        os.environ.setdefault(key, value)
 
-    Two config paths are read, deduped, in this order (#188 Axis B):
+
+def _load_dotenv(path: Path | str = ".env") -> None:
+    """Layer .env files into the environment; the real environment always wins.
+
+    Precedence (highest first): real env > cwd ``.env`` > the ACTIVE root's
+    ``tg_home()/.env`` > the fixed ``~/.tg/.env`` fallback. ``setdefault`` never
+    overwrites, so loading a source EARLIER makes it win; every file yields to a value
+    already in the real environment. The persistent config is what makes
+    ``tg-messenger tui`` work from ANY directory, not just one that happens to hold a ``.env``.
+
+    #197 — TWO PASSES, so a ``TG_HOME`` set INSIDE the cwd ``.env`` steers which active
+    root's ``.env`` gets read. Pass 1 applies ONLY the cwd ``path``; pass 2 resolves the
+    home sources. Building the home list before applying the cwd ``.env`` would resolve
+    ``tg_home()`` against the OLD root, so a cwd ``.env`` holding ``TG_HOME=/custom-root``
+    would never add ``/custom-root/.env`` — its creds pair AND ``SESSION_ENCRYPTION_KEY``
+    silently fall back to ``~/.tg/.env`` while sessions/db operate under the custom root
+    (a wrong-key open, the #190 cycle-3 class). Precedence is unchanged: the cwd source is
+    applied FIRST so it still wins (via ``setdefault``/atomic-pair); only the MOMENT the
+    home root is resolved moves to after the cwd ``.env`` is in effect.
+    ``reset_tg_home_cache()`` clears the memoized legacy-vs-default fallback so pass 2
+    re-resolves from the state the cwd ``.env`` just established.
+
+    Two home config paths are then read, deduped, in this order (#188 Axis B):
 
     1. ``tg_home()/.env`` — the ACTIVE data root. This is ``~/.tg`` normally, but a
        legacy ``~/.tg_messenger`` on fallback, OR an explicit ``TG_HOME`` override. It
@@ -123,31 +162,23 @@ def _load_dotenv(path: Path | str = ".env") -> None:
        miss the file the missing-creds hint told them to create — this fallback catches it.
 
     When ``tg_home()`` already IS ``DEFAULT_HOME`` (the common case), the dedup reads
-    ``~/.tg/.env`` exactly once. Missing files are fine (_parse_dotenv → {}).
+    ``~/.tg/.env`` exactly once; the cwd ``path`` is also deduped so it is never applied
+    twice. Missing files are fine (_parse_dotenv → {}). Per-source layering and the #193
+    atomic-pair rule live in :func:`_apply_dotenv_source`.
     """
-    sources: list[Path | str] = [path]
+    # Pass 1: apply the cwd ``.env`` FIRST, so any ``TG_HOME`` it sets is in effect before
+    # the home root is resolved (highest-precedence file → wins via setdefault/atomic-pair).
+    _apply_dotenv_source(path)
+    # The cwd ``.env`` may have set ``TG_HOME`` (and thus changed the legacy-vs-default
+    # fallback state); drop the memoized root so pass 2 re-resolves from scratch (#197).
+    core_paths.reset_tg_home_cache()
+    # Pass 2: resolve the home sources NOW that the cwd ``.env`` is applied, then layer them
+    # in (deduped against ``path`` and each other so no source is applied twice).
+    applied: list[Path | str] = [path]
     for candidate in (tg_home() / ".env", core_paths.DEFAULT_HOME / ".env"):
-        if candidate not in sources:
-            sources.append(candidate)
-    for source in sources:
-        parsed = _parse_dotenv(source)
-        # #193: the creds pair is atomic — this source completes it ONLY if it holds BOTH
-        # NON-EMPTY halves and neither is already set (real env or an earlier, higher-precedence
-        # file). A source with just one half (or an empty half, e.g. ``TG_API_HASH=``) is skipped
-        # for BOTH keys, so halves from two different sources never merge into a mixed pair.
-        source_has_pair = all((parsed.get(k) or "").strip() for k in _CREDS_PAIR)
-        # Asymmetry is deliberate (fail-closed): source_has_pair treats an empty/whitespace half
-        # as ABSENT (.strip()), but env_pair_empty treats any present key as SET (k in os.environ).
-        # So a real-env var exported empty (TG_API_ID="") counts as present and blocks completing
-        # the pair from a file — no mixed pair is built, and the missing-creds gate still fires.
-        env_pair_empty = all(k not in os.environ for k in _CREDS_PAIR)
-        if env_pair_empty and source_has_pair:
-            for key in _CREDS_PAIR:
-                os.environ[key] = parsed[key]
-        for key, value in parsed.items():
-            if key in _CREDS_PAIR:
-                continue  # handled atomically above; never per-key setdefault
-            os.environ.setdefault(key, value)
+        if candidate not in applied:
+            applied.append(candidate)
+            _apply_dotenv_source(candidate)
 
 
 def _session_store():

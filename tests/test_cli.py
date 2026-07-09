@@ -2277,6 +2277,50 @@ def test_explicit_tg_home_dotenv_beats_fixed_default_dotenv(runner, tmp_path, mo
     assert os.environ["SESSION_ENCRYPTION_KEY"] == "rightkey"
 
 
+def test_tg_home_set_inside_cwd_dotenv_steers_active_root_dotenv(runner, tmp_path, monkeypatch):
+    # #197: TG_HOME is set INSIDE the cwd .env (not the real env, not ~/.tg/.env). The old
+    # loader built its home-source list from tg_home() BEFORE applying the cwd .env, so
+    # <custom_root>/.env was never read — creds/key silently fell back to ~/.tg/.env while
+    # sessions/db ran under the custom root (a wrong-key open, the #190 cycle-3 class).
+    # The two-pass loader applies the cwd .env first, so TG_HOME is in effect when the home
+    # sources resolve → the custom root's OWN creds AND encryption key are read.
+    from tg_messenger.core import paths as core_paths
+
+    default_home = tmp_path / ".tg"         # the fixed ~/.tg fallback (holds stale/other creds)
+    custom_root = tmp_path / "custom-root"  # TG_HOME points here, set from the cwd .env
+    default_home.mkdir()
+    custom_root.mkdir()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items()
+                                        if k not in ("TG_API_ID", "TG_API_HASH",
+                                                     "SESSION_ENCRYPTION_KEY", "TG_HOME")})
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", default_home)
+    monkeypatch.delenv("TG_HOME", raising=False)  # NOT in the real env — only in the cwd .env
+    # the cwd .env carries ONLY the root selector; no creds here
+    (cwd / ".env").write_text(f"TG_HOME={custom_root}\n", encoding="utf-8")
+    # the custom root's own .env holds the authoritative creds + key
+    (custom_root / ".env").write_text(
+        "TG_API_ID=999\nTG_API_HASH=customhash\nSESSION_ENCRYPTION_KEY=rightkey\n",
+        encoding="utf-8",
+    )
+    # the fixed fallback holds DIFFERENT creds that must NOT win
+    (default_home / ".env").write_text(
+        "TG_API_ID=111\nTG_API_HASH=defaulthash\nSESSION_ENCRYPTION_KEY=stalekey\n",
+        encoding="utf-8",
+    )
+    core_paths.reset_tg_home_cache()
+
+    cli_main._load_dotenv()
+    # the crux: the custom root's creds/key are read, NOT the ~/.tg fallback's
+    assert os.environ["TG_API_ID"] == "999"
+    assert os.environ["TG_API_HASH"] == "customhash"
+    assert os.environ["SESSION_ENCRYPTION_KEY"] == "rightkey"
+    # and TG_HOME from the cwd .env is in effect, so sessions/db use the same root
+    assert os.environ["TG_HOME"] == str(custom_root)
+
+
 # --- #193: TG_API_ID/TG_API_HASH are an ATOMIC PAIR across dotenv precedence layers ---
 # A source contributes the pair ONLY if it supplies BOTH halves. A source with only one
 # half must not "fill a gap" from a lower-precedence source — that silently merges two
