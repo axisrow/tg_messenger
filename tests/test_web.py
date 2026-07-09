@@ -2072,15 +2072,21 @@ async def test_index_blocks_outbound_errors_until_explicit_send_original(client_
     # #187: softened copy — the failure path still routes through showSendOriginal (blocks until
     # the user explicitly picks Send original), it just no longer says the alarming "failed".
     assert "showSendOriginal(id, draft, \"Couldn't translate — send as written?\", () => {" in r.text
-    assert "markSubmittingDialog(id);" in r.text
+    assert "evt.detail.issueRequest(true);" in r.text
     assert "Translation timed out — sending the original." not in r.text
 
 
 async def test_index_after_request_clears_submitted_dialog_not_active_dialog(client_app):
     ac, _ = client_app
     r = await ac.get("/")
-    assert "composer.dataset.submittingDialogId = id;" in r.text
-    assert "const submittedDialogId = composer.dataset.submittingDialogId || activeDialogId;" in r.text
+    # #209: the completed send is identified by its OWN request parameters (htmx snapshots the
+    # form into requestConfig.parameters at POST time) — not by a shared composer.dataset stamp
+    # a second concurrent send could overwrite.
+    assert (
+        "const params = (evt.detail.requestConfig && evt.detail.requestConfig.parameters) || {};"
+        in r.text
+    )
+    assert "const submittedDialogId = params.dialog_id || activeDialogId;" in r.text
     assert "clearComposeState(stateFor(submittedDialogId));" in r.text
     assert "if (submittedDialogId === activeDialogId)" in r.text
 
@@ -2375,24 +2381,27 @@ async def test_index_messages_swap_bound_to_requesting_dialog(client_app):
 
 
 async def test_index_send_echo_guarded_against_stale_cross_dialog_swap(client_app):
-    # #203 (visual-only stale-swap): a /send echo carries no dialogId in its path, so the
+    # #203/#209 (visual-only stale-swap): a /send echo carries no dialogId in its path, so the
     # history/search beforeSwap guard never covered it and it always beforeend-appended. If the user
     # switched dialogs before the POST returned, the late echo dropped A's bubble into B's open pane.
-    # The beforeSwap handler now scopes the send by the submitting dialog: markSubmittingDialog stamps
-    # composer.dataset.submittingDialogId (set in htmx:confirm before the POST, deleted in
-    # htmx:afterRequest after the swap — still live at beforeSwap) and the swap is dropped when it no
-    # longer matches the open #dialog_id.
+    # The beforeSwap handler scopes the send by the dialog THIS request was sent to — htmx snapshots
+    # the form into requestConfig.parameters when the POST is issued, so the guard is per-request
+    # (#209: a second send racing in another dialog can't overwrite it, unlike the old shared
+    # composer.dataset.submittingDialogId stamp) — and drops the swap when it no longer matches the
+    # open #dialog_id.
     ac, _ = client_app
     r = await ac.get("/")
     # the beforeSwap handler has a dedicated send branch
     assert "req.kind === 'send'" in r.text
-    # it reads the dialog captured before the POST and compares it to the currently-open dialog
-    assert "dataset.submittingDialogId" in r.text
+    # it reads the dialog from THIS request's own parameter snapshot
+    assert "cfg && cfg.parameters ? cfg.parameters.dialog_id : ''" in r.text
     assert (
         "submitted !== document.getElementById('dialog_id').value" in r.text
     )
     # a mismatch drops the swap so A's echo can't land in B's pane
     assert "evt.detail.shouldSwap = false" in r.text
+    # #209: the shared stamp is gone — nothing for a concurrent send to overwrite
+    assert "submittingDialogId" not in r.text
 
 
 async def test_index_mark_read_is_history_only_and_dialog_scoped(client_app):
