@@ -148,6 +148,27 @@ def _load_dotenv(path: Path | str = ".env") -> None:
     ``reset_tg_home_cache()`` clears the memoized legacy-vs-default fallback so pass 2
     re-resolves from the state the cwd ``.env`` just established.
 
+    #208 — ``TG_HOME`` is a ROOT-SELECTING key, so it is EXTRACTED from the home sources
+    (in precedence order) BEFORE any home ``.env``'s values are layered in. #197 closed
+    the cwd entrance of this sink, but a ``TG_HOME`` set inside a HOME ``.env`` still
+    redirected ``tg_home()`` (read live by sessions/db) AFTER pass 2's source list was
+    built against the OLD root — the redirect target's own ``.env`` was never read, and
+    worse, the redirecting file's stale ``SESSION_ENCRYPTION_KEY`` was already applied,
+    so ``setdefault`` would block the target root's key even if its ``.env`` were then
+    read (the same wrong-key open). Extraction-first gives the FINAL active root's
+    ``.env`` its contract slot (above the fixed ``DEFAULT_HOME`` fallback) before any
+    home value can claim it. The step is bounded BY CONSTRUCTION, not by an iteration
+    cap: ``TG_HOME`` is write-once under ``setdefault`` semantics (the real env, the cwd
+    ``.env``, or the first home source holding the key wins; a blank value still claims
+    the key, mirroring ``setdefault``), so at most ONE redirect can ever take effect —
+    a redirect target's own ``TG_HOME`` never applies, and mutual-redirect cycles are
+    impossible. The REDIRECTING source keeps a value slot too, between the final active
+    root's ``.env`` and the fixed ``DEFAULT_HOME`` fallback: the user's live config file
+    is the one that named the root, so when the target's ``.env`` lacks a key (e.g.
+    ``SESSION_ENCRYPTION_KEY``), the redirecting file's value must win over a stale
+    ``~/.tg/.env`` — dropping it would reopen the wrong-key class through a legacy-root
+    redirect whose target carries no key of its own.
+
     Two home config paths are then read, deduped, in this order (#188 Axis B):
 
     1. ``tg_home()/.env`` — the ACTIVE data root. This is ``~/.tg`` normally, but a
@@ -172,10 +193,34 @@ def _load_dotenv(path: Path | str = ".env") -> None:
     # The cwd ``.env`` may have set ``TG_HOME`` (and thus changed the legacy-vs-default
     # fallback state); drop the memoized root so pass 2 re-resolves from scratch (#197).
     core_paths.reset_tg_home_cache()
+    # #208: extract the root-selecting ``TG_HOME`` from the home sources BEFORE reading any
+    # home ``.env``'s values, so pass 2 is built against the FINAL root and the redirect
+    # target's key/creds get their contract slot. Guarded by the same write-once rule as
+    # ``setdefault``: any ``TG_HOME`` already present (real env or cwd ``.env``) wins and
+    # skips the scan, and the first home source holding the key settles the root for good
+    # (bounded — a second redirect can never take effect; see the docstring).
+    redirecting: Path | None = None
+    if "TG_HOME" not in os.environ:
+        for candidate in (tg_home() / ".env", core_paths.DEFAULT_HOME / ".env"):
+            parsed = _parse_dotenv(candidate)
+            if "TG_HOME" in parsed:
+                os.environ["TG_HOME"] = parsed["TG_HOME"]
+                core_paths.reset_tg_home_cache()
+                # remember WHICH file named the root: it keeps a value slot below the
+                # final active root's .env — losing it would let a stale ~/.tg/.env win
+                # keys the redirect target doesn't carry (wrong-key, see the docstring).
+                redirecting = candidate
+                break
     # Pass 2: resolve the home sources NOW that the cwd ``.env`` is applied, then layer them
-    # in (deduped against ``path`` and each other so no source is applied twice).
+    # in (deduped against ``path`` and each other so no source is applied twice). Order:
+    # the FINAL active root's .env, then the redirecting home .env (if any — usually a
+    # dedup no-op because it IS DEFAULT_HOME's), then the fixed DEFAULT_HOME fallback.
+    candidates: list[Path] = [tg_home() / ".env"]
+    if redirecting is not None:
+        candidates.append(redirecting)
+    candidates.append(core_paths.DEFAULT_HOME / ".env")
     applied: list[Path | str] = [path]
-    for candidate in (tg_home() / ".env", core_paths.DEFAULT_HOME / ".env"):
+    for candidate in candidates:
         if candidate not in applied:
             applied.append(candidate)
             _apply_dotenv_source(candidate)
