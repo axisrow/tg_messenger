@@ -335,15 +335,17 @@
           req.dialogId !== document.getElementById('dialog_id').value) {
         evt.detail.shouldSwap = false;  // stale response for a dialog the user already left
       }
-      // #203 (visual-only stale-swap, same shared-#messages race): a /send echo carries no dialogId
-      // in its path, so the history/search guard above never covers it — it would always beforeend-
-      // append. If the user switched dialogs before the POST returned, that late echo appends A's
-      // bubble into B's open pane. Scope it by the submitting dialog: markSubmittingDialog() stamps
-      // composer.dataset.submittingDialogId in htmx:confirm (BEFORE the POST) and afterRequest deletes
-      // it AFTER the swap, so it is still live here at beforeSwap. Drop the swap when it no longer
-      // matches the open #dialog_id (which restoreComposeState already updated on the switch).
+      // #203/#209 (visual-only stale-swap, same shared-#messages race): a /send echo carries no
+      // dialogId in its path, so the history/search guard above never covers it — it would always
+      // beforeend-append. If the user switched dialogs before the POST returned, that late echo
+      // appends A's bubble into B's open pane. Scope it by the dialog THIS request was sent to:
+      // htmx snapshots the form fields into requestConfig.parameters when it issues the POST, so
+      // parameters.dialog_id is per-request — a second send racing in another dialog can't
+      // overwrite it the way it overwrote the old shared composer.dataset stamp (#209). Drop the
+      // swap when it no longer matches the open #dialog_id.
       if (req.kind === 'send') {
-        const submitted = document.getElementById('composer').dataset.submittingDialogId;
+        const cfg = evt.detail && evt.detail.requestConfig;
+        const submitted = cfg && cfg.parameters ? cfg.parameters.dialog_id : '';
         if (submitted && submitted !== document.getElementById('dialog_id').value) {
           evt.detail.shouldSwap = false;
         }
@@ -811,12 +813,6 @@
       outboundNonce.value = state.outboundNonce || '';
       composer.dataset.outboundReady = state.outboundReady ? '1' : '';
     }
-    function markSubmittingDialog(id) {
-      composer.dataset.submittingDialogId = id;
-      // #48: snapshot the reply target this send carries, so afterRequest only clears it
-      // when the user hasn't picked a newer target while the send was in flight.
-      composer.dataset.submittingReplyTo = replyToInput.value;
-    }
     function saveComposeState() {
       if (!activeDialogId) return;
       const state = stateFor(activeDialogId);
@@ -925,10 +921,15 @@
       clearComposerError();  // #187: a prior send error clears once a send succeeds
       hideMessagesEmptyState();  // the just-sent bubble means the pane is no longer empty
       hideOutboundIndicator();  // #187: the Translating→ hint is per-attempt — clear it on send
-      const submittedDialogId = composer.dataset.submittingDialogId || activeDialogId;
-      const submittedReplyTo = composer.dataset.submittingReplyTo || '';
-      delete composer.dataset.submittingDialogId;
-      delete composer.dataset.submittingReplyTo;
+      // #209: identify the completed send by THIS request's own field snapshot (htmx captures
+      // the form into requestConfig.parameters when the POST is issued), not by a shared
+      // composer.dataset stamp — with two sends in flight across dialogs, the second overwrote
+      // the stamp and A's completion cleared/reset B's compose state. reply_to comes from the
+      // same snapshot (#48: clear the banner only if the user hasn't picked a newer target
+      // while THIS send was in flight).
+      const params = (evt.detail.requestConfig && evt.detail.requestConfig.parameters) || {};
+      const submittedDialogId = params.dialog_id || activeDialogId;
+      const submittedReplyTo = params.reply_to || '';
       if (submittedDialogId) {
         clearComposeState(stateFor(submittedDialogId));
       }
@@ -967,7 +968,6 @@
         state.outboundReady = false;
         composer.dataset.outboundReady = '';
         hideVariants();
-        markSubmittingDialog(id);
         return;
       }
       evt.preventDefault();
@@ -995,13 +995,11 @@
         const data = await resp.json();
         if (data.status === 'disabled' || data.status === 'not_applicable') {
           clearOutboundState(state);
-          markSubmittingDialog(id);
           evt.detail.issueRequest(true);
           return;
         }
         if (data.status === 'error' || !data.applies) {
           showSendOriginal(id, draft, data.error, () => {
-            markSubmittingDialog(id);
             evt.detail.issueRequest(true);
           });
           return;
@@ -1040,13 +1038,11 @@
           state.outboundReady = true;
           applyComposeState(state);
           hideVariants();
-          markSubmittingDialog(id);
           evt.detail.issueRequest(true);
         });
         variantPanel.appendChild(original);
       } catch (err) {
         showSendOriginal(id, draft, "Couldn't translate — send as written?", () => {
-          markSubmittingDialog(id);
           evt.detail.issueRequest(true);
         });
       } finally {

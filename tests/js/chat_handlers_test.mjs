@@ -218,39 +218,101 @@ vm.runInContext(pageScript, sandbox, { filename: 'chat.html:inline' });
   check('BUG-2: negative-current, other-dialog response dropped', negStale.detail.shouldSwap === false);
 }
 
-// ---- #203: a stale /send echo for a left dialog is dropped (behavioral, not grep) -------------
+// ---- #203/#209: a stale /send echo for a left dialog is dropped (behavioral, not grep) --------
 // The /send path carries no dialogId, so the history/search guard above never covered it; the
-// send branch scopes the swap by composer.dataset.submittingDialogId (stamped in htmx:confirm,
-// live at beforeSwap). This drives the real handler so a regression where the send branch stopped
-// setting shouldSwap=false (or read the wrong field) would fail here — unlike the grep test.
+// send branch scopes the swap by the dialog THIS request was sent to — htmx snapshots the form
+// into evt.detail.requestConfig.parameters at POST time, so the guard is per-request (#209), not
+// a shared composer.dataset stamp. This drives the real handler so a regression where the send
+// branch stopped setting shouldSwap=false (or read the wrong field) would fail here.
 {
   const messages = el('messages');
   const dialogId = el('dialog_id');
 
   // User sent in A (=7), then switched to B (=8) before A's /send POST returned.
   dialogId.value = '8';
-  composer.dataset.submittingDialogId = '7';
   const staleSend = messages.dispatch('htmx:beforeSwap', {
     shouldSwap: true,
     pathInfo: { requestPath: '/send' },
+    requestConfig: { parameters: { dialog_id: '7' } },
   });
   check("#203: stale /send echo for the left dialog is dropped", staleSend.detail.shouldSwap === false);
 
   // The normal case: send in the dialog the user is still viewing → the echo swaps in.
-  composer.dataset.submittingDialogId = '8';
   const liveSend = messages.dispatch('htmx:beforeSwap', {
     shouldSwap: true,
     pathInfo: { requestPath: '/send' },
+    requestConfig: { parameters: { dialog_id: '8' } },
   });
   check("#203: same-dialog /send echo is allowed to swap", liveSend.detail.shouldSwap === true);
 
-  // Missing submittingDialogId (no send in flight through the composer) must not drop a swap.
-  delete composer.dataset.submittingDialogId;
-  const noStamp = messages.dispatch('htmx:beforeSwap', {
+  // A /send-shaped swap without request parameters (defensive) must not be dropped.
+  const noParams = messages.dispatch('htmx:beforeSwap', {
     shouldSwap: true,
     pathInfo: { requestPath: '/send' },
   });
-  check("#203: /send with no submitting dialog stamped is not dropped", noStamp.detail.shouldSwap === true);
+  check("#203: /send with no request parameters is not dropped", noParams.detail.shouldSwap === true);
+}
+
+// ---- #209: two CONCURRENT in-flight sends across dialogs must not cross-post ------------------
+// Scenario: send in A (=7) → switch to B (=8) → submit B while A's POST is still in flight →
+// A's echo returns last. The old guard read ONE shared composer.dataset.submittingDialogId that
+// B's submit overwrote to '8', so A's late echo saw submitted==open dialog and appended A's
+// bubble into B's pane; A's afterRequest then consumed the same overwritten slot and reset B's
+// composer. The fix keys both handlers off the request's OWN parameters snapshot.
+{
+  const messages = el('messages');
+  const dialogId = el('dialog_id');
+  const composerText = el('composer-text');
+
+  // Send in A: htmx:confirm sets activeDialogId and records A's draft in its compose state.
+  dialogId.value = '7';
+  composerText.value = 'draft A';
+  composer.dispatch('htmx:confirm', { issueRequest() {} });
+  // Switch to B and submit there while A's POST is still in flight.
+  dialogId.value = '8';
+  composerText.value = 'draft B';
+  composer.dispatch('htmx:confirm', { issueRequest() {} });
+  // Model the legacy shared-stamp contamination (#209): after B's submit the old code held
+  // submittingDialogId='8'. The fixed guard must ignore it and use A's own request parameters.
+  composer.dataset.submittingDialogId = '8';
+
+  // A's late echo (its request carried dialog_id=7) must NOT swap into B's open pane.
+  const echoA = messages.dispatch('htmx:beforeSwap', {
+    shouldSwap: true,
+    pathInfo: { requestPath: '/send' },
+    requestConfig: { parameters: { dialog_id: '7', reply_to: '' } },
+  });
+  check('#209: concurrent-send echo from A is NOT swapped into B', echoA.detail.shouldSwap === false);
+
+  // B's own echo still swaps.
+  const echoB = messages.dispatch('htmx:beforeSwap', {
+    shouldSwap: true,
+    pathInfo: { requestPath: '/send' },
+    requestConfig: { parameters: { dialog_id: '8', reply_to: '' } },
+  });
+  check('#209: concurrent-send echo from B still swaps', echoB.detail.shouldSwap === true);
+
+  // A's completion (afterRequest) must clean up FOR A — not reset B's composer mid-typing.
+  const resetsBefore = composer._resetCount || 0;
+  composer.dispatch('htmx:afterRequest', {
+    successful: true,
+    xhr: { status: 200 },
+    requestConfig: { parameters: { dialog_id: '7', reply_to: '' } },
+  });
+  check("#209: A's completion does not reset the composer while B is open",
+        (composer._resetCount || 0) === resetsBefore);
+  check("#209: B's draft survives A's completion", composerText.value === 'draft B');
+  check("#209: the form still targets B after A's completion", dialogId.value === '8');
+
+  // B's completion runs the normal success path (reset + clear) for B itself.
+  composer.dispatch('htmx:afterRequest', {
+    successful: true,
+    xhr: { status: 200 },
+    requestConfig: { parameters: { dialog_id: '8', reply_to: '' } },
+  });
+  check("#209: B's own completion clears B's composer", composerText.value === '');
+  check("#209: the form still targets B after B's completion", dialogId.value === '8');
+  delete composer.dataset.submittingDialogId;
 }
 
 // ---- #195 round 2: switch-before-history-response must NOT mark the left dialog read ----------
