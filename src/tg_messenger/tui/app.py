@@ -106,6 +106,11 @@ SUGGEST_PREFIX = "💡 Tab: "
 # so the user sees the suggester is working instead of "nothing happening"
 SUGGEST_THINKING = "⏳ Суфлёр думает…"
 
+# #214: page size for both the initial history window and each backfill page. The reachability
+# problem this size used to gate (older history unreachable) is solved by the incremental
+# backfill (#187/#198/#200/#202/#206) — this constant now only controls page granularity.
+_HISTORY_PAGE_SIZE = 50
+
 
 def _history_supports_offset(store) -> bool:
     """True when ``store.history`` accepts ``offset_id`` paging (#200).
@@ -939,9 +944,9 @@ class MessengerTUI(App):
         pane.loading = True
         try:
             if self._store is not None:
-                messages = await self._store.history(dialog_id, limit=50)
+                messages = await self._store.history(dialog_id, limit=_HISTORY_PAGE_SIZE)
             else:
-                messages = await self._client.history(dialog_id, limit=50)
+                messages = await self._client.history(dialog_id, limit=_HISTORY_PAGE_SIZE)
         except Exception as exc:
             pane.loading = False
             logger.exception("history load failed (dialog %s)", dialog_id)
@@ -955,13 +960,14 @@ class MessengerTUI(App):
         await pane.mount(*(_wrap_bubble(b) for b in bubbles))  # #118: align via wrapper row
         # #187: remember the oldest loaded id — the offset_id for the next older page on scroll-to-top.
         # Messages are chronological (oldest first), so the first is the oldest. A short first page
-        # (< the requested 50) means there IS no older history → mark the dialog exhausted up front.
+        # (< the requested _HISTORY_PAGE_SIZE) means there IS no older history → mark the dialog
+        # exhausted up front.
         # #204: exhaustion is keyed by the current oldest-id, so a reopened window that shifted up
         # (new messages) no longer matches the gate and can page again; an unchanged full window
         # keeps the same cursor and stays exhausted (no needless re-page).
         if messages:
             self._oldest_message_id = messages[0].id
-            if len(messages) < 50:
+            if len(messages) < _HISTORY_PAGE_SIZE:
                 self._backfill_exhausted[dialog_id] = self._oldest_message_id
             # A full first page: leave any recorded exhaustion in place — the gate keys on the
             # cursor, so if the window is unchanged (same oldest id) it stays exhausted (no needless
@@ -1042,9 +1048,13 @@ class MessengerTUI(App):
                 return  # switched away before the fetch even started — release the guard only
             try:
                 if self._store is not None:
-                    older = await self._store.history(dialog_id, limit=50, offset_id=offset_id)
+                    older = await self._store.history(
+                        dialog_id, limit=_HISTORY_PAGE_SIZE, offset_id=offset_id
+                    )
                 else:
-                    older = await self._client.history(dialog_id, limit=50, offset_id=offset_id)
+                    older = await self._client.history(
+                        dialog_id, limit=_HISTORY_PAGE_SIZE, offset_id=offset_id
+                    )
             except Exception:
                 logger.exception("history backfill failed (dialog %s, offset %s)", dialog_id, offset_id)
                 return
@@ -1076,7 +1086,7 @@ class MessengerTUI(App):
             added = pane.max_scroll_y - prev_max
             pane.scroll_to(y=prev_scroll + added, animate=False, force=True)
             self._oldest_message_id = fresh[0].id
-            if len(older) < 50:
+            if len(older) < _HISTORY_PAGE_SIZE:
                 # #204: a short page → no more history; key by the just-advanced cursor.
                 self._backfill_exhausted[dialog_id] = self._oldest_message_id
         finally:
