@@ -100,7 +100,7 @@ def _tg_login_phone_fragment(*, error: str) -> str:
         "<h1>Войти в Telegram</h1>"
         f'<div class="error" role="alert">{escape(error)}</div>'
         '<form hx-post="/tg-login/phone" hx-target="#card" hx-swap="outerHTML">'
-        '<label for="phone">Phone</label>'
+        '<label for="phone" lang="en">Phone</label>'
         '<input id="phone" type="tel" name="phone" autofocus>'
         '<button type="submit">Отправить код</button>'
         "</form>"
@@ -143,7 +143,7 @@ def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
         f'<p class="hint">{hint}</p>'
         f"{err}"
         '<form hx-post="/tg-login/code" hx-target="#card" hx-swap="outerHTML">'
-        '<label for="code">Code</label>'
+        '<label for="code" lang="en">Code</label>'
         '<input id="code" type="text" name="code" autofocus inputmode="numeric" '
         'autocomplete="one-time-code">'
         '<button type="submit">Войти</button>'
@@ -161,7 +161,7 @@ def _tg_login_password_fragment(*, error: str | None = None) -> str:
         "<h1>Пароль 2FA</h1>"
         f"{err}"
         '<form hx-post="/tg-login/password" hx-target="#card" hx-swap="outerHTML">'
-        '<label for="password">2FA password</label>'
+        '<label for="password" lang="en">2FA password</label>'
         '<input id="password" type="password" name="password" autofocus '
         'autocomplete="current-password">'
         '<button type="submit">Войти</button>'
