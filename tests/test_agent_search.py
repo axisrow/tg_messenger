@@ -75,6 +75,53 @@ def test_missing_sdk_gives_pip_hint(monkeypatch):
         build_search_fn("tavily")
 
 
+# --- serpdive ---
+
+def _fake_serpdive_module(calls):
+    mod = types.ModuleType("serpdive")
+
+    class _Result:
+        def __init__(self, title, url, content):
+            self.title, self.url, self.content = title, url, content
+
+    class _Response:
+        results = [
+            _Result("S", "https://s.io", "serpdive text"),
+            _Result(None, "https://no-title.io", "titleless page"),
+        ]
+
+    class SerpDive:
+        def __init__(self, api_key=None):
+            calls.append(("init", api_key))
+
+        def search(self, query, max_results=5):
+            calls.append(("search", query, max_results))
+            return _Response()
+
+    mod.SerpDive = SerpDive
+    return mod
+
+
+async def test_serpdive_uses_key_from_env_and_falls_back_to_url_title(monkeypatch):
+    calls = []
+    monkeypatch.setitem(sys.modules, "serpdive", _fake_serpdive_module(calls))
+    monkeypatch.setenv("SERPDIVE_API_KEY", "sd_live_secret")
+    fn = build_search_fn("serpdive")
+    result = await fn("q", max_results=2)
+    assert ("init", "sd_live_secret") in calls
+    assert ("search", "q", 2) in calls
+    assert "serpdive text" in result and "https://s.io" in result
+    # результат без title показывает URL вместо пустой строки
+    assert result.count("https://no-title.io") == 2
+
+
+def test_serpdive_without_key_fails_fast(monkeypatch):
+    monkeypatch.setitem(sys.modules, "serpdive", _fake_serpdive_module([]))
+    monkeypatch.delenv("SERPDIVE_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="SERPDIVE_API_KEY"):
+        build_search_fn("serpdive")
+
+
 # --- exa ---
 
 def _fake_exa_module(calls):

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # flush in a daemon thread and stop waiting on it after this many seconds (env-overridable).
 _FLUSH_TIMEOUT_SECONDS = 5.0
 
-SEARCH_PROVIDERS = ("duckduckgo", "tavily", "exa", "brave")
+SEARCH_PROVIDERS = ("duckduckgo", "tavily", "exa", "brave", "serpdive")
 
 INTENT_PIPELINES = ("chat", "task")
 # встроенные интенты + имена узлов графа — кастомным интентам они запрещены

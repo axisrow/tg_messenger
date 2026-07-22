@@ -89,6 +89,21 @@ def build_search_fn(provider: str) -> Callable[..., Awaitable[str]]:
             data = await asyncio.to_thread(_call)
             return _format_results([(r.title, r.url, r.text) for r in data.results])
 
+    elif provider == "serpdive":
+
+        def _import():
+            from serpdive import SerpDive
+            return SerpDive
+
+        serpdive_cls = _require_import(provider, "serpdive", _import)
+        serpdive = serpdive_cls(api_key=_require_key("SERPDIVE_API_KEY", provider))
+
+        async def _search(query: str, max_results: int) -> str:
+            data = await asyncio.to_thread(serpdive.search, query, max_results=max_results)
+            # content is the extracted text of the page; title can be absent
+            rows = [(r.title or r.url, r.url, r.content) for r in data.results]
+            return _format_results(rows)
+
     elif provider == "brave":
         key = _require_key("BRAVE_API_KEY", provider)
 
