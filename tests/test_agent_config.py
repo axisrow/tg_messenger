@@ -92,7 +92,7 @@ def test_search_defaults_to_duckduckgo():
 
 
 def test_search_providers_tuple_is_complete():
-    assert set(SEARCH_PROVIDERS) == {"duckduckgo", "tavily", "exa", "brave"}
+    assert set(SEARCH_PROVIDERS) == {"duckduckgo", "tavily", "exa", "brave", "serpdive"}
 
 
 def test_from_env_defaults_to_os_environ(monkeypatch):
