@@ -850,7 +850,10 @@ def build_app(
             return _error_response("Translation is not configured.", 503)
         lang = await translator.target_lang()
         return HTMLResponse(
-            '<form hx-post="/settings/lang" hx-swap="outerHTML" '
+            # lang="en": this form is rendered into chat.html (lang="ru"); its visible
+            # strings (placeholder, button) are English, so override per-element so a
+            # screen reader uses the right pronunciation engine (#213).
+            '<form lang="en" hx-post="/settings/lang" hx-swap="outerHTML" '
             'hx-headers=\'{"x-tg-messenger-csrf": "1"}\'>'
             f'<input name="code" value="{escape(lang or "")}" placeholder="Language">'
             '<button type="submit">Save</button>'
@@ -871,14 +874,17 @@ def build_app(
         except ValueError as exc:
             logger.warning("invalid user language code: %s", exc)
             return _error_response(str(exc), 400)
-        return HTMLResponse(f'<div id="lang-status">Language: {escape(value or "unset")}</div>')
+        return HTMLResponse(f'<div id="lang-status" lang="en">Language: {escape(value or "unset")}</div>')
 
     def _suggest_settings_form(settings: dict) -> str:
         enabled = bool(settings.get("enabled", True))
         history = settings.get("history", 30)
         model = settings.get("model") or ""
         return (
-            '<form id="suggest-settings" hx-post="/settings/suggest" hx-swap="outerHTML" '
+            # lang="en": rendered into chat.html (lang="ru") on demand; all visible strings
+            # (labels, placeholders, button) are English — override so a screen reader uses
+            # the right pronunciation engine (#213).
+            '<form id="suggest-settings" lang="en" hx-post="/settings/suggest" hx-swap="outerHTML" '
             'hx-headers=\'{"x-tg-messenger-csrf": "1"}\'>'
             '<label><input type="checkbox" name="enabled" value="1"'
             f'{" checked" if enabled else ""}> Suggest replies</label>'

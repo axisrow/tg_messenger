@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -82,7 +82,7 @@
     <nav id="tabs" role="tablist">
       <button class="tab active" role="tab" aria-selected="true" hx-get="/dialogs?tab=dm"
               hx-target="#dialogs ul" hx-swap="innerHTML"
-              hx-on:click="document.getElementById('dialog-search').value=''">DM</button>
+              hx-on:click="document.getElementById('dialog-search').value=''" lang="en">DM</button>
       <button class="tab" role="tab" aria-selected="false" hx-get="/dialogs?tab=groups"
               hx-target="#dialogs ul" hx-swap="innerHTML"
               hx-on:click="document.getElementById('dialog-search').value=''">Группы</button>
@@ -103,8 +103,8 @@
       <span id="sse-status" role="status" aria-live="polite"></span>
       <span class="header-spacer"></span>
       <button type="button" id="suggest-settings-btn" title="Suggester settings"
-              aria-expanded="false">⚙ Suggest</button>
-      <a id="logout-link" href="/logout" style="display:none">Logout</a>
+              aria-expanded="false" lang="en">⚙ Suggest</button>
+      <a id="logout-link" href="/logout" style="display:none" lang="en">Logout</a>
     </header>
     <!-- #187: the orphan /settings/suggest form — loaded on demand into this host. -->
     <div id="suggest-settings-panel" style="display:none"></div>
@@ -135,9 +135,9 @@
       <input type="hidden" name="web_client_id" id="web_client_id" value="">
       <input type="hidden" name="outbound_nonce" id="outbound_nonce" value="">
       <input type="hidden" name="reply_to" id="reply_to" value="">
-      <input type="text" name="text" id="composer-text" placeholder="Message…" autocomplete="off" required>
-      <button type="button" id="suggest-btn" title="Suggest a reply">💡 Suggest</button>
-      <label id="attach-btn" title="Attach a file">📎
+      <input type="text" name="text" id="composer-text" placeholder="Message…" autocomplete="off" required lang="en">
+      <button type="button" id="suggest-btn" title="Suggest a reply" lang="en">💡 Suggest</button>
+      <label id="attach-btn" title="Attach a file" lang="en">📎
         <input type="file" id="attach-file" style="display:none">
       </label>
       <span id="suggest-error" role="status"></span>
