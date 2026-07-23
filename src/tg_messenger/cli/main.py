@@ -85,6 +85,11 @@ def _chat_line_reader():
     cursor to corrupt and prompt_toolkit's raw-mode terminal I/O doesn't work over a
     pipe anyway, so that case (and a missing prompt_toolkit) falls back to plain
     ``input()`` — unchanged behavior.
+
+    The redraw itself is prompt_toolkit's contract, exercised only over a real (pseudo)
+    terminal; the tests therefore assert WHICH path is taken (patch_stdout on TTY,
+    nullcontext+input elsewhere), not the live redraw — a full pty-based survival test is
+    deferred (the #215 bar is met by the structural fix plus the non-TTY regression test).
     """
     if PromptSession is not None and patch_stdout is not None and sys.stdin.isatty():
         session = PromptSession()
