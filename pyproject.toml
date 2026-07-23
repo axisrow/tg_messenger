@@ -14,6 +14,9 @@ dependencies = [
     "telethon>=1.43",
     "pydantic>=2",
     "click>=8.1",
+    # chat REPL redraw-safe prompt (#215): background echoes redraw above the
+    # in-flight input line instead of corrupting it.
+    "prompt_toolkit>=3.0",
 ]
 
 [project.optional-dependencies]

@@ -1156,8 +1156,8 @@ def test_chat_outbound_picker_indents_multiline_variant(runner, monkeypatch):
     result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n0\n")
     assert result.exit_code == 0, result.output
     lines = result.output.split("\n")
-    # find the "[1] line one" row (a background "> " reprint may precede it on the line)
-    # and assert the continuation "line two" is indented under the text, not flush-left
+    # find the "[1] line one" row and assert the continuation "line two" is indented under
+    # the text, not flush-left
     idx = next(i for i, ln in enumerate(lines) if ln.endswith("[1] line one"))
     assert lines[idx + 1] == "    line two"  # 4-space indent = len("[1] ")
 
@@ -1282,9 +1282,12 @@ def test_chat_prints_reactions_for_open_dialog(runner, monkeypatch):
     assert "❤️" not in result.output
 
 
-def test_chat_reprints_prompt_after_background_line(runner, monkeypatch):
-    # #187: a live-feed line printed into the terminal while the user is typing must
-    # reprint the "> " prompt afterwards so the input line isn't left orphaned/corrupted
+def test_chat_background_line_prints_without_reprint_on_non_tty(runner, monkeypatch):
+    # #215: on a real TTY the redraw-safe prompt (patch_stdout) redraws the in-flight buffer
+    # above a background line. On piped/non-interactive stdin (this test path) there is no
+    # cursor to corrupt, so the background line is printed plainly WITHOUT re-printing the
+    # "> " prompt — the old #187 reprint was a non-TTY stand-in for the redraw that's now done
+    # structurally by prompt_toolkit. The background line itself must still appear.
     r, stub = runner
     stub.listen_interrupt = False
 
@@ -1298,8 +1301,31 @@ def test_chat_reprints_prompt_after_background_line(runner, monkeypatch):
     result = r.invoke(cli_main.cli, ["chat", "7"], input="")
     assert result.exit_code == 0, result.output
     assert "← ping" in result.output
-    # the prompt is reprinted after the background line (more than the single initial "> ")
-    assert result.output.count("> ") >= 2
+    # only the single initial "> " — no reprint after the background line on non-TTY
+    assert result.output.count("> ") == 1
+
+
+def test_chat_line_reader_falls_back_to_input_on_non_tty(monkeypatch):
+    """#215: piped/non-interactive stdin (tests, `| tg-messenger chat`) has no cursor to
+    corrupt, so the reader stays on plain input() rather than prompt_toolkit's raw-mode
+    terminal I/O, which errors out over a pipe."""
+    import contextlib
+
+    monkeypatch.setattr(cli_main.sys.stdin, "isatty", lambda: False)
+    read_line, redraw_ctx = cli_main._chat_line_reader()
+    assert redraw_ctx is contextlib.nullcontext
+
+    monkeypatch.setattr("builtins.input", lambda prompt: f"got:{prompt}")
+    result = asyncio.run(read_line("> "))
+    assert result == "got:> "
+
+
+def test_chat_line_reader_uses_prompt_toolkit_on_tty(monkeypatch):
+    """#215: on a real TTY, the redraw-safe PromptSession path is selected so background
+    echoes redraw the in-flight buffer instead of splicing into it."""
+    monkeypatch.setattr(cli_main.sys.stdin, "isatty", lambda: True)
+    read_line, redraw_ctx = cli_main._chat_line_reader()
+    assert redraw_ctx is cli_main.patch_stdout
 
 
 def test_chat_does_not_echo_back_our_own_input(runner, monkeypatch):
