@@ -1324,8 +1324,23 @@ def test_chat_line_reader_uses_prompt_toolkit_on_tty(monkeypatch):
     """#215: on a real TTY, the redraw-safe PromptSession path is selected so background
     echoes redraw the in-flight buffer instead of splicing into it."""
     monkeypatch.setattr(cli_main.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli_main.sys.stdout, "isatty", lambda: True)
     read_line, redraw_ctx = cli_main._chat_line_reader()
     assert redraw_ctx is cli_main.patch_stdout
+
+
+def test_chat_line_reader_falls_back_on_mixed_tty(monkeypatch):
+    """Interactive stdin with redirected stdout must not use redraw rendering."""
+    import contextlib
+
+    monkeypatch.setattr(cli_main.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli_main.sys.stdout, "isatty", lambda: False)
+    read_line, redraw_ctx = cli_main._chat_line_reader()
+    assert redraw_ctx is contextlib.nullcontext
+
+    monkeypatch.setattr("builtins.input", lambda prompt: f"got:{prompt}")
+    result = asyncio.run(read_line("> "))
+    assert result == "got:> "
 
 
 def test_chat_does_not_echo_back_our_own_input(runner, monkeypatch):
