@@ -1312,6 +1312,7 @@ def test_chat_line_reader_falls_back_to_input_on_non_tty(monkeypatch):
     import contextlib
 
     monkeypatch.setattr(cli_main.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(cli_main.sys.stdout, "isatty", lambda: False)
     read_line, redraw_ctx = cli_main._chat_line_reader()
     assert redraw_ctx is contextlib.nullcontext
 
