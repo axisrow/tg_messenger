@@ -30,7 +30,7 @@ from tg_messenger.core.auth import LoginSession, session_store_from_env
 from tg_messenger.core.cache import bounded_remember
 from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.search import can_send_in
-from tg_messenger.core.ui_strings import READ_ONLY_MESSAGE
+from tg_messenger.core.ui_strings import MESSAGE_SENT, REACTION_SENT, READ_ONLY_MESSAGE
 
 # --- facade re-exports (these names moved to sibling modules; tests + back-compat import them here) ---
 from tg_messenger.tui.bubbles import (  # noqa: F401
@@ -1546,7 +1546,7 @@ class MessengerTUI(App):
         no feedback that the message went out. Title is best-effort from the loaded list.
         """
         title = self._dialog_title(peer)
-        self.notify(f"Sent to {title}" if title else "Message sent")
+        self.notify(f"Sent to {title}" if title else MESSAGE_SENT)
 
     async def _send_media(
         self, peer: int, path: str, caption: str | None, source_text: str | None = None,
@@ -1617,7 +1617,7 @@ class MessengerTUI(App):
             # toast instead (parity with web #103/#97). Title is best-effort — neutral fallback.
             title = self._dialog_title(peer)
             self.notify(
-                f"Reaction in {title} {emoticon}" if title else f"Reaction sent {emoticon}"
+                f"Reaction in {title} {emoticon}" if title else f"{REACTION_SENT} {emoticon}"
             )
 
     async def _drain_incoming(self) -> None:

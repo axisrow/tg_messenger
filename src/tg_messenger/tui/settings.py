@@ -588,7 +588,7 @@ class AccountsScreen(ModalScreen[object]):
 
     async def _confirm_remove(self, profile: str) -> None:
         ok = await self.app.push_screen_wait(
-            ConfirmScreen(f"Delete profile “{profile}»?")
+            ConfirmScreen(f"Delete profile “{profile}”?")
         )
         if not ok:
             return
