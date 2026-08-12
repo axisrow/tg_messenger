@@ -22,8 +22,8 @@ from tg_messenger.core.models import MessagesDeletedEvent, OutgoingEvent
 logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_SIZE = 1000
-MEDIA_PLACEHOLDER = "<медиа/без текста>"
-NOTIFY_HEADER = "🗑 Удалено в «{title}» (id {dialog_id}):"
+MEDIA_PLACEHOLDER = "<media without text>"
+NOTIFY_HEADER = "🗑 Deleted in “{title}” (id {dialog_id}):"
 
 
 @dataclass(frozen=True)
@@ -111,7 +111,7 @@ class DeletionWatcher:
             except Exception:
                 logger.exception("failed to send deletion notice for dialog %s", dialog_id)
                 continue
-            self._echo(f"🗑 {title}: {len(entries)} удалённое(ых) сообщение(й) сохранено в Saved Messages")
+            self._echo(f"🗑 {title}: {len(entries)} deleted message(s) saved to Saved Messages")
 
     async def _title(self, dialog_id: int) -> str:
         if dialog_id not in self._titles:

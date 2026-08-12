@@ -46,7 +46,7 @@ class AccountItem(ListItem):
     """One saved account profile in the settings screen; the active one is marked."""
 
     def __init__(self, profile: str, active: bool):
-        mark = "  (текущий)" if active else ""
+        mark = "  (current)" if active else ""
         super().__init__(Static(f"{profile}{mark}", markup=False))
         self.profile = profile
 
@@ -66,13 +66,13 @@ class ProfileListCard(Vertical):
         self._active = active
 
     def compose(self) -> ComposeResult:
-        yield Label("Аккаунты", id="accounts-title")
+        yield Label("Accounts", id="accounts-title")
         yield ListView(
             *(AccountItem(p, p == self._active) for p in self._profiles),
             id="accounts",
         )
-        yield Label("a — добавить · d — удалить · Esc — закрыть", id="accounts-help")
-        yield Input(placeholder="Имя нового профиля", id="new-profile")
+        yield Label("a — add · d — remove · Esc — close", id="accounts-help")
+        yield Input(placeholder="New profile name", id="new-profile")
 
     async def refresh_profiles(self, profiles, active) -> None:
         self._profiles = list(profiles)
@@ -94,10 +94,10 @@ class TranslateSettingsCard(Vertical):
 
     # Inbound-translation modes, in display order. The id is the stored TranslateMode literal.
     _TRANSLATE_MODE_LABELS = (
-        ("off", "Выкл — не переводить"),
-        ("all_unknown", "Всё незнакомое (кроме моих языков)"),
-        ("skip_known", "Кроме знакомых (список ниже)"),
-        ("only_unknown", "Только указанные (список ниже)"),
+        ("off", "Off — do not translate"),
+        ("all_unknown", "All unknown languages (except my languages)"),
+        ("skip_known", "Except known languages (see below)"),
+        ("only_unknown", "Only specified languages (see below)"),
     )
 
     class ModelChanged(Message):
@@ -120,7 +120,7 @@ class TranslateSettingsCard(Vertical):
         self._applied_model: str = ""
 
     def compose(self) -> ComposeResult:
-        yield Label("Перевод входящих", id="translate-title")
+        yield Label("Incoming translation", id="translate-title")
         with RadioSet(id="translate-mode"):
             for mode_id, label in self._TRANSLATE_MODE_LABELS:
                 yield RadioButton(label, id=f"mode-{mode_id}")
@@ -129,17 +129,17 @@ class TranslateSettingsCard(Vertical):
         # "nearly unreadable"; a plain Label is legible by default and a NEW field added without
         # per-id CSS still gets a visible caption. The two language lists stay always-shown so
         # nothing silently changes meaning by mode.
-        yield Label("Мой язык (на что переводить)", classes="field-caption")
-        yield Input(placeholder="напр. ru", id="target-lang")
-        yield Label("Не переводить", classes="field-caption")
-        yield Input(placeholder="напр. ru, en", id="known-langs")
-        yield Label("Переводить (пусто = всё переводить)", classes="field-caption")
-        yield Input(placeholder="напр. en, ja", id="unknown-langs")
-        yield Label("Модель для перевода", classes="field-caption")
-        yield Input(placeholder="напр. openai:glm-5.1", id="translate-model")
-        yield Label("Сколько переводить за раз (Ctrl+T)", classes="field-caption")
-        yield Input(placeholder="напр. 100", id="translate-max")
-        yield Label("Enter в поле — сохранить", id="translate-help")
+        yield Label("My language (translate to)", classes="field-caption")
+        yield Input(placeholder="e.g. ru", id="target-lang")
+        yield Label("Do not translate", classes="field-caption")
+        yield Input(placeholder="e.g. ru, en", id="known-langs")
+        yield Label("Translate (empty = translate everything)", classes="field-caption")
+        yield Input(placeholder="e.g. en, ja", id="unknown-langs")
+        yield Label("Translation model", classes="field-caption")
+        yield Input(placeholder="e.g. openai:glm-5.1", id="translate-model")
+        yield Label("Messages per batch (Ctrl+T)", classes="field-caption")
+        yield Input(placeholder="e.g. 100", id="translate-max")
+        yield Label("Press Enter in a field to save", id="translate-help")
 
     async def _load(self) -> None:
         if self._translator is None:
@@ -236,7 +236,7 @@ class TranslateSettingsCard(Vertical):
             return
         except Exception:
             logger.exception("settings: failed to save translation settings")
-            self.notify("Не удалось сохранить настройки перевода", severity="error")
+            self.notify("Could not save translation settings", severity="error")
             return
         self._applied_mode = mode
         if model_changed:
@@ -246,10 +246,10 @@ class TranslateSettingsCard(Vertical):
             # key surfaces on the first actual translation, not here, so don't claim "verified".
             self._translator = new_translator
             self._applied_model = model
-            self.notify("Модель сохранена — проверьте перевод в чате")
+            self.notify("Model saved — check translation in the chat")
             self.post_message(self.ModelChanged(new_translator))
             return
-        self.notify("Настройки перевода сохранены")
+        self.notify("Translation settings saved")
 
     @staticmethod
     def _parse_max_messages(raw: str) -> int | None:
@@ -259,9 +259,9 @@ class TranslateSettingsCard(Vertical):
         try:
             n = int(raw)
         except ValueError as exc:
-            raise ValueError("Сколько переводить: введите число") from exc
+            raise ValueError("Message count: enter a number") from exc
         if n < 1:
-            raise ValueError("Сколько переводить: число должно быть ≥ 1")
+            raise ValueError("Message count: must be ≥ 1")
         return n
 
     async def _validate_model(self, model: str):
@@ -274,21 +274,21 @@ class TranslateSettingsCard(Vertical):
         (build_translator_with_probe does cache the per-model structured-output method in kv; that is
         a harmless detection cache keyed by model name, not the model override or any translation.)
         """
-        # #187: "Сохраняю модель…", not "Проверяю модель…" — the probe only checks structured-output
-        # SUPPORT, not credentials (an invalid key surfaces on the first real translation). "Проверяю"
+        # #187: "Saving model…", not "Checking model…" — the probe only checks structured-output
+        # SUPPORT, not credentials (an invalid key surfaces on the first real translation). "Checking"
         # over-promised a validation that doesn't happen; the success toast already says to check the
         # translation in the chat.
-        self.notify("Сохраняю модель…")
+        self.notify("Saving model…")
         try:
             from tg_messenger.agent.factory import build_translator_with_probe
             from tg_messenger.agent.translate import translate_model_from_env
         except ImportError:
             logger.exception("settings: agent extra unavailable for model change")
-            self.notify("Переводчик недоступен (нет extra [agent])", severity="error")
+            self.notify("Translator unavailable (install the [agent] extra)", severity="error")
             return None
         target_model = model or translate_model_from_env()
         if not target_model:
-            self.notify("Не задана модель перевода", severity="error")
+            self.notify("Translation model is not set", severity="error")
             return None
         # the SQLite Storage the Translator caches into lives on the current translator.
         # Reuse it so settings/cache stay in one DB.
@@ -297,7 +297,7 @@ class TranslateSettingsCard(Vertical):
             new_translator = await build_translator_with_probe(storage, target_model)
         except Exception:
             logger.exception("settings: failed to build translator for model %r", target_model)
-            self.notify("Не удалось применить модель — проверьте имя/ключ", severity="error")
+            self.notify("Could not apply model — check the name/key", severity="error")
             return None
         return new_translator
 
@@ -321,17 +321,17 @@ class SuggestSettingsCard(Vertical):
         self._applied_suggest_enabled: bool = True
 
     def compose(self) -> ComposeResult:
-        yield Label("Суфлёр ответов (💡)", id="suggest-title")
+        yield Label("Reply suggester (💡)", id="suggest-title")
         with Horizontal(id="suggest-enabled-row"):
-            yield Label("Подсказывать ответы")
+            yield Label("Suggest replies")
             yield Switch(value=True, id="suggest-enabled")
         # #187: captions as ordinary Labels above each Input (see TranslateSettingsCard), not the
         # nearly-unreadable border_title.
-        yield Label("Сколько сообщений контекста", classes="field-caption")
-        yield Input(placeholder="напр. 30", id="suggest-history")
-        yield Label("Модель суфлёра (пусто = по умолчанию)", classes="field-caption")
-        yield Input(placeholder="напр. openai:gpt-4o", id="suggest-model")
-        yield Label("Enter в поле — сохранить", id="suggest-help")
+        yield Label("Context message count", classes="field-caption")
+        yield Input(placeholder="e.g. 30", id="suggest-history")
+        yield Label("Suggester model (empty = default)", classes="field-caption")
+        yield Input(placeholder="e.g. openai:gpt-4o", id="suggest-model")
+        yield Label("Press Enter in a field to save", id="suggest-help")
 
     async def _load(self) -> None:
         if self._suggester is None:
@@ -360,11 +360,11 @@ class SuggestSettingsCard(Vertical):
         try:
             history = int(history_raw) if history_raw else DEFAULT_SUGGEST_HISTORY
         except ValueError:
-            self.notify("Контекст: введите число", severity="error")
+            self.notify("Context: enter a number", severity="error")
             return
         model_changed = model != self._applied_suggest_model
         if model_changed and model:
-            self.notify("Проверяю модель суфлёра…")
+            self.notify("Checking suggester model…")
         try:
             # save_settings validates the model (building its suggest_fn) BEFORE persisting, so a bad
             # model name raises here and nothing is half-committed (mirrors the translator ordering).
@@ -374,11 +374,11 @@ class SuggestSettingsCard(Vertical):
             return
         except Exception:
             logger.exception("settings: failed to save suggester settings")
-            self.notify("Не удалось сохранить настройки суфлёра", severity="error")
+            self.notify("Could not save suggester settings", severity="error")
             return
         self._applied_suggest_model = model
         self._applied_suggest_enabled = enabled
-        self.notify("Настройки суфлёра сохранены")
+        self.notify("Suggester settings saved")
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
         if event.switch.id != "suggest-enabled":
@@ -497,7 +497,7 @@ class AccountsScreen(ModalScreen[object]):
         # profile is a no-op; add/remove use their own key bindings, not selection.
         item = event.item
         if isinstance(item, AccountItem) and item.profile != self._active:
-            self.notify(f"Переключение на «{item.profile}»: перезапустите приложение")
+            self.notify(f"Switching to “{item.profile}”: restart the application")
 
     def on_translate_settings_card_model_changed(
         self, event: "TranslateSettingsCard.ModelChanged"
@@ -531,13 +531,13 @@ class AccountsScreen(ModalScreen[object]):
         # form already exists. Checked BEFORE building a client — no network on a bad name.
         if not is_safe_profile_name(name):
             self.notify(
-                f"Недопустимое имя профиля: {name} (только латиница, цифры, _.-)",
+                f"Invalid profile name: {name} (letters, numbers, _.- only)",
                 severity="error",
             )
             self.query_one("#new-profile", Input).focus()
             return
         if name in self._store.list_profiles():
-            self.notify(f"Профиль уже существует: {name}", severity="error")
+            self.notify(f"Profile already exists: {name}", severity="error")
             self.query_one("#new-profile", Input).focus()
             return
         self.run_worker(self._add_account(name), exclusive=True)
@@ -562,7 +562,7 @@ class AccountsScreen(ModalScreen[object]):
                 save_session()  # → SessionStore.save(name, ...)
         except Exception:
             logger.exception("settings: add account failed")  # name only; no secrets logged
-            self.notify(f"Не удалось добавить профиль: {name}", severity="error")
+            self.notify(f"Could not add profile: {name}", severity="error")
             return
         finally:
             if client is not None:
@@ -574,7 +574,7 @@ class AccountsScreen(ModalScreen[object]):
                         logger.warning("settings: client disconnect failed", exc_info=True)
         await self._refresh(self._store.list_profiles() or [*self._profiles, name])
         self.query_one("#new-profile", Input).value = ""
-        self.notify(f"Профиль добавлен: {name}")
+        self.notify(f"Profile added: {name}")
 
     def action_remove_account(self) -> None:
         lv = self.query_one("#accounts", ListView)
@@ -588,7 +588,7 @@ class AccountsScreen(ModalScreen[object]):
 
     async def _confirm_remove(self, profile: str) -> None:
         ok = await self.app.push_screen_wait(
-            ConfirmScreen(f"Удалить профиль «{profile}»?")
+            ConfirmScreen(f"Delete profile “{profile}”?")
         )
         if not ok:
             return
@@ -596,10 +596,10 @@ class AccountsScreen(ModalScreen[object]):
             self._store.delete(profile)
         except Exception:
             logger.exception("settings: remove account failed")
-            self.notify(f"Не удалось удалить профиль: {profile}", severity="error")
+            self.notify(f"Could not remove profile: {profile}", severity="error")
             return
         await self._refresh(self._store.list_profiles())
-        self.notify(f"Профиль удалён: {profile}")
+        self.notify(f"Profile removed: {profile}")
 
     async def _refresh(self, profiles) -> None:
         # the profile list lives on its card now; the screen only coordinates the add/remove flow.

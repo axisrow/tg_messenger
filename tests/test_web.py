@@ -2227,8 +2227,8 @@ async def test_index_has_cross_dialog_reaction_toast(client_app):
     # the resolver reads the verbatim data-title attribute, never the rendered text
     # (Codex review of #103 — no more over-trimming of " @"/trailing-digit titles)
     assert "li.dataset.title" in r.text
-    assert "Реакция в " in r.text  # the titled message form
-    assert "Реакция отправлена " in r.text  # the neutral fallback form
+    assert "Reaction in " in r.text  # the titled message form
+    assert "Reaction sent " in r.text  # the neutral fallback form
 
 
 async def test_index_auto_scrolls_to_newest(client_app):
@@ -2276,14 +2276,14 @@ async def test_index_surfaces_send_errors(client_app):
 
 async def test_index_has_in_dialog_message_search(client_app):
     # #187: the chat pane must have its own message-search field wired to /dialogs/{id}/search,
-    # distinct from the sidebar dialog filter (which says "Поиск диалогов…").
+    # distinct from the sidebar dialog filter (which says "Search conversations…").
     ac, _ = client_app
     r = await ac.get("/")
     assert 'id="message-search-input"' in r.text
     assert "/search?q=" in r.text  # the search route is targeted
     assert "target: '#messages'" in r.text  # results swap into the message pane
     # the two search boxes are disambiguated by their placeholders
-    assert "Поиск диалогов…" in r.text and "Поиск в переписке…" in r.text
+    assert "Search conversations…" in r.text and "Search this conversation…" in r.text
 
 
 async def test_index_has_empty_and_loading_states(client_app):
@@ -2291,7 +2291,7 @@ async def test_index_has_empty_and_loading_states(client_app):
     ac, _ = client_app
     r = await ac.get("/")
     assert 'id="messages-empty"' in r.text
-    assert "Выберите диалог" in r.text  # the select-a-conversation hint
+    assert "Select a conversation" in r.text  # the select-a-conversation hint
     assert "hideMessagesEmptyState" in r.text  # cleared once a chat opens
 
 
@@ -2836,7 +2836,7 @@ async def test_tg_login_form_resumes_code_step_on_reload():
         r = await ac.get("/tg-login")
         assert r.status_code == 200
         assert sess.state == "code"  # not restarted
-        assert "Введите код" in r.text  # the code card, not the phone form
+        assert "Enter code" in r.text  # the code card, not the phone form
         assert 'data-timeout="60"' in r.text  # countdown preserved via last_delivery
         # #187: htmx is vendored locally now — the full layout still ships it so the
         # hx-post forms work after reload, just not from the unpkg CDN.
@@ -2854,7 +2854,7 @@ async def test_tg_login_form_resumes_password_step_on_reload():
         r = await ac.get("/tg-login")
         assert r.status_code == 200
         assert sess.state == "password"
-        assert "Пароль 2FA" in r.text  # the password card
+        assert "2FA password" in r.text  # the password card
         assert "/static/htmx.min.js" in r.text  # #187: htmx vendored locally, full layout
 
 
@@ -2870,8 +2870,8 @@ async def test_tg_login_form_while_sending_shows_phone_not_code_card():
         r = await ac.get("/tg-login")
         assert r.status_code == 200
         assert sess.state == "sending"  # reset is a no-op; window untouched
-        assert "Введите код" not in r.text  # no premature code card
-        assert "Войти в Telegram" in r.text  # the phone form is shown
+        assert "Enter code" not in r.text  # no premature code card
+        assert "Sign in to Telegram" in r.text  # the phone form is shown
 
 
 async def test_tg_login_success_saves_session():

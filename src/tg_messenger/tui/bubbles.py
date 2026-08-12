@@ -36,7 +36,7 @@ class MessageBubble(Static):
         # reaction key (Static binds nothing to it by default, so it's free for navigation).
         # #187: show=True so "React" surfaces in the Footer while a bubble is focused (was hidden,
         # discoverable only via F1). A contextual binding shows only when its widget holds focus.
-        Binding("r,x", "react", "Реакция", show=True),
+        Binding("r,x", "react", "React", show=True),
         Binding("space", "jump_edge", "Top/bottom", show=False),
     ]
 

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -21,12 +21,12 @@
 <body>
   {% if card %}{{ card | safe }}{% else %}
   <div id="card">
-    <h1>Войти в Telegram</h1>
+    <h1>Sign in to Telegram</h1>
     <form hx-post="/tg-login/phone" hx-target="#card" hx-swap="outerHTML">
       <label for="phone" lang="en">Phone number</label>
       <input id="phone" type="tel" name="phone" autofocus placeholder="+1 555 0100"
              autocomplete="tel">
-      <button type="submit">Отправить код</button>
+      <button type="submit">Send code</button>
     </form>
   </div>
   {% endif %}
