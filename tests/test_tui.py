@@ -556,7 +556,7 @@ async def test_tui_readonly_channel_disables_composer():
         await pilot.pause()
         composer = app.query_one("#composer", Input)
         assert composer.disabled is True
-        assert composer.placeholder == "Только чтение"
+        assert composer.placeholder == "Read-only"
 
 
 async def test_tui_writable_dialog_enables_composer():
@@ -571,7 +571,7 @@ async def test_tui_writable_dialog_enables_composer():
         composer = app.query_one("#composer", Input)
         assert composer.disabled is False
         # #187: the writable placeholder hints the @file media send (previously undocumented)
-        assert composer.placeholder.startswith("Сообщение")
+        assert composer.placeholder.startswith("Message")
         assert "@" in composer.placeholder
 
 
@@ -580,8 +580,8 @@ def test_tui_help_text_documents_media_send():
     # the help. It must now appear in HELP_TEXT next to /lang and /tlang.
     from tg_messenger.tui.app import HELP_TEXT
 
-    assert "@путь" in HELP_TEXT
-    assert "отправить файл" in HELP_TEXT
+    assert "@path" in HELP_TEXT
+    assert "attach a file" in HELP_TEXT
 
 
 async def test_tui_submit_in_readonly_channel_does_not_send():
@@ -1588,7 +1588,7 @@ async def test_tui_react_targets_bubble_dialog_not_current():
     assert stub.reactions == [(7, 1, "👍")]  # reaction went to the bubble's dialog, not -100300
     # #105: cross-dialog reaction confirms via a toast (the in-pane echo is suppressed since
     # peer != _current), with the source dialog's title — parity with web #103/#97.
-    assert notifications == ["Реакция в Ann [/x 👍"]
+    assert notifications == ["Reaction in Ann [/x 👍"]
 
 
 async def test_tui_react_picker_cancel_sends_nothing():
@@ -2088,7 +2088,7 @@ async def test_tui_search_does_not_hit_network():
         assert stub.dialogs_calls == calls_before
 
 
-# --- Цикл 36: вкладки Все / Контакты / Не контакты / Группы / Каналы / Боты / Непрочитанные / Архив ---
+# --- Цикл 36: вкладки All / Contacts / Не контакты / Groups / Channels / Bots / Unread / Archive ---
 
 
 def _listed_ids(app):
@@ -2110,14 +2110,14 @@ async def test_tui_has_all_tab_active_by_default():
         assert tabs.active == "all"
         # #187: labels shortened to clip less in the 32-col sidebar (ids unchanged)
         assert [tab.label.plain for tab in tabs.query("Tab")] == [
-            "Все",
-            "Контакты",
-            "Не конт.",
-            "Группы",
-            "Каналы",
-            "Боты",
-            "Непроч.",
-            "Архив",
+            "All",
+            "Contacts",
+            "Non-contacts",
+            "Groups",
+            "Channels",
+            "Bots",
+            "Unread",
+            "Archive",
         ]
         assert _listed_ids(app) == [7, 8, -100200, -100300, 9]
 
@@ -2177,7 +2177,7 @@ async def test_tui_unread_tab_lists_unread_non_archived_dialogs():
 
 
 async def test_tui_unread_tab_drops_dialog_that_became_read_on_live_message():
-    # #110 bug #4: a live message in the OPEN dialog zeroes its unread; on the "Непрочитанные"
+    # #110 bug #4: a live message in the OPEN dialog zeroes its unread; on the "Unread"
     # tab the now-read dialog must disappear, not linger until the next reload.
     stub = UnreadTouchClient()
     app = MessengerTUI(client=stub)
@@ -2221,7 +2221,7 @@ class ReadToUnreadClient(TuiStubClient):
 
 async def test_tui_unread_tab_surfaces_dialog_that_became_unread_on_live_message():
     # #110 (Codex re-review): a live message for a NON-open, initially-read dialog must SURFACE on
-    # the open "Непрочитанные" tab without a reload — the live touch updates the full snapshot, and
+    # the open "Unread" tab without a reload — the live touch updates the full snapshot, and
     # the tab projection re-includes it.
     stub = ReadToUnreadClient()
     app = MessengerTUI(client=stub)
@@ -2493,7 +2493,7 @@ async def test_tui_group_incoming_appends_bubble_for_open_group_only():
         stub.fire.set()
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
-        # ЛС-событие не дорисовано (чужой диалог), групповое — да.
+        # ЛС-событие не дорисовано (чужой conversation), групповое — да.
         # #108: в группе у входящего сверху строка автора (sender=None → голый userid).
         assert [_body_without_ts(str(b.render())) for b in bubbles] == ["9\n[21] из группы"]
 
@@ -2981,11 +2981,11 @@ async def test_tui_outgoing_from_another_device_appends_out_bubble_for_open_dial
     app = MessengerTUI(client=stub)
     async with app.run_test() as pilot:
         await pilot.pause()
-        app._current = 7  # открыт диалог 7
+        app._current = 7  # открыт conversation 7
         stub.fire.set()
         await pilot.pause()
         bubbles = list(app.query(MessageBubble))
-        # своё сообщение в открытый диалог дорисовано (out=True), в чужой — нет
+        # своё сообщение в открытый conversation дорисовано (out=True), в чужой — нет
         assert [_body_without_ts(str(b.render())) for b in bubbles] == ["[30] с телефона"]
         assert all("out" in b.classes for b in bubbles)
 
@@ -3688,7 +3688,7 @@ async def test_down_focuses_first_dialog_so_it_is_navigable():
         assert lv.index == 0  # списком сразу можно листать
 
 
-# --- UX: стрелка-вверх на первом диалоге → обратно на вкладки DM/Группы ---
+# --- UX: стрелка-вверх на первом диалоге → обратно на вкладки DM/Groups ---
 
 
 async def test_up_on_first_dialog_returns_focus_to_tabs():
@@ -4213,7 +4213,7 @@ async def test_dialogs_down_handoff_commits_highlighted_dialog():
         await pilot.pause()
         lv = app.query_one("#dialogs", ListView)
         lv.focus()
-        lv.index = 0  # open dialog 7 (first item on the "Все" tab)
+        lv.index = 0  # open dialog 7 (first item on the "All" tab)
         await pilot.press("right")
         await _pause_until(pilot, lambda: app._current == 7)
         # move the cursor to the last dialog WITHOUT opening it (cursor move = Highlighted only)
@@ -4397,7 +4397,7 @@ async def test_dialogs_right_on_readonly_channel_keeps_focus_alive():
     app = MessengerTUI(client=stub)
     async with app.run_test(size=(80, 20)) as pilot:
         await pilot.pause()
-        # the default "Все" tab already lists the read-only channel (-100300)
+        # the default "All" tab already lists the read-only channel (-100300)
         await _pause_until(pilot, lambda: any(
             i.dialog_id == -100300 for i in app.query(DialogItem)))
         lv = app.query_one("#dialogs", ListView)
@@ -4882,8 +4882,8 @@ async def test_tui_open_settings_lists_profiles_with_active_marked():
         assert [it.profile for it in items] == ["alice", "bob"]
         alice_row = next(str(it.query_one(Static).render()) for it in items if it.profile == "alice")
         bob_row = next(str(it.query_one(Static).render()) for it in items if it.profile == "bob")
-        assert "(текущий)" in alice_row  # active profile marked
-        assert "(текущий)" not in bob_row
+        assert "(current)" in alice_row  # active profile marked
+        assert "(current)" not in bob_row
 
 
 async def test_tui_settings_add_profile_runs_wizard_and_saves(caplog):
@@ -5007,7 +5007,7 @@ async def test_tui_settings_add_duplicate_canonical_name_is_rejected():
 async def test_tui_settings_active_marked_and_protected_under_sanitization():
     # #121: the active profile's raw session name may sanitize differently than the listed
     # (canonical) stems. The marker AND the delete guard must compare canonical forms, so the
-    # active row is still marked "(текущий)" and cannot be deleted.
+    # active row is still marked "(current)" and cannot be deleted.
     store = FakeSessionStore(["work_personal", "bob"])
     # active raw name "work/personal" → canonical "work_personal" (the listed stem)
     app = MessengerTUI(client=TuiStubClient(), session_name="work/personal", session_store=store)
@@ -5022,7 +5022,7 @@ async def test_tui_settings_active_marked_and_protected_under_sanitization():
         active_row = next(
             str(it.query_one(Static).render()) for it in items if it.profile == "work_personal"
         )
-        assert "(текущий)" in active_row  # marked despite raw≠canonical
+        assert "(current)" in active_row  # marked despite raw≠canonical
         # try to delete the active (canonical) row — must be refused, no confirm dialog
         screen.query_one("#accounts", ListView).index = next(
             i for i, it in enumerate(items) if it.profile == "work_personal"
@@ -5161,8 +5161,8 @@ async def test_tui_toggle_t_flips_notifies_persists():
         await pilot.press("t")
         await _pause_until(pilot, lambda: app._auto_translate is False)
         await _pause_until(pilot, lambda: ("translate_auto", "0") in storage.sets)
-    assert any("включ" in n for n in notes)
-    assert any("выключ" in n for n in notes)
+    assert any("enabled" in n for n in notes)
+    assert any("disabled" in n for n in notes)
 
 
 async def test_tui_t_swallowed_in_composer_but_ctrl_t_reaches_handler():
@@ -5225,7 +5225,7 @@ async def test_tui_ctrl_t_no_open_chat_notifies():
         app.notify = lambda message, **kw: notes.append(message)  # type: ignore[method-assign]
         await pilot.press("ctrl+t")  # no dialog open
         await pilot.pause()
-    assert any("Нет открытого диалога" in n for n in notes)
+    assert any("No conversation is open" in n for n in notes)
     assert tr.history_calls == []
 
 
@@ -5263,7 +5263,7 @@ async def test_tui_translate_not_configured_warns():
         await pilot.press("t")
         await pilot.pause()
     # both the whole-chat Ctrl+T and the `t` toggle warn when no translator is wired
-    assert sum("Переводчик не настроен" in n for n in notes) >= 2
+    assert sum("Translator is not configured" in n for n in notes) >= 2
 
 
 async def test_tui_auto_translate_covers_channels():
@@ -5393,19 +5393,19 @@ async def test_tui_footer_is_present_and_shows_help_and_settings():
         await pilot.pause()
         # the Footer exists (was missing — the reported "не вижу настроек/?")
         assert app.query(Footer)
-        # exactly one visible "Справка" binding (no F1/? duplicate) and a "Настройки" binding
+        # exactly one visible "Help" binding (no F1/? duplicate) and a "Settings" binding
         labels = [b.description for b in app._bindings.shown_keys]
-        assert labels.count("Справка") == 1
-        assert "Настройки" in labels
+        assert labels.count("Help") == 1
+        assert "Settings" in labels
         # the Footer only renders bindings ACTIVE in the current focus (search Input on startup).
         # The help hint must be the F1 binding (priority → active inside an Input); a "?"-only hint
         # would be filtered out exactly when the user first looks — the original complaint.
         active = [
             ab.binding for ab in app.active_bindings.values() if ab.binding.show
         ]
-        active_help = [b for b in active if b.description == "Справка"]
+        active_help = [b for b in active if b.description == "Help"]
         assert len(active_help) == 1 and active_help[0].key == "f1"
-        assert any(b.description == "Настройки" for b in active)
+        assert any(b.description == "Settings" for b in active)
 
 
 async def test_tui_settings_sections_are_card_widgets():
@@ -5740,18 +5740,18 @@ async def test_tui_settings_fields_have_caption_labels():
         await pilot.pause()
         caption_texts = {str(lbl.render()) for lbl in screen.query(".field-caption")}
         for caption in (
-            "Мой язык (на что переводить)",
-            "Не переводить",
-            "Переводить (пусто = всё переводить)",
-            "Модель для перевода",
-            "Сколько переводить за раз (Ctrl+T)",
+            "My language (translate to)",
+            "Do not translate",
+            "Translate (empty = translate everything)",
+            "Translation model",
+            "Messages per batch (Ctrl+T)",
         ):
             assert caption in caption_texts
         # caption survives a typed value (a Label is independent of the Input's content)
         target = screen.query_one("#target-lang", Input)
         target.value = "ru"
         await pilot.pause()
-        assert "Мой язык (на что переводить)" in {
+        assert "My language (translate to)" in {
             str(lbl.render()) for lbl in screen.query(".field-caption")
         }
 
@@ -5775,8 +5775,8 @@ async def test_tui_settings_model_and_max_fields_present_and_loaded():
         assert max_field.value == "250"
         # #187: captions are Labels above the fields now (not border_title)
         caption_texts = {str(lbl.render()) for lbl in screen.query(".field-caption")}
-        assert "Модель для перевода" in caption_texts
-        assert "Сколько переводить за раз (Ctrl+T)" in caption_texts
+        assert "Translation model" in caption_texts
+        assert "Messages per batch (Ctrl+T)" in caption_texts
         # both Tab-reachable (never disabled — #133 discipline)
         chain_ids = [getattr(w, "id", None) for w in screen.focus_chain]
         assert "translate-model" in chain_ids and "translate-max" in chain_ids
@@ -5814,7 +5814,7 @@ async def test_tui_translate_all_without_dialog_notifies():
         app._current = None
         app.action_translate_all()
         await pilot.pause()
-        assert any("диалог" in m.lower() for m, _ in notes)
+        assert any("conversation" in m.lower() for m, _ in notes)
 
 
 async def test_tui_translate_all_without_translator_notifies():
@@ -5828,7 +5828,7 @@ async def test_tui_translate_all_without_translator_notifies():
         app._translator = None
         app.action_translate_all()
         await pilot.pause()
-        assert any("переводчик" in m.lower() for m, _ in notes)
+        assert any("translator" in m.lower() for m, _ in notes)
 
 
 class _BlockingTranslator(StubTranslator):
@@ -5864,7 +5864,7 @@ async def test_tui_translate_all_shows_status_then_clears():
         # caption and the animated LoadingIndicator (the blinking dots, like history loading)
         status = app.query_one("#translate-status")
         label = status.query_one(Label)
-        assert "Идёт перевод" in str(label.render())
+        assert "Translating" in str(label.render())
         assert status.query(LoadingIndicator), "animated loading dots not shown during translation"
         # release the translator → status clears, bubbles appear WITH the translation rendered
         translator.gate.set()
@@ -6065,7 +6065,7 @@ async def test_tui_notifies_when_suggester_disabled(monkeypatch):
     async with app.run_test() as pilot:
         await pilot.pause()
         await pilot.pause()
-    assert any("Суфлёр" in m and "TG_AGENT_MODEL" in m for m in notes)
+    assert any("Suggester" in m and "TG_AGENT_MODEL" in m for m in notes)
 
 
 async def test_tui_no_disabled_notice_when_suggester_wired(monkeypatch):
@@ -6084,7 +6084,7 @@ async def test_tui_no_disabled_notice_when_suggester_wired(monkeypatch):
     async with app.run_test() as pilot:
         await pilot.pause()
         await pilot.pause()
-    assert not any("Суфлёр" in m for m in notes)
+    assert not any("Suggester" in m for m in notes)
 
 
 # --- #147: the 💡 hint renders with a suggester wired, and stays empty without one ---
@@ -6456,7 +6456,7 @@ async def test_tui_ctrl_g_notifies_without_suggester():
         app.action_suggest_reply()
         await pilot.pause()
     assert suggest_workers == []  # no work scheduled
-    assert any("Суфлёр" in m for m in notes)  # the user got feedback, not silence
+    assert any("Suggester" in m for m in notes)  # the user got feedback, not silence
 
 
 async def test_tui_ctrl_g_dm_only_notifies_in_group():
@@ -6480,7 +6480,7 @@ async def test_tui_ctrl_g_dm_only_notifies_in_group():
         app.action_suggest_reply()
         await pilot.pause()
     assert suggester.calls == []  # never asked for a draft in a group
-    assert any("личных сообщениях" in m for m in notes)
+    assert any("direct messages" in m for m in notes)
 
 
 async def test_tui_ctrl_g_notifies_on_empty_draft():
@@ -6497,7 +6497,7 @@ async def test_tui_ctrl_g_notifies_on_empty_draft():
         await _pause_until(pilot, lambda: app._started)
         app._current = 7  # Ann, a DM
         app.action_suggest_reply()
-        await _pause_until(pilot, lambda: any("не предложил" in m for m in notes))
+        await _pause_until(pilot, lambda: any("did not propose" in m for m in notes))
         assert app._pending_suggestion is None  # nothing pending on an empty draft
         assert str(app.query_one("#suggestion", Static).render()) == ""
 
@@ -6513,14 +6513,14 @@ def test_tui_react_binding_shows_in_footer():
 
 
 async def test_tui_messages_empty_state_hint_shown_then_removed():
-    # #187 (L2): before any dialog is opened, #messages shows a "выберите диалог" hint (was a blank
+    # #187 (L2): before any dialog is opened, #messages shows a "выберите conversation" hint (was a blank
     # void); it's removed once a dialog's history loads.
     app = MessengerTUI(client=TuiStubClient())
     async with app.run_test() as pilot:
         await pilot.pause()
         hint = app.query("#messages-empty")
         assert hint  # the empty-state hint is present at startup
-        assert "Выберите диалог" in str(hint.first().render())
+        assert "Select a conversation" in str(hint.first().render())
         app._current = 7
         await app._show_history(7)
         await pilot.pause()
@@ -6541,12 +6541,12 @@ async def test_tui_variant_picker_does_not_inline_whole_draft():
         items = list(app.screen.query(VariantItem))
         original = next(it for it in items if it.value == ORIGINAL_SENTINEL)
         label = str(original.query_one(Static).render())
-        assert label == "Отправить оригинал"
+        assert label == "Send original"
         assert long_draft not in label  # the draft is NOT inlined
 
 
 async def test_tui_login_phone_step_shows_sending_hint():
-    # #187 (L8): after submitting the phone number the prompt shows "Отправляю код…" while the
+    # #187 (L8): after submitting the phone number the prompt shows "Sending code…" while the
     # network request is in flight (was frozen-looking).
     from tg_messenger.core.auth import CodeDelivery
     from tg_messenger.tui.app import LoginScreen
@@ -6572,7 +6572,7 @@ async def test_tui_login_phone_step_shows_sending_hint():
         screen.on_input_submitted(Input.Submitted(inp, "+10000000000"))
         await pilot.pause()
         prompt = screen.query_one("#login-prompt", Label)
-        assert "Отправляю код" in str(prompt.render())  # in-flight feedback
+        assert "Sending code" in str(prompt.render())  # in-flight feedback
         session.gate.set()  # let it finish so teardown is clean
         await pilot.pause()
 
@@ -6589,12 +6589,12 @@ async def test_tui_cross_dialog_send_toasts():
         app._current = 8  # open dialog 8
         await app._send_text(7, "hi")  # but send to dialog 7 (Ann)
         await pilot.pause()
-        assert any("Отправлено в" in m for m in notes)
+        assert any("Sent to" in m for m in notes)
 
 
 async def test_tui_auto_translate_toast_enriched_with_open_chat():
     # #187 (L14): turning auto-translate ON with a chat open also re-translates it, so the toast
-    # says "перевожу чат…" (was a bare "включён" with no sign the pass started).
+    # says "translating chat…" (was a bare "enabled" with no sign the pass started).
     class _Tr:
         async def auto_enabled(self):
             return None
@@ -6619,7 +6619,7 @@ async def test_tui_auto_translate_toast_enriched_with_open_chat():
         app._current = 7
         app.action_toggle_auto_translate()
         await pilot.pause()
-        assert any("перевожу чат" in m for m in notes)
+        assert any("translating chat" in m for m in notes)
 
 
 async def test_tui_profile_selection_toasts_restart_hint():
@@ -6637,7 +6637,7 @@ async def test_tui_profile_selection_toasts_restart_hint():
         lv = screen.query_one("#accounts", ListView)
         bob = next(it for it in screen.query(AccountItem) if it.profile == "bob")
         screen.on_list_view_selected(ListView.Selected(lv, bob, 0))
-        assert any("перезапустите" in m for m in notes)
+        assert any("restart the application" in m for m in notes)
 
 
 class _FakeErrorCoordinator:
@@ -6663,9 +6663,9 @@ async def test_tui_outbound_timeout_vs_error_are_distinguished():
         app._current = 7
         app._coordinator = _FakeErrorCoordinator("Translation timed out.")
         await app._outbound_flow(7, "hi")
-        assert any("не успел" in m for m in notes)  # timeout wording
+        assert any("timed out" in m for m in notes)  # timeout wording
 
         notes.clear()
         app._coordinator = _FakeErrorCoordinator("Translation failed.")
         await app._outbound_flow(7, "hi")
-        assert any("не удался" in m for m in notes)  # model-failure wording
+        assert any("failed" in m for m in notes)  # model-failure wording

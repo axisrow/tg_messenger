@@ -37,9 +37,10 @@ from tg_messenger.core.auth import (
     LoginSession,
     session_store_from_env,
 )
-from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
+from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.search import filter_dialogs
+from tg_messenger.core.ui_strings import READ_ONLY_MESSAGE
 
 # #181: the cheap layer (cookies / HTML renderers / sent-state) moved to leaf modules; re-export
 # so the routes (closures inside build_app) keep resolving these names as module globals, and so

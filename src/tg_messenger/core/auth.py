@@ -181,9 +181,9 @@ class CodeDelivery(NamedTuple):
 
 
 _DELIVERY_HINTS = {
-    "app": "Код отправлен в приложение Telegram (проверьте чат «Telegram», отправитель 777000).",
-    "sms": "Код отправлен по SMS.",
-    "call": "Вам поступит звонок с кодом.",
+    "app": "Code sent to the Telegram app (check the “Telegram” chat from 777000).",
+    "sms": "Code sent by SMS.",
+    "call": "You will receive a call with a code.",
 }
 
 
@@ -192,9 +192,9 @@ def delivery_hint(delivery: CodeDelivery) -> str:
 
     The phone number is never part of this text — only the delivery channel.
     """
-    msg = _DELIVERY_HINTS.get(delivery.kind, "Код отправлен — проверьте Telegram и SMS.")
+    msg = _DELIVERY_HINTS.get(delivery.kind, "Code sent — check Telegram and SMS.")
     if delivery.next_kind:
-        msg += f" Нет кода? Можно отправить повторно (канал: {delivery.next_kind})."
+        msg += f" No code? You can resend it (channel: {delivery.next_kind})."
     return msg
 
 

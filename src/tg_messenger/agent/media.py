@@ -16,7 +16,7 @@ from tg_messenger.core.models import Message
 
 logger = logging.getLogger(__name__)
 
-IMAGE_PLACEHOLDER = "[изображение]"
+IMAGE_PLACEHOLDER = "[image]"
 MAX_IMAGE_BYTES = 10_000_000
 
 

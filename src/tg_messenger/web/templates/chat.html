@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -85,9 +85,9 @@
               hx-on:click="document.getElementById('dialog-search').value=''" lang="en">DM</button>
       <button class="tab" role="tab" aria-selected="false" hx-get="/dialogs?tab=groups"
               hx-target="#dialogs ul" hx-swap="innerHTML"
-              hx-on:click="document.getElementById('dialog-search').value=''">Группы</button>
+              hx-on:click="document.getElementById('dialog-search').value=''">Groups</button>
     </nav>
-    <input type="search" id="dialog-search" name="q" placeholder="Поиск диалогов…"
+    <input type="search" id="dialog-search" name="q" placeholder="Search conversations…"
            autocomplete="off"
            hx-get="/dialogs" hx-trigger="input changed delay:200ms, search"
            hx-include="#current-tab" hx-target="#dialogs ul" hx-swap="innerHTML">
@@ -112,10 +112,10 @@
          JS builds /dialogs/{id}/search?q=… from the open dialog and targets #messages. -->
     <form id="message-search" style="display:none" onsubmit="return false">
       <input type="search" id="message-search-input" name="q"
-             placeholder="Поиск в переписке…" autocomplete="off" aria-label="Search messages in this chat">
+             placeholder="Search this conversation…" autocomplete="off" aria-label="Search messages in this chat">
     </form>
     <div id="messages" aria-live="polite">
-      <div id="messages-empty" class="empty-state">Выберите диалог слева</div>
+      <div id="messages-empty" class="empty-state">Select a conversation on the left</div>
     </div>
     <div id="reaction-toast" role="status" aria-live="polite"></div>
     <div id="lang-settings" hx-get="/settings/lang" hx-trigger="load" hx-swap="innerHTML"></div>
@@ -648,8 +648,8 @@
           // attach is (correctly, #95/#96) suppressed to avoid cross-dialog contamination, so
           // confirm with a lightweight toast instead. Title is best-effort — neutral fallback.
           const title = dialogTitleById(dialogId);
-          showToast(title ? ('Реакция в ' + title + ' ' + emoticon)
-                          : ('Реакция отправлена ' + emoticon));
+          showToast(title ? ('Reaction in ' + title + ' ' + emoticon)
+                          : ('Reaction sent ' + emoticon));
         }
       } else {
         const html = await resp.text();
@@ -783,7 +783,7 @@
     function setComposerEnabled(canSend) {
       const ro = !canSend;
       composerText.disabled = ro;
-      composerText.placeholder = ro ? 'Только чтение' : 'Message…';
+      composerText.placeholder = ro ? 'Read-only' : 'Message…';
       const suggestBtn = document.getElementById('suggest-btn');
       const attachFile = document.getElementById('attach-file');
       if (suggestBtn) suggestBtn.disabled = ro;

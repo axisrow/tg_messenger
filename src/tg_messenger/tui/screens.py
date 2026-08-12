@@ -24,26 +24,26 @@ logger = logging.getLogger(__name__)
 # this sentinel marks "send the original (untranslated) draft" in the variant picker.
 ORIGINAL_SENTINEL = "__tg_messenger_original__"
 
-# #124: the key-help overlay text (HelpScreen, opened with ? / F1). Russian, to match the UI.
-HELP_TEXT = """Навигация (стрелки):
-  ↑ / ↓     цепочка фокуса: Поиск → Вкладки → Диалоги → Сообщения → Поле ввода
-  ← / →     войти в диалог (→ из списка) · выйти (← на пустом поле); на вкладках — смена вкладки
-  Пробел    к концу/началу списка (диалоги и сообщения)
-  Enter     открыть диалог · отправить сообщение
+# #124: the key-help overlay text (HelpScreen, opened with ? / F1). English, matching every frontend.
+HELP_TEXT = """Navigation (arrow keys):
+  ↑ / ↓     focus chain: Search → Tabs → Conversations → Messages → Input
+  ← / →     enter conversation (→ from list) · leave (← on empty pane); switch tabs on the tabs row
+  Space      jump to the end/start of a list (conversations and messages)
+  Enter      open a conversation · send a message
 
-Действия:
-  Tab       принять подсказку ответа (иначе — вперёд по фокусу)
-  Shift+Tab назад по фокусу
-  r / x     реакция на выбранном сообщении
-  Ctrl+S    настройки: аккаунты + перевод входящих (режим и языки)
-  t         вкл/выкл авто-перевод входящих (вне поля ввода)
-  Ctrl+T    перевести весь чат сейчас
-  @путь [подпись]  отправить файл (команда в поле ввода)
-  /tlang    язык перевода входящих (команда в поле ввода; иначе спросит)
-  /lang     язык перевода ИСХОДЯЩИХ в текущем диалоге (команда в поле ввода)
-  ? / F1    эта справка
-  Esc       очистить поиск · закрыть окно
-  Ctrl+C    выход"""
+Actions:
+  Tab       accept the reply suggestion (otherwise move focus forward)
+  Shift+Tab move focus backward
+  r / x     react to the selected message
+  Ctrl+S    settings: accounts + incoming translation (mode and languages)
+  t         toggle incoming auto-translation (outside text inputs)
+  Ctrl+T    translate the whole chat now
+  @path [caption]  attach a file (input command)
+  /tlang    incoming translation language (input command; prompts if omitted)
+  /lang     outgoing translation language for the current conversation (input command)
+  ? / F1    this help
+  Esc       clear search · close window
+  Ctrl+C    quit"""
 
 
 class ProfileItem(ListItem):
@@ -109,8 +109,8 @@ class LoginScreen(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="login-box"):
-            yield Label("Войти в Telegram", id="login-title")
-            yield Label("Номер телефона (международный формат):", id="login-prompt")
+            yield Label("Sign in to Telegram", id="login-title")
+            yield Label("Phone number (international format):", id="login-prompt")
             yield Input(id="login-input", placeholder="+10000000000")
 
     def on_mount(self) -> None:
@@ -132,17 +132,17 @@ class LoginScreen(ModalScreen[bool]):
 
     async def _do_phone(self, phone: str) -> None:
         # #187: in-flight feedback — after submitting the number the input clears but the network
-        # request can take a moment; without this the screen looked frozen. Show "Отправляю код…"
+        # request can take a moment; without this the screen looked frozen. Show "Sending code…"
         # until the delivery hint (or an error) replaces it.
-        self.query_one("#login-prompt", Label).update("Отправляю код…")
+        self.query_one("#login-prompt", Label).update("Sending code…")
         try:
             delivery = await self._session.submit_phone(phone)
         except Exception as exc:
             logger.exception("login: submit_phone failed")  # phone stays out of the log
-            self.notify(f"Не удалось отправить код: {exc}", severity="error")
+            self.notify(f"Could not send code: {exc}", severity="error")
             return
         self.query_one("#login-prompt", Label).update(delivery_hint(delivery))
-        self.query_one("#login-input", Input).placeholder = "Код"
+        self.query_one("#login-input", Input).placeholder = "Code"
 
     async def _do_code(self, code: str) -> None:
         try:
@@ -152,11 +152,11 @@ class LoginScreen(ModalScreen[bool]):
             return
         except Exception as exc:
             logger.exception("login: submit_code failed")
-            self.notify(f"Ошибка входа: {exc}", severity="error")
+            self.notify(f"Login error: {exc}", severity="error")
             return
         if self._session.state == "password":
-            self.query_one("#login-prompt", Label).update("Пароль 2FA:")
-            self.query_one("#login-input", Input).placeholder = "Пароль 2FA"
+            self.query_one("#login-prompt", Label).update("2FA password:")
+            self.query_one("#login-input", Input).placeholder = "2FA password"
             return
         self.dismiss(True)
 
@@ -168,7 +168,7 @@ class LoginScreen(ModalScreen[bool]):
             return
         except Exception as exc:
             logger.exception("login: submit_password failed")
-            self.notify(f"Ошибка входа: {exc}", severity="error")
+            self.notify(f"Login error: {exc}", severity="error")
             return
         self.dismiss(True)
 
@@ -201,7 +201,7 @@ class VariantPickScreen(ModalScreen[str | None]):
             # #187: the "send original" row is a fixed label — it must NOT inline the whole draft
             # (a long message wrapped over many lines and duplicated the text already in the
             # composer). The draft is right there in the composer; the label just names the choice.
-            rows.append(VariantItem("Отправить оригинал", ORIGINAL_SENTINEL))
+            rows.append(VariantItem("Send original", ORIGINAL_SENTINEL))
             yield ListView(*rows, id="variants")
 
     def on_mount(self) -> None:
@@ -275,7 +275,7 @@ class HelpScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="help-box"):
-            yield Label("Горячие клавиши", id="help-title")
+            yield Label("Keyboard shortcuts", id="help-title")
             yield Static(HELP_TEXT, id="help-body", markup=False)
 
     def action_dismiss(self) -> None:  # type: ignore[override]
@@ -310,7 +310,7 @@ class ConfirmScreen(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-box"):
             yield Label(self._prompt, id="confirm-prompt")
-            yield Label("y — да · n / Esc — нет", id="confirm-help")
+            yield Label("y — yes · n / Esc — no", id="confirm-help")
 
     def action_confirm(self) -> None:
         self.dismiss(True)
@@ -337,9 +337,9 @@ class ReadLangScreen(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="readlang-box"):
-            yield Label("Язык перевода входящих", id="readlang-title")
-            yield Input(placeholder="напр. ru, en, de", id="readlang-input")
-            yield Label("Enter — сохранить · Esc — отмена", id="readlang-help")
+            yield Label("Incoming translation language", id="readlang-title")
+            yield Input(placeholder="e.g. ru, en, de", id="readlang-input")
+            yield Label("Enter — save · Esc — cancel", id="readlang-help")
 
     def on_mount(self) -> None:
         self.query_one("#readlang-input", Input).focus()

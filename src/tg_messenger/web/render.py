@@ -94,15 +94,15 @@ def _error_response(text: str, status_code: int) -> HTMLResponse:
 def _tg_login_phone_fragment(*, error: str) -> str:
     """HTMX fragment: re-render the phone step with an error (e.g. invalid number)."""
     # #187: one canonical heading — the template's first render and this error re-render
-    # must not disagree (Войти↔Вход read as two different screens on a phone typo).
+    # must not disagree (Sign in↔Sign-in read as two different screens on a phone typo).
     return (
         '<div id="card">'
-        "<h1>Войти в Telegram</h1>"
+        "<h1>Sign in to Telegram</h1>"
         f'<div class="error" role="alert">{escape(error)}</div>'
         '<form hx-post="/tg-login/phone" hx-target="#card" hx-swap="outerHTML">'
         '<label for="phone" lang="en">Phone</label>'
         '<input id="phone" type="tel" name="phone" autofocus>'
-        '<button type="submit">Отправить код</button>'
+        '<button type="submit">Send code</button>'
         "</form>"
         "</div>"
     )
@@ -120,33 +120,33 @@ def _tg_login_code_fragment(delivery=None, *, error: str | None = None) -> str:
         resend_form = (
             '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
             f'<button type="submit" id="resend-btn" data-timeout="{int(timeout)}" disabled>'
-            f"Отправить код повторно ({int(timeout)})</button>"
+            f"Resend code ({int(timeout)})</button>"
             "</form>"
             "<script>(function(){"
             "var b=document.getElementById('resend-btn');"
             "if(!b)return;var n=parseInt(b.dataset.timeout,10)||0;"
             "var t=setInterval(function(){n-=1;"
             "if(n<=0){clearInterval(t);b.disabled=false;"
-            "b.textContent='Отправить код повторно';}"
-            "else{b.textContent='Отправить код повторно ('+n+')';}},1000);"
+            "b.textContent='Resend code';}"
+            "else{b.textContent='Resend code ('+n+')';}},1000);"
             "})();</script>"
         )
     else:
         resend_form = (
             '<form hx-post="/tg-login/resend" hx-target="#card" hx-swap="outerHTML">'
-            '<button type="submit">Отправить код повторно</button>'
+            '<button type="submit">Resend code</button>'
             "</form>"
         )
     return (
         '<div id="card">'
-        "<h1>Введите код</h1>"
+        "<h1>Enter code</h1>"
         f'<p class="hint">{hint}</p>'
         f"{err}"
         '<form hx-post="/tg-login/code" hx-target="#card" hx-swap="outerHTML">'
         '<label for="code" lang="en">Code</label>'
         '<input id="code" type="text" name="code" autofocus inputmode="numeric" '
         'autocomplete="one-time-code">'
-        '<button type="submit">Войти</button>'
+        '<button type="submit">Sign in</button>'
         "</form>"
         f"{resend_form}"
         "</div>"
@@ -158,13 +158,13 @@ def _tg_login_password_fragment(*, error: str | None = None) -> str:
     err = f'<div class="error" role="alert">{escape(error)}</div>' if error else ""
     return (
         '<div id="card">'
-        "<h1>Пароль 2FA</h1>"
+        "<h1>2FA password</h1>"
         f"{err}"
         '<form hx-post="/tg-login/password" hx-target="#card" hx-swap="outerHTML">'
         '<label for="password" lang="en">2FA password</label>'
         '<input id="password" type="password" name="password" autofocus '
         'autocomplete="current-password">'
-        '<button type="submit">Войти</button>'
+        '<button type="submit">Sign in</button>'
         "</form>"
         "</div>"
     )

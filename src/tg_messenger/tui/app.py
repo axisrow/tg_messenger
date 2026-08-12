@@ -28,8 +28,9 @@ from textual.widgets import Footer, Input, Label, ListView, LoadingIndicator, St
 from tg_messenger.agent.outbound_coordinator import OutboundError, OutboundSendCoordinator
 from tg_messenger.core.auth import LoginSession, session_store_from_env
 from tg_messenger.core.cache import bounded_remember
-from tg_messenger.core.client import READ_ONLY_MESSAGE, SendForbiddenError
+from tg_messenger.core.client import SendForbiddenError
 from tg_messenger.core.search import can_send_in
+from tg_messenger.core.ui_strings import READ_ONLY_MESSAGE
 
 # --- facade re-exports (these names moved to sibling modules; tests + back-compat import them here) ---
 from tg_messenger.tui.bubbles import (  # noqa: F401
@@ -89,22 +90,22 @@ logger = logging.getLogger(__name__)
 # #187: the writable-composer placeholder. Hints the @file media-send (no button/picker in the
 # TUI — the only way to send a file is the `@path [caption]` magic string), which was previously
 # undocumented anywhere in the UI.
-COMPOSER_PLACEHOLDER = "Сообщение…  (@файл — отправить файл)"
+COMPOSER_PLACEHOLDER = "Message…  (@file — attach file)"
 
 # #187: the empty-state hint shown in #messages before any dialog is opened (was a blank void).
 # Removed on the first _show_history (which clears the pane). The sidebar/Footer hints stay visible.
-EMPTY_MESSAGES_HINT = "Выберите диалог слева · → открыть · F1 справка"
+EMPTY_MESSAGES_HINT = "Select a conversation on the left · → open · F1 help"
 
 # #187: shown in the persistent #connection-status banner while a drain worker is down and
 # reconnecting with backoff — so a dead live-feed is visible and self-heals instead of silently
 # stopping. Hidden again once the listener yields its next event.
-CONNECTION_LOST_TEXT = "⚠ Соединение потеряно — переподключаюсь…"
+CONNECTION_LOST_TEXT = "⚠ Connection lost — reconnecting…"
 
 # shown before a draft in the suggestion strip; Tab accepts it into the composer
 SUGGEST_PREFIX = "💡 Tab: "
 # #158: shown in the suggestion strip while an explicit Ctrl+G LLM call is in flight (~seconds),
 # so the user sees the suggester is working instead of "nothing happening"
-SUGGEST_THINKING = "⏳ Суфлёр думает…"
+SUGGEST_THINKING = "⏳ Suggester is thinking…"
 
 # #214: page size for both the initial history window and each backfill page. The reachability
 # problem this size used to gate (older history unreachable) is solved by the incremental
@@ -166,10 +167,10 @@ class MessengerTUI(App):
         Binding("shift+tab", "focus_previous", "Back", show=False),
         # #115: open account settings (add/list/remove a profile). priority so it works from
         # inside the composer Input.
-        Binding("ctrl+s", "open_settings", "Настройки", priority=True),
+        Binding("ctrl+s", "open_settings", "Settings", priority=True),
         # translate the whole open chat (up to the configured cap) on demand — opening a dialog
         # stays fast (cache only); this runs the long LLM pass with a spinner.
-        Binding("ctrl+t", "translate_all", "Перевести чат", priority=True, show=True),
+        Binding("ctrl+t", "translate_all", "Translate chat", priority=True, show=True),
         # #124: the key-help overlay (toggle). F1 is non-printable so a priority binding fires
         # even from inside an Input; "?" is printable and so is filtered out while an Input is
         # focused — it works everywhere ELSE (tabs/dialogs/a bubble). Documented: ? outside text
@@ -179,9 +180,9 @@ class MessengerTUI(App):
         # while the search Input has focus on startup — so a "?"-hint would be invisible exactly
         # when the user first looks (the original complaint). F1 is priority, stays active inside an
         # Input, and so is always shown. "?" keeps working everywhere outside a text input but is
-        # hidden to avoid a duplicate "Справка" entry.
-        Binding("f1", "toggle_help", "Справка", priority=True, show=True),
-        Binding("question_mark", "toggle_help", "Справка", show=False),
+        # hidden to avoid a duplicate "Help" entry.
+        Binding("f1", "toggle_help", "Help", priority=True, show=True),
+        Binding("question_mark", "toggle_help", "Help", show=False),
         # #124/#156: Escape clears the FOCUSED input — the composer when it's focused (#156, so
         # Ctrl+G gets a clean field), else a non-empty search filter (the original global). NOT
         # priority, so any open modal's own Escape still wins (the modal chain truncates above the app).
@@ -192,13 +193,13 @@ class MessengerTUI(App):
         # message, so it stays non-priority. The on-demand whole-chat translate is Ctrl+T
         # (`translate_all`, bound above) — non-printable + priority, so it fires from inside the
         # composer or a read-only channel where the composer is disabled.
-        Binding("t", "toggle_auto_translate", "Авто-перевод", show=True),
+        Binding("t", "toggle_auto_translate", "Auto-translate", show=True),
         # #155: suggest a reply for the OPEN DM on demand. The automatic 💡 hint only fires on a
         # NEW incoming message (_drain_incoming); opening a DM with existing history never triggers
         # it, so the suggester felt dead when reading an already-delivered message. Ctrl+G generates
         # a draft for the current dialog. Non-printable + priority so it fires from inside the
         # composer too (like Ctrl+T), without stealing a literal key typed into a message.
-        Binding("ctrl+g", "suggest_reply", "Подсказать ответ", priority=True, show=True),
+        Binding("ctrl+g", "suggest_reply", "Suggest a reply", priority=True, show=True),
     ]
 
     CSS = """
@@ -560,19 +561,19 @@ class MessengerTUI(App):
     def compose(self) -> ComposeResult:
         with Horizontal():
             with Vertical(id="sidebar"):
-                yield SearchInput(placeholder="Поиск…", id="search")
-                # #187: shorter labels so the 8 tabs clip less in the 32-col sidebar ("Группы/супер"
-                # → "Группы", "Не контакты" → "Не конт.", "Непрочитанные" → "Непроч."). The ids are
+                yield SearchInput(placeholder="Search…", id="search")
+                # #187: shorter labels so the 8 tabs clip less in the 32-col sidebar ("Groups/супер"
+                # → "Groups", "Не контакты" → "Non-contacts", "Непрочитанные" → "Unread"). The ids are
                 # unchanged (the tab logic keys off ids, not labels).
                 yield SidebarTabs(
-                    Tab("Все", id="all"),
-                    Tab("Контакты", id="contacts"),
-                    Tab("Не конт.", id="non_contacts"),
-                    Tab("Группы", id="groups"),
-                    Tab("Каналы", id="channels"),
-                    Tab("Боты", id="bots"),
-                    Tab("Непроч.", id="unread"),
-                    Tab("Архив", id="archive"),
+                    Tab("All", id="all"),
+                    Tab("Contacts", id="contacts"),
+                    Tab("Non-contacts", id="non_contacts"),
+                    Tab("Groups", id="groups"),
+                    Tab("Channels", id="channels"),
+                    Tab("Bots", id="bots"),
+                    Tab("Unread", id="unread"),
+                    Tab("Archive", id="archive"),
                     id="tabs",
                 )
                 yield DialogListView(id="dialogs")
@@ -590,7 +591,7 @@ class MessengerTUI(App):
                 yield Static("", id="suggestion", markup=False)
                 # #187: the placeholder now hints the (previously undocumented) @file media send.
                 yield ComposerInput(placeholder=COMPOSER_PLACEHOLDER, id="composer")
-        # #124-followup: the Footer surfaces the show=True bindings (Справка, Настройки, Выход) —
+        # #124-followup: the Footer surfaces the show=True bindings (Help, Settings, Выход) —
         # without it the key hints exist but are invisible (the reported "не вижу настроек/?").
         yield Footer()
 
@@ -706,7 +707,7 @@ class MessengerTUI(App):
             logger.exception("could not determine why the suggester is disabled")
             reason = None
         if reason:
-            self.notify(f"Суфлёр (💡) выключен: {reason}", severity="warning", timeout=8)
+            self.notify(f"Suggester (💡) disabled: {reason}", severity="warning", timeout=8)
 
     async def _load_auto_translate_pref(self) -> None:
         try:
@@ -1115,10 +1116,10 @@ class MessengerTUI(App):
         is disabled — then runs the whole-chat pass regardless of the auto-translate toggle (#126).
         """
         if self._translator is None:
-            self.notify("Переводчик не настроен", severity="warning")
+            self.notify("Translator is not configured", severity="warning")
             return
         if self._current is None:
-            self.notify("Нет открытого диалога", severity="warning")
+            self.notify("No conversation is open", severity="warning")
             return
         self.run_worker(
             self._ensure_lang_then_translate_all(self._current),
@@ -1151,7 +1152,7 @@ class MessengerTUI(App):
         self._bubble_index.clear()
         await pane.mount(
             Vertical(
-                Label("Идёт перевод…", classes="translate-status-label"),
+                Label("Translating…", classes="translate-status-label"),
                 LoadingIndicator(),
                 id="translate-status",
                 classes="translate-status",
@@ -1185,7 +1186,7 @@ class MessengerTUI(App):
             for stale in pane.query("#translate-status"):
                 await stale.remove()
         if not ok and dialog_id == self._current:
-            self.notify("Перевод не удался — см. лог", severity="warning")
+            self.notify("Translation failed — see log", severity="warning")
 
     async def _translate_bubble(self, dialog_id: int, message, bubble: MessageBubble) -> None:
         try:
@@ -1305,7 +1306,7 @@ class MessengerTUI(App):
                 return
             unknown = text.lstrip().split(maxsplit=1)[0]
             logger.warning("unknown slash-command in dialog %s: %s", dialog_id, unknown)
-            self.notify(f"Неизвестная команда: {unknown}", severity="error")
+            self.notify(f"Unknown command: {unknown}", severity="error")
             return
         if state.source_text is not None:
             source = state.source_text
@@ -1384,7 +1385,7 @@ class MessengerTUI(App):
     async def _apply_tlang_command(self, command: tuple[str, str | None]) -> None:
         """#126: set/clear the global inbound reading language via Translator.set_target_lang."""
         if self._translator is None:
-            self.notify("Перевод не настроен (нет TG_TRANSLATE_MODEL).", severity="warning")
+            self.notify("Translator is not configured (TG_TRANSLATE_MODEL is unset).", severity="warning")
             return
         action, value = command
         try:
@@ -1398,10 +1399,10 @@ class MessengerTUI(App):
             return
         except Exception:
             logger.exception("reading language command failed")
-            self.notify("Не удалось сохранить язык перевода.", severity="error")
+            self.notify("Could not save translation language.", severity="error")
             return
         self.notify(
-            "Перевод входящих отключён." if action == "off" else "Язык перевода сохранён."
+            "Incoming translation disabled." if action == "off" else "Translation language saved."
         )
 
     async def _apply_lang_command(self, dialog_id: int, command: tuple[str, str | None]) -> None:
@@ -1460,8 +1461,8 @@ class MessengerTUI(App):
                 # #187: distinguish a timeout from a model failure — the coordinator already tells
                 # them apart in result.error ("Translation timed out." vs "Translation failed."), so
                 # relay that instead of one fixed line. Enter still sends the original.
-                reason = "Перевод не успел" if result.error == "Translation timed out." else "Перевод не удался"
-                self.notify(f"{reason} — Enter отправит оригинал", severity="warning")
+                reason = "Translation timed out" if result.error == "Translation timed out." else "Translation failed"
+                self.notify(f"{reason} — press Enter to send the original", severity="warning")
             return
         picked = await self.push_screen_wait(VariantPickScreen(result.variants, text))
         if picked is None:
@@ -1474,7 +1475,7 @@ class MessengerTUI(App):
             state.source_text = None
             state.outbound_token = None
             state.original_confirm_text = text
-            self.notify("Enter отправит оригинал")
+            self.notify("Press Enter to send the original")
             if dialog_id == self._current:
                 composer.value = text
                 composer.focus()
@@ -1503,7 +1504,7 @@ class MessengerTUI(App):
                 msg = await self._coordinator.send_original(peer, text, _do_send)
         except OutboundError:
             logger.warning("outbound token rejected on send (dialog %s)", peer)
-            self.notify("Выбор перевода истёк — выберите вариант заново", severity="warning")
+            self.notify("Translation choice expired — choose a variant again", severity="warning")
             self._restore_draft(peer, text)
             return
         except SendForbiddenError as exc:
@@ -1545,7 +1546,7 @@ class MessengerTUI(App):
         no feedback that the message went out. Title is best-effort from the loaded list.
         """
         title = self._dialog_title(peer)
-        self.notify(f"Отправлено в {title}" if title else "Сообщение отправлено")
+        self.notify(f"Sent to {title}" if title else "Message sent")
 
     async def _send_media(
         self, peer: int, path: str, caption: str | None, source_text: str | None = None,
@@ -1616,7 +1617,7 @@ class MessengerTUI(App):
             # toast instead (parity with web #103/#97). Title is best-effort — neutral fallback.
             title = self._dialog_title(peer)
             self.notify(
-                f"Реакция в {title} {emoticon}" if title else f"Реакция отправлена {emoticon}"
+                f"Reaction in {title} {emoticon}" if title else f"Reaction sent {emoticon}"
             )
 
     async def _drain_incoming(self) -> None:
@@ -1733,19 +1734,19 @@ class MessengerTUI(App):
         at Escape, which clears the composer (action_clear_search) so Ctrl+G runs clean.
         """
         if self._suggester is None:
-            self.notify("Суфлёр не настроен", severity="warning")
+            self.notify("Suggester is not configured", severity="warning")
             return
         if self._current is None:
-            self.notify("Сначала откройте диалог", severity="warning")
+            self.notify("Open a conversation first", severity="warning")
             return
         # _kind_for_rendering prefers the kind captured at open time (_current_kind), so the DM
         # check stays correct even after a tab switch (e.g. to Archive) drops the open dialog from
         # _all_dialogs — without it Ctrl+G would wrongly reject a DM as "not a DM" there.
         if self._kind_for_rendering(self._current) != "dm":
-            self.notify("Суфлёр работает только в личных сообщениях", severity="warning")
+            self.notify("Suggester only works in direct messages", severity="warning")
             return
         if self.query_one("#composer", Input).value:
-            self.notify("Очистите поле ввода (Esc) — черновик не перезаписывается", severity="warning")
+            self.notify("Clear the input (Esc) — the draft will not be overwritten", severity="warning")
             return
         # #158: a draft pre-generated for THIS dialog (e.g. by the auto-path on an incoming message)
         # is shown INSTANTLY — no second LLM call, no ⏳ wait. _pending_suggestion is left intact so
@@ -1792,7 +1793,7 @@ class MessengerTUI(App):
         composer = self.query_one("#composer", Input)
         can = self._dialog_can_send(dialog_id)
         composer.disabled = not can
-        composer.placeholder = COMPOSER_PLACEHOLDER if can else "Только чтение"
+        composer.placeholder = COMPOSER_PLACEHOLDER if can else "Read-only"
 
     def _dialog_telegram_lang_hint(self, dialog_id: int) -> str | None:
         for dialog in self._all_dialogs:
@@ -1803,7 +1804,7 @@ class MessengerTUI(App):
     async def _suggest(
         self, dialog_id: int, *, notify_empty: bool = False, show_thinking: bool = False
     ) -> None:
-        # #158: show "⏳ Суфлёр думает…" BEFORE the (multi-second) LLM await, so an explicit Ctrl+G
+        # #158: show "⏳ Suggester is thinking…" BEFORE the (multi-second) LLM await, so an explicit Ctrl+G
         # isn't a silent ~20s wait. Synchronous on purpose — the only way it's visible during the
         # real call, and the only way a stub-based test can observe it. Auto-path passes
         # show_thinking=False so it never flickers on every incoming message.
@@ -1829,7 +1830,7 @@ class MessengerTUI(App):
         if not draft and notify_empty:
             if thinking_shown:
                 self._set_suggestion_strip("")  # clear ⏳ before the toast
-            self.notify("Суфлёр не предложил ответ", severity="warning")
+            self.notify("Suggester did not propose a reply", severity="warning")
             return
         self._pending_suggestion = draft
         self._pending_suggestion_dialog = dialog_id if draft else None
@@ -1912,7 +1913,7 @@ class MessengerTUI(App):
             if not self._composer_escape_armed:
                 # first Escape: keep the draft, move focus out, and tell the user how to clear it
                 self._composer_escape_armed = True
-                self.notify("Esc ещё раз — очистить черновик")
+                self.notify("Press Esc again to clear the draft")
                 # leave the composer for the history (last bubble) else the dialog list; both are
                 # safe focus targets that _show_history never removes out from under us.
                 bubbles = _navigable_bubbles(self.screen)
@@ -1967,16 +1968,16 @@ class MessengerTUI(App):
         open, immediately translates it (prompting for a reading language first if none is set).
         """
         if self._translator is None:
-            self.notify("Переводчик не настроен", severity="warning")
+            self.notify("Translator is not configured", severity="warning")
             return
         self._auto_translate = not self._auto_translate
         # #187: when turning ON with a chat open we ALSO re-translate that chat below, so say so —
         # the bare "включён" gave no sign the visible pass was starting. Turning off / no open chat
         # keeps the plain toast.
         if self._auto_translate and self._current is not None:
-            self.notify("Авто-перевод включён — перевожу чат…")
+            self.notify("Auto-translation enabled — translating chat…")
         else:
-            self.notify(f"Авто-перевод {'включён' if self._auto_translate else 'выключен'}")
+            self.notify(f"Auto-translation {'enabled' if self._auto_translate else 'disabled'}")
         self.run_worker(
             self._persist_auto_translate(self._auto_translate),
             group="translate-pref",
@@ -2019,7 +2020,7 @@ class MessengerTUI(App):
             finally:
                 self._lang_prompt_open = False
             if not code:
-                self.notify("Язык перевода не задан.", severity="warning")
+                self.notify("Translation language is not set.", severity="warning")
                 return
             try:
                 await self._translator.set_target_lang(code)
@@ -2028,6 +2029,6 @@ class MessengerTUI(App):
                 return
             except Exception:
                 logger.exception("saving reading language failed")
-                self.notify("Не удалось сохранить язык перевода.", severity="error")
+                self.notify("Could not save translation language.", severity="error")
                 return
         await self._translate_whole_dialog(dialog_id)

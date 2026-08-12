@@ -53,6 +53,7 @@ from tg_messenger.core.models import (
 from tg_messenger.core.paths import resolve_env_dir
 from tg_messenger.core.ratelimit import TokenBucket
 from tg_messenger.core.search import can_send_in
+from tg_messenger.core.ui_strings import READ_ONLY_MESSAGE
 
 logger = logging.getLogger(__name__)
 
@@ -137,11 +138,6 @@ def credentials_missing_from_env() -> bool:
         api_id = 0
     api_hash = os.environ.get("TG_API_HASH", "")
     return not api_id or not (api_hash or "").strip()
-
-
-# The single user-facing read-only message, shared by every UI (Russian per the
-# project's user-communication language). Avoids drift across cli/tui/web.
-READ_ONLY_MESSAGE = "Сюда писать нельзя — чат только для чтения."
 
 
 # Telegram rights-rejection errors reclassified into SendForbiddenError at the send seam.
