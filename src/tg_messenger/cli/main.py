@@ -78,20 +78,22 @@ def _reaction_emoticon(emoticon: str | None) -> str:
 def _chat_line_reader():
     """Build (reader, redraw_ctx) for the chat REPL's input line (#215).
 
-    On a real TTY with prompt_toolkit installed, background ``click.echo`` calls made
+    With prompt_toolkit installed and both streams attached to a real TTY, background
+    ``click.echo`` calls made
     while the user is mid-keystroke would otherwise splice into the half-typed line —
     ``patch_stdout()`` intercepts stdout writes and redraws the in-flight buffer above
-    them instead. Piped/non-interactive stdin (tests, `| tg-messenger chat`) has no
-    cursor to corrupt and prompt_toolkit's raw-mode terminal I/O doesn't work over a
-    pipe anyway, so that case (and a missing prompt_toolkit) falls back to plain
-    ``input()`` — unchanged behavior.
+    them instead. Piped/non-interactive stdin or stdout (tests, `| tg-messenger chat`,
+    or redirected output) has no cursor to corrupt and prompt_toolkit's raw-mode
+    terminal I/O doesn't work over a pipe anyway, so that case (and a missing
+    prompt_toolkit) falls back to plain ``input()`` — unchanged behavior.
 
     The redraw itself is prompt_toolkit's contract, exercised only over a real (pseudo)
     terminal; the tests therefore assert WHICH path is taken (patch_stdout on TTY,
     nullcontext+input elsewhere), not the live redraw — a full pty-based survival test is
     deferred (the #215 bar is met by the structural fix plus the non-TTY regression test).
     """
-    if PromptSession is not None and patch_stdout is not None and sys.stdin.isatty():
+    if (PromptSession is not None and patch_stdout is not None
+            and sys.stdin.isatty() and sys.stdout.isatty()):
         session = PromptSession()
 
         async def reader(prompt: str) -> str:
