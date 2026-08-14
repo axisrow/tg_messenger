@@ -1,4 +1,5 @@
 import stat
+from pathlib import Path
 
 import pytest
 from telethon.crypto import AuthKey
@@ -79,6 +80,28 @@ def test_save_temp_file_is_private_before_content_lands(session_dir, monkeypatch
     store.save("default", VALID_SESSION)
     assert seen["modes"] == [0o600]
     assert store.load("default") == VALID_SESSION
+
+
+def test_concurrent_saves_use_distinct_temp_files(session_dir, monkeypatch):
+    # Codex review on #226/#230: the temp filename was derived only from os.getpid(),
+    # so two saves of the SAME profile within one process share one temp path. A
+    # second save's os.open(..., O_TRUNC) would reopen the FIRST save's still-live
+    # temp inode instead of failing, letting the two writes interleave. Each save
+    # must get its own unique temp file regardless of how many times save() runs.
+    store = SessionStore(session_dir)
+    seen_tmp_names = []
+    real_open = auth.os.open
+
+    def spy_open(path, flags, mode=0o777):
+        if str(path).endswith(".tmp"):
+            seen_tmp_names.append(Path(path).name)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(auth.os, "open", spy_open)
+    store.save("default", VALID_SESSION)
+    store.save("default", VALID_SESSION)
+    assert len(seen_tmp_names) == 2
+    assert seen_tmp_names[0] != seen_tmp_names[1]
 
 
 def test_name_is_sanitized(session_dir):

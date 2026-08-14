@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -122,8 +123,15 @@ class SessionStore:
         # crash/disk-full mid-write destroys the authorization. Temp file in the SAME
         # dir (os.replace is atomic on one FS), 0600 BEFORE content so the secret never
         # exists with umask permissions, fsync, then rename over the target.
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # mkstemp (not a PID-derived name) so two saves of the same profile in one
+        # process — however unlikely today — never share one temp inode: O_EXCL
+        # guarantees each call gets its own file instead of silently reopening
+        # another in-flight save's temp file.
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        tmp = Path(tmp_name)
+        os.chmod(tmp, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(stored)
