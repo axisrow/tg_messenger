@@ -690,11 +690,23 @@
       if (!e.target.closest('.reaction-palette')) closeReactionPalettes();  // click elsewhere closes it
     });
     // Suggest: fetch a draft for the open dialog and drop it into the composer.
+    let suggestController = null;
     document.getElementById('suggest-btn').addEventListener('click', async () => {
-      const id = document.getElementById('dialog_id').value;
+      const composerField = document.getElementById('composer-text');
+      const dialogField = document.getElementById('dialog_id');
+      const id = dialogField.value;
       if (!id) return;
       const btn = document.getElementById('suggest-btn');
       const error = document.getElementById('suggest-error');
+      // #227: the LLM answer arrives seconds later — the user may have switched dialogs
+      // or started typing meanwhile. Snapshot both; the response is applied only if they
+      // are unchanged (the TUI's _suggest guard), and a dialog switch aborts the request
+      // (restoreComposeState) like the outbound-translation fetch.
+      const before = composerField.value;
+      if (suggestController) suggestController.abort();
+      const myController = new AbortController();
+      suggestController = myController;
+      const signal = myController.signal;
       btn.disabled = true;
       // #187: the LLM runs for several seconds — write a "thinking…" status synchronously so the
       // UI doesn't look hung (mirrors the TUI's SUGGEST_THINKING). Cleared on success/failure.
@@ -702,22 +714,34 @@
       try {
         const resp = await fetch('/dialogs/' + encodeURIComponent(id) + '/suggest', {
           method: 'POST',
-          headers: { 'X-TG-Messenger-CSRF': '1' }
+          headers: { 'X-TG-Messenger-CSRF': '1' },
+          signal
         });
         const text = await resp.text();
+        if (dialogField.value !== id) return;  // #227: user left the dialog — drop the draft
+        if (composerField.value !== before) {  // #227: user typed meanwhile — never clobber
+          error.textContent = '';
+          return;
+        }
         if (resp.ok) {
-          document.getElementById('composer-text').value = text;
-          const state = currentState();
-          if (state) state.draft = text;
+          composerField.value = text;
+          stateFor(id).draft = text;  // #227: this dialog's state, never currentState()
           error.textContent = '';  // clear the thinking hint once the draft lands
         } else {
           const doc = new DOMParser().parseFromString(text, 'text/html');
           error.textContent = (doc.body.textContent || '').trim() || 'Suggest failed.';
         }
       } catch (err) {
-        error.textContent = 'Suggest failed.';
+        if (err && err.name === 'AbortError') return;  // superseded/dialog switch — not an error
+        // same ownership check as finally: a non-abort failure (e.g. a real network error) from
+        // a superseded same-dialog request must not stomp a newer request's "Thinking…" status.
+        if (suggestController === myController && dialogField.value === id) {
+          error.textContent = 'Suggest failed.';
+        }
       } finally {
-        btn.disabled = false;
+        // review nit: only the still-current controller may re-enable the button — a
+        // superseded request's finally must not flip it back on while a newer one is in flight.
+        if (suggestController === myController) btn.disabled = false;
       }
     });
     // Reply (#48): clicking ↩ on a message targets it; the composer submits reply_to.
@@ -840,6 +864,7 @@
       activeDialogId = dialogId;
       dialogInput.value = dialogId;
       if (outboundController) outboundController.abort();
+      if (suggestController) suggestController.abort();  // #227: a pending draft is for the OLD dialog
       const state = stateFor(dialogId);
       applyComposeState(state);
       hideVariants();

@@ -407,5 +407,84 @@ vm.runInContext(pageScript, sandbox, { filename: 'chat.html:inline' });
         readMixed.length === 1 && readMixed[0].body.get('max_id') === '11');
 }
 
+// ---- #227: a slow /suggest response must not land in another dialog's composer ----------------
+// The suggest click snapshots the dialog and composer; the LLM answer arrives seconds later.
+// Without post-await ownership guards, the response for dialog A overwrites whatever the user
+// is typing in dialog B and is persisted as B's draft (wrong-recipient send path).
+// These checks await real microtasks, so they run inside an async wrapper; the process summary
+// moved here too (it must print after the awaited checks).
+await (async () => {
+  const drain = () => new Promise((r) => setTimeout(r, 0));  // node's real setTimeout
+  const composerText = el('composer-text');
+  const dialogId = el('dialog_id');
+  const suggestBtn = el('suggest-btn');
+  const suggestError = el('suggest-error');
+
+  function controlledFetch() {
+    let resolve;
+    const origFetch = sandbox.fetch;
+    sandbox.fetch = (url, opts) => {
+      sandbox.fetch = origFetch;
+      fetchCalls.push({ url, opts });
+      return new Promise((res) => {
+        resolve = (body, ok = true) =>
+          res({ ok, status: ok ? 200 : 500, text: () => Promise.resolve(body) });
+      });
+    };
+    return () => resolve;
+  }
+
+  // 1) switch-away race: suggest in A (=7), open B (=8) and type while the fetch is pending.
+  dialogId.value = '7';
+  composerText.value = '';
+  composer.dispatch('htmx:confirm', { issueRequest() {} });  // activeDialogId = '7'
+  let getResolve = controlledFetch();
+  suggestBtn.dispatch('click');
+  await drain();
+  const suggestCall = fetchCalls[fetchCalls.length - 1];
+  check('#227: suggest request carries an abort signal',
+        !!(suggestCall.opts && suggestCall.opts.signal));
+  dialogId.value = '8';
+  composerText.value = '';
+  composer.dispatch('htmx:confirm', { issueRequest() {} });  // activeDialogId = '8'
+  composerText.value = 'draft B';                            // user typing in B
+  getResolve()('suggested for A');
+  await drain(); await drain();
+  check("#227: A's late suggestion does NOT overwrite B's composer",
+        composerText.value === 'draft B');
+  check('#227: the form still targets B after the stale suggestion', dialogId.value === '8');
+
+  // 2) same-dialog typing race: the user starts typing while the suggestion is pending.
+  dialogId.value = '7';
+  composerText.value = '';
+  composer.dispatch('htmx:confirm', { issueRequest() {} });
+  getResolve = controlledFetch();
+  suggestBtn.dispatch('click');
+  await drain();
+  composerText.value = 'half-typed reply';
+  getResolve()('suggested text');
+  await drain(); await drain();
+  check('#227: a suggestion never clobbers text typed while it was pending',
+        composerText.value === 'half-typed reply');
+  check('#227: the thinking hint is cleared when the suggestion is dropped',
+        suggestError.textContent === '');
+
+  // 3) happy path: no switch, no typing — the suggestion lands in the composer.
+  dialogId.value = '7';
+  composerText.value = '';
+  composer.dispatch('htmx:confirm', { issueRequest() {} });
+  getResolve = controlledFetch();
+  suggestBtn.dispatch('click');
+  await drain();
+  check('#227: thinking hint shows while the request is in flight',
+        suggestError.textContent.length > 0);
+  getResolve()('use this draft');
+  await drain(); await drain();
+  check('#227: same-dialog suggestion still lands in the composer',
+        composerText.value === 'use this draft');
+  check('#227: the thinking hint is cleared on success', suggestError.textContent === '');
+  check('#227: the suggest button is re-enabled', suggestBtn.disabled === false);
+})();
+
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
