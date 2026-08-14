@@ -66,7 +66,7 @@ def test_profile_name_non_canonical_prefix_is_rejected_before_save():
     assert is_safe_profile_name(raw) is False
 
 
-def _make_factory_db(tmp_path: Path, rows: list[tuple[int, str | None, int, str]]) -> Path:
+def _make_factory_db(tmp_path: Path, rows: list[tuple[int, str | None, int, str | None]]) -> Path:
     db_path = tmp_path / "factory.db"
     con = sqlite3.connect(db_path)
     try:
@@ -124,3 +124,46 @@ def test_main_never_overwrites_an_existing_profile_via_crafted_prefix(tmp_path, 
     assert store.load("existing") == original_session
     out = capsys.readouterr().out
     assert "not canonical" in out and "refusing" in out
+
+
+def test_main_skips_a_null_session_string_instead_of_crashing(tmp_path, capsys):
+    """A NULL ``session_string`` (e.g. a factory account row that was never
+    actually logged in) must be skipped like any other bad row — not crash
+    the whole import loop (Codex/`/review` round-2 finding on PR #239)."""
+    from tg_messenger.core.auth import SessionStore
+    from tg_messenger.core.session_cipher import encrypt_session
+
+    key = "test-key-not-a-real-secret"
+    session_dir = tmp_path / "sessions"
+    good_session = _make_session(dc_id=6)
+    db_path = _make_factory_db(
+        tmp_path,
+        [
+            (1, "nulled", 0, None),
+            (2, "good", 0, encrypt_session(good_session, key)),
+        ],
+    )
+
+    argv = [
+        "import_factory_sessions.py",
+        "--db",
+        str(db_path),
+        "--key",
+        key,
+        "--session-dir",
+        str(session_dir),
+        "--apply",
+    ]
+    old_argv = sys.argv
+    sys.argv = argv
+    try:
+        rc = import_factory_sessions.main()
+    finally:
+        sys.argv = old_argv
+
+    assert rc == 0
+    # The NULL row is skipped, not fatal — the good row after it still imports.
+    store = SessionStore(session_dir=session_dir, encryption_key=key)
+    assert store.load("factory_good") == good_session
+    out = capsys.readouterr().out
+    assert "id=1" in out and "skip" in out

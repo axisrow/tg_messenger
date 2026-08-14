@@ -68,8 +68,13 @@ def resolve_key(args: argparse.Namespace) -> str | None:
     )
 
 
-def fetch_accounts(db_path: str) -> list[tuple[int, str, bool, str]]:
-    """Read (id, phone, is_primary, session_string) rows, read-only."""
+def fetch_accounts(db_path: str) -> list[tuple[int, str | None, bool, str | None]]:
+    """Read (id, phone, is_primary, session_string) rows, read-only.
+
+    ``phone``/``session_string`` are nullable in practice (e.g. a factory
+    account row that was never actually logged in) — the caller must handle
+    both as absent, not assume a well-formed string.
+    """
     uri = f"file:{db_path}?mode=ro"
     con = sqlite3.connect(uri, uri=True)
     try:
@@ -149,6 +154,9 @@ def main() -> int:
                 "canonical (would collapse onto a different file via sanitization) — "
                 "refusing to guess; fix --prefix or the source phone value"
             )
+            continue
+        if not enc:
+            print(f"[skip] id={id_} phone={phone}: session_string is empty/NULL — nothing to import")
             continue
         if not is_encrypted(enc):
             print(
