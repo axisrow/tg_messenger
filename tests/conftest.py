@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import socket
 from datetime import datetime, timezone
 
 import pytest
@@ -464,16 +466,71 @@ class FakeTelethonClient:
 
 
 @pytest.fixture(autouse=True)
-def _isolated_log_dir(tmp_path, monkeypatch):
-    # the CLI entrypoint calls setup_logging(); tests must never write ~/.tg_messenger/logs
-    monkeypatch.setenv("TG_LOG_DIR", str(tmp_path / "logs"))
-    # tg_home() memoizes the resolved root per process; reset it around every test so
-    # one test's TG_HOME / DEFAULT_HOME monkeypatch can't leak into the next via the cache
+def _isolated_environment(tmp_path, monkeypatch):
+    """#229: isolate every test from the developer's real machine.
+
+    Without this, any ``CliRunner().invoke(cli, ...)`` runs the real ``_load_dotenv()``,
+    which reads the repo-root ``.env`` (real API creds, LangSmith keys) plus the real
+    ``~/.tg/.env`` and writes them into ``os.environ`` via ``setdefault`` — OUTSIDE
+    monkeypatch, so they survived into every later test (real Telegram connection
+    attempts were observed in a full local run). Four layers:
+
+    - cwd → tmp_path (no repo ``.env`` for ``_load_dotenv`` to find);
+    - every ``TG_*`` / ``LANGSMITH_*`` / ``LANGCHAIN_*`` / ``SESSION_ENCRYPTION_KEY``
+      var purged, then sandbox ``TG_HOME``/``TG_LOG_DIR`` set (tests that need a value
+      ``setenv`` their own AFTER this fixture — unchanged);
+    - ``DEFAULT_HOME``/``LEGACY_HOME`` module attributes → tmp dirs (they are read
+      live but are NOT env-driven, and ``_load_dotenv`` always tries the fixed
+      ``DEFAULT_HOME/.env`` fallback);
+    - an ``os.environ`` snapshot diff-restored at teardown, closing the
+      setdefault-past-monkeypatch leak class for anything a test loads itself.
+    """
+    from tg_messenger.core import paths as core_paths
     from tg_messenger.core.paths import reset_tg_home_cache
 
+    monkeypatch.chdir(tmp_path)
+    for key in list(os.environ):
+        if key.startswith(("TG_", "LANGSMITH_", "LANGCHAIN_")) or key == "SESSION_ENCRYPTION_KEY":
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TG_HOME", str(tmp_path / "tg-home"))
+    # the CLI entrypoint calls setup_logging(); tests must never write ~/.tg_messenger/logs
+    monkeypatch.setenv("TG_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(core_paths, "DEFAULT_HOME", tmp_path / "default-home")
+    monkeypatch.setattr(core_paths, "LEGACY_HOME", tmp_path / "legacy-home")
+    # tg_home() memoizes the resolved root per process; reset it around every test so
+    # one test's TG_HOME / DEFAULT_HOME monkeypatch can't leak into the next via the cache
     reset_tg_home_cache()
+    baseline = dict(os.environ)
     yield
+    # diff-restore against the isolated baseline: _load_dotenv (and any direct
+    # os.environ writes) bypass monkeypatch and would otherwise leak across tests
+    for key in set(os.environ) - set(baseline):
+        del os.environ[key]
+    for key, value in baseline.items():
+        if os.environ.get(key) != value:
+            os.environ[key] = value
     reset_tg_home_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch):
+    """#229: any test reaching a real outgoing network connection fails fast.
+
+    Every network seam in the suite is faked (FakeTelethonClient, httpx.MockTransport,
+    in-process TestClient) — an actual connect means a seam was missed, not a slow
+    test. AF_UNIX stays allowed (local plumbing, e.g. event-loop internals).
+    """
+    real_connect = socket.socket.connect
+
+    def guarded_connect(self, address, *args, **kwargs):
+        if self.family == socket.AF_UNIX:
+            return real_connect(self, address, *args, **kwargs)
+        raise RuntimeError(
+            f"test tried to open a real network connection to {address!r} — "
+            "fake the client/transport seam instead (#229)"
+        )
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
 
 
 @pytest.fixture

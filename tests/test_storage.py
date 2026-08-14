@@ -200,8 +200,11 @@ async def test_close_waits_for_in_flight_operation(tmp_path, monkeypatch):
 def test_default_db_path_per_profile():
     assert default_db_path("default").name == "default.db"
     assert default_db_path("work").name == "work.db"
-    # root is tg_home() — ~/.tg by default, or the legacy ~/.tg_messenger fallback
-    assert default_db_path("work").parent.name in (".tg", ".tg_messenger")
+    # root is tg_home() (#229: the isolated sandbox in tests — asserting the literal
+    # ".tg"/".tg_messenger" name here read the developer's REAL home resolution)
+    from tg_messenger.core.paths import tg_home
+
+    assert default_db_path("work").parent == tg_home()
 
 
 def test_default_db_path_sanitizes_profile_name():
