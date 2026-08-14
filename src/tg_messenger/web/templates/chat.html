@@ -741,7 +741,10 @@
       } finally {
         // review nit: only the still-current controller may re-enable the button — a
         // superseded request's finally must not flip it back on while a newer one is in flight.
-        if (suggestController === myController) btn.disabled = false;
+        if (suggestController === myController) {
+          suggestController = null;
+          btn.disabled = false;
+        }
       }
     });
     // Reply (#48): clicking ↩ on a message targets it; the composer submits reply_to.
@@ -864,7 +867,14 @@
       activeDialogId = dialogId;
       dialogInput.value = dialogId;
       if (outboundController) outboundController.abort();
-      if (suggestController) suggestController.abort();  // #227: a pending draft is for the OLD dialog
+      if (suggestController) {
+        // Detach ownership BEFORE aborting. The stale request's finally runs after
+        // setComposerEnabled() for the newly-opened dialog; if it still owned the
+        // shared controller, it could re-enable Suggest in a read-only chat.
+        const staleSuggestController = suggestController;
+        suggestController = null;
+        staleSuggestController.abort();
+      }
       const state = stateFor(dialogId);
       applyComposeState(state);
       hideVariants();
