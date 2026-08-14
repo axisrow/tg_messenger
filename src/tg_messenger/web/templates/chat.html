@@ -733,7 +733,11 @@
         }
       } catch (err) {
         if (err && err.name === 'AbortError') return;  // superseded/dialog switch — not an error
-        if (dialogField.value === id) error.textContent = 'Suggest failed.';
+        // same ownership check as finally: a non-abort failure (e.g. a real network error) from
+        // a superseded same-dialog request must not stomp a newer request's "Thinking…" status.
+        if (suggestController === myController && dialogField.value === id) {
+          error.textContent = 'Suggest failed.';
+        }
       } finally {
         // review nit: only the still-current controller may re-enable the button — a
         // superseded request's finally must not flip it back on while a newer one is in flight.
