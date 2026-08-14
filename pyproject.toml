@@ -8,6 +8,23 @@ version = "0.1.0"
 description = "Standalone reusable Telegram messenger client (Web / TUI / CLI) over Telethon"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "axisrow" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 # base = core + CLI only: `pip install tg-messenger` для импорта StandaloneTelegramClient
 # не тащит web/tui-стек. telethon>=1.43 — паритет с tg_content_factory (см. #9).
 dependencies = [
@@ -18,6 +35,11 @@ dependencies = [
     # in-flight input line instead of corrupting it.
     "prompt_toolkit>=3.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/axisrow/tg_messenger"
+Repository = "https://github.com/axisrow/tg_messenger"
+Issues = "https://github.com/axisrow/tg_messenger/issues"
 
 [project.optional-dependencies]
 web = [
