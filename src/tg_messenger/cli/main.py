@@ -797,6 +797,32 @@ def _is_interactive() -> bool:
     return sys.stdin.isatty()
 
 
+def _require_safe_profile(name: str) -> str:
+    """Reject a profile name that is not its own canonical form (#225).
+
+    ``sanitize_profile_name`` silently collapses ``../work`` -> ``work`` inside
+    ``SessionStore.path_for``, so an unvalidated user-supplied name can target
+    ANOTHER profile's session file (remove/logout/login overwrite). Refuse it
+    before any store lookup or client build; names read back from disk
+    (``list_profiles``) are canonical by construction and need no check.
+    """
+    from tg_messenger.core.names import is_safe_profile_name
+
+    if not is_safe_profile_name(name):
+        raise click.ClickException(
+            f"invalid profile name {name!r} — use letters, digits, '_', '.' or '-'"
+        )
+    return name
+
+
+def _validate_profile_option(ctx, param, value):
+    """Click callback for the global ``--profile``: validate at parse time, before
+    ``setup_logging(profile=...)`` or ``ctx.obj`` ever see the name."""
+    if value is None:
+        return None
+    return _require_safe_profile(value)
+
+
 def _resolve_profile(session: str) -> str:
     """Pick the profile when ``--session/--profile`` was left at its default.
 
@@ -805,7 +831,7 @@ def _resolve_profile(session: str) -> str:
     An explicit non-default ``session`` short-circuits all of this.
     """
     if session != "default":
-        return session
+        return _require_safe_profile(session)
     profiles = _session_store().list_profiles()
     if len(profiles) <= 1:
         return profiles[0] if profiles else session
@@ -824,7 +850,8 @@ def _resolve_profile(session: str) -> str:
 
 @click.group()
 @click.option("-v", "--verbose", is_flag=True, help="Verbose (DEBUG) logging.")
-@click.option("--profile", default=None, help="Account profile (session name) to use.")
+@click.option("--profile", default=None, callback=_validate_profile_option,
+              help="Account profile (session name) to use.")
 @click.pass_context
 def cli(ctx: click.Context, verbose: bool, profile: str | None) -> None:
     """tg_messenger — chat in your Telegram DMs from the terminal."""
@@ -852,12 +879,14 @@ def _effective_session(ctx: click.Context | None, session: str) -> str:
     """Combine the global --profile with a command's --session, then resolve a menu."""
     profile = ctx.obj.get("profile") if ctx is not None and ctx.obj else None
     if profile:
-        return profile
+        # already validated by the --profile callback; re-check for callers that
+        # stuff ctx.obj["profile"] directly (defense-in-depth, #225)
+        return _require_safe_profile(profile)
     if (
         ctx is not None
         and ctx.get_parameter_source("session") == ParameterSource.COMMANDLINE
     ):
-        return session
+        return _require_safe_profile(session)
     resolved = _resolve_profile(session)
     # #52: a non-default profile picked via the interactive menu (no explicit --profile)
     # must isolate its log file too — re-init logging with the chosen profile. cli() only
@@ -1234,7 +1263,7 @@ def tui(ctx: click.Context, session: str) -> None:
         if explicit_profile:
             resolved = explicit_profile
         elif explicit_session:
-            resolved = session
+            resolved = _require_safe_profile(session)  # #225: raw --session input
         else:
             profiles = _session_store().list_profiles()
             if len(profiles) <= 1:

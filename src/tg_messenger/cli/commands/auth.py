@@ -77,6 +77,9 @@ def login(ctx: click.Context, session: str, phone: str | None,
     # pop a selection menu here (you're creating/replacing this one).
     if ctx.obj and ctx.obj.get("profile"):
         session = ctx.obj["profile"]
+    # #225: login CREATES/REPLACES a session file — a non-canonical --session
+    # (e.g. ../work -> work) would silently overwrite another profile's login.
+    cli_main._require_safe_profile(session)
 
     if export_session and import_session:
         raise click.ClickException("choose either --export-session or --import-session, not both")
@@ -179,6 +182,9 @@ def profiles_remove(name: str, yes: bool) -> None:
     To also invalidate the session on Telegram's side use `tg-messenger
     --profile NAME logout`.
     """
+    # #225: path_for silently canonicalizes (../work -> work) — an unvalidated
+    # name would delete ANOTHER profile's session file.
+    cli_main._require_safe_profile(name)
     store = cli_main._session_store()
     if not store.path_for(name).is_file():
         raise click.ClickException(f"no saved session for profile {name!r}.")

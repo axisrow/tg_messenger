@@ -3483,6 +3483,66 @@ def test_profiles_remove_prints_recovery_hint(monkeypatch, tmp_path):
     assert "dead" in result.output
 
 
+# --- #225: non-canonical profile names are rejected at every CLI input ---
+# sanitize_profile_name collapses "../work" -> "work" inside SessionStore.path_for,
+# so an unvalidated name silently targets ANOTHER profile's session file.
+
+
+def test_profiles_remove_rejects_traversal_name(monkeypatch, tmp_path):
+    store = _profile_store(monkeypatch, tmp_path, "work")
+    result = CliRunner().invoke(cli_main.cli, ["profiles", "remove", "../work", "--yes"])
+    assert result.exit_code != 0
+    assert "invalid profile name" in result.output
+    assert store.list_profiles() == ["work"]  # the real file survived
+
+
+def test_global_profile_option_rejects_traversal_name(monkeypatch, tmp_path):
+    store = _profile_store(monkeypatch, tmp_path, "work")
+    stub = StubClient()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "../work", "logout", "--yes"])
+    assert result.exit_code != 0
+    assert "invalid profile name" in result.output
+    assert store.list_profiles() == ["work"]
+    assert stub.logged_out is False
+
+
+def test_session_option_rejects_unsafe_name(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--session", "../work"])
+    assert result.exit_code != 0
+    assert "invalid profile name" in result.output
+    assert stub.connected is False  # rejected before any client work
+
+
+def test_login_rejects_unsafe_session_before_network(monkeypatch):
+    inner = FakeInnerLoginClient()
+    stub = LoginStubClient(inner)
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(
+        cli_main.cli, ["login", "--session", "../work"], input="+10000000000\n123\n"
+    )
+    assert result.exit_code != 0
+    assert "invalid profile name" in result.output
+    assert stub.connected is False
+    assert stub.saved is False
+
+
+def test_global_profile_rejects_name_with_space():
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "a b", "profiles"])
+    assert result.exit_code != 0
+    assert "invalid profile name" in result.output
+
+
+def test_safe_profile_names_still_work(monkeypatch, tmp_path):
+    store = _profile_store(monkeypatch, tmp_path, "work")
+    stub = StubClient()
+    monkeypatch.setattr(cli_main, "make_client", lambda **kw: stub)
+    result = CliRunner().invoke(cli_main.cli, ["--profile", "work", "logout", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert store.list_profiles() == []
+
+
 def test_logout_prints_recovery_hint(monkeypatch, tmp_path):
     # #187: after logout, remind that recovery needs a fresh phone login
     _profile_store(monkeypatch, tmp_path, "work")
