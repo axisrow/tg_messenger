@@ -3,6 +3,14 @@
 Креды берутся из окружения или из .env в корне проекта (приложение само
 .env НЕ читает — тут он парсится только чтобы передать значения подпроцессу).
 Тесты, требующие TG_API_ID/TG_API_HASH, скипаются, если кредов нет.
+
+Namespace note (#229 review): the suite-wide `_no_real_network` socket guard in
+conftest.py is process-local (monkeypatch) and does NOT extend into the
+subprocess these tests launch — by design, since this file's whole purpose is a
+real, unfaked server making real network calls (opt-in via real credentials,
+skipped otherwise). #229's isolation guarantee is scoped to the unit/CLI suite
+that runs in-process; it does not (and cannot, without redesigning this file)
+cover this deliberately real E2E path.
 """
 
 from __future__ import annotations
