@@ -484,6 +484,21 @@ await (async () => {
         composerText.value === 'use this draft');
   check('#227: the thinking hint is cleared on success', suggestError.textContent === '');
   check('#227: the suggest button is re-enabled', suggestBtn.disabled === false);
+
+  // 4) controller ownership: aborting A during a switch to read-only B must not let
+  // A's stale finally undo setComposerEnabled(false) for B.
+  dialogId.value = '7';
+  composerText.value = '';
+  composer.dispatch('htmx:confirm', { issueRequest() {} });
+  getResolve = controlledFetch();
+  suggestBtn.dispatch('click');
+  await drain();
+  sandbox.openDialog({ dataset: { dialog: '8', canSend: '0' } });
+  check('#227 follow-up: switching to read-only B disables Suggest', suggestBtn.disabled === true);
+  getResolve()('late suggestion for A');
+  await drain(); await drain();
+  check("#227 follow-up: A's stale finally does not re-enable Suggest in B",
+        suggestBtn.disabled === true);
 })();
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);
