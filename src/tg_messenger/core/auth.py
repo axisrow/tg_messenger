@@ -126,12 +126,13 @@ class SessionStore:
         # mkstemp (not a PID-derived name) so two saves of the same profile in one
         # process — however unlikely today — never share one temp inode: O_EXCL
         # guarantees each call gets its own file instead of silently reopening
-        # another in-flight save's temp file.
+        # another in-flight save's temp file. mkstemp already creates it at 0600
+        # on POSIX (no separate chmod needed — one that ran outside this try would
+        # leak the temp file on failure instead of guaranteeing cleanup).
         fd, tmp_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
         )
         tmp = Path(tmp_name)
-        os.chmod(tmp, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(stored)
