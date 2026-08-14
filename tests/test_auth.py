@@ -45,6 +45,42 @@ def test_session_dir_is_private(session_dir):
     assert mode == 0o700
 
 
+def test_save_failure_keeps_existing_session_intact(session_dir, monkeypatch):
+    # #226: write_text would truncate the WORKING session before the new bytes land.
+    # A failure anywhere before the final rename must leave the old file byte-identical
+    # and no temp fragments behind.
+    store = SessionStore(session_dir)
+    store.save("default", VALID_SESSION)
+    original = store.path_for("default").read_bytes()
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(auth.os, "replace", boom)
+    with pytest.raises(OSError):
+        store.save("default", "REPLACEMENT")
+    assert store.path_for("default").read_bytes() == original
+    assert [p.name for p in session_dir.iterdir()] == ["default.session"]
+
+
+def test_save_temp_file_is_private_before_content_lands(session_dir, monkeypatch):
+    # #226: the session secret must never exist on disk with umask permissions —
+    # the temp file has to be 0600 from creation, checked at fsync time (bytes present).
+    store = SessionStore(session_dir)
+    seen = {}
+    real_fsync = auth.os.fsync
+
+    def spy(fd):
+        tmps = [p for p in session_dir.iterdir() if p.name.endswith(".tmp")]
+        seen["modes"] = [stat.S_IMODE(p.stat().st_mode) for p in tmps]
+        return real_fsync(fd)
+
+    monkeypatch.setattr(auth.os, "fsync", spy)
+    store.save("default", VALID_SESSION)
+    assert seen["modes"] == [0o600]
+    assert store.load("default") == VALID_SESSION
+
+
 def test_name_is_sanitized(session_dir):
     store = SessionStore(session_dir)
     store.save("../../evil name", "S")
