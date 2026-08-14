@@ -704,8 +704,9 @@
       // (restoreComposeState) like the outbound-translation fetch.
       const before = composerField.value;
       if (suggestController) suggestController.abort();
-      suggestController = new AbortController();
-      const signal = suggestController.signal;
+      const myController = new AbortController();
+      suggestController = myController;
+      const signal = myController.signal;
       btn.disabled = true;
       // #187: the LLM runs for several seconds — write a "thinking…" status synchronously so the
       // UI doesn't look hung (mirrors the TUI's SUGGEST_THINKING). Cleared on success/failure.
@@ -734,7 +735,9 @@
         if (err && err.name === 'AbortError') return;  // superseded/dialog switch — not an error
         if (dialogField.value === id) error.textContent = 'Suggest failed.';
       } finally {
-        btn.disabled = false;
+        // review nit: only the still-current controller may re-enable the button — a
+        // superseded request's finally must not flip it back on while a newer one is in flight.
+        if (suggestController === myController) btn.disabled = false;
       }
     });
     // Reply (#48): clicking ↩ on a message targets it; the composer submits reply_to.
