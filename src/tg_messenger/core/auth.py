@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -117,8 +118,42 @@ class SessionStore:
             if self._encryption_key
             else session_string
         )
-        path.write_text(stored, encoding="utf-8")
-        os.chmod(path, 0o600)
+        # Atomic write (mirror core/dotenv.write_env_values): writing the live file
+        # directly would truncate a WORKING session before the new bytes land, so a
+        # crash/disk-full mid-write destroys the authorization. Temp file in the SAME
+        # dir (os.replace is atomic on one FS), 0600 BEFORE content so the secret never
+        # exists with umask permissions, fsync, then rename over the target.
+        # mkstemp (not a PID-derived name) so two saves of the same profile in one
+        # process — however unlikely today — never share one temp inode: O_EXCL
+        # guarantees each call gets its own file instead of silently reopening
+        # another in-flight save's temp file. mkstemp already creates it at 0600
+        # on POSIX (no separate chmod needed — one that ran outside this try would
+        # leak the temp file on failure instead of guaranteeing cleanup).
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(stored)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            # fsyncing the temp file's data is not enough: os.replace's directory-entry
+            # update is only durable across a crash once the containing directory is
+            # fsynced too (Codex review on #230 — POSIX rename durability).
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except BaseException:
+            # leave no half-written temp behind on failure (the real file is untouched)
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
         return path
 
     def from_external(self, session_string: str) -> str:

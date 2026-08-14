@@ -1,4 +1,6 @@
+import os
 import stat
+from pathlib import Path
 
 import pytest
 from telethon.crypto import AuthKey
@@ -43,6 +45,100 @@ def test_session_dir_is_private(session_dir):
     store.save("default", "S")
     mode = stat.S_IMODE(nested.stat().st_mode)
     assert mode == 0o700
+
+
+def test_save_failure_keeps_existing_session_intact(session_dir, monkeypatch):
+    # #226: write_text would truncate the WORKING session before the new bytes land.
+    # A failure anywhere before the final rename must leave the old file byte-identical
+    # and no temp fragments behind.
+    store = SessionStore(session_dir)
+    store.save("default", VALID_SESSION)
+    original = store.path_for("default").read_bytes()
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(auth.os, "replace", boom)
+    with pytest.raises(OSError):
+        store.save("default", "REPLACEMENT")
+    assert store.path_for("default").read_bytes() == original
+    assert [p.name for p in session_dir.iterdir()] == ["default.session"]
+
+
+def test_save_temp_file_is_private_before_content_lands(session_dir, monkeypatch):
+    # #226: the session secret must never exist on disk with umask permissions —
+    # the temp file has to be 0600 from creation, checked at fsync time (bytes present).
+    # save() also fsyncs the parent dir for rename durability (#230 round 3) — that
+    # second fsync call has no ".tmp" file left to see, so only record the first.
+    store = SessionStore(session_dir)
+    seen = {}
+    real_fsync = auth.os.fsync
+
+    def spy(fd):
+        if "modes" not in seen:
+            tmps = [p for p in session_dir.iterdir() if p.name.endswith(".tmp")]
+            seen["modes"] = [stat.S_IMODE(p.stat().st_mode) for p in tmps]
+        return real_fsync(fd)
+
+    monkeypatch.setattr(auth.os, "fsync", spy)
+    store.save("default", VALID_SESSION)
+    assert seen["modes"] == [0o600]
+    assert store.load("default") == VALID_SESSION
+
+
+def test_concurrent_saves_use_distinct_temp_files(session_dir, monkeypatch):
+    # Codex review on #226/#230: the temp filename was derived only from os.getpid(),
+    # so two saves of the SAME profile within one process share one temp path. A
+    # second save's os.open(..., O_TRUNC) would reopen the FIRST save's still-live
+    # temp inode instead of failing, letting the two writes interleave. Each save
+    # must get its own unique temp file regardless of how many times save() runs.
+    store = SessionStore(session_dir)
+    seen_tmp_names = []
+    real_open = auth.os.open
+
+    def spy_open(path, flags, mode=0o777):
+        if str(path).endswith(".tmp"):
+            seen_tmp_names.append(Path(path).name)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(auth.os, "open", spy_open)
+    store.save("default", VALID_SESSION)
+    store.save("default", VALID_SESSION)
+    assert len(seen_tmp_names) == 2
+    assert seen_tmp_names[0] != seen_tmp_names[1]
+
+
+def test_save_fsyncs_parent_dir_after_replace(session_dir, monkeypatch):
+    # Codex review on #230: fsyncing the temp file's data is not enough — os.replace's
+    # directory-entry update is only durable across a crash once the PARENT DIRECTORY
+    # itself is fsynced. Without it, a crash right after save() returns can lose the
+    # rename or leave the old session, even though save() reported success.
+    store = SessionStore(session_dir)
+    fsynced_fds = []
+    real_fsync = auth.os.fsync
+    real_open = auth.os.open
+
+    def spy_fsync(fd):
+        fsynced_fds.append(fd)
+        return real_fsync(fd)
+
+    dir_fds = []
+
+    def spy_open(path, flags, mode=0o777):
+        fd = real_open(path, flags, mode)
+        if str(path) == str(session_dir) and not (flags & os.O_CREAT):
+            dir_fds.append(fd)
+        return fd
+
+    monkeypatch.setattr(auth.os, "fsync", spy_fsync)
+    monkeypatch.setattr(auth.os, "open", spy_open)
+    store.save("default", VALID_SESSION)
+
+    assert dir_fds, "save() never opened the parent directory for a durability fsync"
+    assert any(fd in fsynced_fds for fd in dir_fds), (
+        "save() opened the parent dir but never fsynced it — the rename is not "
+        "guaranteed durable across a crash"
+    )
 
 
 def test_name_is_sanitized(session_dir):
