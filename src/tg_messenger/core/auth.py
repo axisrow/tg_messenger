@@ -139,6 +139,14 @@ class SessionStore:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
+            # fsyncing the temp file's data is not enough: os.replace's directory-entry
+            # update is only durable across a crash once the containing directory is
+            # fsynced too (Codex review on #230 — POSIX rename durability).
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except BaseException:
             # leave no half-written temp behind on failure (the real file is untouched)
             try:
