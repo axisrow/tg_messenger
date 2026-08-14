@@ -8,6 +8,7 @@ helpers directly. Imported by file path since ``scripts/`` is not a package.
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import sqlite3
 import sys
@@ -43,6 +44,17 @@ def test_profile_name_returns_none_for_missing_phone(bad_phone):
     # A NULL/blank phone must never crash the import loop — it's just an
     # unusable row, like a decrypt failure elsewhere in the same loop.
     assert profile_name("factory_", bad_phone) is None
+
+
+def test_resolve_key_reports_a_clean_error_for_a_bad_key_file(capsys):
+    # A missing/unreadable --key-file must not crash with a raw traceback,
+    # unlike every other input-validation path in main() (/review round-3
+    # finding on PR #239).
+    args = argparse.Namespace(key=None, key_file="/definitely/does/not/exist.txt")
+    resolve_key = import_factory_sessions.resolve_key
+    assert resolve_key(args) is None
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
 
 
 def test_profile_name_non_canonical_prefix_is_rejected_before_save():
@@ -167,3 +179,53 @@ def test_main_skips_a_null_session_string_instead_of_crashing(tmp_path, capsys):
     assert store.load("factory_good") == good_session
     out = capsys.readouterr().out
     assert "id=1" in out and "skip" in out
+
+
+def test_main_two_rows_normalizing_to_the_same_profile_do_not_overwrite_each_other(
+    tmp_path, capsys
+):
+    """The 'never overwrites an existing profile' guarantee must also hold
+    WITHIN a single run: two source rows whose phone normalizes to the same
+    profile name (e.g. "+123" and "123" both -> "factory_123") must not let
+    the second row silently replace what the first just wrote (Codex round-3
+    finding on PR #239 — no concurrency needed to reproduce this)."""
+    from tg_messenger.core.auth import SessionStore
+    from tg_messenger.core.session_cipher import encrypt_session
+
+    key = "test-key-not-a-real-secret"
+    session_dir = tmp_path / "sessions"
+    first_session = _make_session(dc_id=8)
+    second_session = _make_session(dc_id=10)
+    db_path = _make_factory_db(
+        tmp_path,
+        [
+            (1, "+123", 0, encrypt_session(first_session, key)),
+            (2, "123", 0, encrypt_session(second_session, key)),
+        ],
+    )
+
+    argv = [
+        "import_factory_sessions.py",
+        "--db",
+        str(db_path),
+        "--key",
+        key,
+        "--session-dir",
+        str(session_dir),
+        "--apply",
+    ]
+    old_argv = sys.argv
+    sys.argv = argv
+    try:
+        rc = import_factory_sessions.main()
+    finally:
+        sys.argv = old_argv
+
+    assert rc == 0
+    store = SessionStore(session_dir=session_dir, encryption_key=key)
+    # Whichever row imports first, the second must be skipped, not silently
+    # overwrite it — both being "[ok]" is exactly the bug.
+    saved = store.load("factory_123")
+    assert saved in (first_session, second_session)
+    out = capsys.readouterr().out
+    assert out.count("[ok]") == 1

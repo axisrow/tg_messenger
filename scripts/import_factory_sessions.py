@@ -62,7 +62,11 @@ def resolve_key(args: argparse.Namespace) -> str | None:
     if args.key:
         return args.key
     if args.key_file:
-        return Path(args.key_file).read_text(encoding="utf-8").strip()
+        try:
+            return Path(args.key_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            print(f"error: could not read --key-file {args.key_file!r}: {exc}", file=sys.stderr)
+            return None
     return os.environ.get("SESSION_ENCRYPTION_KEY") or os.environ.get(
         "TG_FACTORY_SESSION_KEY"
     )
@@ -176,6 +180,12 @@ def main() -> int:
             continue
 
         marker = " (primary)" if is_primary else ""
+        # Claim the name NOW, in-memory, before moving to the next row — two
+        # rows in this same DB can normalize to the same profile (e.g. "+123"
+        # and "123"), and without this the second row's `profile in existing`
+        # check above would still pass, silently overwriting what this row
+        # just wrote (or would have written in dry-run).
+        existing.add(profile)
         if args.apply:
             store.save(profile, plain)
             print(
