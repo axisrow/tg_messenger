@@ -1232,8 +1232,14 @@ class MessengerTUI(App):
         await self._render_dialogs()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
-        # the search box submits nothing — only the composer sends messages
-        if event.input.id == "search":
+        # #223: ONLY the composer sends. Every other Input in the app (search, and every field
+        # on a modal settings/login screen) submits Enter that bubbles up here; a denylist
+        # ("not search") meant a new field anywhere — or a modal handler that returns without
+        # event.stop() — could fall through into the SEND path and deliver a profile/model name
+        # to a real contact (reproduced: text typed into the settings screen's profile-name
+        # field was sent to the open chat). An allowlist makes that structurally impossible: a
+        # field the app doesn't own is ignored, regardless of what future fields get added.
+        if event.input.id != "composer":
             return
         if self._current is None or not event.value.strip():
             return

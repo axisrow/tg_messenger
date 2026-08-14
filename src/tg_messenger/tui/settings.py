@@ -58,7 +58,18 @@ class ProfileListCard(Vertical):
     but the add/remove ACTIONS stay on AccountsScreen — they are key-bound (`a`/`d`) and mount the
     LoginScreen/ConfirmScreen sub-screens, which is naturally screen-level work. The screen reaches
     into `#accounts`/`#new-profile` (query searches the whole DOM subtree) for those flows.
+
+    #223: Enter in `#new-profile` used to do nothing at all — no `on_input_submitted` existed
+    anywhere on the field's bubbling path, and the only entry point (`a`) is a printable key
+    that a focused Input eats before the binding ever fires (typing "bob" then pressing "a"
+    yields "boba", not an add). This card now handles its own field's Enter, matching the
+    `TranslateSettingsCard`/`SuggestSettingsCard` pattern: it can't run the add flow itself
+    (that mounts `LoginScreen`, screen-level work), so it posts `AddRequested` and the screen
+    calls its existing `action_add_account()` — no validation duplicated.
     """
+
+    class AddRequested(Message):
+        """Enter in `#new-profile` — the screen owns the add flow (it mounts LoginScreen)."""
 
     def __init__(self, *, profiles, active):
         super().__init__(id="profiles-section")
@@ -71,8 +82,17 @@ class ProfileListCard(Vertical):
             *(AccountItem(p, p == self._active) for p in self._profiles),
             id="accounts",
         )
-        yield Label("a — add · d — remove · Esc — close", id="accounts-help")
+        yield Label("Name + Enter — add · d/Delete — remove · Esc — close", id="accounts-help")
         yield Input(placeholder="New profile name", id="new-profile")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # #223: MessengerTUI.on_input_submitted's composer allowlist (app.py) is the single,
+        # sufficient fix that keeps this field's Enter out of the send path — it's a chokepoint
+        # every Input.Submitted bubbles through regardless of which screen posted it, so no
+        # per-card event.stop() is needed here for that. This handler exists only to translate
+        # the field's submit into the screen-level add-profile flow.
+        if event.input.id == "new-profile":
+            self.post_message(self.AddRequested())
 
     async def refresh_profiles(self, profiles, active) -> None:
         self._profiles = list(profiles)
@@ -185,9 +205,10 @@ class TranslateSettingsCard(Vertical):
         self.run_worker(self._save(), exclusive=True)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        # Enter in any translation field saves. The message still bubbles on past this card to the
-        # App regardless, so the explicit id allowlist below — not bubbling isolation — is what keeps
-        # a foreign field (e.g. the sibling profile-name Input) from triggering a translate save.
+        # #223: an unmatched id here used to fall through all the way to
+        # MessengerTUI.on_input_submitted and, with a dialog open, into the SEND path. That's now
+        # structurally impossible regardless of this handler — app.py's composer allowlist is the
+        # single chokepoint every Input.Submitted bubbles through, so no event.stop() is needed.
         if event.input.id in ("target-lang", "known-langs", "unknown-langs",
                                "translate-model", "translate-max"):
             self.run_worker(self._save(), exclusive=True)
@@ -391,6 +412,9 @@ class SuggestSettingsCard(Vertical):
         self.run_worker(self._save(), exclusive=True)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        # #223: app.py's composer allowlist is the single chokepoint every Input.Submitted
+        # bubbles through — it alone keeps this field's Enter out of the send path, so no
+        # event.stop() is needed here.
         if event.input.id in ("suggest-history", "suggest-model"):
             self.run_worker(self._save(), exclusive=True)
 
@@ -444,6 +468,9 @@ class AccountsScreen(ModalScreen[object]):
         Binding("escape", "close", "Close", show=False),
         Binding("a", "add_account", "Add account", show=False),
         Binding("d", "remove_account", "Remove", show=False),
+        # #223: `delete` is a non-printable alias for the same action as `d` — reachable even
+        # while focus is in #new-profile (a focused Input eats the printable `d` as a letter).
+        Binding("delete", "remove_account", "Remove", show=False),
     ]
 
     def __init__(self, *, profiles, active, store, account_client_factory=None,
@@ -506,6 +533,11 @@ class AccountsScreen(ModalScreen[object]):
         # back to the app (so it can swap the live translator in).
         self._translator = event.translator
         self.dismiss(event.translator)
+
+    def on_profile_list_card_add_requested(self, event: ProfileListCard.AddRequested) -> None:
+        # #223: Enter in #new-profile — the card can't run the add flow itself (it mounts
+        # LoginScreen), so it asks the screen. All validation stays in action_add_account.
+        self.action_add_account()
 
     # --- thin shims so direct-call tests keep targeting the screen (the card owns the real work) ---
 

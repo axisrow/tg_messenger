@@ -4458,6 +4458,20 @@ async def _pause_until(pilot, predicate, attempts=20):
     assert predicate()
 
 
+async def _type(pilot, widget, text: str) -> None:
+    """Focus `widget` and PRESS each character — the real focus state a user is in.
+
+    A `.value = "..."` assignment never moves focus, so a subsequent `pilot.press("a")`
+    reaches the SCREEN binding — which in production it cannot, because a focused Input
+    eats printable keys first. That gap hid #223's Enter-in-#new-profile dead end for
+    ~35 AccountsScreen tests. If a test then presses a key the focused widget could
+    consume, use this helper instead of assigning `.value`.
+    """
+    widget.focus()
+    await pilot.pause()
+    await pilot.press(*text)
+
+
 async def _select_dialog(pilot, app, dialog_id: int):
     lv = app.query_one("#dialogs", ListView)
     for idx, item in enumerate(app.query(DialogItem)):
@@ -4899,9 +4913,9 @@ async def test_tui_settings_add_profile_runs_wizard_and_saves(caplog):
         )
         app.push_screen(screen)
         await pilot.pause()
-        screen.query_one("#new-profile", Input).value = "bob"
         with caplog.at_level("INFO"):
-            await pilot.press("a")  # add_account → pushes LoginScreen
+            await _type(pilot, screen.query_one("#new-profile", Input), "bob")
+            await pilot.press("enter")  # #223: Enter in the field adds the profile
             await _pause_until(pilot, lambda: app.screen.query("#login-input"))
             # drive the wizard: phone then code
             app.screen.query_one("#login-input", Input).value = "+10000000000"
@@ -4920,6 +4934,46 @@ async def test_tui_settings_add_profile_runs_wizard_and_saves(caplog):
         for rec in caplog.records:
             msg = rec.getMessage()
             assert "+10000000000" not in msg and "12345" not in msg
+
+
+async def test_tui_settings_typing_a_in_name_field_types_a_letter():
+    # #223: `a` is a deliberately non-priority binding (making it priority would make the
+    # letter "a" untypeable in a profile name). Once focus is in #new-profile, `a` must be
+    # swallowed as ordinary text, NOT fire action_add_account — pins that decision so a future
+    # "fix" doesn't flip it to priority=True and break typing "a" into a profile name.
+    store = FakeSessionStore(["alice"])
+    app = MessengerTUI(client=TuiStubClient(), session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = AccountsScreen(profiles=store.list_profiles(), active="alice", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        inp = screen.query_one("#new-profile", Input)
+        await _type(pilot, inp, "bob")
+        await pilot.press("a")
+        await pilot.pause()
+        assert inp.value == "boba"
+        assert isinstance(app.screen, AccountsScreen)  # no LoginScreen pushed
+
+
+async def test_tui_settings_enter_never_reaches_the_send_path():
+    # #223 defect 3: MessengerTUI.on_input_submitted used to be a denylist ("not search"), so a
+    # settings field's Enter that no card handler stopped fell through into the SEND path.
+    # Reproduced live: typing "secret" into #new-profile with a dialog open sent "secret" to it.
+    store = FakeSessionStore(["alice"])
+    client = TuiStubClient()
+    app = MessengerTUI(client=client, session_name="alice", session_store=store)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _select_dialog(pilot, app, 7)
+        assert app._current == 7
+        screen = AccountsScreen(profiles=store.list_profiles(), active="alice", store=store)
+        app.push_screen(screen)
+        await pilot.pause()
+        await _type(pilot, screen.query_one("#new-profile", Input), "secret")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert client.sent == []
 
 
 async def test_tui_settings_remove_non_active_profile():
@@ -4974,8 +5028,9 @@ async def test_tui_settings_add_unsafe_name_is_rejected():
         )
         app.push_screen(screen)
         await pilot.pause()
-        screen.query_one("#new-profile", Input).value = "../alice"  # → sanitizes to "alice"
-        await pilot.press("a")
+        # "../alice" sanitizes to "alice"
+        await _type(pilot, screen.query_one("#new-profile", Input), "../alice")
+        await pilot.press("enter")
         await pilot.pause()
         assert app.screen is screen  # no LoginScreen pushed
         assert built == []  # client never built for an unsafe name
@@ -4996,8 +5051,9 @@ async def test_tui_settings_add_duplicate_canonical_name_is_rejected():
         )
         app.push_screen(screen)
         await pilot.pause()
-        screen.query_one("#new-profile", Input).value = "work_personal"  # already present
-        await pilot.press("a")
+        # "work_personal" already present
+        await _type(pilot, screen.query_one("#new-profile", Input), "work_personal")
+        await pilot.press("enter")
         await pilot.pause()
         assert app.screen is screen
         assert built == []
@@ -5060,8 +5116,9 @@ async def test_tui_settings_add_empty_name_is_noop():
         )
         app.push_screen(screen)
         await pilot.pause()
-        screen.query_one("#new-profile", Input).value = "   "  # whitespace only
-        await pilot.press("a")
+        # whitespace only
+        await _type(pilot, screen.query_one("#new-profile", Input), "   ")
+        await pilot.press("enter")
         await pilot.pause()
         assert app.screen is screen  # no LoginScreen pushed (still on AccountsScreen)
         assert store.list_profiles() == ["alice"]  # nothing added

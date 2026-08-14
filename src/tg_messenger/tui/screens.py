@@ -35,7 +35,7 @@ Actions:
   Tab       accept the reply suggestion (otherwise move focus forward)
   Shift+Tab move focus backward
   r / x     react to the selected message
-  Ctrl+S    settings: accounts + incoming translation (mode and languages)
+  Ctrl+S    settings: accounts (name + Enter to add) + incoming translation (mode and languages)
   t         toggle incoming auto-translation (outside text inputs)
   Ctrl+T    translate the whole chat now
   @path [caption]  attach a file (input command)
