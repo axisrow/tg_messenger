@@ -466,7 +466,7 @@ class FakeTelethonClient:
 
 
 @pytest.fixture(autouse=True)
-def _isolated_environment(tmp_path, monkeypatch):
+def _isolated_environment(tmp_path, monkeypatch, request):
     """#229: isolate every test from the developer's real machine.
 
     Without this, any ``CliRunner().invoke(cli, ...)`` runs the real ``_load_dotenv()``,
@@ -485,6 +485,14 @@ def _isolated_environment(tmp_path, monkeypatch):
     - an ``os.environ`` snapshot diff-restored at teardown, closing the
       setdefault-past-monkeypatch leak class for anything a test loads itself.
     """
+    if request.node.get_closest_marker("real_e2e") is not None:
+        if os.environ.get("TG_RUN_REAL_E2E") != "1":
+            pytest.skip("real Telegram E2E requires explicit TG_RUN_REAL_E2E=1")
+        # Explicitly opted-in real E2E owns its real cwd/home/session namespace.
+        # The module is skipped by default; see tests/test_e2e.py.
+        yield
+        return
+
     from tg_messenger.core import paths as core_paths
     from tg_messenger.core.paths import reset_tg_home_cache
 
@@ -513,13 +521,20 @@ def _isolated_environment(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_real_network(monkeypatch):
+def _no_real_network(monkeypatch, request):
     """#229: any test reaching a real outgoing network connection fails fast.
 
     Every network seam in the suite is faked (FakeTelethonClient, httpx.MockTransport,
     in-process TestClient) — an actual connect means a seam was missed, not a slow
     test. AF_UNIX stays allowed (local plumbing, e.g. event-loop internals).
     """
+    if request.node.get_closest_marker("real_e2e") is not None:
+        if os.environ.get("TG_RUN_REAL_E2E") != "1":
+            pytest.skip("real Telegram E2E requires explicit TG_RUN_REAL_E2E=1")
+        # Real E2E launches and probes an actual subprocess server. It is reachable
+        # only through the explicit TG_RUN_REAL_E2E=1 gate in tests/test_e2e.py.
+        return
+
     real_connect = socket.socket.connect
 
     def guarded_connect(self, address, *args, **kwargs):

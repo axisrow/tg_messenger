@@ -82,3 +82,6 @@ asyncio_default_fixture_loop_scope = "function"
 timeout = 30
 pythonpath = ["src", "."]
 filterwarnings = ["error"]
+markers = [
+    "real_e2e: explicitly opted-in tests that may use real Telegram credentials and network",
+]

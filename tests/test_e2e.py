@@ -1,16 +1,13 @@
-"""E2E: запуск реального приложения подпроцессом (без фейков).
+"""Opt-in E2E: запуск реального приложения подпроцессом (без фейков).
 
-Креды берутся из окружения или из .env в корне проекта (приложение само
-.env НЕ читает — тут он парсится только чтобы передать значения подпроцессу).
-Тесты, требующие TG_API_ID/TG_API_HASH, скипаются, если кредов нет.
+Обычный ``pytest`` ВСЕГДА скипает этот модуль до чтения repo ``.env`` и
+вычисления реального session path. Для осознанного запуска выставить
+``TG_RUN_REAL_E2E=1``; только тогда креды берутся из окружения или ``.env``
+в корне проекта, а тесты могут подключаться к реальному Telegram.
 
-Namespace note (#229 review): the suite-wide `_no_real_network` socket guard in
-conftest.py is process-local (monkeypatch) and does NOT extend into the
-subprocess these tests launch — by design, since this file's whole purpose is a
-real, unfaked server making real network calls (opt-in via real credentials,
-skipped otherwise). #229's isolation guarantee is scoped to the unit/CLI suite
-that runs in-process; it does not (and cannot, without redesigning this file)
-cover this deliberately real E2E path.
+The explicit ``real_e2e`` marker makes the suite-wide cwd/home/socket isolation
+yield to these tests after opt-in. Without the flag, collection neither parses
+local credentials nor probes the real session namespace (#229 follow-up).
 """
 
 from __future__ import annotations
@@ -29,11 +26,21 @@ from tg_messenger.cli.main import _parse_dotenv
 from tg_messenger.core.auth import default_session_dir
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-# resolve the session path the same way the app does (tg_home(): ~/.tg, or the
-# legacy ~/.tg_messenger fallback) rather than hardcoding a root
-SESSION_FILE = default_session_dir() / "default.session"
+RUN_REAL_E2E = os.environ.get("TG_RUN_REAL_E2E") == "1"
+pytestmark = [
+    pytest.mark.real_e2e,
+    pytest.mark.skipif(
+        not RUN_REAL_E2E,
+        reason="real Telegram E2E requires explicit TG_RUN_REAL_E2E=1",
+    ),
+]
 
-DOTENV = _parse_dotenv(PROJECT_ROOT / ".env")
+# These are deliberately resolved only after explicit opt-in. Module import during
+# ordinary pytest collection must not read repo credentials or inspect ~/.tg*.
+DOTENV = _parse_dotenv(PROJECT_ROOT / ".env") if RUN_REAL_E2E else {}
+SESSION_FILE = (
+    default_session_dir() / "default.session" if RUN_REAL_E2E else None
+)
 
 
 def _cred_env() -> dict[str, str]:
@@ -44,7 +51,10 @@ def _cred_env() -> dict[str, str]:
     return env
 
 
-HAS_CREDS = bool(_cred_env().get("TG_API_ID") and _cred_env().get("TG_API_HASH"))
+HAS_CREDS = RUN_REAL_E2E and bool(
+    _cred_env().get("TG_API_ID") and _cred_env().get("TG_API_HASH")
+)
+HAS_SESSION = SESSION_FILE is not None and SESSION_FILE.exists()
 
 
 def _free_port() -> int:
@@ -97,6 +107,7 @@ def test_serve_without_creds_fails_with_clear_error(tmp_path):
     # ~/.tg_messenger). Point HOME at an empty tmp dir so the developer's REAL creds there
     # can't leak into this "no creds" subprocess and keep the server alive.
     env["HOME"] = str(tmp_path / "empty-home")
+    env["TG_HOME"] = str(tmp_path / "empty-tg-home")
     (tmp_path / "empty-home").mkdir()
     proc = _serve(_free_port(), env, cwd=tmp_path)
     try:
@@ -125,7 +136,7 @@ def test_serve_starts_and_serves_index():
 
 
 @pytest.mark.skipif(not HAS_CREDS, reason="нет TG_API_ID/TG_API_HASH (окружение или .env)")
-@pytest.mark.skipif(SESSION_FILE.exists(), reason="сессия есть — этот тест про её отсутствие")
+@pytest.mark.skipif(HAS_SESSION, reason="сессия есть — этот тест про её отсутствие")
 def test_serve_dialogs_without_session_gives_401_hint():
     """Без логина /dialogs отвечает 401 с подсказкой, а не 500 с traceback."""
     port = _free_port()
@@ -140,7 +151,7 @@ def test_serve_dialogs_without_session_gives_401_hint():
 
 
 @pytest.mark.skipif(not HAS_CREDS, reason="нет TG_API_ID/TG_API_HASH (окружение или .env)")
-@pytest.mark.skipif(not SESSION_FILE.exists(),
+@pytest.mark.skipif(not HAS_SESSION,
                     reason="нет сессии — выполните: tg-messenger login")
 def test_serve_dialogs_with_real_session():
     """С залогиненной сессией /dialogs отдаёт список без 500-х."""
