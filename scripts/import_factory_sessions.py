@@ -40,7 +40,22 @@ if _SRC.is_dir():
     sys.path.insert(0, str(_SRC))
 
 from tg_messenger.core.auth import SessionStore  # noqa: E402
+from tg_messenger.core.names import is_safe_profile_name  # noqa: E402
 from tg_messenger.core.session_cipher import decrypt_session, is_encrypted  # noqa: E402
+
+
+def profile_name(prefix: str, phone: str | None) -> str | None:
+    """Build the target profile name, or None when ``phone`` is unusable.
+
+    Pure and side-effect-free so it's independently testable. Returns None
+    (never raises) for a missing/blank phone, matching the loop's existing
+    "skip this row, keep going" contract for other bad-data cases (a NULL
+    ``phone`` column crashing the whole import would be worse than skipping
+    one row of a human-run migration helper).
+    """
+    if not phone or not phone.strip():
+        return None
+    return prefix + phone.lstrip("+")
 
 
 def resolve_key(args: argparse.Namespace) -> str | None:
@@ -124,7 +139,17 @@ def main() -> int:
     print()
 
     for id_, phone, is_primary, enc in rows:
-        profile = args.prefix + phone.lstrip("+")
+        profile = profile_name(args.prefix, phone)
+        if profile is None:
+            print(f"[skip] id={id_} phone={phone!r}: missing/blank phone — cannot name a profile")
+            continue
+        if not is_safe_profile_name(profile):
+            print(
+                f"[skip] id={id_} phone={phone}: generated profile name {profile!r} is not "
+                "canonical (would collapse onto a different file via sanitization) — "
+                "refusing to guess; fix --prefix or the source phone value"
+            )
+            continue
         if not is_encrypted(enc):
             print(
                 f"[skip] id={id_} phone={phone}: session_string is not enc:v2: "
