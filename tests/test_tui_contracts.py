@@ -553,6 +553,52 @@ async def test_add_account_mounts_login_before_connect_finishes():
         await pilot.pause()
 
 
+async def test_retrying_phone_does_not_cancel_the_shared_connection():
+    from tg_messenger.core.auth import CodeDelivery
+
+    connect_started = asyncio.Event()
+    connect_release = asyncio.Event()
+
+    async def connect():
+        connect_started.set()
+        await connect_release.wait()
+
+    class RetryLoginSession:
+        state = "phone"
+
+        def __init__(self):
+            self.phones = []
+
+        async def submit_phone(self, phone):
+            self.phones.append(phone)
+            self.state = "code"
+            return CodeDelivery(kind="app")
+
+    session = RetryLoginSession()
+    connect_task = asyncio.create_task(connect())
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = LoginScreen(session, ready=connect_task)
+        app.push_screen(screen)
+        await _pause_until(pilot, lambda: screen.is_mounted)
+        inp = screen.query_one("#login-input", Input)
+
+        inp.value = "+10000000001"
+        await pilot.press("enter")
+        await _pause_until(pilot, connect_started.is_set)
+
+        # The exclusive replacement cancels the first phone worker, but must not cancel the
+        # connection task both attempts share.
+        inp.value = "+10000000002"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not connect_task.cancelled()
+
+        connect_release.set()
+        await _pause_until(pilot, lambda: session.phones == ["+10000000002"])
+
+
 async def test_outbound_prepare_shows_status_before_slow_await():
     from tg_messenger.agent.outbound_coordinator import PrepareResult
 

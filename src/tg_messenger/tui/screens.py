@@ -8,6 +8,7 @@ Re-exported from ``tg_messenger.tui.app`` for backward-compatible imports.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable
 from typing import TypeVar
@@ -162,7 +163,10 @@ class LoginScreen(DismissableModal[bool]):
         self.query_one("#login-prompt", Label).update("Sending code…")
         try:
             if self._ready is not None:
-                await self._ready
+                # The phone worker is exclusive, so submitting again cancels the previous worker.
+                # Do not let that cancellation propagate into the one shared connection task;
+                # _add_account owns cancelling it when the modal actually closes.
+                await asyncio.shield(self._ready)
             delivery = await self._session.submit_phone(phone)
         except Exception as exc:
             logger.exception("login: submit_phone failed")  # phone stays out of the log
