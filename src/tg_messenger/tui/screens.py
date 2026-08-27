@@ -8,7 +8,10 @@ Re-exported from ``tg_messenger.tui.app`` for backward-compatible imports.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Awaitable
+from typing import TypeVar
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -20,6 +23,23 @@ from tg_messenger.core.auth import LoginError, delivery_hint
 from tg_messenger.tui.bubbles import REACTION_PRESETS
 
 logger = logging.getLogger(__name__)
+
+_DismissResult = TypeVar("_DismissResult")
+
+
+class DismissableModal(ModalScreen[_DismissResult]):
+    """Modal with a keyboard escape hatch by default.
+
+    Every TUI modal inherits this class so a newly added modal cannot accidentally trap
+    keyboard users. Subclasses only override :meth:`action_cancel` when their cancelled result
+    is not ``None``.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
 
 # this sentinel marks "send the original (untranslated) draft" in the variant picker.
 ORIGINAL_SENTINEL = "__tg_messenger_original__"
@@ -42,7 +62,7 @@ Actions:
   /tlang    incoming translation language (input command; prompts if omitted)
   /lang     outgoing translation language for the current conversation (input command)
   ? / F1    this help
-  Esc       clear search · close window
+  Esc       clear the focused field · close any window
   Ctrl+C    quit"""
 
 
@@ -54,7 +74,7 @@ class ProfileItem(ListItem):
         self.profile = profile
 
 
-class ProfileScreen(ModalScreen[str]):
+class ProfileScreen(DismissableModal[str | None]):
     """Startup account picker — dismisses with the chosen profile name.
 
     Only shown when >1 profile exists and none was preselected; selecting a row
@@ -85,7 +105,7 @@ class ProfileScreen(ModalScreen[str]):
             self.dismiss(item.profile)
 
 
-class LoginScreen(ModalScreen[bool]):
+class LoginScreen(DismissableModal[bool]):
     """Telegram login wizard: phone → code → (2FA password) → done.
 
     Drives a core ``LoginSession`` (the state machine that keeps phone_code_hash
@@ -103,9 +123,12 @@ class LoginScreen(ModalScreen[bool]):
         Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
     ]
 
-    def __init__(self, login_session):
+    def __init__(self, login_session, *, ready: Awaitable[None] | None = None):
         super().__init__()
         self._session = login_session
+        # Adding an account starts client.connect() in parallel with mounting this screen. If the
+        # user submits the phone before that finishes, the phone step waits for the same task.
+        self._ready = ready
 
     def compose(self) -> ComposeResult:
         with Vertical(id="login-box"):
@@ -115,6 +138,9 @@ class LoginScreen(ModalScreen[bool]):
 
     def on_mount(self) -> None:
         self.query_one("#login-input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # never await network in a handler — hand each step to a worker
@@ -136,6 +162,11 @@ class LoginScreen(ModalScreen[bool]):
         # until the delivery hint (or an error) replaces it.
         self.query_one("#login-prompt", Label).update("Sending code…")
         try:
+            if self._ready is not None:
+                # The phone worker is exclusive, so submitting again cancels the previous worker.
+                # Do not let that cancellation propagate into the one shared connection task;
+                # _add_account owns cancelling it when the modal actually closes.
+                await asyncio.shield(self._ready)
             delivery = await self._session.submit_phone(phone)
         except Exception as exc:
             logger.exception("login: submit_phone failed")  # phone stays out of the log
@@ -179,15 +210,9 @@ class VariantItem(ListItem):
         self.value = value
 
 
-class VariantPickScreen(ModalScreen[str | None]):
+class VariantPickScreen(DismissableModal[str | None]):
     # #116: center the modal card (the box geometry is shaped by App.CSS #variant-box).
     DEFAULT_CSS = "VariantPickScreen { align: center middle; }"
-
-    # #124: Escape must CONSUME the event (a Binding, not a key_escape method) so it cancels only
-    # this modal — a method handler lets Escape bubble to the app and silently clears the search.
-    BINDINGS = [
-        Binding("escape", "cancel", "Cancel", show=False),
-    ]
 
     def __init__(self, variants: list[str], draft: str):
         super().__init__()
@@ -215,11 +240,8 @@ class VariantPickScreen(ModalScreen[str | None]):
         if isinstance(item, VariantItem):
             self.dismiss(item.value)
 
-    def action_cancel(self) -> None:
-        self.dismiss(None)
 
-
-class EmojiPickerScreen(ModalScreen[str | None]):
+class EmojiPickerScreen(DismissableModal[str | None]):
     """Pick one of the 4 reaction presets for the focused message (#93).
 
     Mirrors VariantPickScreen and the web palette (REACTION_PRESETS). Returns the chosen
@@ -228,12 +250,6 @@ class EmojiPickerScreen(ModalScreen[str | None]):
 
     # #116: center the modal card (the box geometry is shaped by App.CSS #emoji-box).
     DEFAULT_CSS = "EmojiPickerScreen { align: center middle; }"
-
-    # #124: Escape as a Binding (consumes the event) — see VariantPickScreen: a key_escape method
-    # would let Escape bubble to the app and clear the search filter while only closing this picker.
-    BINDINGS = [
-        Binding("escape", "cancel", "Cancel", show=False),
-    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="emoji-box"):
@@ -251,11 +267,8 @@ class EmojiPickerScreen(ModalScreen[str | None]):
         if isinstance(item, VariantItem):
             self.dismiss(item.value)
 
-    def action_cancel(self) -> None:
-        self.dismiss(None)
 
-
-class HelpScreen(ModalScreen[None]):
+class HelpScreen(DismissableModal[None]):
     """The key-help overlay (#124): a centered card listing navigation + hotkeys.
 
     Opened/closed by ? or F1 (toggle, via the app's action_toggle_help) and dismissed by
@@ -268,7 +281,6 @@ class HelpScreen(ModalScreen[None]):
 
     BINDINGS = [
         Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
-        Binding("escape", "dismiss", "Close", show=False),
         Binding("f1", "dismiss", "Close", show=False),
         Binding("question_mark", "dismiss", "Close", show=False),
     ]
@@ -282,7 +294,7 @@ class HelpScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
-class ConfirmScreen(ModalScreen[bool]):
+class ConfirmScreen(DismissableModal[bool]):
     """A small yes/no confirmation card (#121): dismisses True (y / Enter) or False (n / Esc).
 
     Reused for destructive account actions so a single keypress can't delete a saved session —
@@ -300,7 +312,6 @@ class ConfirmScreen(ModalScreen[bool]):
         Binding("y", "confirm", "Yes", show=False),
         Binding("enter", "confirm", "Yes", show=False),
         Binding("n", "cancel", "No", show=False),
-        Binding("escape", "cancel", "No", show=False),
     ]
 
     def __init__(self, prompt: str):
@@ -319,7 +330,7 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class ReadLangScreen(ModalScreen[str | None]):
+class ReadLangScreen(DismissableModal[str | None]):
     """Prompt for the inbound reading language (#126).
 
     The reading language (``user_lang``) was previously settable only via TG_USER_LANG / the CLI.
@@ -332,7 +343,6 @@ class ReadLangScreen(ModalScreen[str | None]):
 
     BINDINGS = [
         Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
-        Binding("escape", "cancel", "Cancel", show=False),
     ]
 
     def compose(self) -> ComposeResult:
@@ -347,6 +357,3 @@ class ReadLangScreen(ModalScreen[str | None]):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         code = event.value.strip()
         self.dismiss(code or None)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)

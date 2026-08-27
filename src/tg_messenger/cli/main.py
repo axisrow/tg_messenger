@@ -922,7 +922,9 @@ def _import_session(session: str) -> None:
     if sys.stdin.isatty():
         raw = click.prompt("Paste StringSession", hide_input=True).strip()
     else:
-        raw = click.get_text_stream("stdin").read().strip()
+        # Click 8.3 deprecated get_text_stream(); sys.stdin is already the text stream and is
+        # replaced correctly by CliRunner for piped-input tests.
+        raw = sys.stdin.read().strip()
     if not raw:
         raise click.ClickException("invalid StringSession")
     try:
