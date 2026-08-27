@@ -361,6 +361,10 @@ class StandaloneTelegramClient:
     def save_session(self) -> None:
         self._store.save(self._session_name, self._client.session.save())
 
+    def save_session_if_absent(self) -> None:
+        """Persist a newly named profile without replacing a concurrent creator."""
+        self._store.save_if_absent(self._session_name, self._client.session.save())
+
     def export_session_string(self) -> str:
         """Return the current plaintext StringSession — full account access; never log it."""
         return self._client.session.save()

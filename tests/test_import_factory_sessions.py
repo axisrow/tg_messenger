@@ -229,3 +229,55 @@ def test_main_two_rows_normalizing_to_the_same_profile_do_not_overwrite_each_oth
     assert saved in (first_session, second_session)
     out = capsys.readouterr().out
     assert out.count("[ok]") == 1
+
+
+def test_main_does_not_overwrite_profile_created_after_existence_snapshot(
+    tmp_path, capsys, monkeypatch
+):
+    """The apply path must use SessionStore's atomic create, not trust its stale
+    pre-loop ``list_profiles()`` snapshot (the cross-process #240 regression)."""
+    from tg_messenger.core.auth import SessionStore
+    from tg_messenger.core.session_cipher import encrypt_session
+
+    key = "test-key-not-a-real-secret"
+    session_dir = tmp_path / "sessions"
+    imported_session = _make_session(dc_id=12)
+    competing_session = _make_session(dc_id=14)
+    db_path = _make_factory_db(
+        tmp_path,
+        [(1, "+123", 0, encrypt_session(imported_session, key))],
+    )
+    real_save_if_absent = SessionStore.save_if_absent
+    injected_competitor = False
+
+    def race_at_create(self, name, session_string):
+        nonlocal injected_competitor
+        if not injected_competitor:
+            injected_competitor = True
+            real_save_if_absent(self, name, competing_session)
+        return real_save_if_absent(self, name, session_string)
+
+    monkeypatch.setattr(SessionStore, "save_if_absent", race_at_create)
+    argv = [
+        "import_factory_sessions.py",
+        "--db",
+        str(db_path),
+        "--key",
+        key,
+        "--session-dir",
+        str(session_dir),
+        "--apply",
+    ]
+    old_argv = sys.argv
+    sys.argv = argv
+    try:
+        rc = import_factory_sessions.main()
+    finally:
+        sys.argv = old_argv
+
+    assert rc == 0
+    store = SessionStore(session_dir=session_dir, encryption_key=key)
+    assert store.load("factory_123") == competing_session
+    out = capsys.readouterr().out
+    assert "[skip] profile 'factory_123' already exists" in out
+    assert "[ok]" not in out

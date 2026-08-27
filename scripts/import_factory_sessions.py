@@ -187,7 +187,15 @@ def main() -> int:
         # just wrote (or would have written in dry-run).
         existing.add(profile)
         if args.apply:
-            store.save(profile, plain)
+            try:
+                store.save_if_absent(profile, plain)
+            except FileExistsError:
+                # The pre-loop snapshot is only for a useful preview/fast path. The
+                # filesystem-level create is authoritative: another process, or a
+                # differently-cased alias on a case-insensitive filesystem, may have
+                # claimed this profile since that snapshot was taken.
+                print(f"[skip] profile '{profile}' already exists — not overwriting")
+                continue
             print(
                 f"[ok] id={id_} phone={phone}{marker} -> profile '{profile}' "
                 f"saved (session_len={len(plain)})"

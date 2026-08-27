@@ -1,5 +1,8 @@
+import errno
 import os
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -10,9 +13,9 @@ from tg_messenger.core import auth
 from tg_messenger.core.auth import SessionStore
 
 
-def _make_session() -> str:
+def _make_session(dc_id: int = 2) -> str:
     s = StringSession()
-    s.set_dc(2, "149.154.167.51", 443)
+    s.set_dc(dc_id, "149.154.167.51", 443)
     s.auth_key = AuthKey(b"\x00" * 256)
     return s.save()
 
@@ -62,7 +65,10 @@ def test_save_failure_keeps_existing_session_intact(session_dir, monkeypatch):
     with pytest.raises(OSError):
         store.save("default", "REPLACEMENT")
     assert store.path_for("default").read_bytes() == original
-    assert [p.name for p in session_dir.iterdir()] == ["default.session"]
+    assert sorted(p.name for p in session_dir.iterdir()) == [
+        ".session-store.lock",
+        "default.session",
+    ]
 
 
 def test_save_temp_file_is_private_before_content_lands(session_dir, monkeypatch):
@@ -108,6 +114,73 @@ def test_concurrent_saves_use_distinct_temp_files(session_dir, monkeypatch):
     assert seen_tmp_names[0] != seen_tmp_names[1]
 
 
+@pytest.mark.parametrize("hard_links_supported", [True, False])
+def test_save_if_absent_atomic_conflict_preserves_competing_profile(
+    session_dir, monkeypatch, hard_links_supported
+):
+    store = SessionStore(session_dir)
+    candidates = [_make_session(2), _make_session(4)]
+    start = threading.Barrier(2)
+
+    if not hard_links_supported:
+        def unsupported_link(src, dst):
+            raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+        monkeypatch.setattr(auth.os, "link", unsupported_link)
+
+    def create(candidate):
+        start.wait()
+        try:
+            store.save_if_absent("shared", candidate)
+        except FileExistsError:
+            return "conflict", candidate
+        return "saved", candidate
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(create, candidates))
+
+    assert [status for status, _ in results].count("saved") == 1
+    assert [status for status, _ in results].count("conflict") == 1
+    winner = next(candidate for status, candidate in results if status == "saved")
+    assert store.load("shared") == winner
+    assert [p.name for p in session_dir.glob("*.session")] == ["shared.session"]
+
+
+def test_save_if_absent_rejects_case_alias_on_case_insensitive_filesystem(session_dir):
+    store = SessionStore(session_dir)
+    original = _make_session()
+    replacement = StringSession().save()
+    store.save_if_absent("Factory_123", original)
+
+    # On a case-sensitive filesystem these are legitimately different identities,
+    # so only assert the alias contract where the filesystem treats them as one.
+    if not store.path_for("factory_123").exists():
+        pytest.skip("filesystem is case-sensitive")
+
+    with pytest.raises(FileExistsError):
+        store.save_if_absent("factory_123", replacement)
+    assert store.load("Factory_123") == original
+
+
+def test_save_if_absent_falls_back_when_hard_links_are_unsupported(
+    session_dir, monkeypatch
+):
+    store = SessionStore(session_dir)
+    original = _make_session()
+    replacement = StringSession().save()
+
+    def unsupported_link(src, dst):
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    monkeypatch.setattr(auth.os, "link", unsupported_link)
+    store.save_if_absent("portable", original)
+    with pytest.raises(FileExistsError):
+        store.save_if_absent("portable", replacement)
+
+    assert store.load("portable") == original
+    assert [p.name for p in session_dir.glob("*.session")] == ["portable.session"]
+
+
 def test_save_fsyncs_parent_dir_after_replace(session_dir, monkeypatch):
     # Codex review on #230: fsyncing the temp file's data is not enough — os.replace's
     # directory-entry update is only durable across a crash once the PARENT DIRECTORY
@@ -145,7 +218,7 @@ def test_name_is_sanitized(session_dir):
     store = SessionStore(session_dir)
     store.save("../../evil name", "S")
     # file must live inside session_dir, no traversal
-    files = list(session_dir.iterdir())
+    files = list(session_dir.glob("*.session"))
     assert len(files) == 1
     assert files[0].parent == session_dir
 
