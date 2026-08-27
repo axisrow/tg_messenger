@@ -31,6 +31,7 @@ class MessageBubble(Static):
     BINDINGS = [
         Binding("up", "focus_prev_bubble", "Prev message", show=False),
         Binding("down", "focus_next_bubble", "Next message", show=False),
+        Binding("left", "focus_dialogs", "Conversations", show=False),
         # #124-r2: "x" is a synonym for "r" (both open the reaction picker); Space jumps to the
         # last/first message (toggle) — the same edge-jump as the dialog list. Space is NOT a
         # reaction key (Static binds nothing to it by default, so it's free for navigation).
@@ -133,6 +134,9 @@ class MessageBubble(Static):
 
     def action_focus_next_bubble(self) -> None:
         self._focus_sibling(+1)
+
+    def action_focus_dialogs(self) -> None:
+        self.screen.query_one("#dialogs", ListView).focus()
 
     def _focus_sibling(self, delta: int) -> None:
         # #118: bubbles now sit inside a per-message BubbleRow wrapper, so they are no longer

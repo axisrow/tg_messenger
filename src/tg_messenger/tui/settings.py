@@ -3,26 +3,27 @@
 
 Each settings card (Vertical subclass) owns its own compose + _load/_save + load-echo guards and
 handles its OWN children's RadioSet/Switch/Input messages (Textual bubbles widget messages to the
-owning widget). The add/remove account actions stay on AccountsScreen (key-bound a/d, they mount
-LoginScreen/ConfirmScreen). Re-exported from ``tg_messenger.tui.app`` for backward-compatible
+owning widget). The add/remove account actions stay on AccountsScreen (the add shortcut is on the
+screen; removal keys are on the profile list, and the actions mount LoginScreen/ConfirmScreen).
+Re-exported from ``tg_messenger.tui.app`` for backward-compatible
 imports — including ``_make_real_client`` (the default account-client factory and a test seam).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, RadioButton, RadioSet, Static, Switch
 
 from tg_messenger.core.auth import LoginSession
 from tg_messenger.core.languages import parse_lang_codes, validate_supported_lang_code
 from tg_messenger.core.names import is_safe_profile_name, sanitize_profile_name
-from tg_messenger.tui.screens import ConfirmScreen, LoginScreen
+from tg_messenger.tui.screens import ConfirmScreen, DismissableModal, LoginScreen
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +52,25 @@ class AccountItem(ListItem):
         self.profile = profile
 
 
+class AccountListView(ListView):
+    """Profile operations live on the list whose highlighted row they act on."""
+
+    BINDINGS = [
+        Binding("d", "remove_account", "Remove", show=False),
+        Binding("delete", "remove_account", "Remove", show=False),
+    ]
+
+    def action_remove_account(self) -> None:
+        screen = self.screen
+        if isinstance(screen, AccountsScreen):
+            screen.action_remove_account()
+
+
 class ProfileListCard(Vertical):
     """The saved-profile list section of AccountsScreen (#163).
 
     A thin composition wrapper: it owns the profile-list markup (`#accounts` + `#new-profile`),
-    but the add/remove ACTIONS stay on AccountsScreen — they are key-bound (`a`/`d`) and mount the
+    but the add/remove ACTIONS stay on AccountsScreen — their bindings delegate there to mount the
     LoginScreen/ConfirmScreen sub-screens, which is naturally screen-level work. The screen reaches
     into `#accounts`/`#new-profile` (query searches the whole DOM subtree) for those flows.
 
@@ -78,11 +93,14 @@ class ProfileListCard(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Label("Accounts", id="accounts-title")
-        yield ListView(
+        yield AccountListView(
             *(AccountItem(p, p == self._active) for p in self._profiles),
             id="accounts",
         )
-        yield Label("Name + Enter — add · d/Delete — remove · Esc — close", id="accounts-help")
+        yield Label(
+            "Name + Enter — add · focus the list, then d/Delete — remove · Esc — close",
+            id="accounts-help",
+        )
         yield Input(placeholder="New profile name", id="new-profile")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -419,7 +437,7 @@ class SuggestSettingsCard(Vertical):
             self.run_worker(self._save(), exclusive=True)
 
 
-class AccountsScreen(ModalScreen[object]):
+class AccountsScreen(DismissableModal[object]):
     """Account settings (#115): list saved profiles (active marked), add a new one, remove one.
 
     A thin orchestrator (#163): it composes three sibling cards — ProfileListCard,
@@ -465,12 +483,7 @@ class AccountsScreen(ModalScreen[object]):
 
     BINDINGS = [
         Binding("ctrl+c", "app.quit", "Quit", priority=True, show=False),
-        Binding("escape", "close", "Close", show=False),
         Binding("a", "add_account", "Add account", show=False),
-        Binding("d", "remove_account", "Remove", show=False),
-        # #223: `delete` is a non-printable alias for the same action as `d` — reachable even
-        # while focus is in #new-profile (a focused Input eats the printable `d` as a letter).
-        Binding("delete", "remove_account", "Remove", show=False),
     ]
 
     def __init__(self, *, profiles, active, store, account_client_factory=None,
@@ -521,10 +534,13 @@ class AccountsScreen(ModalScreen[object]):
         # #187: selecting a profile in the accounts list looked like it would switch accounts, but
         # did nothing (a dead end). In-session switching needs a full deps rebuild + reconnect, so
         # give explicit feedback pointing at the real path (restart) instead of silence. The active
-        # profile is a no-op; add/remove use their own key bindings, not selection.
+        # add/remove use their own key bindings, not selection.
         item = event.item
-        if isinstance(item, AccountItem) and item.profile != self._active:
-            self.notify(f"Switching to “{item.profile}”: restart the application")
+        if isinstance(item, AccountItem):
+            if item.profile == self._active:
+                self.notify(f"“{item.profile}” is already the current profile")
+            else:
+                self.notify(f"Switching to “{item.profile}”: restart the application")
 
     def on_translate_settings_card_model_changed(
         self, event: "TranslateSettingsCard.ModelChanged"
@@ -550,9 +566,6 @@ class AccountsScreen(ModalScreen[object]):
     async def _validate_model(self, model: str):
         return await self.query_one(TranslateSettingsCard)._validate_model(model)
 
-    def action_close(self) -> None:
-        self.dismiss(None)
-
     def action_add_account(self) -> None:
         name = self.query_one("#new-profile", Input).value.strip()
         if not name:
@@ -575,18 +588,21 @@ class AccountsScreen(ModalScreen[object]):
         self.run_worker(self._add_account(name), exclusive=True)
 
     async def _add_account(self, name: str) -> None:
-        # build + connect a client for the NEW profile, then run the existing login wizard.
+        # Build the client and mount the login wizard immediately. The connection runs in parallel
+        # and the wizard's first phone submission awaits it, so opening this screen never waits on
+        # a slow network handshake.
         # name is already validated as safe + unique by action_add_account.
         client = None
+        connect_task: asyncio.Task[None] | None = None
         try:
             if self._login_session is not None:  # test seam: skip the real client/network
                 session = self._login_session
                 client = self._account_client_factory(name)
             else:
                 client = self._account_client_factory(name)
-                await client.connect()
+                connect_task = asyncio.create_task(client.connect())
                 session = LoginSession(getattr(client, "_client", client))
-            ok = await self.app.push_screen_wait(LoginScreen(session))
+            ok = await self.app.push_screen_wait(LoginScreen(session, ready=connect_task))
             if not ok:
                 return
             save_session = getattr(client, "save_session", None)
@@ -597,6 +613,17 @@ class AccountsScreen(ModalScreen[object]):
             self.notify(f"Could not add profile: {name}", severity="error")
             return
         finally:
+            if connect_task is not None:
+                if not connect_task.done():
+                    connect_task.cancel()
+                try:
+                    await connect_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    # LoginScreen reports connection errors at the phone step. If the user closes
+                    # the screen first, this still retrieves the task exception cleanly.
+                    pass
             if client is not None:
                 disconnect = getattr(client, "disconnect", None)
                 if disconnect is not None:
@@ -613,8 +640,12 @@ class AccountsScreen(ModalScreen[object]):
         item = lv.highlighted_child
         # #121: both sides are canonical (item.profile from list_profiles, self._active sanitized
         # in __init__), so the active profile is recognised even when its raw name differs.
-        if not isinstance(item, AccountItem) or item.profile == self._active:
-            return  # never remove the active profile
+        if not isinstance(item, AccountItem):
+            self.notify("Select a profile in the list before removing it", severity="warning")
+            return
+        if item.profile == self._active:
+            self.notify("The current profile cannot be removed", severity="warning")
+            return
         # #121: destructive — confirm before deleting a saved session (parity with CLI).
         self.run_worker(self._confirm_remove(item.profile), exclusive=True)
 
@@ -637,5 +668,3 @@ class AccountsScreen(ModalScreen[object]):
         # the profile list lives on its card now; the screen only coordinates the add/remove flow.
         self._profiles = list(profiles)
         await self.query_one(ProfileListCard).refresh_profiles(self._profiles, self._active)
-
-

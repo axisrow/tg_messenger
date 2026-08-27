@@ -94,7 +94,7 @@ COMPOSER_PLACEHOLDER = "Message…  (@file — attach file)"
 
 # #187: the empty-state hint shown in #messages before any dialog is opened (was a blank void).
 # Removed on the first _show_history (which clears the pane). The sidebar/Footer hints stay visible.
-EMPTY_MESSAGES_HINT = "Select a conversation on the left · → open · F1 help"
+EMPTY_MESSAGES_HINT = "Select a conversation · Search, then Enter to focus results · F1 help"
 
 # #187: shown in the persistent #connection-status banner while a drain worker is down and
 # reconnecting with backoff — so a dead live-feed is visible and self-heals instead of silently
@@ -106,6 +106,9 @@ SUGGEST_PREFIX = "💡 Tab: "
 # #158: shown in the suggestion strip while an explicit Ctrl+G LLM call is in flight (~seconds),
 # so the user sees the suggester is working instead of "nothing happening"
 SUGGEST_THINKING = "⏳ Suggester is thinking…"
+# Shown before outbound translation's slow prepare() call. The composer has already been cleared
+# at that point, so this prevents the empty field from looking like a completed send.
+OUTBOUND_TRANSLATING = "⏳ Translating message…"
 
 # #214: page size for both the initial history window and each backfill page. The reachability
 # problem this size used to gate (older history unreachable) is solved by the incremental
@@ -193,7 +196,7 @@ class MessengerTUI(App):
         # message, so it stays non-priority. The on-demand whole-chat translate is Ctrl+T
         # (`translate_all`, bound above) — non-printable + priority, so it fires from inside the
         # composer or a read-only channel where the composer is disabled.
-        Binding("t", "toggle_auto_translate", "Auto-translate", show=True),
+        Binding("t", "toggle_auto_translate", "Auto-translate (outside inputs)", show=True),
         # #155: suggest a reply for the OPEN DM on demand. The automatic 💡 hint only fires on a
         # NEW incoming message (_drain_incoming); opening a DM with existing history never triggers
         # it, so the suggester felt dead when reading an already-delivered message. Ctrl+G generates
@@ -618,6 +621,9 @@ class MessengerTUI(App):
                 if len(self._profiles) > 1:
                     # >1 account and none preselected → ask which one, then build it
                     chosen = await self.push_screen_wait(ProfileScreen(self._profiles))
+                    if chosen is None:
+                        self.exit()
+                        return
                     if self._deps_factory is not None:
                         # #52: the `tui` entrypoint builds the WHOLE dependency set for the
                         # picked profile (client + suggester/store/translator/outbound) and
@@ -1239,6 +1245,13 @@ class MessengerTUI(App):
         # to a real contact (reproduced: text typed into the settings screen's profile-name
         # field was sent to the open chat). An allowlist makes that structurally impossible: a
         # field the app doesn't own is ignored, regardless of what future fields get added.
+        if event.input.id == "search":
+            # Search filters live while typing; Enter advances into the filtered results instead
+            # of being a dead submit on the widget that owns startup focus.
+            dialogs = self.query_one("#dialogs", ListView)
+            dialogs.index = 0 if len(dialogs) else None
+            dialogs.focus()
+            return
         if event.input.id != "composer":
             return
         if self._current is None or not event.value.strip():
@@ -1445,9 +1458,20 @@ class MessengerTUI(App):
         state = self._compose_state_for(dialog_id)
         state.draft = text
         telegram_lang_code = self._dialog_telegram_lang_hint(dialog_id)
-        result = await self._coordinator.prepare(
-            dialog_id, text, telegram_lang_code=telegram_lang_code, owner_id=str(dialog_id)
-        )
+        status_shown = dialog_id == self._current
+        if status_shown:
+            self._set_suggestion_strip(OUTBOUND_TRANSLATING)
+        try:
+            result = await self._coordinator.prepare(
+                dialog_id, text, telegram_lang_code=telegram_lang_code, owner_id=str(dialog_id)
+            )
+        finally:
+            # A dialog switch may have replaced the strip with that dialog's suggestion. Clear
+            # only the status this flow owns, never newer content.
+            if status_shown and dialog_id == self._current:
+                strip = self.query_one("#suggestion", Static)
+                if str(strip.render()) == OUTBOUND_TRANSLATING:
+                    self._set_suggestion_strip("")
         if result.status == "not_applicable":
             state.draft = ""
             self._clear_pending_outbound(dialog_id)
