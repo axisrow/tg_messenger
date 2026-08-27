@@ -1,3 +1,4 @@
+import errno
 import os
 import stat
 from pathlib import Path
@@ -151,6 +152,25 @@ def test_save_if_absent_rejects_case_alias_on_case_insensitive_filesystem(sessio
     with pytest.raises(FileExistsError):
         store.save_if_absent("factory_123", replacement)
     assert store.load("Factory_123") == original
+
+
+def test_save_if_absent_falls_back_when_hard_links_are_unsupported(
+    session_dir, monkeypatch
+):
+    store = SessionStore(session_dir)
+    original = _make_session()
+    replacement = StringSession().save()
+
+    def unsupported_link(src, dst):
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    monkeypatch.setattr(auth.os, "link", unsupported_link)
+    store.save_if_absent("portable", original)
+    with pytest.raises(FileExistsError):
+        store.save_if_absent("portable", replacement)
+
+    assert store.load("portable") == original
+    assert [p.name for p in session_dir.iterdir()] == ["portable.session"]
 
 
 def test_save_fsyncs_parent_dir_after_replace(session_dir, monkeypatch):

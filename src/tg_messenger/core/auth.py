@@ -7,6 +7,7 @@ session string can be wrapped without touching disk.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import tempfile
@@ -147,6 +148,37 @@ class SessionStore:
         finally:
             os.close(dir_fd)
 
+    @staticmethod
+    def _unlink_if_same_file(path: Path, expected_stat: os.stat_result) -> None:
+        """Best-effort cleanup without deleting a replacement at ``path``."""
+        try:
+            current_stat = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if os.path.samestat(expected_stat, current_stat):
+            os.unlink(path)
+
+    def _create_exclusive(self, path: Path, stored: str) -> None:
+        """Portable ``O_EXCL`` fallback for filesystems without hard links."""
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created_stat = os.fstat(fd)
+        try:
+            try:
+                fh = os.fdopen(fd, "w", encoding="utf-8")
+            except BaseException:
+                os.close(fd)
+                raise
+            with fh:
+                fh.write(stored)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            # A failed first write must not leave a corrupt profile that permanently
+            # blocks retries. Avoid removing the path if another writer replaced it.
+            self._unlink_if_same_file(path, created_stat)
+            raise
+        self._fsync_parent(path)
+
     def save(self, name: str, session_string: str) -> Path:
         path = self.path_for(name)
         stored = self._stored_session(session_string)
@@ -180,7 +212,23 @@ class SessionStore:
         try:
             # tmp and path share a directory/filesystem. link() publishes the complete
             # inode atomically and, unlike replace(), refuses an existing destination.
-            os.link(tmp, path)
+            try:
+                os.link(tmp, path)
+            except OSError as exc:
+                # Hard links provide atomic publication of already-fsynced contents,
+                # but writable FAT/FUSE/network mounts may not support them. O_EXCL is
+                # the portable no-clobber primitive proposed for that environment.
+                unsupported = {
+                    errno.EPERM,
+                    errno.ENOSYS,
+                    errno.EOPNOTSUPP,
+                    getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+                }
+                if exc.errno not in unsupported:
+                    raise
+                os.unlink(tmp)
+                self._create_exclusive(path, stored)
+                return path
             os.unlink(tmp)
             self._fsync_parent(path)
         except BaseException:
