@@ -1,6 +1,8 @@
 import errno
 import os
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -11,9 +13,9 @@ from tg_messenger.core import auth
 from tg_messenger.core.auth import SessionStore
 
 
-def _make_session() -> str:
+def _make_session(dc_id: int = 2) -> str:
     s = StringSession()
-    s.set_dc(2, "149.154.167.51", 443)
+    s.set_dc(dc_id, "149.154.167.51", 443)
     s.auth_key = AuthKey(b"\x00" * 256)
     return s.save()
 
@@ -63,7 +65,10 @@ def test_save_failure_keeps_existing_session_intact(session_dir, monkeypatch):
     with pytest.raises(OSError):
         store.save("default", "REPLACEMENT")
     assert store.path_for("default").read_bytes() == original
-    assert [p.name for p in session_dir.iterdir()] == ["default.session"]
+    assert sorted(p.name for p in session_dir.iterdir()) == [
+        ".session-store.lock",
+        "default.session",
+    ]
 
 
 def test_save_temp_file_is_private_before_content_lands(session_dir, monkeypatch):
@@ -109,33 +114,36 @@ def test_concurrent_saves_use_distinct_temp_files(session_dir, monkeypatch):
     assert seen_tmp_names[0] != seen_tmp_names[1]
 
 
+@pytest.mark.parametrize("hard_links_supported", [True, False])
 def test_save_if_absent_atomic_conflict_preserves_competing_profile(
-    session_dir, monkeypatch
+    session_dir, monkeypatch, hard_links_supported
 ):
-    """Deterministically interleave two creators at the final publish operation.
-
-    The inner creator claims the destination while the outer creator is paused. The
-    outer call must then report a clean conflict rather than replace the winner.
-    """
     store = SessionStore(session_dir)
-    winner = _make_session()
-    loser = StringSession().save()
-    real_link = auth.os.link
-    injected_competitor = False
+    candidates = [_make_session(2), _make_session(4)]
+    start = threading.Barrier(2)
 
-    def race_at_publish(src, dst):
-        nonlocal injected_competitor
-        if not injected_competitor:
-            injected_competitor = True
-            store.save_if_absent("shared", winner)
-        return real_link(src, dst)
+    if not hard_links_supported:
+        def unsupported_link(src, dst):
+            raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
 
-    monkeypatch.setattr(auth.os, "link", race_at_publish)
-    with pytest.raises(FileExistsError):
-        store.save_if_absent("shared", loser)
+        monkeypatch.setattr(auth.os, "link", unsupported_link)
 
+    def create(candidate):
+        start.wait()
+        try:
+            store.save_if_absent("shared", candidate)
+        except FileExistsError:
+            return "conflict", candidate
+        return "saved", candidate
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(create, candidates))
+
+    assert [status for status, _ in results].count("saved") == 1
+    assert [status for status, _ in results].count("conflict") == 1
+    winner = next(candidate for status, candidate in results if status == "saved")
     assert store.load("shared") == winner
-    assert [p.name for p in session_dir.iterdir()] == ["shared.session"]
+    assert [p.name for p in session_dir.glob("*.session")] == ["shared.session"]
 
 
 def test_save_if_absent_rejects_case_alias_on_case_insensitive_filesystem(session_dir):
@@ -170,7 +178,7 @@ def test_save_if_absent_falls_back_when_hard_links_are_unsupported(
         store.save_if_absent("portable", replacement)
 
     assert store.load("portable") == original
-    assert [p.name for p in session_dir.iterdir()] == ["portable.session"]
+    assert [p.name for p in session_dir.glob("*.session")] == ["portable.session"]
 
 
 def test_save_fsyncs_parent_dir_after_replace(session_dir, monkeypatch):
@@ -210,7 +218,7 @@ def test_name_is_sanitized(session_dir):
     store = SessionStore(session_dir)
     store.save("../../evil name", "S")
     # file must live inside session_dir, no traversal
-    files = list(session_dir.iterdir())
+    files = list(session_dir.glob("*.session"))
     assert len(files) == 1
     assert files[0].parent == session_dir
 

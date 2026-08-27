@@ -11,6 +11,7 @@ import errno
 import logging
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
@@ -148,36 +149,35 @@ class SessionStore:
         finally:
             os.close(dir_fd)
 
-    @staticmethod
-    def _unlink_if_same_file(path: Path, expected_stat: os.stat_result) -> None:
-        """Best-effort cleanup without deleting a replacement at ``path``."""
+    @contextmanager
+    def _write_lock(self):
+        """Cross-process store lock, released by the OS even after a crash."""
+        lock_path = self.session_dir / ".session-store.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        locked = False
         try:
-            current_stat = os.stat(path, follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        if os.path.samestat(expected_stat, current_stat):
-            os.unlink(path)
+            if os.name == "nt":
+                import msvcrt
 
-    def _create_exclusive(self, path: Path, stored: str) -> None:
-        """Portable ``O_EXCL`` fallback for filesystems without hard links."""
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        created_stat = os.fstat(fd)
-        try:
-            try:
-                fh = os.fdopen(fd, "w", encoding="utf-8")
-            except BaseException:
-                os.close(fd)
-                raise
-            with fh:
-                fh.write(stored)
-                fh.flush()
-                os.fsync(fh.fileno())
-        except BaseException:
-            # A failed first write must not leave a corrupt profile that permanently
-            # blocks retries. Avoid removing the path if another writer replaced it.
-            self._unlink_if_same_file(path, created_stat)
-            raise
-        self._fsync_parent(path)
+                # msvcrt.locking locks bytes, so ensure byte zero exists and lock it.
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+            yield
+        finally:
+            if locked:
+                if os.name == "nt":
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def save(self, name: str, session_string: str) -> Path:
         path = self.path_for(name)
@@ -186,8 +186,9 @@ class SessionStore:
         # filesystem, so a failed write cannot truncate a working live session.
         tmp = self._write_temp(path, stored)
         try:
-            os.replace(tmp, path)
-            self._fsync_parent(path)
+            with self._write_lock():
+                os.replace(tmp, path)
+                self._fsync_parent(path)
         except BaseException:
             # Leave no half-written temp behind on failure (the real file is untouched
             # unless replace itself already succeeded, matching the existing contract).
@@ -201,36 +202,41 @@ class SessionStore:
     def save_if_absent(self, name: str, session_string: str) -> Path:
         """Atomically create a profile, raising ``FileExistsError`` on conflict.
 
-        The final hard-link creation is the existence check: the filesystem decides
-        whether the target identity is already present, including case aliases on a
-        case-insensitive filesystem. Unlike a snapshot followed by :meth:`save`, no
-        competing create can slip between the check and the write or be overwritten.
+        The filesystem decides whether the target identity is already present,
+        including case aliases on a case-insensitive filesystem. Publication uses a
+        no-replace hard link where supported and a store-locked atomic replace
+        fallback elsewhere, so readers never observe partial session contents.
         """
         path = self.path_for(name)
         stored = self._stored_session(session_string)
         tmp = self._write_temp(path, stored)
         try:
-            # tmp and path share a directory/filesystem. link() publishes the complete
-            # inode atomically and, unlike replace(), refuses an existing destination.
-            try:
-                os.link(tmp, path)
-            except OSError as exc:
-                # Hard links provide atomic publication of already-fsynced contents,
-                # but writable FAT/FUSE/network mounts may not support them. O_EXCL is
-                # the portable no-clobber primitive proposed for that environment.
-                unsupported = {
-                    errno.EPERM,
-                    errno.ENOSYS,
-                    errno.EOPNOTSUPP,
-                    getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
-                }
-                if exc.errno not in unsupported:
-                    raise
-                os.unlink(tmp)
-                self._create_exclusive(path, stored)
-                return path
-            os.unlink(tmp)
-            self._fsync_parent(path)
+            with self._write_lock():
+                # tmp and path share a directory/filesystem. link() publishes the
+                # complete inode atomically and refuses an existing destination.
+                try:
+                    os.link(tmp, path)
+                except OSError as exc:
+                    # Some writable FAT/FUSE/network mounts do not support hard links.
+                    # The store lock makes this check + atomic replace one critical
+                    # section for every SessionStore writer, without exposing partial
+                    # contents or leaving a stale reservation after a crash.
+                    unsupported = {
+                        errno.EPERM,
+                        errno.ENOSYS,
+                        errno.EOPNOTSUPP,
+                        getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+                    }
+                    if exc.errno not in unsupported:
+                        raise
+                    if os.path.lexists(path):
+                        raise FileExistsError(
+                            errno.EEXIST, os.strerror(errno.EEXIST), path
+                        ) from exc
+                    os.replace(tmp, path)
+                else:
+                    os.unlink(tmp)
+                self._fsync_parent(path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -286,7 +292,10 @@ class SessionStore:
         path = self.path_for(name)
         if not path.is_file():
             return False
-        path.unlink()
+        with self._write_lock():
+            if not path.is_file():
+                return False
+            path.unlink()
         return True
 
 
