@@ -605,9 +605,18 @@ class AccountsScreen(DismissableModal[object]):
             ok = await self.app.push_screen_wait(LoginScreen(session, ready=connect_task))
             if not ok:
                 return
-            save_session = getattr(client, "save_session", None)
+            # This flow creates a NEW named profile. Re-checking list_profiles()
+            # above is useful UX but cannot prevent another process from claiming
+            # the name while the Telegram login wizard is open, so publish it with
+            # SessionStore's atomic no-clobber primitive when the real client offers it.
+            save_session = getattr(client, "save_session_if_absent", None)
+            if save_session is None:  # compatibility with test/custom client stand-ins
+                save_session = getattr(client, "save_session", None)
             if save_session is not None:
-                save_session()  # → SessionStore.save(name, ...)
+                save_session()  # → SessionStore.save_if_absent(name, ...)
+        except FileExistsError:
+            self.notify(f"Profile already exists: {name}", severity="error")
+            return
         except Exception:
             logger.exception("settings: add account failed")  # name only; no secrets logged
             self.notify(f"Could not add profile: {name}", severity="error")

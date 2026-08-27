@@ -107,28 +107,19 @@ class SessionStore:
             self.save(name, validated)
         return validated
 
-    def save(self, name: str, session_string: str) -> Path:
+    def _stored_session(self, session_string: str) -> str:
         from tg_messenger.core.session_cipher import encrypt_session
 
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.session_dir, 0o700)
-        path = self.path_for(name)
-        stored = (
+        return (
             encrypt_session(session_string, self._encryption_key)
             if self._encryption_key
             else session_string
         )
-        # Atomic write (mirror core/dotenv.write_env_values): writing the live file
-        # directly would truncate a WORKING session before the new bytes land, so a
-        # crash/disk-full mid-write destroys the authorization. Temp file in the SAME
-        # dir (os.replace is atomic on one FS), 0600 BEFORE content so the secret never
-        # exists with umask permissions, fsync, then rename over the target.
-        # mkstemp (not a PID-derived name) so two saves of the same profile in one
-        # process — however unlikely today — never share one temp inode: O_EXCL
-        # guarantees each call gets its own file instead of silently reopening
-        # another in-flight save's temp file. mkstemp already creates it at 0600
-        # on POSIX (no separate chmod needed — one that ran outside this try would
-        # leak the temp file on failure instead of guaranteeing cleanup).
+
+    def _write_temp(self, path: Path, stored: str) -> Path:
+        """Write and fsync a private temporary file next to ``path``."""
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.session_dir, 0o700)
         fd, tmp_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
         )
@@ -138,17 +129,61 @@ class SessionStore:
                 fh.write(stored)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, path)
-            # fsyncing the temp file's data is not enough: os.replace's directory-entry
-            # update is only durable across a crash once the containing directory is
-            # fsynced too (Codex review on #230 — POSIX rename durability).
-            dir_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
         except BaseException:
-            # leave no half-written temp behind on failure (the real file is untouched)
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+        return tmp
+
+    @staticmethod
+    def _fsync_parent(path: Path) -> None:
+        # fsyncing file data is not enough: a directory-entry update is only durable
+        # across a crash once the containing directory is fsynced too (#230).
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    def save(self, name: str, session_string: str) -> Path:
+        path = self.path_for(name)
+        stored = self._stored_session(session_string)
+        # Atomic replacement: the fully written 0600 temp file lives on the same
+        # filesystem, so a failed write cannot truncate a working live session.
+        tmp = self._write_temp(path, stored)
+        try:
+            os.replace(tmp, path)
+            self._fsync_parent(path)
+        except BaseException:
+            # Leave no half-written temp behind on failure (the real file is untouched
+            # unless replace itself already succeeded, matching the existing contract).
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+        return path
+
+    def save_if_absent(self, name: str, session_string: str) -> Path:
+        """Atomically create a profile, raising ``FileExistsError`` on conflict.
+
+        The final hard-link creation is the existence check: the filesystem decides
+        whether the target identity is already present, including case aliases on a
+        case-insensitive filesystem. Unlike a snapshot followed by :meth:`save`, no
+        competing create can slip between the check and the write or be overwritten.
+        """
+        path = self.path_for(name)
+        stored = self._stored_session(session_string)
+        tmp = self._write_temp(path, stored)
+        try:
+            # tmp and path share a directory/filesystem. link() publishes the complete
+            # inode atomically and, unlike replace(), refuses an existing destination.
+            os.link(tmp, path)
+            os.unlink(tmp)
+            self._fsync_parent(path)
+        except BaseException:
             try:
                 os.unlink(tmp)
             except FileNotFoundError:

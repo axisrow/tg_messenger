@@ -108,6 +108,51 @@ def test_concurrent_saves_use_distinct_temp_files(session_dir, monkeypatch):
     assert seen_tmp_names[0] != seen_tmp_names[1]
 
 
+def test_save_if_absent_atomic_conflict_preserves_competing_profile(
+    session_dir, monkeypatch
+):
+    """Deterministically interleave two creators at the final publish operation.
+
+    The inner creator claims the destination while the outer creator is paused. The
+    outer call must then report a clean conflict rather than replace the winner.
+    """
+    store = SessionStore(session_dir)
+    winner = _make_session()
+    loser = StringSession().save()
+    real_link = auth.os.link
+    injected_competitor = False
+
+    def race_at_publish(src, dst):
+        nonlocal injected_competitor
+        if not injected_competitor:
+            injected_competitor = True
+            store.save_if_absent("shared", winner)
+        return real_link(src, dst)
+
+    monkeypatch.setattr(auth.os, "link", race_at_publish)
+    with pytest.raises(FileExistsError):
+        store.save_if_absent("shared", loser)
+
+    assert store.load("shared") == winner
+    assert [p.name for p in session_dir.iterdir()] == ["shared.session"]
+
+
+def test_save_if_absent_rejects_case_alias_on_case_insensitive_filesystem(session_dir):
+    store = SessionStore(session_dir)
+    original = _make_session()
+    replacement = StringSession().save()
+    store.save_if_absent("Factory_123", original)
+
+    # On a case-sensitive filesystem these are legitimately different identities,
+    # so only assert the alias contract where the filesystem treats them as one.
+    if not store.path_for("factory_123").exists():
+        pytest.skip("filesystem is case-sensitive")
+
+    with pytest.raises(FileExistsError):
+        store.save_if_absent("factory_123", replacement)
+    assert store.load("Factory_123") == original
+
+
 def test_save_fsyncs_parent_dir_after_replace(session_dir, monkeypatch):
     # Codex review on #230: fsyncing the temp file's data is not enough — os.replace's
     # directory-entry update is only durable across a crash once the PARENT DIRECTORY

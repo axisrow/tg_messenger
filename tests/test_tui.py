@@ -4857,6 +4857,13 @@ class FakeSessionStore:
             self._profiles.append(canon)
         self.saved.append((canon, session_string))
 
+    def save_if_absent(self, name, session_string):
+        canon = self._sanitize(name)
+        if canon in self._profiles:
+            raise FileExistsError(canon)
+        self._profiles.append(canon)
+        self.saved.append((canon, session_string))
+
     def delete(self, name):
         canon = self._sanitize(name)
         if canon in self._profiles:
@@ -4883,6 +4890,10 @@ class SavingStubClient(TuiStubClient):
     def save_session(self):
         super().save_session()
         self._store.save(self._name, "session-string-stub")
+
+    def save_session_if_absent(self):
+        super().save_session()
+        self._store.save_if_absent(self._name, "session-string-stub")
 
 
 async def test_tui_open_settings_lists_profiles_with_active_marked():
