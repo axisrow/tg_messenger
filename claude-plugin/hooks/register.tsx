@@ -71,7 +71,7 @@ export const register: Register = on => {
     const props = (e as { props?: { scroll?: { bodyRows?: number }; bodyColumns?: number } }).props
     const rows = props?.scroll?.bodyRows ?? e.viewport?.rows ?? 20
     const cols = (props?.bodyColumns ?? e.viewport?.columns ?? 80) - 2
-    const shown = list.slice(-Math.max(1, rows - 4))
+    const shown = list.slice(-50)
 
     return (
       <Box flexDirection="column" height={rows} gap={1} padding={1}>
@@ -82,9 +82,11 @@ export const register: Register = on => {
             close
           </Button>
         </Box>
-        <Box flexDirection="column" flexGrow={1} justifyContent="flex-end">
+        <Box flexDirection="column" flexGrow={1} justifyContent="flex-end" overflow="hidden">
           {shown.map(m => (
-            <Text dimColor={!m.out}>{m.out ? `→ ${m.text}` : `← ${m.text}`}</Text>
+            <Text dimColor={!m.out} wrap="wrap">
+              {m.out ? `→ ${m.text}` : `← ${m.text}`}
+            </Text>
           ))}
         </Box>
         <Box flexDirection="column" gap={0}>
