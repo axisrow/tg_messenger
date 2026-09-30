@@ -359,10 +359,14 @@ class StandaloneTelegramClient:
         category = TelegramRateLimitGate.category_for(operation)
         if category == "send" and not self._send_bucket.enabled:
             return  # explicit TG_SEND_RATE=0 opts the whole send category out (#25)
+        # try_acquire returning >0 consumed NO slot (package contract): re-acquire
+        # after each sleep until a slot is reserved, or the woken call passes
+        # unrecorded and a binding category admits ~2x max_calls.
         retry_after = self._gate.try_acquire(self._session_name, category)
-        if retry_after > 0:
+        while retry_after > 0:
             logger.info("%s: rate-limit gate defers %.1fs", operation, retry_after)
             await self._sleep(retry_after)
+            retry_after = self._gate.try_acquire(self._session_name, category)
 
     # --- connection ---
     async def connect(self) -> None:

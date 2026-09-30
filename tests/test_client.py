@@ -430,18 +430,26 @@ async def test_rate_limit_gate_defers_send_then_proceeds(fake_client):
     client = _build(fake_client, sleep=fake_sleep)
     await client.connect()
 
-    class DeferredGate:
+    class DefersOnceGate:
+        # package contract: try_acquire >0 consumed no slot, so the caller must
+        # re-acquire after sleeping — this stub pins that loop.
         seen = None
 
-        def try_acquire(self, account, category):
-            self.seen = (account, category)
-            return 2.5
+        def __init__(self):
+            self.calls = 0
 
-    client._gate = DeferredGate()
+        def try_acquire(self, account, category):
+            self.calls += 1
+            self.seen = (account, category)
+            return 2.5 if self.calls == 1 else 0.0
+
+    gate = DefersOnceGate()
+    client._gate = gate
 
     await client.send_text(7, "paced")
     assert slept == [2.5]
-    assert client._gate.seen == ("default", "send")
+    assert gate.calls == 2  # deferred, then re-acquired into a real slot
+    assert gate.seen == ("default", "send")
     assert fake_client.sent[-1]["text"] == "paced"
 
 
