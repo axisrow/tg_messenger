@@ -3,11 +3,13 @@
 Thin async wrapper over a single Telethon client: dialogs (DM-only by default,
 ``dm_only=False`` for every kind), history, send, media, plus event streams
 fanned out through EventBus (``listen`` private-only, ``listen_all`` every chat).
-All network calls route through the vendored flood-wait retry.
+All network calls route through the flood-wait retry; history/send/resolve also
+pass the proactive telethon-floodgate rate-limit gate first (#252).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -31,6 +33,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.account import CheckUsernameRequest, UpdateUsernameRequest
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
+from telethon_floodgate import TelegramRateLimitGate
 
 from tg_messenger.core.auth import SessionStore, default_session_dir
 from tg_messenger.core.cache import TTLCache
@@ -342,6 +345,25 @@ class StandaloneTelegramClient:
         self._send_bucket = TokenBucket(
             send_rate_per_min, burst=max(1, int(send_rate_per_min)), clock=clock
         )
+        # #252: proactive per-category pacing (telethon-floodgate) around the
+        # history/send/resolve call sites; package defaults — see _gate_acquire.
+        self._gate = TelegramRateLimitGate()
+
+    async def _gate_acquire(self, operation: str) -> None:
+        """Reserve a slot in the proactive rate-limit gate (#252) before a Telegram
+        call; a deferral sleeps out instead of raising, so UIs gain pacing with zero
+        new error paths (the flood-wait retry stays the hard net).
+
+        Package defaults are deliberately permissive (history 600/min, send 30/min)
+        and never bind normal traffic — calibrate a category only on a real flood
+        signal (factory playbook: from logs, not guesses).
+        """
+        retry_after = self._gate.try_acquire(
+            self._session_name, TelegramRateLimitGate.category_for(operation)
+        )
+        if retry_after > 0:
+            logger.info("%s: rate-limit gate defers %.1fs", operation, retry_after)
+            await asyncio.sleep(retry_after)
 
     # --- connection ---
     async def connect(self) -> None:
@@ -379,6 +401,7 @@ class StandaloneTelegramClient:
 
     async def entity_title(self, peer: int) -> str:
         """Human-readable name of a user/group/channel (group title wins)."""
+        await self._gate_acquire("telegram_resolve_entity")
         entity = await run_with_flood_wait_retry(
             lambda: self._client.get_entity(int(peer)), operation="entity_title"
         )
@@ -487,6 +510,7 @@ class StandaloneTelegramClient:
         return list(msgs)
 
     async def _fetch_history(self, peer, limit, offset_id) -> list[Message]:
+        await self._gate_acquire("telegram_stream_messages")
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_history(peer, limit, offset_id), operation="history"
         )
@@ -501,6 +525,7 @@ class StandaloneTelegramClient:
         The persistent message store owns its own cooldown/watermarks. It must not
         build those watermarks from the short-lived UI TTL cache used by ``history``.
         """
+        await self._gate_acquire("telegram_stream_messages")
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_history_since(peer, min_id, limit), operation="history_since"
         )
@@ -520,6 +545,7 @@ class StandaloneTelegramClient:
         NOT cached (a one-off lookup, not a page the UIs re-read); routed through
         ``run_with_flood_wait_retry`` like every other network read.
         """
+        await self._gate_acquire("telegram_stream_messages")
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_search(peer, query, limit), operation="search_messages"
         )
@@ -538,6 +564,8 @@ class StandaloneTelegramClient:
     ) -> Message:
         """Send ``text`` to ``peer``; ``schedule`` (a delay or absolute time) defers it server-side."""
         await self._send_bucket.acquire()  # global outgoing cap (#25), before the retry loop
+        if self._send_bucket.enabled:  # explicit TG_SEND_RATE=0 opts sends out of pacing too
+            await self._gate_acquire("telegram_send_message")
         try:
             msg = await run_with_flood_wait_retry(
                 lambda: self._client.send_message(peer, text, reply_to=reply_to, schedule=schedule),
@@ -555,6 +583,7 @@ class StandaloneTelegramClient:
         Telegram's own behaviour, and the destination gains the new messages).
         """
         await self._send_bucket.acquire()  # global outgoing cap (#25)
+        await self._gate_acquire("telegram_forward_messages")
         sent = await run_with_flood_wait_retry(
             lambda: self._client.forward_messages(to_peer, message_ids, from_peer),
             operation="forward",
@@ -573,6 +602,7 @@ class StandaloneTelegramClient:
         return [self._to_message(m, dialog_id=int(to_peer)) for m in raw_sent if m is not None]
 
     async def edit_text(self, peer: int, message_id: int, text: str) -> Message:
+        await self._gate_acquire("telegram_edit_message")
         msg = await run_with_flood_wait_retry(
             lambda: self._client.edit_message(peer, int(message_id), text),
             operation="edit_text",
@@ -747,6 +777,8 @@ class StandaloneTelegramClient:
         if not path.is_file():
             raise ValueError(f"file not found: {file_path}")
         await self._send_bucket.acquire()  # global outgoing cap (#25), after the cheap path check
+        if self._send_bucket.enabled:  # explicit TG_SEND_RATE=0 opts sends out of pacing too
+            await self._gate_acquire("telegram_send_message")
         try:
             msg = await run_with_flood_wait_retry(
                 lambda: self._client.send_file(

@@ -1,7 +1,10 @@
-"""Slim, dependency-free FloodWait handling vendored from the main project.
+"""FloodWait handling for the single-account client.
 
-No pool/DB coupling: just transient-retry with a budget. Mirrors the discipline
-of ``src/telegram/flood_wait.py`` in tg_content_factory.
+Constants and classification helpers come from the shared telethon-floodgate
+package (#252) instead of being vendored here. The retry loop stays local: it
+must raise THIS app's ``HandledFloodWaitError`` shape (``.operation`` /
+``.wait_seconds`` / ``.user_message``) and must keep catching the
+``FloodWaitError`` referenced in this module (tests patch it here).
 """
 
 from __future__ import annotations
@@ -12,14 +15,17 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 from telethon.errors import FloodWaitError
+from telethon_floodgate import (
+    FLOOD_WAIT_RETRY_BUFFER_SEC,
+    TRANSIENT_FLOOD_WAIT_MAX_SEC,
+    TRANSIENT_FLOOD_WAIT_RETRY_BUDGET_SEC,
+    coerce_flood_wait_seconds,
+    is_transient_flood_wait_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
-
-TRANSIENT_FLOOD_WAIT_MAX_SEC = 60
-TRANSIENT_FLOOD_WAIT_RETRY_BUDGET_SEC = 120
-FLOOD_WAIT_RETRY_BUFFER_SEC = 1.0
 
 
 class HandledFloodWaitError(RuntimeError):
@@ -34,20 +40,6 @@ class HandledFloodWaitError(RuntimeError):
     def user_message(self) -> str:
         """One user-facing phrasing for every UI."""
         return f"Telegram flood wait {self.wait_seconds}s — try again later."
-
-
-def coerce_flood_wait_seconds(value: object) -> int:
-    return max(1, int(value or 0))
-
-
-def is_transient_flood_wait_seconds(
-    wait_seconds: int | None,
-    *,
-    max_seconds: int = TRANSIENT_FLOOD_WAIT_MAX_SEC,
-) -> bool:
-    if wait_seconds is None:
-        return False
-    return 0 < int(wait_seconds) <= max_seconds
 
 
 async def run_with_flood_wait_retry(
