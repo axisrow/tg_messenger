@@ -331,8 +331,11 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column" flexGrow={1} gap={1} padding={1} paddingBottom={0}>
         <Box gap={2}>
           <Text bold>tg-messenger</Text>
-          {target ? (
+          {ready ? (
             <Text>— {target}</Text>
+          ) : target ? (
+            // rejected (@username/malformed): dim so it never reads as a live dialog
+            <Text dimColor>— {target} (invalid — not sending)</Text>
           ) : (
             <Text dimColor>— set the dialog: claude plugin configure tg-messenger</Text>
           )}
@@ -368,7 +371,7 @@ export const register: Register = (on, options) => {
 
               if (!ready) {
                 // degraded, not broken: keep the local append, just say it went nowhere
-                $.ui.toast(`tg-messenger: ${reason} — not sent`)
+                $.ui.toast(`tg-messenger: not sent — ${reason}`)
                 void update($, messages, all => [...all, { text, out: true }].slice(-100) as TgMessage[])
                 return
               }
