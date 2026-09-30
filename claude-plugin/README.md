@@ -48,7 +48,7 @@ options (the serve URL / password when the bridge lands) are set with
 
 ## Transport (issues #246, #247)
 
-With `serveUrl` / `webPass` / `dialogId` configured (`claude plugin configure
+With `serveUrl` / `webPass` / `dialog` configured (`claude plugin configure
 tg-messenger`; values arrive as the `options` argument of `register`), the
 pane is live: the composer POSTs to `tg-messenger serve` (`/login` → HMAC
 cookie, `POST /send`) and the dialog's SSE stream (`/stream/{id}`) appends
@@ -56,3 +56,15 @@ incoming lines. Without config the pane degrades to a local-only scratchpad
 with a one-line toast. The transport lives in `hooks/register.tsx` (the
 engine follows `$` only within the file that declares it) — one host `curl`
 child per call, no dependencies; the password never appears in argv or logs.
+
+## Dialog targeting (#248)
+
+The `dialog` option picks which Telegram dialog the pane talks to: a marked
+numeric dialog id (negative for groups, as shown by `tg-messenger` dialogs).
+`@usernames` are accepted syntactically but **not resolvable in v1** — serve
+has no dialog-list endpoint the mod could resolve against (and per-message
+resolving would break flood discipline), so a username is rejected with a
+clear toast and the pane stays in the dead-safe no-send mode (composer
+visible, sends fail fast, nothing auto-retries). The same applies to any
+malformed value; with the option unset the pane header shows how to set it.
+The pre-#248 `dialogId` option spelling still works.
