@@ -212,8 +212,10 @@ function postReaction(
 
 /**
  * POSTs a reaction. The server remembers (dialog, message, emoticon) under
- * `web_client_id` and suppresses that frame from our SSE stream — the echo
- * dedup is server-side, exactly as for a browser tab.
+ * `web_client_id` and suppresses that frame from the SSE stream opened with
+ * the same `?client_id=` — the echo dedup is server-side, as for a browser
+ * tab. A repeated emoticon toggles the reaction off server-side (no removal
+ * frame), so callers must not append it a second time locally.
  */
 async function sendReaction(
   $: EngineInterface,
@@ -232,6 +234,15 @@ async function sendReaction(
     const detail = /<div class="error"[^>]*>([\s\S]*?)<\/div>/.exec(res.body)?.[1]
     throw new Error(detail ? `reaction failed: ${detail}` : `reaction failed (HTTP ${res.status})`)
   }
+}
+
+/** Attaches one emoticon under its target message, skipping a duplicate. */
+function withReaction(all: TgMessage[], id: number, emoticon: string): TgMessage[] {
+  return all.map(m =>
+    m.id === id && !m.reactions?.includes(emoticon)
+      ? { ...m, reactions: [...(m.reactions ?? []), emoticon] }
+      : m,
+  )
 }
 
 type StreamFrame = {
@@ -378,7 +389,9 @@ async function* streamFrames(
       `Cookie: ${cookie}`,
       '-H',
       'Accept: text/event-stream',
-      `${cfg.serveUrl}/stream/${cfg.dialogId}`,
+      // ?client_id= picks the server's echo-suppression bucket: the same one
+      // sendReaction registers our (dialog, message, emoticon) keys under
+      `${cfg.serveUrl}/stream/${cfg.dialogId}?client_id=${WEB_CLIENT_ID}`,
     ],
   })
   let buffer = ''
@@ -443,11 +456,7 @@ async function runStream($: EngineInterface, cfg: ServeConfig): Promise<never> {
           if (frame.message_id && frame.emoticon) {
             const mid = frame.message_id
             const emoticon = frame.emoticon
-            await update($, messages, all =>
-              all.map(m =>
-                m.id === mid ? { ...m, reactions: [...(m.reactions ?? []), emoticon] } : m,
-              ) as TgMessage[],
-            )
+            await update($, messages, all => withReaction(all, mid, emoticon))
           }
           continue
         }
@@ -547,15 +556,15 @@ export const register: Register = (on, options) => {
             const react = (emoticon: string) => {
               const id = m.id as number
               void update($, paletteFor, () => -1)
+              // a repeat pick would toggle the reaction OFF server-side (with
+              // no removal frame coming back) — the pane has no remove UI, so
+              // an already-shown emoticon is a no-op instead of a divergence
+              if (m.reactions?.includes(emoticon)) return
               void (async () => {
                 try {
                   // optimistic attach — the server suppresses our own SSE echo
                   await sendReaction($, cfg, id, emoticon)
-                  await update($, messages, all =>
-                    all.map(x =>
-                      x.id === id ? { ...x, reactions: [...(x.reactions ?? []), emoticon] } : x,
-                    ) as TgMessage[],
-                  )
+                  await update($, messages, all => withReaction(all, id, emoticon))
                 } catch (error) {
                   const message = error instanceof Error ? error.message : String(error)
                   $.ui.toast(`tg-messenger: ${message}`)
