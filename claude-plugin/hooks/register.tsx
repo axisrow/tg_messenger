@@ -31,6 +31,11 @@ const messages = atom(
   [{ text: 'hello world — the bridge lands here', out: false }] as TgMessage[],
 )
 
+// #256: text of a FAILED send, restored into the composer until the first
+// keystroke touches it (cleared in onInput). Rendered as `value` only while
+// non-empty, so stream-frame redraws never clobber live typing.
+const pendingSend = atom({ plugin: 'tg-messenger', key: 'pendingSend' } as const, '')
+
 // --- serve transport ---------------------------------------------------------
 
 type ServeConfig = { serveUrl: string; webPass: string; dialogId: string }
@@ -162,6 +167,114 @@ async function sendText($: EngineInterface, cfg: ServeConfig, text: string): Pro
 }
 
 type StreamFrame = { id?: number; text?: string; out?: boolean; type?: string }
+
+// --- media command (#250) -----------------------------------------------------
+
+/**
+ * Splits off the first shlex token of `s` (posix rules: quotes group, `\`
+ * escapes, `#` is a plain char). Returns null on an unbalanced quote —
+ * the mirror of `shlex.split`'s ValueError in the TUI parser.
+ */
+function shlexFirstToken(s: string): { token: string; rest: string } | null {
+  let i = 0
+  let token = ''
+  let started = false
+  while (i < s.length) {
+    const c = s[i]
+    if (c === ' ' || c === '\t') {
+      if (started) return { token, rest: s.slice(i + 1) }
+      i++
+      continue
+    }
+    started = true
+    if (c === "'") {
+      i++
+      while (i < s.length && s[i] !== "'") token += s[i++]
+      if (i >= s.length) return null
+      i++
+    } else if (c === '"') {
+      i++
+      while (i < s.length && s[i] !== '"') {
+        if (s[i] === '\\' && i + 1 < s.length && ' "\\$`'.includes(s[i + 1])) i++
+        token += s[i++]
+      }
+      if (i >= s.length) return null
+      i++
+    } else if (c === '\\') {
+      if (i + 1 >= s.length) return null
+      token += s[i + 1]
+      i += 2
+    } else {
+      token += c
+      i++
+    }
+  }
+  return started ? { token, rest: '' } : null
+}
+
+/**
+ * Parses an `@PATH [caption]` composer command — quote-for-quote parity with
+ * `parse_media_command` in `src/tg_messenger/tui/parsing.py`: `@` with no
+ * path (or an unbalanced quote) is plain text, the path may be quoted, the
+ * remainder verbatim is the caption. Pure — no filesystem.
+ */
+function parseMediaCommand(
+  text: string,
+): { path: string; caption: string | null } | null {
+  if (!text.startsWith('@')) return null
+  const first = shlexFirstToken(text.slice(1))
+  if (!first || !first.token) return null
+  return { path: first.token, caption: first.rest.trim() || null }
+}
+
+/** One multipart POST /dialogs/{id}/media attempt with the current cookie. */
+function postMedia(
+  $: EngineInterface,
+  cfg: ServeConfig,
+  path: string,
+  caption: string | null,
+): Promise<CurlResponse> {
+  return curlOnce($, [
+    'curl',
+    '-isS',
+    '-X',
+    'POST',
+    '-H',
+    'x-tg-messenger-csrf: 1',
+    '-H',
+    `Cookie: ${cookie}`,
+    '-F',
+    `file=@${path}`,
+    ...(caption ? ['-F', `caption=${caption}`] : []),
+    `${cfg.serveUrl}/dialogs/${cfg.dialogId}/media`,
+  ])
+}
+
+/** POSTs the file to the media route; success/failure contract as `sendText`. */
+async function sendMedia(
+  $: EngineInterface,
+  cfg: ServeConfig,
+  path: string,
+  caption: string | null,
+): Promise<void> {
+  // curl -F parses `;`/`=` inside the value as part parameters — refuse instead
+  // of silently uploading a truncated filename
+  if (/[;]/.test(path)) throw new Error(`media path contains ';' (unsupported)`)
+  await ensureLogin($, cfg)
+  let res = await postMedia($, cfg, path, caption)
+  if (res.status === 401) {
+    forgetCookie()
+    await ensureLogin($, cfg)
+    res = await postMedia($, cfg, path, caption)
+  }
+  if (res.status !== 200 || !res.body.startsWith('<div class="msg ')) {
+    // a missing file dies in curl's stderr (thrown above); server-side
+    // rejections (too large, empty, read-only chat) come as the error fragment
+    const detail = /<div class="error"[^>]*>([\s\S]*?)<\/div>/.exec(res.body)?.[1]
+    throw new Error(detail ? `media failed: ${detail}` : `media failed (HTTP ${res.status})`)
+  }
+}
+
 
 /** Drops the cookie so the next `ensureLogin` starts a fresh serve session. */
 function forgetCookie(): void {
@@ -339,9 +452,12 @@ export const register: Register = (on, options) => {
           >
             <Input
             key="composer"
-            placeholder={ready ? 'сообщение' : 'сообщение (уйдёт в никуда)'}
+            placeholder={ready ? 'сообщение, @/path/to/file [caption]' : 'сообщение (уйдёт в никуда)'}
             submitLabel="send"
+            value={(await read($, pendingSend)) || undefined}
             onInput={value => {
+              // #256: the first keystroke takes ownership — the restore is done
+              void update($, pendingSend, () => '')
               void update($, draft, () => value.length)
             }}
             onSubmit={value => {
@@ -357,16 +473,25 @@ export const register: Register = (on, options) => {
                 return
               }
 
+              // #250: @PATH [caption] routes to the media upload; plain text to /send
+              const media = parseMediaCommand(text)
+
               void (async () => {
                 try {
-                  await sendText($, cfg, text)
-                  await update($, messages, all => [...all, { text, out: true }].slice(-100) as TgMessage[])
+                  if (media) await sendMedia($, cfg, media.path, media.caption)
+                  else await sendText($, cfg, text)
+                  const shown = media ? `@${media.path}` : text
+                  await update($, messages, all => [...all, { text: shown, out: true }].slice(-100) as TgMessage[])
                 } catch (error) {
                   const message = error instanceof Error ? error.message : String(error)
                   $.ui.toast(`tg-messenger: ${message}`)
                   void update($, messages, all =>
                     [...all, { text: message, out: false, system: true }].slice(-100) as TgMessage[],
                   )
+                  // #256: keep the composed text for fix/retry — drawn as the
+                  // Input's value until the first keystroke (onInput clears it)
+                  void update($, pendingSend, () => text)
+                  void update($, draft, () => text.length)
                 }
               })()
             }}
