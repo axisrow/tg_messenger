@@ -1,4 +1,4 @@
 {
-  "description": "tg-messenger bridge: /tg opens the messenger pane; the Telegram transport (serve SSE + send) plugs into this same pane",
+  "description": "tg-messenger bridge: /tg opens the messenger pane wired to tg-messenger serve (send + live stream)",
   "modules": ["./register.tsx"]
 }

@@ -46,10 +46,13 @@ Function hooks are early access — until that changes, the installing user need
 options (the serve URL / password when the bridge lands) are set with
 `claude plugin configure tg-messenger`.
 
-## Next (issue #244)
+## Transport (issues #246, #247)
 
-Replace the HELLO branch in `hooks/register.ts` with the real bridge:
-incoming DMs from `tg-messenger serve` (SSE `/stream/{id}`) surfaced into the
-session, replies via `POST /dialogs/{id}/send`. Serve URL / `TG_WEB_PASS`
-arrive as plugin options (`userConfig` in `plugin.json` + the `options`
-argument of `register`).
+With `serveUrl` / `webPass` / `dialogId` configured (`claude plugin configure
+tg-messenger`; values arrive as the `options` argument of `register`), the
+pane is live: the composer POSTs to `tg-messenger serve` (`/login` → HMAC
+cookie, `POST /send`) and the dialog's SSE stream (`/stream/{id}`) appends
+incoming lines. Without config the pane degrades to a local-only scratchpad
+with a one-line toast. The transport lives in `hooks/register.tsx` (the
+engine follows `$` only within the file that declares it) — one host `curl`
+child per call, no dependencies; the password never appears in argv or logs.
