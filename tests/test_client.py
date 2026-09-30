@@ -419,33 +419,55 @@ async def test_send_text_forbidden_carries_clean_message(fake_client):
     assert "write in this chat" in str(ei.value)
 
 
-async def test_rate_limit_gate_defers_send_then_proceeds(fake_client, monkeypatch):
+async def test_rate_limit_gate_defers_send_then_proceeds(fake_client):
     # the #252 gate seam: a deferred send sleeps out retry_after (no new exception
     # path) and proceeds; the send operation maps to the package's "send" category.
-    client = _build(fake_client)
-    await client.connect()
-
-    class DeferredGate:
-        def __init__(self):
-            self.seen = None
-
-        def try_acquire(self, account, category, **kw):
-            self.seen = (account, category)
-            return 2.5
-
-    gate = DeferredGate()
-    monkeypatch.setattr(client, "_gate", gate)
     slept = []
 
     async def fake_sleep(sec):
         slept.append(sec)
 
-    monkeypatch.setattr(client_module.asyncio, "sleep", fake_sleep)
+    client = _build(fake_client, sleep=fake_sleep)
+    await client.connect()
+
+    class DeferredGate:
+        seen = None
+
+        def try_acquire(self, account, category):
+            self.seen = (account, category)
+            return 2.5
+
+    client._gate = DeferredGate()
 
     await client.send_text(7, "paced")
     assert slept == [2.5]
-    assert gate.seen == ("default", "send")
+    assert client._gate.seen == ("default", "send")
     assert fake_client.sent[-1]["text"] == "paced"
+
+
+async def test_rate_limit_gate_respects_send_rate_zero_for_whole_send_category(fake_client):
+    # TG_SEND_RATE=0 opts every send-category write (sends, media, forwards, edits)
+    # out of proactive pacing — the gate never consults, never sleeps (#252).
+    _seed_dm(fake_client)
+    client = _build(fake_client, send_rate_per_min=0)
+
+    class RecordingGate:
+        calls: list[str] = []
+
+        def try_acquire(self, account, category):
+            self.calls.append(category)
+            return 0.0
+
+    gate = RecordingGate()
+    client._gate = gate
+
+    await client.send_text(7, "x")
+    await client.forward(7, [1], 8)
+    await client.edit_text(7, 1, "y")
+    assert gate.calls == []  # never consulted, pacing fully off
+    assert len(fake_client.sent) == 1  # every write still went through
+    assert len(fake_client.forwarded) == 1
+    assert len(fake_client.edited) == 1
 
 
 async def test_send_media_forbidden_carries_clean_message(fake_client, tmp_path):
