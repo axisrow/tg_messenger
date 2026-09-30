@@ -16,10 +16,9 @@ Safety rules, non-negotiable:
 ## Prerequisites
 
 ```bash
-# fresh code under test (this checkout)
-PYTHONPATH="$PWD/src" tg-messenger --profile <test-profile> serve --port 18090
-# in another shell, with a throwaway password (never the real one):
-TG_WEB_PASS=<throwaway> PYTHONPATH="$PWD/src" tg-messenger --profile <test-profile> serve --port 18090
+# fresh code under test (this checkout), throwaway password for the run
+TG_WEB_PASS=<throwaway> PYTHONPATH="$PWD/src" \
+  tg-messenger --profile <test-profile> serve --port 18090
 ```
 
 - `TG_WEB_PASS` set to a **throwaway** value for the run (serve refuses
