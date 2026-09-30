@@ -114,12 +114,6 @@ async function ensureLogin($: EngineInterface, cfg: ServeConfig): Promise<void> 
   cookie = pair
 }
 
-/**
- * POSTs the outgoing message to /send (form dialog_id+text, the server's
- * same-origin header, cookie). Resolves only after the server answered with
- * the sent-bubble fragment; anything else (error fragment, a redirect to the
- * login wizard when the Telegram session itself is logged out) throws.
- */
 /** One POST /send attempt with the current cookie. */
 function postSend($: EngineInterface, cfg: ServeConfig, text: string): Promise<CurlResponse> {
   return curlOnce(
@@ -233,42 +227,52 @@ const startStream = ($: EngineInterface, cfg: ServeConfig) => {
   if (streamAlive) return
   streamAlive = true
   void (async () => {
-    let backoff = 1000
-    let lost = false // the panel line is on state change, not every retry
-    while (true) {
-      try {
-        // a fresh login per attempt: a serve restart invalidates its cookies
-        forgetCookie()
-        for await (const frame of streamFrames($, cfg)) {
-          backoff = 1000 // a live frame proves the link works
-          lost = false
-          // typed frames (translation/reaction) and our own echoes are not pane
-          // lines — the composer already appended what this mod itself sent
-          if (frame.type || frame.out || !frame.text) continue
-          const text = frame.text
-          await update($, messages, all => [...all, { text, out: false }].slice(-100) as TgMessage[])
-        }
-      } catch (error) {
-        $.ui.log(`tg-messenger: stream error: ${String(error)}`)
-        if (!lost) {
-          lost = true
-          const message = error instanceof Error ? error.message : String(error)
-          await update($, messages, all =>
-            [...all, { text: `bridge error: ${message}`, out: false, system: true }].slice(-100) as TgMessage[],
-          )
-        }
-      }
-      if (!lost) {
-        lost = true
-        const wait = Math.round(backoff / 1000)
-        await update($, messages, all =>
-          [...all, { text: `stream lost — retrying in ${wait} s`, out: false, system: true }].slice(-100) as TgMessage[],
-        )
-      }
-      await $.clock.sleep(backoff)
-      backoff = Math.min(backoff * 2, 30000)
+    try {
+      await runStream($, cfg)
+    } finally {
+      // any escape from the loop (an unprotected state write or sleep
+      // rejecting) must leave the bridge revivable by the next /tg
+      streamAlive = false
     }
   })()
+}
+
+async function runStream($: EngineInterface, cfg: ServeConfig): Promise<never> {
+  let backoff = 1000
+  let lost = false // the panel line is on state change, not every retry
+  while (true) {
+    try {
+      // a fresh login per attempt: a serve restart invalidates its cookies
+      forgetCookie()
+      for await (const frame of streamFrames($, cfg)) {
+        backoff = 1000 // a live frame proves the link works
+        lost = false
+        // typed frames (translation/reaction) and our own echoes are not pane
+        // lines — the composer already appended what this mod itself sent
+        if (frame.type || frame.out || !frame.text) continue
+        const text = frame.text
+        await update($, messages, all => [...all, { text, out: false }].slice(-100) as TgMessage[])
+      }
+    } catch (error) {
+      $.ui.log(`tg-messenger: stream error: ${String(error)}`)
+      if (!lost) {
+        lost = true
+        const message = error instanceof Error ? error.message : String(error)
+        await update($, messages, all =>
+          [...all, { text: `bridge error: ${message}`, out: false, system: true }].slice(-100) as TgMessage[],
+        )
+      }
+    }
+    if (!lost) {
+      lost = true
+      const wait = Math.round(backoff / 1000)
+      await update($, messages, all =>
+        [...all, { text: `stream lost — retrying in ${wait} s`, out: false, system: true }].slice(-100) as TgMessage[],
+      )
+    }
+    await $.clock.sleep(backoff)
+    backoff = Math.min(backoff * 2, 30000)
+  }
 }
 
 export const register: Register = (on, options) => {
