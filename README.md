@@ -322,9 +322,13 @@ env only, never in logs or the repo.
 Several commands send on your behalf in the background — `agent`, `heartbeat run`,
 `worker`, `ghostwrite`, and `moderate` (warn/notice actions). A systematically high
 send rate is the main account-ban risk (worse than any single FloodWait), so a
-token-bucket caps every outgoing message in the process.
+shared token bucket paces sends, media, forwards and reactions within each client.
+Its implementation and FloodWait retries live in `telethon-floodgate`; messenger
+keeps only application settings and its public error-message adapter.
 
-The default cap is **20 messages/minute**. You can override it with `TG_SEND_RATE`;
+The default refill is **20 tokens/minute**, with an initial burst of 20. One
+send/media/forward/reaction operation consumes one token (a bulk forward is one
+operation, not one token per message). You can override it with `TG_SEND_RATE`;
 setting `TG_SEND_RATE=0` explicitly turns the cap **off** (no ceiling). When it is
 off, automated sender commands log a WARNING on start so the unbounded state is never
 silent:
@@ -333,10 +337,19 @@ silent:
 TG_SEND_RATE=0 tg-messenger agent
 ```
 
-**Scope: the cap is per-process, not per-account.** Each running command (a separate
+**Scope: the cap is per-client, not per-account.** Each running command (a separate
 `agent`, `worker`, `serve`, `tui`, …) holds its own bucket, so two senders running at
 once can put up to `2 × TG_SEND_RATE` on the same account. If you run several senders
 in parallel, size `TG_SEND_RATE` with that multiplication in mind (or run one at a time).
 
 When the cap is reached, a send **waits** for the next token (nothing is lost) and
-logs a WARNING — it never errors. Reads (dialogs/history) are not limited.
+logs a WARNING — it never errors.
+
+The package also applies a separate sliding-window gate: **30 send attempts/minute**
+(sends, media, forwards and edits) and **600 message-fetch requests/minute**.
+Every retry and every internal history/search/ID-fetch page reserves its own slot;
+cache hits reserve none. The send gate can bind even at `TG_SEND_RATE=20` because
+the token bucket permits a burst and refills continuously. `TG_SEND_RATE=0` disables
+both outgoing limiters, not history gating or reactive FloodWait retries. Dialog
+listing keeps its cache and retries without a proactive gate. Limits remain local
+to one client; no per-peer or circuit-breaker policy is enabled by this integration.

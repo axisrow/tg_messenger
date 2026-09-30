@@ -24,6 +24,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      # Draft prerequisite; remove this source pin once floodgate 0.1.1 is on PyPI.
+      # Runtime/package metadata keeps the normal PyPI dependency, not a Git URL.
+      - name: Install unreleased floodgate prerequisite
+        run: pip install "telethon-floodgate @ git+https://github.com/axisrow/telethon-floodgate.git@e821fa8be1b498f83c6930b1724b26e2021eb78b"
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: pytest -q
@@ -40,5 +44,8 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      # Remove with the matching prerequisite step above after the library release.
+      - name: Install unreleased floodgate prerequisite
+        run: pip install "telethon-floodgate @ git+https://github.com/axisrow/telethon-floodgate.git@e821fa8be1b498f83c6930b1724b26e2021eb78b"
       - run: pip install -e ".[dev,agent]"
       - run: pytest -q

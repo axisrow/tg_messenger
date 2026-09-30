@@ -3,8 +3,8 @@
 Thin async wrapper over a single Telethon client: dialogs (DM-only by default,
 ``dm_only=False`` for every kind), history, send, media, plus event streams
 fanned out through EventBus (``listen`` private-only, ``listen_all`` every chat).
-All network calls route through the flood-wait retry; history reads and outgoing
-writes also pass the proactive telethon-floodgate rate-limit gate first (#252).
+History page requests and each outgoing attempt also pass the proactive
+telethon-floodgate rate-limit gate before dispatch (#252).
 """
 
 from __future__ import annotations
@@ -344,29 +344,31 @@ class StandaloneTelegramClient:
         # one global cap on outgoing sends across every caller (#25); 0 explicitly disables.
         # burst = the rate (1 minute's worth) so a quiet account isn't throttled.
         self._send_bucket = TokenBucket(
-            send_rate_per_min, burst=max(1, int(send_rate_per_min)), clock=clock
+            send_rate_per_min, burst=max(1, int(send_rate_per_min)), clock=clock, sleep=sleep
         )
         # #252: proactive per-category pacing (telethon-floodgate) around the
         # history/send call sites; package defaults — see _gate_acquire.
-        self._gate = TelegramRateLimitGate()
+        self._gate = TelegramRateLimitGate(time_func=clock)
         self._sleep = sleep
 
     async def _gate_acquire(self, operation: str) -> None:
-        """Reserve a proactive gate slot (#252); a deferral sleeps out instead of
-        raising — the flood-wait retry stays the hard net. Package defaults;
-        calibrate a category only on a real flood signal (factory playbook).
-        """
+        """Apply messenger's send opt-out; pacing belongs to the shared package."""
         category = TelegramRateLimitGate.category_for(operation)
         if category == "send" and not self._send_bucket.enabled:
             return  # explicit TG_SEND_RATE=0 opts the whole send category out (#25)
-        # try_acquire returning >0 consumed NO slot (package contract): re-acquire
-        # after each sleep until a slot is reserved, or the woken call passes
-        # unrecorded and a binding category admits ~2x max_calls.
-        retry_after = self._gate.try_acquire(self._session_name, category)
-        while retry_after > 0:
-            logger.info("%s: rate-limit gate defers %.1fs", operation, retry_after)
-            await self._sleep(retry_after)
-            retry_after = self._gate.try_acquire(self._session_name, category)
+        await self._gate.acquire(self._session_name, category, sleep=self._sleep)
+
+    async def _run_gated(self, factory, *, operation: str, gate_operation: str):
+        async def attempt():
+            await self._gate_acquire(gate_operation)
+            return await factory()
+
+        return await run_with_flood_wait_retry(attempt, operation=operation)
+
+    def _iter_messages(self, *args, **kwargs):
+        return self._gate.wrap_messages_iterator(
+            self._client.iter_messages(*args, **kwargs), self._session_name, sleep=self._sleep,
+        )
 
     # --- connection ---
     async def connect(self) -> None:
@@ -512,14 +514,13 @@ class StandaloneTelegramClient:
         return list(msgs)
 
     async def _fetch_history(self, peer, limit, offset_id) -> list[Message]:
-        await self._gate_acquire("telegram_stream_messages")
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_history(peer, limit, offset_id), operation="history"
         )
         return [self._to_message(m, dialog_id=int(peer)) for m in reversed(raw)]
 
     async def _collect_history(self, peer, limit, offset_id) -> list:
-        return [m async for m in self._client.iter_messages(peer, limit=limit, offset_id=offset_id)]
+        return [m async for m in self._iter_messages(peer, limit=limit, offset_id=offset_id)]
 
     async def history_since(self, peer: int, min_id: int = 0, limit: int = 50) -> list[Message]:
         """Uncached history page newer than ``min_id``, chronological.
@@ -527,14 +528,13 @@ class StandaloneTelegramClient:
         The persistent message store owns its own cooldown/watermarks. It must not
         build those watermarks from the short-lived UI TTL cache used by ``history``.
         """
-        await self._gate_acquire("telegram_stream_messages")
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_history_since(peer, min_id, limit), operation="history_since"
         )
         return [self._to_message(m, dialog_id=int(peer)) for m in reversed(raw)]
 
     async def _collect_history_since(self, peer, min_id, limit) -> list:
-        return [m async for m in self._client.iter_messages(peer, limit=limit, min_id=min_id)]
+        return [m async for m in self._iter_messages(peer, limit=limit, min_id=min_id)]
 
     def _invalidate_history(self, peer: int) -> None:
         """Drop every cached history page of ``peer`` (any limit/offset)."""
@@ -547,14 +547,13 @@ class StandaloneTelegramClient:
         NOT cached (a one-off lookup, not a page the UIs re-read); routed through
         ``run_with_flood_wait_retry`` like every other network read.
         """
-        await self._gate_acquire("telegram_stream_messages")
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_search(peer, query, limit), operation="search_messages"
         )
         return [self._to_message(m, dialog_id=int(peer)) for m in raw]
 
     async def _collect_search(self, peer, query, limit) -> list:
-        return [m async for m in self._client.iter_messages(peer, search=query, limit=limit)]
+        return [m async for m in self._iter_messages(peer, search=query, limit=limit)]
 
     # --- sending ---
     async def send_text(
@@ -566,11 +565,11 @@ class StandaloneTelegramClient:
     ) -> Message:
         """Send ``text`` to ``peer``; ``schedule`` (a delay or absolute time) defers it server-side."""
         await self._send_bucket.acquire()  # global outgoing cap (#25), before the retry loop
-        await self._gate_acquire("telegram_send_message")
         try:
-            msg = await run_with_flood_wait_retry(
+            msg = await self._run_gated(
                 lambda: self._client.send_message(peer, text, reply_to=reply_to, schedule=schedule),
                 operation="send_text",
+                gate_operation="telegram_send_message",
             )
         except _SEND_FORBIDDEN_ERRORS as exc:
             raise SendForbiddenError(_forbidden_message(exc)) from exc
@@ -584,10 +583,10 @@ class StandaloneTelegramClient:
         Telegram's own behaviour, and the destination gains the new messages).
         """
         await self._send_bucket.acquire()  # global outgoing cap (#25)
-        await self._gate_acquire("telegram_forward_messages")
-        sent = await run_with_flood_wait_retry(
+        sent = await self._run_gated(
             lambda: self._client.forward_messages(to_peer, message_ids, from_peer),
             operation="forward",
+            gate_operation="telegram_forward_messages",
         )
         self._invalidate_history(from_peer)
         self._invalidate_history(to_peer)
@@ -603,10 +602,10 @@ class StandaloneTelegramClient:
         return [self._to_message(m, dialog_id=int(to_peer)) for m in raw_sent if m is not None]
 
     async def edit_text(self, peer: int, message_id: int, text: str) -> Message:
-        await self._gate_acquire("telegram_edit_message")
-        msg = await run_with_flood_wait_retry(
+        msg = await self._run_gated(
             lambda: self._client.edit_message(peer, int(message_id), text),
             operation="edit_text",
+            gate_operation="telegram_edit_message",
         )
         self._invalidate_history(peer)
         return self._to_message(msg, dialog_id=int(peer))
@@ -647,7 +646,7 @@ class StandaloneTelegramClient:
                 )
 
     async def _collect_messages_by_ids(self, peer, message_ids) -> list:
-        return [m async for m in self._client.iter_messages(peer, ids=message_ids)]
+        return [m async for m in self._iter_messages(peer, ids=message_ids)]
 
     async def mute_user(self, peer: int, user_id: int, until_sec: int) -> None:
         """Restrict a user from sending messages in ``peer`` for ``until_sec`` seconds.
@@ -778,14 +777,14 @@ class StandaloneTelegramClient:
         if not path.is_file():
             raise ValueError(f"file not found: {file_path}")
         await self._send_bucket.acquire()  # global outgoing cap (#25), after the cheap path check
-        await self._gate_acquire("telegram_send_message")
         try:
-            msg = await run_with_flood_wait_retry(
+            msg = await self._run_gated(
                 lambda: self._client.send_file(
                     peer, str(path), caption=caption, voice_note=voice_note,
                     video_note=video_note, force_document=force_document,
                 ),
                 operation="send_media",
+                gate_operation="telegram_publish_files",
             )
         except _SEND_FORBIDDEN_ERRORS as exc:
             raise SendForbiddenError(_forbidden_message(exc)) from exc

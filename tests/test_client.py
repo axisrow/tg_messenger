@@ -5,6 +5,7 @@ import pytest
 from telethon import events
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser
+from telethon_floodgate import TelegramRateLimitGate
 
 from tests.conftest import (
     FakeAdminRights,
@@ -16,8 +17,10 @@ from tests.conftest import (
     FakeDocument,
     FakeMessage,
     FakeMessageReadEvent,
+    FakeMessagesIterator,
     FakeUser,
 )
+from tests.conftest import flood_wait_error as flood_error
 from tg_messenger.core import client as client_module
 from tg_messenger.core.client import (
     READ_ONLY_MESSAGE,
@@ -430,7 +433,7 @@ async def test_rate_limit_gate_defers_send_then_proceeds(fake_client):
     client = _build(fake_client, sleep=fake_sleep)
     await client.connect()
 
-    class DefersOnceGate:
+    class DefersOnceGate(TelegramRateLimitGate):
         # package contract: try_acquire >0 consumed no slot, so the caller must
         # re-acquire after sleeping — this stub pins that loop.
         seen = None
@@ -459,7 +462,7 @@ async def test_rate_limit_gate_respects_send_rate_zero_for_whole_send_category(f
     _seed_dm(fake_client)
     client = _build(fake_client, send_rate_per_min=0)
 
-    class RecordingGate:
+    class RecordingGate(TelegramRateLimitGate):
         calls: list[str] = []
 
         def try_acquire(self, account, category):
@@ -505,9 +508,7 @@ async def test_send_reaction_forbidden_carries_clean_message(fake_client):
 async def test_send_text_floodwait_still_retries(fake_client, monkeypatch):
     # классификация прав НЕ должна ломать обычный FloodWait-ретрай:
     # первый вызов кидает транзиентный FloodWait(0), второй — успех.
-    from tests.conftest import patch_flood_error
 
-    flood_error = patch_flood_error(monkeypatch)
     client = _build(fake_client)
     await client.connect()
     calls = {"n": 0}
@@ -570,22 +571,16 @@ async def test_search_messages_limit_passed(fake_client):
 
 async def test_search_messages_flood_is_handled(fake_client, monkeypatch):
     # search routes through run_with_flood_wait_retry like every other read
-    from tests.conftest import patch_flood_error
     from tg_messenger.core.flood import HandledFloodWaitError
 
-    flood_error = patch_flood_error(monkeypatch)
     _seed_dm(fake_client)
     client = _build(fake_client)
     await client.connect()
 
-    def boom(*a, **k):
-        async def gen():
-            raise flood_error(9999)  # non-transient → HandledFloodWaitError
-            yield  # pragma: no cover
+    async def boom(self, request):
+        raise flood_error(9999)  # non-transient → HandledFloodWaitError
 
-        return gen()
-
-    fake_client.iter_messages = boom
+    monkeypatch.setattr(FakeMessagesIterator, "_fetch", boom)
     with pytest.raises(HandledFloodWaitError):
         await client.search_messages(7, "hi", limit=5)
 
@@ -1273,10 +1268,8 @@ async def test_default_factory_disables_silent_flood_sleep():
 
 
 async def test_dialogs_flood_raises_handled_and_leaves_cache_empty(fake_client, monkeypatch):
-    from tests.conftest import patch_flood_error
     from tg_messenger.core.flood import HandledFloodWaitError
 
-    flood_error = patch_flood_error(monkeypatch)
     _seed_dm(fake_client)
     client = _build(fake_client)
     await client.connect()
@@ -1599,10 +1592,8 @@ async def test_send_reaction_sends_request(fake_client):
 
 
 async def test_send_reaction_flood_is_handled(fake_client, monkeypatch):
-    from tests.conftest import patch_flood_error
     from tg_messenger.core.flood import HandledFloodWaitError
 
-    flood_error = patch_flood_error(monkeypatch)
     client = _build(fake_client)
     await client.connect()
 
@@ -1701,12 +1692,6 @@ async def test_send_text_no_schedule_by_default(fake_client):
 # --- Цикл 78: forward / edit / delete ---
 
 
-def _flood_patch(monkeypatch):
-    from tests.conftest import patch_flood_error
-
-    return patch_flood_error(monkeypatch)
-
-
 def _seed_delete_messages(fake_client, peer: int = 7, ids=(1, 2)) -> None:
     fake_client.messages[int(peer)] = [
         FakeMessage(id=mid, sender_id=1, text=f"m{mid}", out=True, peer_id=int(peer))
@@ -1756,7 +1741,6 @@ async def test_forward_filters_partial_missing_results(fake_client, caplog):
 
 async def test_forward_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
-    flood_error = _flood_patch(monkeypatch)
     client = _build(fake_client)
     await client.connect()
 
@@ -1789,7 +1773,6 @@ async def test_edit_text_invalidates_history(fake_client):
 
 async def test_edit_text_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
-    flood_error = _flood_patch(monkeypatch)
     client = _build(fake_client)
     await client.connect()
 
@@ -1830,7 +1813,6 @@ async def test_delete_messages_invalidates_history(fake_client):
 
 async def test_delete_messages_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
-    flood_error = _flood_patch(monkeypatch)
     _seed_delete_messages(fake_client, ids=(1,))
     client = _build(fake_client)
     await client.connect()
@@ -1927,7 +1909,6 @@ async def test_mark_read_invalidates_archived_dialogs_cache(fake_client):
 
 async def test_mark_read_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
-    flood_error = _flood_patch(monkeypatch)
     client = _build(fake_client)
     await client.connect()
 
@@ -1941,7 +1922,6 @@ async def test_mark_read_flood_is_handled(fake_client, monkeypatch):
 
 async def test_mark_read_flood_keeps_dialogs_cache(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
-    flood_error = _flood_patch(monkeypatch)
     _seed_dm(fake_client)
     client = _build(fake_client)
     await client.connect()
@@ -1962,7 +1942,6 @@ async def test_mark_read_flood_keeps_dialogs_cache(fake_client, monkeypatch):
 
 async def test_mark_read_flood_keeps_archived_dialogs_cache(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
-    flood_error = _flood_patch(monkeypatch)
     fake_client.dialogs = [
         FakeDialog(
             FakeUser(id=8, first_name="Old", contact=False),
@@ -2029,7 +2008,6 @@ async def test_ban_user_revokes_view_messages(fake_client):
 
 async def test_mute_user_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
-    flood_error = _flood_patch(monkeypatch)
     client = _build(fake_client)
     await client.connect()
 
@@ -2043,7 +2021,6 @@ async def test_mute_user_flood_is_handled(fake_client, monkeypatch):
 
 async def test_ban_user_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
-    flood_error = _flood_patch(monkeypatch)
     client = _build(fake_client)
     await client.connect()
 
@@ -2198,10 +2175,8 @@ async def test_clear_username_sends_empty(fake_client):
 
 
 async def test_check_username_flood_is_handled(fake_client, monkeypatch):
-    from tests.conftest import patch_flood_error
     from tg_messenger.core.flood import HandledFloodWaitError
 
-    flood_error = patch_flood_error(monkeypatch)
     client = _build(fake_client)
     await client.connect()
 
@@ -2231,7 +2206,7 @@ async def test_send_rate_limit_waits_when_exhausted(fake_client, caplog):
     client = _build(fake_client)
     client._send_bucket = TokenBucket(60.0, burst=1, clock=lambda: t["now"], sleep=fake_sleep)
     await client.connect()
-    with caplog.at_level("WARNING", logger="tg_messenger.core.ratelimit"):
+    with caplog.at_level("WARNING", logger="telethon_floodgate.token_bucket"):
         await client.send_text(7, "first")
         await client.send_text(7, "second")
     assert len(slept) == 1
