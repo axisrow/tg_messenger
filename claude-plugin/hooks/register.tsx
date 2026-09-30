@@ -26,6 +26,14 @@ const PANE = 'tg'
 
 const draft = atom({ plugin: 'tg-messenger', key: 'draft' } as const, 0)
 
+// message id whose reaction palette is open (-1 = none) — the web's toggle pattern
+const paletteFor = atom({ plugin: 'tg-messenger', key: 'paletteFor' } as const, -1)
+
+// the same 4 presets as web/TUI REACTION_PRESETS; also names this pane to the
+// serve echo-suppression buckets, so our own reactions come back suppressed
+const REACTION_PRESETS = ['👍', '❤️', '🔥', '😂'] as const
+const WEB_CLIENT_ID = 'cc-pane'
+
 const messages = atom(
   { plugin: 'tg-messenger', key: 'messages' } as const,
   [{ text: 'hello world — the bridge lands here', out: false }] as TgMessage[],
@@ -174,7 +182,77 @@ async function sendText($: EngineInterface, cfg: ServeConfig, text: string): Pro
   }
 }
 
-type StreamFrame = { id?: number; text?: string; out?: boolean; type?: string }
+/** One POST /dialogs/{id}/reaction attempt with the current cookie. */
+function postReaction(
+  $: EngineInterface,
+  cfg: ServeConfig,
+  messageId: number,
+  emoticon: string,
+): Promise<CurlResponse> {
+  return curlOnce(
+    $,
+    [
+      'curl',
+      '-isS',
+      '-X',
+      'POST',
+      '-H',
+      'content-type: application/x-www-form-urlencoded',
+      '-H',
+      'x-tg-messenger-csrf: 1',
+      '-H',
+      `Cookie: ${cookie}`,
+      '--data-binary',
+      '@-',
+      `${cfg.serveUrl}/dialogs/${cfg.dialogId}/reaction`,
+    ],
+    `message_id=${messageId}&emoticon=${encodeURIComponent(emoticon)}&web_client_id=${WEB_CLIENT_ID}`,
+  )
+}
+
+/**
+ * POSTs a reaction. The server remembers (dialog, message, emoticon) under
+ * `web_client_id` and suppresses that frame from the SSE stream opened with
+ * the same `?client_id=` — the echo dedup is server-side, as for a browser
+ * tab. A repeated emoticon toggles the reaction off server-side (no removal
+ * frame), so callers must not append it a second time locally.
+ */
+async function sendReaction(
+  $: EngineInterface,
+  cfg: ServeConfig,
+  messageId: number,
+  emoticon: string,
+): Promise<void> {
+  await ensureLogin($, cfg)
+  let res = await postReaction($, cfg, messageId, emoticon)
+  if (res.status === 401) {
+    forgetCookie()
+    await ensureLogin($, cfg)
+    res = await postReaction($, cfg, messageId, emoticon)
+  }
+  if (res.status !== 204) {
+    const detail = /<div class="error"[^>]*>([\s\S]*?)<\/div>/.exec(res.body)?.[1]
+    throw new Error(detail ? `reaction failed: ${detail}` : `reaction failed (HTTP ${res.status})`)
+  }
+}
+
+/** Attaches one emoticon under its target message, skipping a duplicate. */
+function withReaction(all: TgMessage[], id: number, emoticon: string): TgMessage[] {
+  return all.map(m =>
+    m.id === id && !m.reactions?.includes(emoticon)
+      ? { ...m, reactions: [...(m.reactions ?? []), emoticon] }
+      : m,
+  )
+}
+
+type StreamFrame = {
+  id?: number
+  text?: string
+  out?: boolean
+  type?: string
+  message_id?: number
+  emoticon?: string
+}
 
 // --- media command (#250) -----------------------------------------------------
 
@@ -311,7 +389,9 @@ async function* streamFrames(
       `Cookie: ${cookie}`,
       '-H',
       'Accept: text/event-stream',
-      `${cfg.serveUrl}/stream/${cfg.dialogId}`,
+      // ?client_id= picks the server's echo-suppression bucket: the same one
+      // sendReaction registers our (dialog, message, emoticon) keys under
+      `${cfg.serveUrl}/stream/${cfg.dialogId}?client_id=${WEB_CLIENT_ID}`,
     ],
   })
   let buffer = ''
@@ -370,11 +450,22 @@ async function runStream($: EngineInterface, cfg: ServeConfig): Promise<never> {
       for await (const frame of streamFrames($, cfg)) {
         backoff = 1000 // a live frame proves the link works
         lost = false
-        // typed frames (translation/reaction) and our own echoes are not pane
+        // a reaction lands as an accumulating line UNDER its target message
+        // (the web/TUI convention); our own sends are suppressed server-side
+        if (frame.type === 'reaction') {
+          if (frame.message_id && frame.emoticon) {
+            const mid = frame.message_id
+            const emoticon = frame.emoticon
+            await update($, messages, all => withReaction(all, mid, emoticon))
+          }
+          continue
+        }
+        // other typed frames (translation) and our own echoes are not pane
         // lines — the composer already appended what this mod itself sent
         if (frame.type || frame.out || !frame.text) continue
         const text = frame.text
-        await update($, messages, all => [...all, { text, out: false }].slice(-100) as TgMessage[])
+        const id = frame.id
+        await update($, messages, all => [...all, { id, text, out: false }].slice(-100) as TgMessage[])
       }
     } catch (error) {
       $.ui.log(`tg-messenger: stream error: ${String(error)}`)
@@ -436,6 +527,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
     const list = await read($, messages)
+    const openPalette = await read($, paletteFor)
     // body height of the pane (docked panes are full-height): diff reads e.props.scroll.bodyRows
     const props = (e as { props?: { scroll?: { bodyRows?: number }; bodyColumns?: number } }).props
     const rows = props?.scroll?.bodyRows ?? e.viewport?.rows ?? 20
@@ -459,11 +551,56 @@ export const register: Register = (on, options) => {
           </Button>
         </Box>
         <Box flexDirection="column" flexGrow={1} justifyContent="flex-end" overflow="hidden">
-          {shown.map(m => (
-            <Text dimColor={!m.out} wrap="wrap">
-              {m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`}
-            </Text>
-          ))}
+          {shown.map((m, i) => {
+            const canReact = ready && !m.out && !m.system && m.id != null
+            const react = (emoticon: string) => {
+              const id = m.id as number
+              void update($, paletteFor, () => -1)
+              // a repeat pick would toggle the reaction OFF server-side (with
+              // no removal frame coming back) — the pane has no remove UI, so
+              // an already-shown emoticon is a no-op instead of a divergence
+              if (m.reactions?.includes(emoticon)) return
+              void (async () => {
+                try {
+                  // optimistic attach — the server suppresses our own SSE echo
+                  await sendReaction($, cfg, id, emoticon)
+                  await update($, messages, all => withReaction(all, id, emoticon))
+                } catch (error) {
+                  const message = error instanceof Error ? error.message : String(error)
+                  $.ui.toast(`tg-messenger: ${message}`)
+                }
+              })()
+            }
+            return (
+              <Box flexDirection="column" key={m.id ?? `i${i}`}>
+                <Box gap={1}>
+                  <Text dimColor={!m.out} wrap="wrap">
+                    {m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`}
+                  </Text>
+                  {canReact && (
+                    <Button
+                      plain
+                      onPress={() =>
+                        void update($, paletteFor, open => (open === m.id ? -1 : (m.id as number)))
+                      }
+                    >
+                      🙂
+                    </Button>
+                  )}
+                </Box>
+                {m.reactions?.length ? <Text dimColor>{`  ${m.reactions.join(' ')}`}</Text> : null}
+                {canReact && openPalette === m.id && (
+                  <Box gap={1}>
+                    {REACTION_PRESETS.map(emoji => (
+                      <Button plain key={emoji} onPress={() => react(emoji)}>
+                        {emoji}
+                      </Button>
+                    ))}
+                  </Box>
+                )}
+              </Box>
+            )
+          })}
         </Box>
         <Box flexDirection="column" gap={0}>
           <Text dimColor>{'─'.repeat(Math.max(1, cols))}</Text>
