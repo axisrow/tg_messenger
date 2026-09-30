@@ -14,6 +14,9 @@ import type { TgMessage } from '../types'
 
 const PANE = 'tg'
 
+// typed-but-unsubmitted length: grows the composer clip so wrapped text shows
+let draftLen = 0
+
 const messages = atom(
   { plugin: 'tg-messenger', key: 'messages' } as const,
   [{ text: 'hello world — the bridge lands here', out: false }] as TgMessage[],
@@ -91,13 +94,22 @@ export const register: Register = on => {
         </Box>
         <Box flexDirection="column" gap={0}>
           <Text dimColor>{'─'.repeat(Math.max(1, cols))}</Text>
-          <Box height={1} overflow="hidden">
+          <Box
+            height={Math.min(5, Math.max(1, Math.ceil((draftLen + 1) / Math.max(4, cols - 4))))}
+            overflow="hidden"
+          >
             <Input
             key="composer"
             placeholder="сообщение (уйдёт в никуда)"
             submitLabel="send"
+            onInput={value => {
+              draftLen = value.length
+              $.ui.invalidate('ui.render')
+            }}
             onSubmit={value => {
               const text = value.trim()
+              draftLen = 0
+              $.ui.invalidate('ui.render')
 
               if (text) {
                 void update($, messages, all => [...all, { text, out: true }] as TgMessage[])
