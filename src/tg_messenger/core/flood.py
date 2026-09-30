@@ -62,4 +62,13 @@ async def run_with_flood_wait_retry(
             transient_wait_budget_sec=transient_wait_budget_sec,
         )
     except floodgate.HandledFloodWaitError as exc:
+        # The package logs transient waits at INFO, so an exhausted budget
+        # would otherwise never surface above INFO. Blocking waits are already
+        # warned by the package itself.
+        if is_transient_flood_wait_seconds(exc.info.wait_seconds):
+            logger.warning(
+                "%s: flood-wait budget exhausted, last transient wait %ss",
+                exc.info.operation,
+                exc.info.wait_seconds,
+            )
         raise HandledFloodWaitError(exc.info.operation, exc.info.wait_seconds) from exc
