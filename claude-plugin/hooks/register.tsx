@@ -74,7 +74,7 @@ export const register: Register = on => {
     const shown = list.slice(-50)
 
     return (
-      <Box flexDirection="column" height={rows} gap={1} padding={1}>
+      <Box flexDirection="column" flexGrow={1} height={rows + 2} gap={1} padding={1} paddingBottom={0}>
         <Box gap={2}>
           <Text bold>tg-messenger — hello world (v2)</Text>
           <Button onPress={() => $.ui.toast('pong')}>ping</Button>
@@ -91,7 +91,8 @@ export const register: Register = on => {
         </Box>
         <Box flexDirection="column" gap={0}>
           <Text dimColor>{'─'.repeat(Math.max(1, cols))}</Text>
-          <Input
+          <Box height={1} overflow="hidden">
+            <Input
             key="composer"
             placeholder="сообщение (уйдёт в никуда)"
             submitLabel="send"
@@ -102,7 +103,8 @@ export const register: Register = on => {
                 void update($, messages, all => [...all, { text, out: true }] as TgMessage[])
               }
             }}
-          />
+            />
+          </Box>
         </Box>
       </Box>
     )
