@@ -14,8 +14,7 @@ import type { TgMessage } from '../types'
 
 const PANE = 'tg'
 
-// typed-but-unsubmitted length: grows the composer clip so wrapped text shows
-let draftLen = 0
+const draft = atom({ plugin: 'tg-messenger', key: 'draft' } as const, 0)
 
 const messages = atom(
   { plugin: 'tg-messenger', key: 'messages' } as const,
@@ -77,7 +76,7 @@ export const register: Register = on => {
     const shown = list.slice(-50)
 
     return (
-      <Box flexDirection="column" flexGrow={1} height={rows + 2} gap={1} padding={1} paddingBottom={0}>
+      <Box flexDirection="column" flexGrow={1} gap={1} padding={1} paddingBottom={0}>
         <Box gap={2}>
           <Text bold>tg-messenger — hello world (v2)</Text>
           <Button onPress={() => $.ui.toast('pong')}>ping</Button>
@@ -95,7 +94,7 @@ export const register: Register = on => {
         <Box flexDirection="column" gap={0}>
           <Text dimColor>{'─'.repeat(Math.max(1, cols))}</Text>
           <Box
-            height={Math.min(5, Math.max(1, Math.ceil((draftLen + 1) / Math.max(4, cols - 4))))}
+            height={Math.min(5, Math.max(1, Math.ceil(((await read($, draft)) + 1) / Math.max(4, cols - 4))))}
             overflow="hidden"
           >
             <Input
@@ -103,13 +102,11 @@ export const register: Register = on => {
             placeholder="сообщение (уйдёт в никуда)"
             submitLabel="send"
             onInput={value => {
-              draftLen = value.length
-              $.ui.invalidate('ui.render')
+              void update($, draft, () => value.length)
             }}
             onSubmit={value => {
               const text = value.trim()
-              draftLen = 0
-              $.ui.invalidate('ui.render')
+              void update($, draft, () => 0)
 
               if (text) {
                 void update($, messages, all => [...all, { text, out: true }] as TgMessage[])
