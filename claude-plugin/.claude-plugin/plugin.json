@@ -1,0 +1,9 @@
+{
+  "name": "tg-messenger",
+  "version": "0.1.0",
+  "description": "Telegram inside Claude Code: /tg opens a pane that will host the messenger UI (issue #244).",
+  "author": {
+    "name": "axisrow"
+  },
+  "types": "./types/index.d.ts"
+}
