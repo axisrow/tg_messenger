@@ -3,16 +3,18 @@
 Thin async wrapper over a single Telethon client: dialogs (DM-only by default,
 ``dm_only=False`` for every kind), history, send, media, plus event streams
 fanned out through EventBus (``listen`` private-only, ``listen_all`` every chat).
-All network calls route through the vendored flood-wait retry.
+All network calls route through the flood-wait retry; history reads and outgoing
+writes also pass the proactive telethon-floodgate rate-limit gate first (#252).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -31,6 +33,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.account import CheckUsernameRequest, UpdateUsernameRequest
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
+from telethon_floodgate import TelegramRateLimitGate
 
 from tg_messenger.core.auth import SessionStore, default_session_dir
 from tg_messenger.core.cache import TTLCache
@@ -307,6 +310,7 @@ class StandaloneTelegramClient:
         history_ttl: float = DEFAULT_HISTORY_TTL_SEC,
         send_rate_per_min: float = 20.0,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ):
         # #188 Axis B: fail with the friendly, actionable hint BEFORE Telethon sees
         # empty creds (its own ValueError points at telethon.rtfd.io — useless to a
@@ -342,6 +346,27 @@ class StandaloneTelegramClient:
         self._send_bucket = TokenBucket(
             send_rate_per_min, burst=max(1, int(send_rate_per_min)), clock=clock
         )
+        # #252: proactive per-category pacing (telethon-floodgate) around the
+        # history/send call sites; package defaults — see _gate_acquire.
+        self._gate = TelegramRateLimitGate()
+        self._sleep = sleep
+
+    async def _gate_acquire(self, operation: str) -> None:
+        """Reserve a proactive gate slot (#252); a deferral sleeps out instead of
+        raising — the flood-wait retry stays the hard net. Package defaults;
+        calibrate a category only on a real flood signal (factory playbook).
+        """
+        category = TelegramRateLimitGate.category_for(operation)
+        if category == "send" and not self._send_bucket.enabled:
+            return  # explicit TG_SEND_RATE=0 opts the whole send category out (#25)
+        # try_acquire returning >0 consumed NO slot (package contract): re-acquire
+        # after each sleep until a slot is reserved, or the woken call passes
+        # unrecorded and a binding category admits ~2x max_calls.
+        retry_after = self._gate.try_acquire(self._session_name, category)
+        while retry_after > 0:
+            logger.info("%s: rate-limit gate defers %.1fs", operation, retry_after)
+            await self._sleep(retry_after)
+            retry_after = self._gate.try_acquire(self._session_name, category)
 
     # --- connection ---
     async def connect(self) -> None:
@@ -487,6 +512,7 @@ class StandaloneTelegramClient:
         return list(msgs)
 
     async def _fetch_history(self, peer, limit, offset_id) -> list[Message]:
+        await self._gate_acquire("telegram_stream_messages")
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_history(peer, limit, offset_id), operation="history"
         )
@@ -501,6 +527,7 @@ class StandaloneTelegramClient:
         The persistent message store owns its own cooldown/watermarks. It must not
         build those watermarks from the short-lived UI TTL cache used by ``history``.
         """
+        await self._gate_acquire("telegram_stream_messages")
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_history_since(peer, min_id, limit), operation="history_since"
         )
@@ -520,6 +547,7 @@ class StandaloneTelegramClient:
         NOT cached (a one-off lookup, not a page the UIs re-read); routed through
         ``run_with_flood_wait_retry`` like every other network read.
         """
+        await self._gate_acquire("telegram_stream_messages")
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_search(peer, query, limit), operation="search_messages"
         )
@@ -538,6 +566,7 @@ class StandaloneTelegramClient:
     ) -> Message:
         """Send ``text`` to ``peer``; ``schedule`` (a delay or absolute time) defers it server-side."""
         await self._send_bucket.acquire()  # global outgoing cap (#25), before the retry loop
+        await self._gate_acquire("telegram_send_message")
         try:
             msg = await run_with_flood_wait_retry(
                 lambda: self._client.send_message(peer, text, reply_to=reply_to, schedule=schedule),
@@ -555,6 +584,7 @@ class StandaloneTelegramClient:
         Telegram's own behaviour, and the destination gains the new messages).
         """
         await self._send_bucket.acquire()  # global outgoing cap (#25)
+        await self._gate_acquire("telegram_forward_messages")
         sent = await run_with_flood_wait_retry(
             lambda: self._client.forward_messages(to_peer, message_ids, from_peer),
             operation="forward",
@@ -573,6 +603,7 @@ class StandaloneTelegramClient:
         return [self._to_message(m, dialog_id=int(to_peer)) for m in raw_sent if m is not None]
 
     async def edit_text(self, peer: int, message_id: int, text: str) -> Message:
+        await self._gate_acquire("telegram_edit_message")
         msg = await run_with_flood_wait_retry(
             lambda: self._client.edit_message(peer, int(message_id), text),
             operation="edit_text",
@@ -747,6 +778,7 @@ class StandaloneTelegramClient:
         if not path.is_file():
             raise ValueError(f"file not found: {file_path}")
         await self._send_bucket.acquire()  # global outgoing cap (#25), after the cheap path check
+        await self._gate_acquire("telegram_send_message")
         try:
             msg = await run_with_flood_wait_retry(
                 lambda: self._client.send_file(
