@@ -1,0 +1,11 @@
+{
+  "name": "tg-messenger",
+  "description": "tg-messenger: Telegram inside Claude Code (pane mod)",
+  "owner": { "name": "axisrow" },
+  "plugins": [
+    {
+      "name": "tg-messenger",
+      "source": "./claude-plugin"
+    }
+  ]
+}
