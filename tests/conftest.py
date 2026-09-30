@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 
 import pytest
 from telethon import events as _tg_events
+from telethon.errors import FloodWaitError
+from telethon.tl.functions.messages import GetMessagesRequest
 
 
 def _builder_matches(builder, event) -> bool:
@@ -49,20 +51,24 @@ def _builder_matches(builder, event) -> bool:
     return True
 
 
-class FakeFloodWaitError(Exception):
-    """Mimics telethon.errors.FloodWaitError (.seconds attribute)."""
-
-    def __init__(self, seconds):
-        super().__init__(f"flood {seconds}s")
-        self.seconds = seconds
+def flood_wait_error(seconds) -> FloodWaitError:
+    """Exercise the real shared package handler, not a module-local patched type."""
+    return FloodWaitError(request=None, capture=seconds)
 
 
-def patch_flood_error(monkeypatch) -> type[FakeFloodWaitError]:
-    """Point core.flood at the fake FloodWaitError; returns the class to raise."""
-    import tg_messenger.core.flood as flood
+class FakeMessagesIterator:
+    """Telethon-shaped one-page iterator; its client is the page RPC seam."""
 
-    monkeypatch.setattr(flood, "FloodWaitError", FakeFloodWaitError)
-    return FakeFloodWaitError
+    def __init__(self, items):
+        self._items = items
+        self.client = self._fetch
+
+    async def _fetch(self, request):
+        return self._items
+
+    async def __aiter__(self):
+        for message in await self.client(GetMessagesRequest([m.id for m in self._items])):
+            yield message
 
 
 class FakeUser:
@@ -370,11 +376,7 @@ class FakeTelethonClient:
                 items = [m for m in items if m.id > int(min_id)]
             items = items[:limit]
 
-        async def gen():
-            for m in items:
-                yield m
-
-        return gen()
+        return FakeMessagesIterator(items)
 
     async def get_entity(self, peer):
         for d in self.dialogs:

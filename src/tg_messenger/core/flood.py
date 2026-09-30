@@ -1,26 +1,24 @@
-"""FloodWait handling for the single-account client.
-
-Constants and classification helpers come from the shared telethon-floodgate
-package (#252) instead of being vendored here. The retry loop stays local: it
-must raise THIS app's ``HandledFloodWaitError`` shape (``.operation`` /
-``.wait_seconds`` / ``.user_message``) and must keep catching the
-``FloodWaitError`` referenced in this module (tests patch it here).
-"""
+"""Compatibility surface for the shared telethon-floodgate retry policy."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
-from telethon.errors import FloodWaitError
+import telethon_floodgate as floodgate
 from telethon_floodgate import (
-    FLOOD_WAIT_RETRY_BUFFER_SEC,
+    FLOOD_WAIT_RETRY_BUFFER_SEC as FLOOD_WAIT_RETRY_BUFFER_SEC,
+)
+from telethon_floodgate import (
     TRANSIENT_FLOOD_WAIT_MAX_SEC,
     TRANSIENT_FLOOD_WAIT_RETRY_BUDGET_SEC,
-    coerce_flood_wait_seconds,
-    is_transient_flood_wait_seconds,
+)
+from telethon_floodgate import (
+    coerce_flood_wait_seconds as coerce_flood_wait_seconds,
+)
+from telethon_floodgate import (
+    is_transient_flood_wait_seconds as is_transient_flood_wait_seconds,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,20 +53,13 @@ async def run_with_flood_wait_retry(
     Non-transient FloodWaits (or budget exhaustion) raise ``HandledFloodWaitError``.
     Any other exception propagates unchanged.
     """
-    active_logger = logger_ or logger
-    waited_seconds = 0
-    while True:
-        try:
-            return await awaitable_factory()
-        except FloodWaitError as exc:
-            wait_seconds = coerce_flood_wait_seconds(getattr(exc, "seconds", 0))
-            if not is_transient_flood_wait_seconds(wait_seconds, max_seconds=transient_wait_max_sec):
-                active_logger.warning("%s: blocking flood wait %ss", operation, wait_seconds)
-                raise HandledFloodWaitError(operation, wait_seconds) from exc
-            if waited_seconds + wait_seconds > transient_wait_budget_sec:
-                active_logger.warning("%s: flood-wait budget exhausted", operation)
-                raise HandledFloodWaitError(operation, wait_seconds) from exc
-            sleep_for = float(wait_seconds) + FLOOD_WAIT_RETRY_BUFFER_SEC
-            active_logger.info("%s: transient flood wait %.1fs, retrying", operation, sleep_for)
-            await asyncio.sleep(sleep_for)
-            waited_seconds += wait_seconds
+    try:
+        return await floodgate.run_with_flood_wait_retry(
+            awaitable_factory,
+            operation=operation,
+            logger_=logger_ or logger,
+            transient_wait_max_sec=transient_wait_max_sec,
+            transient_wait_budget_sec=transient_wait_budget_sec,
+        )
+    except floodgate.HandledFloodWaitError as exc:
+        raise HandledFloodWaitError(exc.info.operation, exc.info.wait_seconds) from exc

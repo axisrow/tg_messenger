@@ -1,17 +1,12 @@
 import pytest
+import telethon_floodgate
 
-from tests.conftest import FakeFloodWaitError, patch_flood_error
+from tests.conftest import flood_wait_error
 from tg_messenger.core.flood import (
     HandledFloodWaitError,
     is_transient_flood_wait_seconds,
     run_with_flood_wait_retry,
 )
-
-
-@pytest.fixture(autouse=True)
-def _patch_flood_error(monkeypatch):
-    # core.flood catches telethon's FloodWaitError; point it at our fake.
-    patch_flood_error(monkeypatch)
 
 
 def test_transient_classification():
@@ -29,7 +24,7 @@ async def test_returns_result_without_error():
 
 
 async def test_retries_transient_then_succeeds(monkeypatch):
-    import tg_messenger.core.flood as flood
+    import telethon_floodgate.flood_wait as flood
 
     slept = []
 
@@ -43,7 +38,7 @@ async def test_retries_transient_then_succeeds(monkeypatch):
     async def flaky():
         calls["n"] += 1
         if calls["n"] == 1:
-            raise FakeFloodWaitError(2)
+            raise flood_wait_error(2)
         return "ok"
 
     result = await run_with_flood_wait_retry(flaky, operation="t")
@@ -54,7 +49,7 @@ async def test_retries_transient_then_succeeds(monkeypatch):
 
 async def test_non_transient_raises_handled():
     async def big_flood():
-        raise FakeFloodWaitError(9999)
+        raise flood_wait_error(9999)
 
     with pytest.raises(HandledFloodWaitError) as exc:
         await run_with_flood_wait_retry(big_flood, operation="t")
@@ -67,3 +62,54 @@ async def test_non_flood_error_propagates():
 
     with pytest.raises(ValueError):
         await run_with_flood_wait_retry(boom, operation="t")
+
+
+@pytest.mark.parametrize(
+    "wait,budget,calls,sleeps",
+    [(60, 120, 3, [61.0, 61.0]), (61, 120, 1, []), (2, 1, 1, []), (0, 2, 3, [2.0, 2.0])],
+)
+async def test_packaged_retry_boundaries_preserve_error_contract(monkeypatch, wait, budget, calls, sleeps):
+    import telethon_floodgate.flood_wait as flood
+
+    attempts = 0
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    async def fail():
+        nonlocal attempts
+        attempts += 1
+        raise flood_wait_error(wait)
+
+    monkeypatch.setattr(flood.asyncio, "sleep", sleep)
+    with pytest.raises(HandledFloodWaitError) as caught:
+        await run_with_flood_wait_retry(fail, operation="history", transient_wait_budget_sec=budget)
+    assert attempts == calls
+    assert slept == sleeps
+    assert caught.value.operation == "history"
+    assert caught.value.wait_seconds == max(1, wait)
+    assert caught.value.user_message == f"Telegram flood wait {max(1, wait)}s — try again later."
+    assert isinstance(caught.value.__cause__, telethon_floodgate.HandledFloodWaitError)
+
+
+async def test_adapter_delegates_policy_and_logger_to_package(monkeypatch):
+    import logging
+    from unittest.mock import AsyncMock
+
+    retry = AsyncMock(return_value="delegated")
+    factory = AsyncMock()
+    logger = logging.getLogger("custom")
+    monkeypatch.setattr(telethon_floodgate, "run_with_flood_wait_retry", retry)
+    assert await run_with_flood_wait_retry(
+        factory, operation="op", logger_=logger, transient_wait_max_sec=7, transient_wait_budget_sec=9,
+    ) == "delegated"
+    retry.assert_awaited_once_with(
+        factory, operation="op", logger_=logger, transient_wait_max_sec=7, transient_wait_budget_sec=9,
+    )
+
+
+def test_token_bucket_is_only_a_compatibility_import():
+    from tg_messenger.core.ratelimit import TokenBucket
+
+    assert TokenBucket is telethon_floodgate.TokenBucket
