@@ -120,9 +120,9 @@ async function ensureLogin($: EngineInterface, cfg: ServeConfig): Promise<void> 
  * the sent-bubble fragment; anything else (error fragment, a redirect to the
  * login wizard when the Telegram session itself is logged out) throws.
  */
-async function sendText($: EngineInterface, cfg: ServeConfig, text: string): Promise<void> {
-  await ensureLogin($, cfg)
-  const res = await curlOnce(
+/** One POST /send attempt with the current cookie. */
+function postSend($: EngineInterface, cfg: ServeConfig, text: string): Promise<CurlResponse> {
+  return curlOnce(
     $,
     [
       'curl',
@@ -141,8 +141,29 @@ async function sendText($: EngineInterface, cfg: ServeConfig, text: string): Pro
     ],
     `dialog_id=${encodeURIComponent(cfg.dialogId)}&text=${encodeURIComponent(text)}`,
   )
+}
+
+/**
+ * POSTs the outgoing message to /send (form dialog_id+text, the server's
+ * same-origin header, cookie). Resolves only after the server answered with
+ * the sent-bubble fragment; anything else (error fragment, a redirect to the
+ * login wizard when the Telegram session itself is logged out) throws.
+ */
+async function sendText($: EngineInterface, cfg: ServeConfig, text: string): Promise<void> {
+  await ensureLogin($, cfg)
+  let res = await postSend($, cfg, text)
+  if (res.status === 401) {
+    // a serve restart regenerates its cookie key — the kept cookie is dead:
+    // re-login once and retry before giving up
+    forgetCookie()
+    await ensureLogin($, cfg)
+    res = await postSend($, cfg, text)
+  }
   if (res.status !== 200 || !res.body.startsWith('<div class="msg ')) {
-    throw new Error(`send failed (HTTP ${res.status})`)
+    // the server's error fragment text ("Select a dialog first.", read-only
+    // chat, …) beats a bare status in the toast
+    const detail = /<div class="error"[^>]*>([\s\S]*?)<\/div>/.exec(res.body)?.[1]
+    throw new Error(detail ? `send failed: ${detail}` : `send failed (HTTP ${res.status})`)
   }
 }
 
@@ -204,21 +225,23 @@ async function* streamFrames(
 
 // --- pane --------------------------------------------------------------------
 
-// one live SSE subscription per activation: starting a new one invalidates the
-// previous loop, which exits (and kills its curl child) at the next check
-let streamRun = 0
+// one live SSE subscription per activation: pane reopen and session re-seat
+// reuse it instead of stacking another curl child on a quiet dialog
+let streamAlive = false
 
 const startStream = ($: EngineInterface, cfg: ServeConfig) => {
-  const run = ++streamRun
+  if (streamAlive) return
+  streamAlive = true
   void (async () => {
     let backoff = 1000
-    while (streamRun === run) {
+    let lost = false // the panel line is on state change, not every retry
+    while (true) {
       try {
         // a fresh login per attempt: a serve restart invalidates its cookies
         forgetCookie()
         for await (const frame of streamFrames($, cfg)) {
-          if (streamRun !== run) return // a newer subscription replaced this one
           backoff = 1000 // a live frame proves the link works
+          lost = false
           // typed frames (translation/reaction) and our own echoes are not pane
           // lines — the composer already appended what this mod itself sent
           if (frame.type || frame.out || !frame.text) continue
@@ -227,12 +250,21 @@ const startStream = ($: EngineInterface, cfg: ServeConfig) => {
         }
       } catch (error) {
         $.ui.log(`tg-messenger: stream error: ${String(error)}`)
+        if (!lost) {
+          lost = true
+          const message = error instanceof Error ? error.message : String(error)
+          await update($, messages, all =>
+            [...all, { text: `bridge error: ${message}`, out: false, system: true }].slice(-100) as TgMessage[],
+          )
+        }
       }
-      if (streamRun !== run) return
-      const wait = Math.round(backoff / 1000)
-      await update($, messages, all =>
-        [...all, { text: `stream lost — retrying in ${wait} s`, out: false, system: true }].slice(-100) as TgMessage[],
-      )
+      if (!lost) {
+        lost = true
+        const wait = Math.round(backoff / 1000)
+        await update($, messages, all =>
+          [...all, { text: `stream lost — retrying in ${wait} s`, out: false, system: true }].slice(-100) as TgMessage[],
+        )
+      }
       await $.clock.sleep(backoff)
       backoff = Math.min(backoff * 2, 30000)
     }
