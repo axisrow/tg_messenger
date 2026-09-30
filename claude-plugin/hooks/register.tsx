@@ -245,7 +245,9 @@ function postMedia(
     `Cookie: ${cookie}`,
     '-F',
     `file=@${path}`,
-    ...(caption ? ['-F', `caption=${caption}`] : []),
+    // --form-string: the caption is literal text — `-F caption=@x` would attach
+    // a local file's contents, `<x` read one, `;x` truncate at it
+    ...(caption ? ['--form-string', `caption=${caption}`] : []),
     `${cfg.serveUrl}/dialogs/${cfg.dialogId}/media`,
   ])
 }
@@ -480,6 +482,9 @@ export const register: Register = (on, options) => {
                 try {
                   if (media) await sendMedia($, cfg, media.path, media.caption)
                   else await sendText($, cfg, text)
+                  // #256: the restored text was resubmitted unchanged (no
+                  // onInput fired) — the restore is consumed, don't re-draw it
+                  void update($, pendingSend, () => '')
                   const shown = media ? `@${media.path}` : text
                   await update($, messages, all => [...all, { text: shown, out: true }].slice(-100) as TgMessage[])
                 } catch (error) {
