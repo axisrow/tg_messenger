@@ -1,4 +1,4 @@
-export type TgMessage = { text: string; out: boolean }
+export type TgMessage = { text: string; out: boolean; system?: boolean }
 
 declare module 'claude-code' {
   interface PluginState {
