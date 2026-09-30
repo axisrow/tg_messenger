@@ -19,10 +19,10 @@
       "description": "TG_WEB_PASS of that serve instance",
       "sensitive": true
     },
-    "dialogId": {
+    "dialog": {
       "type": "string",
-      "title": "Dialog id",
-      "description": "Numeric Telegram dialog id the pane reads and writes",
+      "title": "Dialog",
+      "description": "Dialog the pane reads and writes: numeric Telegram dialog id (negative for groups). @usernames are not resolvable in v1 yet.",
       "default": ""
     }
   }

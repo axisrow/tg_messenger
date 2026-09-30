@@ -4,11 +4,11 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { TgMessage } from '../types'
 
 /**
- * tg-messenger mod — pane with a real serve transport (issues #246, #247).
+ * tg-messenger mod — pane with a real serve transport (issues #246, #247, #248).
  *
  * `/tg` opens a bottom pane (the cc-arcade kind): `$.ui.open` asks for it,
  * a `ui.render` hook on `{component: 'Pane', requestId}` draws it with JSX.
- * With `serveUrl`/`webPass`/`dialogId` configured the composer POSTs to
+ * With `serveUrl`/`webPass`/`dialog` (a numeric dialog id) configured the composer POSTs to
  * `tg-messenger serve` (`/login` → HMAC cookie, `POST /send`) and the pane
  * follows the dialog's SSE stream; without them it degrades to the old
  * local-only append with a one-line toast.
@@ -36,27 +36,35 @@ const messages = atom(
 type ServeConfig = { serveUrl: string; webPass: string; dialogId: string }
 
 /**
- * Reads the `userConfig` options. `ready: false` → the mod stays in degraded
- * no-op mode; `reason` names the missing/invalid field for the one-line toast.
+ * Reads the `userConfig` options (#248). `dialog` is a marked numeric id
+ * (negative for groups); `@username` needs a resolve endpoint serve does not
+ * expose yet, so v1 is id-only — a username is rejected up front, never
+ * resolved per message (flood discipline). `ready: false` → the mod stays in
+ * the dead-safe no-send mode; `reason` is the full one-line explanation.
  */
 function readConfig(options: Readonly<Record<string, unknown>>): {
   cfg: ServeConfig
   ready: boolean
   reason: string
+  target: string
 } {
   const pick = (name: string): string =>
     typeof options[name] === 'string' ? (options[name] as string).trim() : ''
   const serveUrl = pick('serveUrl').replace(/\/+$/, '')
   const webPass = pick('webPass')
-  const dialogId = pick('dialogId')
-  const missing = !serveUrl
-    ? 'serveUrl'
-    : !webPass
-      ? 'webPass'
-      : !/^-?\d+$/.test(dialogId)
-        ? 'dialogId'
-        : ''
-  return { cfg: { serveUrl, webPass, dialogId }, ready: missing === '', reason: missing }
+  // `dialogId` is the pre-#248 spelling — honor it if the new option is unset
+  const target = pick('dialog') || pick('dialogId')
+  let dialogId = ''
+  let problem = ''
+  if (!target) problem = 'dialog not set — claude plugin configure tg-messenger'
+  else if (/^-?\d+$/.test(target)) dialogId = target
+  else if (target.startsWith('@'))
+    problem = `cannot resolve ${target} in v1 — set the numeric dialog id`
+  else problem = `invalid dialog "${target}" — expected a numeric dialog id`
+  const missing = !serveUrl ? 'serveUrl' : !webPass ? 'webPass' : ''
+  const ready = missing === '' && problem === ''
+  const reason = missing ? `${missing} not configured` : problem
+  return { cfg: { serveUrl, webPass, dialogId }, ready, reason, target }
 }
 
 // HMAC cookie of the current serve session ("tg_session=…"). Module state: per
@@ -276,7 +284,14 @@ async function runStream($: EngineInterface, cfg: ServeConfig): Promise<never> {
 }
 
 export const register: Register = (on, options) => {
-  const { cfg, ready, reason } = readConfig(options)
+  const { cfg, ready, reason, target } = readConfig(options)
+
+  /** Opens the pane; a set-but-unusable dialog gets its toast right here (#248). */
+  const openPane = ($: EngineInterface) => {
+    void $.ui.open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
+    if (!ready && target) $.ui.toast(`tg-messenger: ${reason}`)
+    if (ready) startStream($, cfg)
+  }
 
   on('session.start', async ($, e, next) => {
     try {
@@ -292,17 +307,13 @@ export const register: Register = (on, options) => {
     // hot reload: a pane left open keeps the previous drawing — re-seat it
     const panes = await $.ui.panes().catch(() => [])
 
-    if (panes.some(p => p.id === PANE)) {
-      void $.ui.open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
-      if (ready) startStream($, cfg)
-    }
+    if (panes.some(p => p.id === PANE)) openPane($)
 
     return next(e)
   })
 
   on('command.run', { command: 'tg' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
-    if (ready) startStream($, cfg)
+    openPane($)
 
     return { text: 'tg-messenger: pane opened below the prompt.' }
   })
@@ -320,6 +331,14 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column" flexGrow={1} gap={1} padding={1} paddingBottom={0}>
         <Box gap={2}>
           <Text bold>tg-messenger</Text>
+          {ready ? (
+            <Text>— {target}</Text>
+          ) : target ? (
+            // rejected (@username/malformed): dim so it never reads as a live dialog
+            <Text dimColor>— {target} (invalid — not sending)</Text>
+          ) : (
+            <Text dimColor>— set the dialog: claude plugin configure tg-messenger</Text>
+          )}
           <Button role="dismiss" onPress={() => $.ui.close({ id: PANE })}>
             close
           </Button>
@@ -352,7 +371,7 @@ export const register: Register = (on, options) => {
 
               if (!ready) {
                 // degraded, not broken: keep the local append, just say it went nowhere
-                $.ui.toast(`tg-messenger: ${reason} not configured — not sent`)
+                $.ui.toast(`tg-messenger: not sent — ${reason}`)
                 void update($, messages, all => [...all, { text, out: true }].slice(-100) as TgMessage[])
                 return
               }
