@@ -489,15 +489,19 @@ async function runStream($: EngineInterface, cfg: ServeConfig): Promise<never> {
   }
 }
 
+/**
+ * Opens the pane; a set-but-unusable dialog gets its toast right here (#248).
+ * Top-level declaration: the engine's static checks only let `$` be passed to
+ * functions declared at the top of the file.
+ */
+function openPane($: EngineInterface, cfg: ServeConfig, ready: boolean, reason: string, target: string) {
+  void $.ui.open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
+  if (!ready && target) $.ui.toast(`tg-messenger: ${reason}`)
+  if (ready) startStream($, cfg)
+}
+
 export const register: Register = (on, options) => {
   const { cfg, ready, reason, target } = readConfig(options)
-
-  /** Opens the pane; a set-but-unusable dialog gets its toast right here (#248). */
-  const openPane = ($: EngineInterface) => {
-    void $.ui.open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
-    if (!ready && target) $.ui.toast(`tg-messenger: ${reason}`)
-    if (ready) startStream($, cfg)
-  }
 
   on('session.start', async ($, e, next) => {
     try {
@@ -513,13 +517,13 @@ export const register: Register = (on, options) => {
     // hot reload: a pane left open keeps the previous drawing — re-seat it
     const panes = await $.ui.panes().catch(() => [])
 
-    if (panes.some(p => p.id === PANE)) openPane($)
+    if (panes.some(p => p.id === PANE)) openPane($, cfg, ready, reason, target)
 
     return next(e)
   })
 
   on('command.run', { command: 'tg' }, async $ => {
-    openPane($)
+    openPane($, cfg, ready, reason, target)
 
     return { text: 'tg-messenger: pane opened below the prompt.' }
   })
