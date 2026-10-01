@@ -159,7 +159,15 @@ scripts/e2e/04_guided_events.sh
 - `watch`: start the watcher, then perform a throwaway group deletion scenario
   that produces a Saved Messages backup.
 
-### Dangerous parity: `99_dangerous_parity.sh`
+### Claude Code mod: `05_claude_mod.md`
+
+Manual real-account acceptance of the `/tg` pane mod (`claude-plugin/`,
+epic #244): serve + plugin configured, a real incoming message in the pane,
+a reply that reaches Telegram, and secret hygiene. Human-run against the
+authorized test account, Saved Messages only. See the file for the checklist,
+parity stubs and the results template.
+
+## Dangerous parity: `99_dangerous_parity.sh`
 
 Dangerous scenarios are documented for parity only and intentionally not
 automated. This script is never run by `run_safe.sh`, and it does not call

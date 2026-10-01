@@ -2400,3 +2400,21 @@ def test_valid_creds_do_not_trigger_the_guard(monkeypatch):
 
     assert captured["api_id"] == 123
     assert captured["api_hash"] == "realhash"
+
+
+def test_tg_proxy_env_parsing(monkeypatch):
+    parse = client_module._proxy_from_env
+    monkeypatch.delenv("TG_PROXY", raising=False)
+    assert parse() is None
+    monkeypatch.setenv("TG_PROXY", "socks5://tg:secret@127.0.0.1:1080")
+    assert parse() == dict(
+        proxy_type="SOCKS5", addr="127.0.0.1", port=1080, username="tg", password="secret"
+    )
+    monkeypatch.setenv("TG_PROXY", "127.0.0.1:1080")  # schemeless → socks5 implied
+    assert parse() == dict(proxy_type="SOCKS5", addr="127.0.0.1", port=1080)
+    monkeypatch.setenv("TG_PROXY", "http://127.0.0.1:8118")
+    with pytest.raises(ValueError, match="socks5"):
+        parse()
+    monkeypatch.setenv("TG_PROXY", "socks5://noport")
+    with pytest.raises(ValueError, match="host:port"):
+        parse()
