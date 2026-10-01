@@ -372,6 +372,9 @@ async def test_worker_fail_task_report_failure_does_not_stop_next_task(caplog):
     await worker.process_once()
 
     assert worker._client.sent == [(8, "y")]
+    # the queued failure report for bad-report is replayed BEFORE the new claim
+    assert factory.failed == [("bad-report", factory.failed[0][1])]
+    assert "send blew up" in factory.failed[0][1]
     assert factory.completed == [("good", {"sent": 12345})]
 
 
@@ -403,7 +406,119 @@ async def test_worker_complete_task_report_failure_does_not_stop_next_task(caplo
     await worker.process_once()
 
     assert client.sent == [(7, "x"), (8, "y")]
-    assert factory.completed == [("good", {"sent": 12345})]
+    # the queued completion for bad-report is replayed BEFORE the new claim
+    assert factory.completed == [
+        ("bad-report", {"sent": 12345}),
+        ("good", {"sent": 12345}),
+    ]
+
+
+# --- #228: report durability + retry safety ---
+
+
+async def test_worker_report_queue_survives_worker_restart(tmp_path):
+    """A lost completion report is persisted on disk and replayed by a NEW worker."""
+    factory = StubFactory(complete_raises=True)
+    client = StubCoreClient()
+    factory.enqueue({
+        "id": "t1", "type": "dm_reply",
+        "payload": {"v": 1, "peer": 7, "text": "x"}, "status": "claimed",
+        "result_payload": None,
+    })
+    reports_path = tmp_path / "reports.json"
+    worker = _make_worker(factory, client, reports_path=reports_path)
+    await worker.process_once()
+    assert factory.completed == []  # report failed, must be on disk
+
+    factory.complete_raises = False
+    fresh_worker = _make_worker(factory, StubCoreClient(), reports_path=reports_path)
+    handled = await fresh_worker.process_once()
+
+    assert handled is False  # nothing left to claim — the step went to the replay
+    assert factory.completed == [("t1", {"sent": 12345})]
+    assert fresh_worker._reports.items == []  # acked after a successful replay
+
+
+async def test_worker_conflicting_report_is_dropped_not_stuck():
+    """409 from a replay means the other outcome won; the queue must not wedge."""
+
+    class ConflictingFactory(StubFactory):
+        async def fail_task(self, task_id, error):
+            self.failed.append((task_id, error))
+            if task_id == "t1":
+                from tg_messenger.interop.factory_client import FactoryError
+
+                raise FactoryError("conflict", status_code=409)
+
+    factory = ConflictingFactory()
+    factory.enqueue({
+        "id": "t1", "type": "dm_reply",
+        "payload": {"v": 1, "peer": 7, "text": "x"}, "status": "claimed",
+        "result_payload": None,
+    })
+    worker = _make_worker(factory, StubCoreClient(send_raises=True))
+    await worker.process_once()  # send fails → fail report fails → queued
+    assert worker._reports.items
+
+    await worker.process_once()  # replay hits 409 → dropped, then claims nothing
+    assert worker._reports.items == []
+
+
+def test_report_queue_corrupt_file_is_quarantined(tmp_path):
+    from tg_messenger.interop.worker import ReportQueue
+
+    path = tmp_path / "reports.json"
+    path.write_text("{not json", "utf-8")
+    queue = ReportQueue(path)
+
+    assert queue.items == []
+    assert path.with_suffix(path.suffix + ".corrupt").exists()
+
+
+async def test_create_task_does_not_retry_ambiguous_read_error():
+    """POST + lost response after the server got it: never blindly retried (#228)."""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        raise httpx.ReadError("response lost", request=request)
+
+    async with make_client(handler) as fc:
+        with pytest.raises(FactoryError):
+            await fc.create_task("dm_reply", {"peer": 7})
+    assert attempts["n"] == 1
+
+
+async def test_create_task_sends_idempotency_key():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        seen["body"] = _json.loads(request.content)
+        return httpx.Response(200, json={"id": "task-1"})
+
+    async with make_client(handler) as fc:
+        await fc.create_task("dm_reply", {"peer": 7})
+
+    key = seen["body"]["idempotency_key"]
+    assert isinstance(key, str) and 1 <= len(key) <= 255
+
+
+async def test_get_task_retries_ambiguous_read_error():
+    """GET is idempotent — ambiguous transport errors are still retried."""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            raise httpx.ReadError("response lost", request=request)
+        return httpx.Response(200, json={"id": "t1", "status": "pending"})
+
+    async with make_client(handler) as fc:
+        task = await fc.get_task("t1")
+    assert attempts["n"] == 2
+    assert task["status"] == "pending"
 
 
 # --- цикл 108: fetch_history / fetch_dialogs ---

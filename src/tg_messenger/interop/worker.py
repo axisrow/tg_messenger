@@ -14,12 +14,23 @@ Executors map a task ``type`` to core-client work:
 
 ``process_once()`` runs a single claim→execute→report step (no loop) so tests
 drive it directly; ``run()`` is the production loop with an idle ``sleep``.
+
+Report durability (#228): a Telegram send is irreversible, so its completion/
+failure report must never be lost. Failed reports go to a durable on-disk
+queue (``reports_path``; in-memory when None) and are flushed at the start of
+every ``process_once()`` — before any new claim — until the factory acks them.
+The factory treats an identical replay of a terminal report as success and a
+conflicting one as 409 (dropped: the other outcome already won).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
+from pathlib import Path
+
+from tg_messenger.interop.factory_client import FactoryError
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +38,49 @@ DEFAULT_TYPES = ["dm_reply", "chat_answer"]
 IDLE_SLEEP = 5.0  # seconds between empty polls
 
 _SleepFn = Callable[[float], Awaitable[None]]
+
+
+class ReportQueue:
+    """Durable list of unacknowledged reports; JSON-file-backed when given a path.
+
+    Item shape: ``{"kind": "complete", "task_id": ..., "result_payload": ...}`` or
+    ``{"kind": "fail", "task_id": ..., "error": ...}`` — exactly what the factory
+    methods take, so a flush replays the original report byte-for-byte.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._path = path
+        self.items: list[dict] = []
+        if path is None:
+            return
+        try:
+            self.items = json.loads(path.read_text("utf-8"))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            # don't let one corrupt file wedge the worker; keep it for forensics
+            logger.exception("report queue %s is unreadable — starting empty", path)
+            corrupt = path.with_suffix(path.suffix + ".corrupt")
+            try:
+                path.replace(corrupt)
+            except OSError:
+                logger.exception("could not move corrupt report queue aside")
+
+    def add(self, item: dict) -> None:
+        self.items.append(item)
+        self._save()
+
+    def ack(self) -> None:
+        self.items.pop(0)
+        self._save()
+
+    def _save(self) -> None:
+        if self._path is None:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.items, ensure_ascii=False), "utf-8")
+        tmp.replace(self._path)
 
 
 async def _default_sleep(seconds: float) -> None:
@@ -51,6 +105,7 @@ class Worker:
         agent=None,
         sleep: _SleepFn | None = None,
         idle_sleep: float = IDLE_SLEEP,
+        reports_path: Path | str | None = None,
     ) -> None:
         self._client = client
         self._factory = factory
@@ -58,16 +113,24 @@ class Worker:
         self._agent = agent
         self._sleep = sleep or _default_sleep
         self._idle_sleep = idle_sleep
+        self._reports = ReportQueue(Path(reports_path) if reports_path is not None else None)
 
     async def run(self) -> None:
         """Forever: claim → execute → report; idle-sleep when the queue is empty."""
         while True:
-            handled = await self.process_once()
+            try:
+                handled = await self.process_once()
+            except Exception:
+                # a dead poll (factory unreachable, ...) must not kill the loop;
+                # pending reports survive in the queue and retry next round
+                logger.exception("worker: poll step failed")
+                handled = False
             if not handled:
                 await self._sleep(self._idle_sleep)
 
     async def process_once(self) -> bool:
         """One step. Returns True if a task was claimed (success OR handled failure)."""
+        await self._flush_reports()
         task = await self._factory.claim_next(self._types)
         if task is None:
             return False
@@ -81,17 +144,49 @@ class Worker:
         await self._safe_complete_task(task_id, result)
         return True
 
+    async def _flush_reports(self) -> None:
+        """Replay queued reports oldest-first until acked; stop on the first failure.
+
+        A 409 means a conflicting report already won on the factory side — the
+        replay can never succeed, so it is dropped (with a loud log) instead of
+        blocking the queue forever.
+        """
+        while self._reports.items:
+            item = self._reports.items[0]
+            try:
+                if item["kind"] == "complete":
+                    await self._factory.complete_task(item["task_id"], item["result_payload"])
+                else:
+                    await self._factory.fail_task(item["task_id"], item["error"])
+            except FactoryError as exc:
+                if exc.status_code == 409:
+                    logger.error(
+                        "worker: report for task %s conflicts with the factory state"
+                        " (another outcome won) — dropping",
+                        item["task_id"],
+                    )
+                    self._reports.ack()
+                    continue
+                break
+            except Exception:
+                logger.exception("worker: report replay for task %s failed", item["task_id"])
+                break
+            else:
+                self._reports.ack()
+
     async def _safe_complete_task(self, task_id: str, result: dict) -> None:
         try:
             await self._factory.complete_task(task_id, result)
         except Exception:
             logger.exception("worker: failed to report task %s completion", task_id)
+            self._reports.add({"kind": "complete", "task_id": task_id, "result_payload": result})
 
     async def _safe_fail_task(self, task_id: str, error: str) -> None:
         try:
             await self._factory.fail_task(task_id, error)
         except Exception:
             logger.exception("worker: failed to report task %s failure", task_id)
+            self._reports.add({"kind": "fail", "task_id": task_id, "error": error})
 
     async def _execute(self, task: dict) -> dict:
         task_type = task.get("type")

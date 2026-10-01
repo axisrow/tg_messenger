@@ -5,16 +5,20 @@ shared password (``httpx.BasicAuth("", password)``). It's a mock contract — th
 factory side adjusts to match in its companion issue. A 401 surfaces as a clear
 ``FactoryError`` (never a bare httpx exception).
 
-Resilience: transient network errors (``httpx.TransportError`` — ConnectError,
-ReadTimeout, ...) are retried up to ``MAX_ATTEMPTS`` with a simple linear backoff
-through an INJECTED ``sleep`` (tests pass a no-op — time never really passes).
-HTTP 4xx/5xx responses are NOT network errors: they go straight up as
-``FactoryError`` without retries.
+Resilience (#228): only errors where the request is KNOWN never to have reached
+the factory are retried — ``httpx.ConnectError`` — plus ambiguous read errors
+(ReadError/ReadTimeout/...) for idempotent GETs. Ambiguous errors on POSTs are
+NOT retried blindly: the server may have committed the operation while the
+response was lost, so a retry could duplicate a task creation or claim an
+extra task. POST /tasks carries a client-generated ``idempotency_key`` so a
+caller-level retry dedupes on the factory side. HTTP 4xx/5xx responses are not
+network errors: they go straight up as ``FactoryError`` without retries.
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -29,7 +33,15 @@ PAYLOAD_VERSION = 1
 
 
 class FactoryError(RuntimeError):
-    """Any factory call that failed in a way the caller should see (auth, HTTP, network)."""
+    """Any factory call that failed in a way the caller should see (auth, HTTP, network).
+
+    ``status_code`` is set when the failure came from an HTTP response (None for
+    network-level failures) so callers can distinguish e.g. a 409 conflict.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class InteropTask(BaseModel):
@@ -95,17 +107,26 @@ class FactoryClient:
                     method, path, params=params, json=json, auth=self._auth,
                 )
             except httpx.TransportError as exc:
-                # transient: connect/read/network — retry with backoff (injected sleep)
-                last_exc = exc
+                # ConnectError: the request never left — always safe to retry.
+                # Other transport errors (ReadError/ReadTimeout/...) are ambiguous:
+                # the server may have processed the request, so only idempotent
+                # GETs are retried (#228).
+                retryable = isinstance(exc, httpx.ConnectError) or method == "GET"
                 logger.warning(
-                    "factory %s %s network error (attempt %d/%d): %s",
-                    method, path, attempt, MAX_ATTEMPTS, exc,
+                    "factory %s %s network error (attempt %d/%d%s): %s",
+                    method, path, attempt, MAX_ATTEMPTS,
+                    ", retrying" if retryable else ", NOT retrying (ambiguous)", exc,
                 )
-                if attempt < MAX_ATTEMPTS:
+                if retryable and attempt < MAX_ATTEMPTS:
                     await self._sleep(BACKOFF_BASE * attempt)
                     continue
+                hint = (
+                    f" after {MAX_ATTEMPTS} attempts" if retryable
+                    else "; the request may have been processed — retry only if the"
+                    " operation is idempotent"
+                )
                 raise FactoryError(
-                    f"factory {method} {path} failed after {MAX_ATTEMPTS} attempts: {exc}"
+                    f"factory {method} {path} failed{hint}: {exc}"
                 ) from exc
             return self._handle_response(method, path, response, allow_404_none)
         # unreachable, but keeps the type checker honest
@@ -118,11 +139,13 @@ class FactoryClient:
             return None
         if response.status_code == 401:
             raise FactoryError(
-                "factory rejected the request: 401 Unauthorized — check TG_FACTORY_PASSWORD."
+                "factory rejected the request: 401 Unauthorized — check TG_FACTORY_PASSWORD.",
+                status_code=401,
             )
         if response.status_code >= 400:
             raise FactoryError(
-                f"factory {method} {path} returned HTTP {response.status_code}: {response.text}"
+                f"factory {method} {path} returned HTTP {response.status_code}: {response.text}",
+                status_code=response.status_code,
             )
         if not response.content:
             return None
@@ -152,8 +175,18 @@ class FactoryClient:
     # --- cycle 106: tasks ---
 
     async def create_task(self, type: str, payload: dict) -> str:
-        """Enqueue a task; returns its id. ``payload['v']`` is stamped with the version."""
-        body = {"type": type, "payload": {**payload, "v": PAYLOAD_VERSION}}
+        """Enqueue a task; returns its id. ``payload['v']`` is stamped with the version.
+
+        A fresh client-generated ``idempotency_key`` is sent per call: if the
+        factory received the first request but the response was lost, a
+        caller-level retry with the same key returns the original id instead of
+        creating a duplicate (#228).
+        """
+        body = {
+            "type": type,
+            "payload": {**payload, "v": PAYLOAD_VERSION},
+            "idempotency_key": uuid.uuid4().hex,
+        }
         result = await self._request("POST", "/tasks", json=body)
         return result["id"]
 

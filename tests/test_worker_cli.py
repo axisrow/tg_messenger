@@ -49,7 +49,8 @@ class StubFactory:
 class StubWorker:
     last = None
 
-    def __init__(self, client, factory, *, types=None, sleep=None, agent=None, idle_sleep=None):
+    def __init__(self, client, factory, *, types=None, sleep=None, agent=None, idle_sleep=None,
+                 reports_path=None):
         self.client = client
         self.factory = factory
         self.types = types
