@@ -195,10 +195,34 @@ def _message_dialog_id(raw) -> int | None:
     return int(tl_utils.get_peer_id(peer))
 
 
+def _proxy_from_env() -> dict | None:
+    """Parse ``TG_PROXY`` (``socks5://[user:pass@]host:port``) into a Telethon
+    proxy dict. ``None`` when unset/blank; a ValueError names the bad value.
+    Only socks5 is supported — MTProto needs a raw-TCP tunnel, not an HTTP
+    CONNECT proxy (those silently kill the handshake).
+    """
+    raw = (os.environ.get("TG_PROXY") or "").strip()
+    if not raw:
+        return None
+    from urllib.parse import urlparse
+
+    parsed = urlparse(raw if "://" in raw else f"socks5://{raw}")
+    if parsed.scheme != "socks5":
+        raise ValueError(f"TG_PROXY: only socks5:// is supported, got {parsed.scheme!r}")
+    if not parsed.hostname or parsed.port is None:
+        raise ValueError("TG_PROXY: expected socks5://[user:pass@]host:port")
+    proxy = dict(proxy_type="SOCKS5", addr=parsed.hostname, port=parsed.port)
+    if parsed.username:
+        proxy["username"] = parsed.username
+    if parsed.password:
+        proxy["password"] = parsed.password
+    return proxy
+
+
 def _default_factory(session, api_id, api_hash):
     # flood_sleep_threshold=0: Telethon never sleeps silently on a FloodWait —
     # every wait surfaces as an exception routed through run_with_flood_wait_retry.
-    return TelegramClient(session, api_id, api_hash, flood_sleep_threshold=0)
+    return TelegramClient(session, api_id, api_hash, flood_sleep_threshold=0, proxy=_proxy_from_env())
 
 
 def _dialog_kind(entity) -> DialogKind:
