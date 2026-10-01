@@ -120,9 +120,15 @@ class Worker:
         while True:
             try:
                 handled = await self.process_once()
-            except Exception:
+            except FactoryError as exc:
                 # a dead poll (factory unreachable, ...) must not kill the loop;
-                # pending reports survive in the queue and retry next round
+                # pending reports survive in the queue and retry next round.
+                # A 4xx (bad password, bad request) will never succeed — exit.
+                if exc.status_code is not None and exc.status_code < 500:
+                    raise
+                logger.exception("worker: poll step failed")
+                handled = False
+            except Exception:
                 logger.exception("worker: poll step failed")
                 handled = False
             if not handled:

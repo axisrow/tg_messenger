@@ -7,6 +7,8 @@ httpx живёт ТОЛЬКО в interop/ — тесты мокают HTTP че�
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -475,6 +477,42 @@ def test_report_queue_corrupt_file_is_quarantined(tmp_path):
     assert path.with_suffix(path.suffix + ".corrupt").exists()
 
 
+async def test_worker_run_exits_on_4xx_but_survives_transport_errors(caplog):
+    """Bad password (401) exits the loop; an unreachable factory just idles."""
+    import logging as _logging
+
+    from tg_messenger.interop.factory_client import FactoryError
+
+    class AuthFailFactory:
+        async def claim_next(self, types):
+            raise FactoryError("401 Unauthorized", status_code=401)
+
+    worker = _make_worker(AuthFailFactory(), StubCoreClient())
+    with caplog.at_level(_logging.ERROR, logger="tg_messenger.interop.worker"):
+        with pytest.raises(FactoryError):
+            await worker.run()
+
+    class TransportFailFactory:
+        async def claim_next(self, types):
+            raise FactoryError("connect failed")
+
+    sleeps = []
+
+    async def _sleep(s):
+        sleeps.append(s)
+
+    worker = _make_worker(TransportFailFactory(), StubCoreClient())
+    worker._sleep = _sleep
+    with caplog.at_level(_logging.ERROR, logger="tg_messenger.interop.worker"):
+        run_task = asyncio.create_task(worker.run())
+        await asyncio.sleep(0)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        run_task.cancel()
+
+    assert len(sleeps) >= 1  # loop survived and idled instead of dying
+
+
 async def test_create_task_does_not_retry_ambiguous_read_error():
     """POST + lost response after the server got it: never blindly retried (#228)."""
     attempts = {"n": 0}
@@ -503,6 +541,24 @@ async def test_create_task_sends_idempotency_key():
 
     key = seen["body"]["idempotency_key"]
     assert isinstance(key, str) and 1 <= len(key) <= 255
+
+
+async def test_create_task_reuses_caller_supplied_idempotency_key():
+    """The retry path must be able to send the SAME key so the factory dedupes."""
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        bodies.append(_json.loads(request.content))
+        return httpx.Response(200, json={"id": "task-1" if len(bodies) == 1 else "task-2"})
+
+    async with make_client(handler) as fc:
+        await fc.create_task("dm_reply", {"peer": 7}, idempotency_key="op-1")
+        await fc.create_task("dm_reply", {"peer": 7}, idempotency_key="op-1")
+
+    # the retry carried the SAME key — that's what the factory dedupes on
+    assert bodies[0]["idempotency_key"] == bodies[1]["idempotency_key"] == "op-1"
 
 
 async def test_get_task_retries_ambiguous_read_error():

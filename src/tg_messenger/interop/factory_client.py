@@ -174,18 +174,20 @@ class FactoryClient:
 
     # --- cycle 106: tasks ---
 
-    async def create_task(self, type: str, payload: dict) -> str:
+    async def create_task(
+        self, type: str, payload: dict, *, idempotency_key: str | None = None
+    ) -> str:
         """Enqueue a task; returns its id. ``payload['v']`` is stamped with the version.
 
-        A fresh client-generated ``idempotency_key`` is sent per call: if the
-        factory received the first request but the response was lost, a
-        caller-level retry with the same key returns the original id instead of
-        creating a duplicate (#228).
+        ``idempotency_key``: pass the SAME key on a retry of the same logical
+        create and the factory returns the original id instead of making a
+        duplicate (#228). Omitted, a fresh key is sent — the factory stores it,
+        but two calls are two unrelated creates.
         """
         body = {
             "type": type,
             "payload": {**payload, "v": PAYLOAD_VERSION},
-            "idempotency_key": uuid.uuid4().hex,
+            "idempotency_key": idempotency_key or uuid.uuid4().hex,
         }
         result = await self._request("POST", "/tasks", json=body)
         return result["id"]
