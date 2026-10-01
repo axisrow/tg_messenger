@@ -62,10 +62,15 @@ def worker(ctx: click.Context, session: str, factory_url: str | None, types: str
             # #125-A6: the factory owns its httpx.AsyncClient (http=None) — close it via
             # `async with` so the process doesn't leak the connection / emit "Unclosed
             # AsyncClient" ResourceWarning on shutdown (mirrors agent/tools.py).
+            from tg_messenger.core.paths import tg_home
+
             async with factory:
                 await Worker(
                     client, factory, types=task_types, sleep=_sleep, idle_sleep=interval,
                     agent=agent,
+                    # #228: completion/failure reports survive a crash and are
+                    # replayed before the next claim
+                    reports_path=tg_home() / "interop_reports.json",
                 ).run()
         finally:
             await client.disconnect()
