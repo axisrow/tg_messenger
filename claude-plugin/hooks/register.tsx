@@ -12,10 +12,15 @@ import type { TgDialog, TgMessage } from '../types'
  * through `$.process.spawn` — no HTTP, no passwords, nothing in argv but a
  * profile name and a dialog id:
  *
- *   history   `--profile P read <id> --limit 50`   (once per pane open)
+ *   history   `--profile P read <id|@user> --limit 50`   (once per pane open)
  *   live      `--profile P listen --ids --out`     (one long-running child)
- *   send      `--profile P send <id> <text> | send <id> --file <path>`
- *   react     `--profile P react <id> <msg-id> <emoji>`
+ *   send      `--profile P send <id|@user> <text> | send <id|@user> --file <path>`
+ *   react     `--profile P react <id|@user> <msg-id> <emoji>`
+ *
+ * An `@username` dialog goes to every child VERBATIM (#268): each spawn is a
+ * fresh cold process, and a numeric id there makes Telethon page the whole
+ * dialog list — one ResolveUsername RPC beats that. The resolved numeric id
+ * feeds the live-stream line filter only.
  *
  * `profile` comes from the plugin's userConfig; an empty one is auto-resolved
  * at pane boot from `tg-messenger profiles` — exactly one valid saved profile
