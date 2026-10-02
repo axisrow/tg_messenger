@@ -436,6 +436,26 @@ class StandaloneTelegramClient:
         )
         return _entity_title(entity)
 
+    async def resolve_username(self, username: str) -> Dialog:
+        """Resolve an ``@username`` to a one-row dialog with ONE ResolveUsername RPC.
+
+        A fresh session (StringSession) carries no entity cache, so handing Telethon
+        a bare numeric id makes it page the ENTIRE dialog list — thousands of dialogs
+        on a factory account, then flood waits, on every single CLI invocation. This
+        is the cheap path the CLI's ``@username`` arguments ride (#268). The resolve
+        also warms the in-process entity cache, so the follow-up int-id calls in the
+        same process are instant. Per the flood rule: never call it in a loop.
+        """
+        entity = await run_with_flood_wait_retry(
+            lambda: self._client.get_entity(username), operation="resolve_username"
+        )
+        return Dialog(
+            id=int(entity.id),
+            title=_entity_title(entity),
+            kind=_dialog_kind(entity),
+            username=getattr(entity, "username", None),
+        )
+
     # --- dialogs / history ---
     async def dialogs(self, dm_only: bool = True) -> list[Dialog]:
         """Mapped dialog list, served from a short-TTL cache.

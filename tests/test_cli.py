@@ -44,6 +44,14 @@ class StubClient:
         self.send_media_raises = None
         self.send_reaction_raises = None
         self.dialogs_calls = 0  # count dialog-list fetches (F-cli-preflight regression)
+        self.resolved_usernames = []  # @username refs resolved through #268's cheap path
+
+    async def resolve_username(self, username):
+        # #268: the one-RPC @username resolve; maps to the single-row dialog
+        from tg_messenger.core.models import Dialog
+
+        self.resolved_usernames.append(username)
+        return Dialog(id=7, title="Ann", kind="dm", username=username.lstrip("@"))
 
     async def is_authorized(self):
         return self.authorized
@@ -346,6 +354,34 @@ def test_send_file_caption_option(runner, tmp_path):
     result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--caption", "cap"])
     assert result.exit_code == 0, result.output
     assert stub.sent[-1] == (7, "file", str(f), "cap")
+
+
+# #268: @username dialog refs resolve with one RPC instead of a cold-session crawl
+
+
+def test_send_accepts_username(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["send", "@ann", "hello"])
+    assert result.exit_code == 0, result.output
+    assert stub.resolved_usernames == ["@ann"]
+    assert stub.sent == [(7, "hello", None, None)]
+
+
+def test_read_accepts_username(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["read", "@ann"])
+    assert result.exit_code == 0, result.output
+    assert stub.resolved_usernames == ["@ann"]
+    assert "hi" in result.output
+
+
+def test_dialogs_find_username_is_one_rpc(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--find", "@ann"])
+    assert result.exit_code == 0, result.output
+    assert stub.resolved_usernames == ["@ann"]
+    assert stub.dialogs_calls == 0  # the full list was never fetched
+    assert "7\tAnn" in result.output
 
 
 def test_send_file_voice_flag(runner, tmp_path):

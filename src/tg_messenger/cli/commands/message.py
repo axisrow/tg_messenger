@@ -12,6 +12,19 @@ from tg_messenger.cli import main as cli_main
 from tg_messenger.core.client import is_channel_or_megagroup_id
 
 
+async def _dialog_arg(client, value: str) -> int:
+    """Numeric dialog id passes through; ``@username`` resolves with one cheap RPC (#268).
+
+    Each CLI invocation is a fresh cold process: a bare numeric id would make
+    Telethon page the whole dialog list, while the resolve also warms this
+    process's entity cache for the follow-up calls. Negative ids need ``--``
+    before them (click would read the minus as a flag).
+    """
+    if value.startswith("@"):
+        return (await client.resolve_username(value)).id
+    return int(value)
+
+
 @click.command()
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
 @click.option("--groups", is_flag=True, help="List groups/channels/bots instead of DMs.")
@@ -26,12 +39,18 @@ def dialogs(session: str, groups: bool, find: str | None) -> None:
     """
     from tg_messenger.core.search import filter_dialogs
 
+    fast_resolve = find is not None and find.startswith("@")
+
     async def _do(client):
+        if fast_resolve:
+            # one ResolveUsername RPC — fetching the whole list to filter it
+            # locally would crawl/flood on a big account (#268)
+            return [await client.resolve_username(find)]
         return await (client.group_dialogs() if groups else client.dialogs())
 
     click.echo("Loading dialogs…", err=True)  # #187: a one-line status before the blocking fetch
     items = cli_main._run(cli_main._with_client(session, _do), session=session)
-    if find is not None:
+    if find is not None and not fast_resolve:
         items = filter_dialogs(items, find)
     for d in items:
         unread = f" ({d.unread} unread)" if d.unread else ""
@@ -46,18 +65,19 @@ def dialogs(session: str, groups: bool, find: str | None) -> None:
 
 
 @click.command()
-@click.argument("dialog_id", type=int)
+@click.argument("dialog_id", type=str)
 @click.argument("query")
 @click.option("--limit", default=20, help="Max number of messages to return.")
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
-def search(dialog_id: int, query: str, limit: int, session: str) -> None:
+def search(dialog_id: str, query: str, limit: int, session: str) -> None:
     """Search messages inside a dialog (Telegram's own server-side search).
 
-    Get DIALOG_ID from `tg-messenger dialogs`.
+    Get DIALOG_ID from `tg-messenger dialogs`, or pass an @username.
     """
 
     async def _do(client):
-        return await client.search_messages(dialog_id, query, limit=limit)
+        peer = await _dialog_arg(client, dialog_id)
+        return await client.search_messages(peer, query, limit=limit)
 
     messages = cli_main._run(cli_main._with_client(session, _do), session=session)
     if not messages:
@@ -70,35 +90,36 @@ def search(dialog_id: int, query: str, limit: int, session: str) -> None:
 
 
 @click.command()
-@click.argument("dialog_id", type=int)
+@click.argument("dialog_id", type=str)
 @click.option("--limit", default=50)
 @click.option("--download", "download_dir", default=None,
               help="Download media of each message into this directory.")
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
-def read(dialog_id: int, limit: int, download_dir: str | None, session: str) -> None:
+def read(dialog_id: str, limit: int, download_dir: str | None, session: str) -> None:
     """Print the message history of a dialog (and optionally download media).
 
-    Get DIALOG_ID from `tg-messenger dialogs`. Each printed line starts with the
-    MESSAGE_ID that edit/react/delete take.
+    Get DIALOG_ID from `tg-messenger dialogs`, or pass an @username. Each printed
+    line starts with the MESSAGE_ID that edit/react/delete take.
     """
 
     async def _do(client):
+        peer = await _dialog_arg(client, dialog_id)
         store, storage = cli_main.make_message_store(client, session=session)
         translator = cli_main.make_optional_translator(storage)
         if download_dir:
             os.makedirs(download_dir, exist_ok=True)
         try:
-            messages = await store.history(dialog_id, limit=limit)
+            messages = await store.history(peer, limit=limit)
             if not messages:
                 # #187: an empty history must say so, not print nothing and exit 0
                 click.echo("No messages.")
                 return
-            messages = await cli_main._maybe_translate_history(translator, dialog_id, messages)
+            messages = await cli_main._maybe_translate_history(translator, peer, messages)
             for m in messages:
                 cli_main._print_message_with_translation(m)
                 if download_dir and m.media is not None and m.media.downloadable:
-                    dest = os.path.join(download_dir, f"{dialog_id}_{m.id}")
-                    saved = await client.download_message_media(dialog_id, m.id, dest)
+                    dest = os.path.join(download_dir, f"{peer}_{m.id}")
+                    saved = await client.download_message_media(peer, m.id, dest)
                     if saved:
                         click.echo(f"  saved: {saved}")
         finally:
@@ -262,7 +283,7 @@ def dialog_lang(
 
 
 @click.command()
-@click.argument("dialog_id", type=int)
+@click.argument("dialog_id", type=str)
 @click.argument("text", required=False)
 @click.option("--file", "file_path", default=None, help="Send a file/photo instead of text.")
 @click.option("--caption", "caption", default=None,
@@ -275,7 +296,7 @@ def dialog_lang(
 @click.option("--reply-to", "reply_to", type=int, default=None,
               help="Reply to this message id.")
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
-def send(dialog_id: int, text: str | None, file_path: str | None, caption: str | None,
+def send(dialog_id: str, text: str | None, file_path: str | None, caption: str | None,
          voice: bool, video_note: bool, as_file: bool,
          reply_to: int | None, session: str) -> None:
     """Send a text message (or a file with --file); --reply-to to quote a message.
@@ -298,12 +319,13 @@ def send(dialog_id: int, text: str | None, file_path: str | None, caption: str |
         # read-only check would cost a full dialog list every time. send_media's own
         # offline path check runs first; the core SendForbiddenError seam (mapped in
         # _run) is the authoritative net for a read-only chat.
+        peer = await _dialog_arg(client, dialog_id)
         if file_path:
             return await client.send_media(
-                dialog_id, file_path, caption=caption or text,
+                peer, file_path, caption=caption or text,
                 voice_note=voice, video_note=video_note, force_document=as_file,
             )
-        return await client.send_text(dialog_id, text or "", reply_to=reply_to)
+        return await client.send_text(peer, text or "", reply_to=reply_to)
 
     msg = cli_main._run(cli_main._with_client(session, _do), session=session)
     # #187: echo the returned id so a follow-up edit/react has an id to use without a read
@@ -311,40 +333,45 @@ def send(dialog_id: int, text: str | None, file_path: str | None, caption: str |
 
 
 @click.command()
-@click.argument("dialog_id", type=int)
+@click.argument("dialog_id", type=str)
 @click.argument("message_id", type=int)
 @click.argument("emoticon")
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
-def react(dialog_id: int, message_id: int, emoticon: str, session: str) -> None:
+def react(dialog_id: str, message_id: int, emoticon: str, session: str) -> None:
     """React to a message with a standard emoji.
 
-    Get DIALOG_ID from `tg-messenger dialogs` and MESSAGE_ID from `tg-messenger read`.
+    Get DIALOG_ID from `tg-messenger dialogs` (or pass an @username) and MESSAGE_ID
+    from `tg-messenger read`.
     """
 
     async def _do(client):
         # No pre-flight gate: reactions are a separate capability from posting, and a
         # one-shot CLI has a cold cache. Telegram rejects (→ SendForbiddenError) if the
         # channel truly forbids reactions. Proper per-message reaction UI: issue #86.
-        await client.send_reaction(dialog_id, message_id, emoticon)
+        peer = await _dialog_arg(client, dialog_id)
+        await client.send_reaction(peer, message_id, emoticon)
 
     cli_main._run(cli_main._with_client(session, _do), session=session)
     click.echo(f"reacted to [id={message_id}].")  # #187: name the affected message
 
 
 @click.command()
-@click.argument("from_peer", type=int)
+@click.argument("from_peer", type=str)
 @click.argument("ids")
-@click.argument("to_peer", type=int)
+@click.argument("to_peer", type=str)
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
-def forward(from_peer: int, ids: str, to_peer: int, session: str) -> None:
+def forward(from_peer: str, ids: str, to_peer: str, session: str) -> None:
     """Forward messages (comma-separated IDS) from FROM_PEER to TO_PEER.
 
-    Get FROM_PEER/TO_PEER from `tg-messenger dialogs` and the IDS from `tg-messenger read`.
+    Get FROM_PEER/TO_PEER from `tg-messenger dialogs` (or @usernames) and the IDS
+    from `tg-messenger read`.
     """
     message_ids = cli_main._parse_ids(ids)
 
     async def _do(client):
-        return await client.forward(from_peer, message_ids, to_peer)
+        src = await _dialog_arg(client, from_peer)
+        dst = await _dialog_arg(client, to_peer)
+        return await client.forward(src, message_ids, dst)
 
     forwarded = cli_main._run(cli_main._with_client(session, _do), session=session)
     # #187: client.forward returns only the messages Telegram actually forwarded — a
@@ -363,38 +390,42 @@ def forward(from_peer: int, ids: str, to_peer: int, session: str) -> None:
 
 
 @click.command()
-@click.argument("dialog_id", type=int)
+@click.argument("dialog_id", type=str)
 @click.argument("message_id", type=int)
 @click.argument("text")
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
-def edit(dialog_id: int, message_id: int, text: str, session: str) -> None:
+def edit(dialog_id: str, message_id: int, text: str, session: str) -> None:
     """Edit the text of one of your messages.
 
-    Get DIALOG_ID from `tg-messenger dialogs` and MESSAGE_ID from `tg-messenger read`.
+    Get DIALOG_ID from `tg-messenger dialogs` (or pass an @username) and MESSAGE_ID
+    from `tg-messenger read`.
     """
 
     async def _do(client):
-        return await client.edit_text(dialog_id, message_id, text)
+        peer = await _dialog_arg(client, dialog_id)
+        return await client.edit_text(peer, message_id, text)
 
     cli_main._run(cli_main._with_client(session, _do), session=session)
     click.echo(f"edited. [id={message_id}]")  # #187: name the affected message
 
 
 @click.command()
-@click.argument("dialog_id", type=int)
+@click.argument("dialog_id", type=str)
 @click.argument("ids")
 @click.option("--for-me", "for_me", is_flag=True,
               help="Delete only for yourself (don't revoke for everyone).")
 @click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
-def delete(dialog_id: int, ids: str, for_me: bool, yes: bool, session: str) -> None:
+def delete(dialog_id: str, ids: str, for_me: bool, yes: bool, session: str) -> None:
     """Delete messages (comma-separated IDS); --for-me to keep them for others.
 
     Deletes for EVERYONE by default (irreversible). Get DIALOG_ID from
-    `tg-messenger dialogs` and the IDS from `tg-messenger read`.
+    `tg-messenger dialogs` (or pass an @username) and the IDS from `tg-messenger read`.
     """
     message_ids = cli_main._parse_ids(ids)
-    if for_me and is_channel_or_megagroup_id(dialog_id):
+    if for_me and not dialog_id.startswith("@") and is_channel_or_megagroup_id(int(dialog_id)):
+        # fail BEFORE the confirm prompt; the @username variant of this guard
+        # runs inside _do once the ref is resolved (#268)
         raise click.ClickException(
             "--for-me is not supported for channels/supergroups; Telegram deletes there for everyone"
         )
@@ -408,7 +439,13 @@ def delete(dialog_id: int, ids: str, for_me: bool, yes: bool, session: str) -> N
         )
 
     async def _do(client):
-        return await client.delete_messages(dialog_id, message_ids, revoke=not for_me)
+        peer = await _dialog_arg(client, dialog_id)
+        if for_me and is_channel_or_megagroup_id(peer):
+            raise click.ClickException(
+                "--for-me is not supported for channels/supergroups; "
+                "Telegram deletes there for everyone"
+            )
+        return await client.delete_messages(peer, message_ids, revoke=not for_me)
 
     cli_main._run(cli_main._with_client(session, _do), session=session)
     click.echo(f"deleted {len(message_ids)} message(s) {scope} in {dialog_id}.")

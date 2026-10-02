@@ -2508,3 +2508,18 @@ def test_tg_proxy_env_parsing(monkeypatch):
     monkeypatch.setenv("TG_PROXY", "socks5://noport")
     with pytest.raises(ValueError, match="host:port"):
         parse()
+
+
+async def test_resolve_username_maps_one_row_dialog():
+    """#268: resolve_username = ONE get_entity('@x') RPC, mapped to a single-row Dialog."""
+
+    class _Raw:
+        async def get_entity(self, ref):
+            assert ref == "@ann"
+            return FakeUser(id=5146088037, first_name="Ann", username="ann")
+
+    c = _build(_Raw())
+    d = await c.resolve_username("@ann")
+    assert d.id == 5146088037
+    assert d.kind == "dm"
+    assert d.title == "Ann"
