@@ -4,6 +4,7 @@ them. Registered onto the root ``cli`` group from main.py via the ``COMMANDS`` l
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import click
@@ -13,10 +14,20 @@ from tg_messenger.cli import main as cli_main
 
 @click.command()
 @click.option("--session", default="default")
+@click.option("--ids", is_flag=True,
+              help="Include the message id in every line: [DIALOG_ID] [MSG_ID] text.")
+@click.option("--out", is_flag=True,
+              help="Also print own messages sent from other devices (→ lines).")
 @click.pass_context
-def listen(ctx: click.Context, session: str) -> None:
+def listen(ctx: click.Context, session: str, ids: bool, out: bool) -> None:
     """Print incoming messages live."""
     session = cli_main._effective_session(ctx, session)
+
+    def _line(arrow: str, ev) -> str:
+        text = ev.message.text or "<media>"
+        if ids:
+            return f"{arrow} [{ev.dialog_id}] [{ev.message.id}] {text}"
+        return f"{arrow} [{ev.dialog_id}] {text}"
 
     async def _do():
         client = cli_main.make_client(session_name=session)
@@ -24,8 +35,20 @@ def listen(ctx: click.Context, session: str) -> None:
         try:
             await cli_main._ensure_authorized(client, session)
             click.echo("Listening for incoming messages (Ctrl+C to stop)...")
-            async for ev in client.listen():
-                click.echo(f"← [{ev.dialog_id}] {ev.message.text or '<media>'}")
+
+            async def _incoming() -> None:
+                async for ev in client.listen():
+                    click.echo(_line("←", ev))
+
+            # gather, NOT TaskGroup — the project's Ctrl+C convention (watch.py)
+            async def _pump_outgoing() -> None:
+                async for ev in client.listen_outgoing():
+                    click.echo(_line("→", ev))
+
+            if out:
+                await asyncio.gather(_incoming(), _pump_outgoing())
+            else:
+                await _incoming()
         finally:
             await client.disconnect()
 

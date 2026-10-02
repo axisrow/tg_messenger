@@ -1,28 +1,22 @@
 {
   "name": "tg-messenger",
-  "version": "0.2.0",
-  "description": "Telegram inside Claude Code: /tg opens a pane wired to tg-messenger serve (issues #246, #247).",
+  "version": "0.2.1",
+  "description": "Telegram inside Claude Code: /tg opens a pane driven by the tg-messenger CLI.",
   "author": {
     "name": "axisrow"
   },
   "types": "./types/index.d.ts",
   "userConfig": {
-    "serveUrl": {
+    "profile": {
       "type": "string",
-      "title": "Serve URL",
-      "description": "tg-messenger serve base URL, e.g. http://127.0.0.1:8080",
+      "title": "Profile",
+      "description": "Saved tg-messenger profile (session name) to use, e.g. default. Required — the mod never picks an account silently.",
       "default": ""
-    },
-    "webPass": {
-      "type": "string",
-      "title": "Web password",
-      "description": "TG_WEB_PASS of that serve instance",
-      "sensitive": true
     },
     "dialog": {
       "type": "string",
       "title": "Dialog",
-      "description": "Dialog the pane reads and writes: numeric Telegram dialog id (negative for groups). @usernames are not resolvable in v1 yet.",
+      "description": "Dialog the pane reads and writes: numeric Telegram dialog id (negative for groups) or @username (resolved once via the cached dialog list).",
       "default": ""
     }
   }
