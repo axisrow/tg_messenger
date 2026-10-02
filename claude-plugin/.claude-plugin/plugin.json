@@ -10,7 +10,7 @@
     "profile": {
       "type": "string",
       "title": "Profile",
-      "description": "Saved tg-messenger profile (session name) to use, e.g. default. Required — the mod never picks an account silently.",
+      "description": "Saved tg-messenger profile (session name) to use, e.g. default. Optional — when empty, the mod picks the single valid saved profile at boot (several valid profiles still require this to be set).",
       "default": ""
     },
     "dialog": {
