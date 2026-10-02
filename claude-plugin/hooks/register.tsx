@@ -456,9 +456,20 @@ export const register: Register = (on, options) => {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
     const list = await read($, messages)
     const openPalette = await read($, paletteFor)
-    // body height of the pane (docked panes are full-height): diff reads e.props.scroll.bodyRows
+    const draftLen = await read($, draft)
+    // pane geometry: diff reads e.props.scroll.bodyRows/bodyColumns
     const props = (e as { props?: { scroll?: { bodyRows?: number }; bodyColumns?: number } }).props
     const cols = (props?.bodyColumns ?? e.viewport?.columns ?? 80) - 2
+    const composerRows = Math.min(5, Math.max(1, Math.ceil((draftLen + 1) / Math.max(4, cols - 4))))
+    // the engine (2.1.287) stopped stretching docked panes, so flexGrow alone
+    // left the composer floating mid-pane: size the message area EXPLICITLY
+    // from the pane's body height (fixed spend: top padding + header + 2 gaps
+    // + separator + composer; bottom padding is 0 — verified flush at 200x60
+    // and 110x40). Falls back to flex when
+    // the engine reports no body height.
+    const listRows = props?.scroll?.bodyRows
+      ? Math.max(1, props.scroll.bodyRows - 5 - composerRows)
+      : undefined
     const shown = list.slice(-50)
 
     return (
@@ -476,7 +487,13 @@ export const register: Register = (on, options) => {
             close
           </Button>
         </Box>
-        <Box flexDirection="column" flexGrow={1} justifyContent="flex-end" overflow="hidden">
+        <Box
+          flexDirection="column"
+          flexGrow={1}
+          justifyContent="flex-end"
+          overflow="hidden"
+          height={listRows}
+        >
           {shown.length === 0 && (
             <Text dimColor>{ready ? 'loading history…' : 'not configured — see the header'}</Text>
           )}
@@ -531,10 +548,7 @@ export const register: Register = (on, options) => {
         </Box>
         <Box flexDirection="column" gap={0}>
           <Text dimColor>{'─'.repeat(Math.max(1, cols))}</Text>
-          <Box
-            height={Math.min(5, Math.max(1, Math.ceil(((await read($, draft)) + 1) / Math.max(4, cols - 4))))}
-            overflow="hidden"
-          >
+          <Box height={composerRows} overflow="hidden">
             <Input
             key="composer"
             placeholder={ready ? 'сообщение, @/path/to/file [caption]' : 'сообщение (уйдёт в никуда)'}
