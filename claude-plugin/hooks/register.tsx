@@ -100,7 +100,7 @@ function parseHistory(stdout: string): TgMessage[] {
     const m = HISTORY_LINE.exec(raw)
     if (m) {
       out.push({ id: Number(m[2]), text: m[3], out: m[1] === '→' })
-      prefixLen = m[1].length + m[2].length + 5 // `← [123] `
+      prefixLen = m[1].length + m[2].length + 4 // `← [123] ` = arrow+space+[+id+]+space
       continue
     }
     if (out.length && raw.startsWith(' '.repeat(Math.min(prefixLen, raw.length)))) {
@@ -227,7 +227,8 @@ async function resolveDialog($: EngineInterface, cfg: ModConfig): Promise<void> 
   ])
   const err = cliError(stderr)
   if (err) throw new Error(err)
-  const line = stdout.split('\n').find(l => l.includes('\t'))
+  // rows are `id\ttitle…` — a numeric guard keeps any odd stdout line out
+  const line = stdout.split('\n').find(l => /^\d+\t/.test(l))
   if (!line) throw new Error(`dialog ${cfg.target} not found`)
   cfg.resolvedId = line.slice(0, line.indexOf('\t'))
   cfg.isGroup = cfg.resolvedId.startsWith('-')
@@ -253,12 +254,18 @@ async function sendText($: EngineInterface, cfg: ModConfig, text: string): Promi
 }
 
 /** Sends a file (`@PATH [caption]` composer syntax → `send --file/--caption`). */
-async function sendMedia($: EngineInterface, cfg: ModConfig, path: string, caption: string | null): Promise<void> {
+async function sendMedia($: EngineInterface, cfg: ModConfig, path: string, caption: string | null): Promise<number | undefined> {
   const args = ['--profile', cfg.profile, 'send', cfg.resolvedId, '--file', path]
   if (caption) args.push('--caption', caption)
-  const { stderr } = await runCli($, args)
+  const { stdout, stderr } = await runCli($, args)
   const err = cliError(stderr)
   if (err) throw new Error(err)
+  // media prints the same `sent. [id=N]` — record it so the `--out` echo
+  // (text `<media>`/caption) is suppressed next to the optimistic `@path` line
+  const m = /sent\. \[id=(\d+)\]/.exec(stdout)
+  const id = m ? Number(m[1]) : undefined
+  if (id != null) rememberSent(id)
+  return id
 }
 
 /** Reacts to a message (`react DIALOG MSG_ID EMOTICON`). */
@@ -547,7 +554,7 @@ export const register: Register = (on, options) => {
                 try {
                   let id: number | undefined
                   if (media) {
-                    await sendMedia($, cfg, media.path, media.caption)
+                    id = await sendMedia($, cfg, media.path, media.caption)
                   } else {
                     id = await sendText($, cfg, text)
                   }
