@@ -4,7 +4,8 @@ import logging
 import pytest
 from telethon import events
 from telethon.sessions import StringSession
-from telethon.tl.types import PeerUser
+from telethon.tl.types import PeerUser, ReactionEmoji
+from telethon.tl.types import User as TlUser
 from telethon_floodgate import TelegramRateLimitGate
 
 from tests.conftest import (
@@ -45,6 +46,23 @@ from tg_messenger.core.models import (
 )
 
 VALID_SESSION = StringSession().save()  # valid, empty session string
+
+
+class _NewMessageEvt:
+    """Stand-in for a telethon NewMessage event — the handler reads only these."""
+
+    chat_id: int
+    is_private: bool
+    # object(): one test deliberately mounts a non-message to exercise the
+    # handler's exception path — the handler only touches attributes defensively
+    message: object
+
+
+class _DeletedEvt:
+    """Stand-in for a telethon MessagesDeleted event."""
+
+    deleted_ids: list
+    chat_id: int
 
 
 def _build(fake_client, **kw):
@@ -531,9 +549,9 @@ async def test_rate_limit_gate_defers_send_then_proceeds(fake_client):
         def __init__(self):
             self.calls = 0
 
-        def try_acquire(self, account, category):
+        def try_acquire(self, phone, category, *, slots=1, peer=None):
             self.calls += 1
-            self.seen = (account, category)
+            self.seen = (phone, category)
             return 2.5 if self.calls == 1 else 0.0
 
     gate = DefersOnceGate()
@@ -555,7 +573,7 @@ async def test_rate_limit_gate_respects_send_rate_zero_for_whole_send_category(f
     class RecordingGate(TelegramRateLimitGate):
         calls: list[str] = []
 
-        def try_acquire(self, account, category):
+        def try_acquire(self, phone, category, *, slots=1, peer=None):
             self.calls.append(category)
             return 0.0
 
@@ -681,6 +699,7 @@ def test_media_ref_voice_wins_over_document():
     raw = FakeMessage(id=1, sender_id=7, voice=doc,
                       file=FakeDocument(file_name="note.ogg", size=2048, mime_type="audio/ogg"))
     ref = StandaloneTelegramClient._to_media_ref(raw)
+    assert ref is not None
     assert ref.kind == "voice"
     assert ref.mime_type == "audio/ogg"
 
@@ -689,6 +708,7 @@ def test_media_ref_photo_carries_mime_type():
     raw = FakeMessage(id=1, sender_id=7, photo=object(),
                       file=FakeDocument(mime_type="image/jpeg"))
     ref = StandaloneTelegramClient._to_media_ref(raw)
+    assert ref is not None
     assert ref.kind == "photo"
     assert ref.mime_type == "image/jpeg"
 
@@ -696,6 +716,7 @@ def test_media_ref_photo_carries_mime_type():
 def test_media_ref_without_file_has_no_mime_type():
     raw = FakeMessage(id=1, sender_id=7, photo=object())
     ref = StandaloneTelegramClient._to_media_ref(raw)
+    assert ref is not None
     assert ref.kind == "photo"
     assert ref.mime_type is None
 
@@ -715,7 +736,7 @@ async def test_listen_yields_incoming(fake_client):
     await client.connect()
 
     # Build a fake NewMessage event that points at dialog 7
-    event = type("Evt", (), {})()
+    event = _NewMessageEvt()
     event.chat_id = 7
     event.is_private = True
     event.message = FakeMessage(id=50, sender_id=7, text="ping", out=False)
@@ -740,12 +761,12 @@ async def test_listen_skips_non_private_chats(fake_client):
     client = _build(fake_client)
     await client.connect()
 
-    group_event = type("Evt", (), {})()
+    group_event = _NewMessageEvt()
     group_event.chat_id = -100123
     group_event.is_private = False
     group_event.message = FakeMessage(id=51, sender_id=9, text="group noise", out=False)
 
-    dm_event = type("Evt", (), {})()
+    dm_event = _NewMessageEvt()
     dm_event.chat_id = 7
     dm_event.is_private = True
     dm_event.message = FakeMessage(id=52, sender_id=7, text="dm", out=False)
@@ -769,7 +790,7 @@ async def test_listen_handler_error_is_logged_not_raised(fake_client, caplog):
     client = _build(fake_client)
     await client.connect()
 
-    broken_event = type("Evt", (), {})()
+    broken_event = _NewMessageEvt()
     broken_event.chat_id = 7
     broken_event.is_private = True
     broken_event.message = object()  # no .date -> mapping blows up
@@ -786,7 +807,7 @@ async def test_listen_handler_error_is_logged_not_raised(fake_client, caplog):
 
 
 def _evt(chat_id, *, is_private, message):
-    event = type("Evt", (), {})()
+    event = _NewMessageEvt()
     event.chat_id = chat_id
     event.is_private = is_private
     event.message = message
@@ -943,7 +964,7 @@ async def test_broken_group_event_is_logged_not_raised(fake_client, caplog):
 
 
 def _deleted_evt(ids, chat_id=None):
-    event = type("Del", (), {})()
+    event = _DeletedEvt()
     event.deleted_ids = list(ids)
     if chat_id is not None:
         event.chat_id = chat_id
@@ -1412,6 +1433,7 @@ async def test_chat_action_join_carries_user(fake_client):
     assert isinstance(out, ChatActionEvent)
     assert out.kind == "join"
     assert out.dialog_id == -100123
+    assert out.user is not None
     assert out.user.id == 42 and out.user.username == "joiner"
 
 
@@ -1649,7 +1671,7 @@ async def test_reaction_unknown_structure_is_warned_not_raised(fake_client, capl
 async def test_incoming_event_carries_album_id(fake_client):
     client = _build(fake_client)
     await client.connect()
-    ev = type("Evt", (), {})()
+    ev = _NewMessageEvt()
     ev.chat_id = 7
     ev.is_private = True
     ev.message = FakeMessage(id=80, sender_id=7, text="part of album", grouped_id=9001)
@@ -1661,7 +1683,7 @@ async def test_incoming_event_carries_album_id(fake_client):
 async def test_incoming_event_without_album_has_none(fake_client):
     client = _build(fake_client)
     await client.connect()
-    ev = type("Evt", (), {})()
+    ev = _NewMessageEvt()
     ev.chat_id = 7
     ev.is_private = True
     ev.message = FakeMessage(id=81, sender_id=7, text="single")
@@ -1678,7 +1700,9 @@ async def test_send_reaction_sends_request(fake_client):
     sent = [r for r in fake_client.requests if isinstance(r, SendReactionRequest)]
     assert sent, "send_reaction must issue a SendReactionRequest"
     assert sent[-1].msg_id == 55
-    assert sent[-1].reaction[0].emoticon == "👍"
+    reactions = sent[-1].reaction or []
+    assert reactions and isinstance(reactions[0], ReactionEmoji)
+    assert reactions[0].emoticon == "👍"
 
 
 async def test_send_reaction_flood_is_handled(fake_client, monkeypatch):
@@ -2508,3 +2532,23 @@ def test_tg_proxy_env_parsing(monkeypatch):
     monkeypatch.setenv("TG_PROXY", "socks5://noport")
     with pytest.raises(ValueError, match="host:port"):
         parse()
+
+
+async def test_resolve_username_maps_one_row_dialog():
+    """#268: resolve_username = ONE get_entity('@x') RPC, mapped to a single-row
+    Dialog with the MARKED peer id (#269 review: real TL User — get_peer_id needs it)."""
+
+    class _Raw:
+        async def get_entity(self, ref):
+            assert ref == "@ann"
+            return TlUser(
+                id=5146088037,
+                first_name="Ann",
+                username="ann",
+            )
+
+    c = _build(_Raw())
+    d = await c.resolve_username("@ann")
+    assert d.id == 5146088037
+    assert d.kind == "dm"
+    assert d.title == "Ann"

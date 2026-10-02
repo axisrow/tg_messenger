@@ -44,6 +44,14 @@ class StubClient:
         self.send_media_raises = None
         self.send_reaction_raises = None
         self.dialogs_calls = 0  # count dialog-list fetches (F-cli-preflight regression)
+        self.resolved_usernames = []  # @username refs resolved through #268's cheap path
+
+    async def resolve_username(self, username):
+        # #268: the one-RPC @username resolve; maps to the single-row dialog
+        from tg_messenger.core.models import Dialog
+
+        self.resolved_usernames.append(username)
+        return Dialog(id=7, title="Ann", kind="dm", username=username.lstrip("@"))
 
     async def is_authorized(self):
         return self.authorized
@@ -154,7 +162,7 @@ class StubClient:
         return "My Group"
 
     # username (#22): override .occupied to mark names taken
-    occupied: set = frozenset()
+    occupied: set = set()
     set_username_to = None
     cleared = False
 
@@ -346,6 +354,50 @@ def test_send_file_caption_option(runner, tmp_path):
     result = r.invoke(cli_main.cli, ["send", "7", "--file", str(f), "--caption", "cap"])
     assert result.exit_code == 0, result.output
     assert stub.sent[-1] == (7, "file", str(f), "cap")
+
+
+# #268: @username dialog refs resolve with one RPC instead of a cold-session crawl
+
+
+def test_send_accepts_username(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["send", "@ann", "hello"])
+    assert result.exit_code == 0, result.output
+    assert stub.resolved_usernames == ["@ann"]
+    assert stub.sent == [(7, "hello", None, None)]
+
+
+def test_read_accepts_username(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["read", "@ann"])
+    assert result.exit_code == 0, result.output
+    assert stub.resolved_usernames == ["@ann"]
+    assert "hi" in result.output
+
+
+def test_dialogs_find_username_is_one_rpc(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--find", "@ann"])
+    assert result.exit_code == 0, result.output
+    assert stub.resolved_usernames == ["@ann"]
+    assert stub.dialogs_calls == 0  # the full list was never fetched
+    assert "7\tAnn" in result.output
+
+
+def test_dialogs_find_username_with_groups_keeps_local_filter(runner):
+    # #269 review: --groups must not silently gain a fast path that ignores the flag
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--groups", "--find", "@ann"])
+    assert result.exit_code == 0, result.output
+    assert stub.resolved_usernames == []
+
+
+def test_bad_numeric_dialog_id_is_a_clean_click_error(runner):
+    # #269 review: a free-form str argument must not raise a bare ValueError traceback
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["send", "12a4", "hello"])
+    assert result.exit_code != 0
+    assert "not a valid dialog id" in result.output
 
 
 def test_send_file_voice_flag(runner, tmp_path):
@@ -3902,7 +3954,7 @@ def test_tui_defers_to_screen_when_multi_profile_interactive(monkeypatch, tmp_pa
     assert deps_calls == []  # built lazily inside the TUI, not up front
     cap = _FakeTUIAllKwargs.captured
     assert cap.get("client") is None
-    assert sorted(cap.get("profiles")) == ["alice", "bob"]
+    assert sorted(cap.get("profiles") or []) == ["alice", "bob"]
     assert cap.get("deps_factory") is not None
     # the factory routes to make_tui_deps for the chosen profile
     cap["deps_factory"]("bob")

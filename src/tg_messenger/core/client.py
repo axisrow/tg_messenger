@@ -32,7 +32,7 @@ from telethon.errors import (
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import CheckUsernameRequest, UpdateUsernameRequest
 from telethon.tl.functions.messages import SendReactionRequest
-from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
+from telethon.tl.types import PeerChannel, PeerChat, PeerUser, ReactionEmoji, UpdateMessageReactions
 from telethon_floodgate import TelegramRateLimitGate
 
 from tg_messenger.core.auth import SessionStore, default_session_dir
@@ -42,6 +42,7 @@ from tg_messenger.core.flood import run_with_flood_wait_retry
 from tg_messenger.core.languages import clean_supported_lang_code
 from tg_messenger.core.models import (
     ChatActionEvent,
+    ChatActionKind,
     Dialog,
     DialogKind,
     IncomingEvent,
@@ -222,7 +223,8 @@ def _proxy_from_env() -> dict | None:
 def _default_factory(session, api_id, api_hash):
     # flood_sleep_threshold=0: Telethon never sleeps silently on a FloodWait —
     # every wait surfaces as an exception routed through run_with_flood_wait_retry.
-    return TelegramClient(session, api_id, api_hash, flood_sleep_threshold=0, proxy=_proxy_from_env())
+    # `or ()`: an unset proxy is an empty tuple (falsy) — telethon checks truthiness.
+    return TelegramClient(session, api_id, api_hash, flood_sleep_threshold=0, proxy=_proxy_from_env() or ())
 
 
 def _dialog_kind(entity) -> DialogKind:
@@ -346,7 +348,7 @@ class StandaloneTelegramClient:
         else:
             session_string = self._store.load(session_name)
         self._session_name = session_name
-        self._client = client_factory(StringSession(session_string or None), api_id, api_hash)
+        self._client = client_factory(StringSession(session_string or ""), api_id, api_hash)
         self._bus: EventBus[IncomingEvent] = EventBus()
         self._bus_all: EventBus[IncomingEvent] = EventBus()
         self._bus_out: EventBus[OutgoingEvent] = EventBus()
@@ -435,6 +437,36 @@ class StandaloneTelegramClient:
             lambda: self._client.get_entity(int(peer)), operation="entity_title"
         )
         return _entity_title(entity)
+
+    async def resolve_username(self, username: str) -> Dialog:
+        """Resolve an ``@username`` to a one-row dialog with ONE ResolveUsername RPC.
+
+        A fresh session (StringSession) carries no entity cache, so handing Telethon
+        a bare numeric id makes it page the ENTIRE dialog list — thousands of dialogs
+        on a factory account, then flood waits, on every single CLI invocation. This
+        is the cheap path the CLI's ``@username`` arguments ride (#268). The resolve
+        also warms the in-process entity cache, so the follow-up int-id calls in the
+        same process are instant. Per the flood rule: never call it in a loop.
+        """
+        entity = await run_with_flood_wait_retry(
+            lambda: self._client.get_entity(username), operation="resolve_username"
+        )
+        kind = _dialog_kind(entity)
+        # marked peer id (negative -100… for channels/supergroups) — the same
+        # contract as dialogs()/events (#269 review); utils.get_peer_id does not
+        # take full entities in this telethon, so build the Peer by kind
+        entity_peer = {  # pragma: no branch — kind is always one of the four
+            "dm": PeerUser(entity.id),
+            "bot": PeerUser(entity.id),
+            "group": PeerChat(entity.id),
+            "channel": PeerChannel(entity.id),
+        }[kind]
+        return Dialog(
+            id=int(tl_utils.get_peer_id(entity_peer)),
+            title=_entity_title(entity),
+            kind=kind,
+            username=getattr(entity, "username", None),
+        )
 
     # --- dialogs / history ---
     async def dialogs(self, dm_only: bool = True) -> list[Dialog]:
@@ -855,7 +887,10 @@ class StandaloneTelegramClient:
             await run_with_flood_wait_retry(
                 lambda: self._client(
                     SendReactionRequest(
-                        peer=peer, msg_id=int(message_id),
+                        # telethon's TLRequest.resolve() fills the InputPeer from a
+                        # bare marked id at call time — the constructor type lies
+                        peer=peer,  # type: ignore[arg-type]
+                        msg_id=int(message_id),
                         reaction=[ReactionEmoji(emoticon=emoticon)],
                     )
                 ),
@@ -969,7 +1004,7 @@ class StandaloneTelegramClient:
         )
 
     @staticmethod
-    def _chat_action_kind(event) -> str:
+    def _chat_action_kind(event) -> ChatActionKind:
         if getattr(event, "user_joined", False) or getattr(event, "user_added", False):
             return "join"
         if getattr(event, "user_kicked", False):

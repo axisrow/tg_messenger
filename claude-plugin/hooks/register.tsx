@@ -12,10 +12,15 @@ import type { TgDialog, TgMessage } from '../types'
  * through `$.process.spawn` — no HTTP, no passwords, nothing in argv but a
  * profile name and a dialog id:
  *
- *   history   `--profile P read <id> --limit 50`   (once per pane open)
+ *   history   `--profile P read <id|@user> --limit 50`   (once per pane open)
  *   live      `--profile P listen --ids --out`     (one long-running child)
- *   send      `--profile P send <id> <text> | send <id> --file <path>`
- *   react     `--profile P react <id> <msg-id> <emoji>`
+ *   send      `--profile P send <id|@user> <text> | send <id|@user> --file <path>`
+ *   react     `--profile P react <id|@user> <msg-id> <emoji>`
+ *
+ * An `@username` dialog goes to every child VERBATIM (#268): each spawn is a
+ * fresh cold process, and a numeric id there makes Telethon page the whole
+ * dialog list — one ResolveUsername RPC beats that. The resolved numeric id
+ * feeds the live-stream line filter only.
  *
  * `profile` comes from the plugin's userConfig; an empty one is auto-resolved
  * at pane boot from `tg-messenger profiles` — exactly one valid saved profile
@@ -68,6 +73,16 @@ type ModConfig = {
   resolvedId: string
   /** true when the resolved dialog is a group/channel (marked negative) */
   isGroup: boolean
+}
+
+/**
+ * Per-call peer ref. An `@username` target goes through VERBATIM: every spawned
+ * CLI child is a fresh cold process, and a numeric id there makes Telethon page
+ * the whole dialog list (#268) — the `@` ref is one ResolveUsername RPC. The
+ * resolved numeric id stays for the live-stream line filter only.
+ */
+function peerRef(cfg: ModConfig): string {
+  return cfg.target.startsWith('@') ? cfg.target : cfg.resolvedId
 }
 
 type CliResult = { stdout: string; stderr: string }
@@ -125,7 +140,7 @@ async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
     '--profile',
     cfg.profile,
     'read',
-    cfg.resolvedId,
+    peerRef(cfg),
     '--limit',
     '50',
   ])
@@ -278,7 +293,7 @@ async function sendText($: EngineInterface, cfg: ModConfig, text: string): Promi
     '--profile',
     cfg.profile,
     'send',
-    cfg.resolvedId,
+    peerRef(cfg),
     text,
   ])
   const err = cliError(stderr)
@@ -291,7 +306,7 @@ async function sendText($: EngineInterface, cfg: ModConfig, text: string): Promi
 
 /** Sends a file (`@PATH [caption]` composer syntax → `send --file/--caption`). */
 async function sendMedia($: EngineInterface, cfg: ModConfig, path: string, caption: string | null): Promise<number | undefined> {
-  const args = ['--profile', cfg.profile, 'send', cfg.resolvedId, '--file', path]
+  const args = ['--profile', cfg.profile, 'send', peerRef(cfg), '--file', path]
   if (caption) args.push('--caption', caption)
   const { stdout, stderr } = await runCli($, args)
   const err = cliError(stderr)
@@ -315,7 +330,7 @@ async function sendReaction(
     '--profile',
     cfg.profile,
     'react',
-    cfg.resolvedId,
+    peerRef(cfg),
     String(messageId),
     emoticon,
   ])
