@@ -17,10 +17,11 @@ import type { TgDialog, TgMessage } from '../types'
  *   send      `--profile P send <id> <text> | send <id> --file <path>`
  *   react     `--profile P react <id> <msg-id> <emoji>`
  *
- * `profile` comes from the plugin's userConfig and is REQUIRED — with several
- * saved profiles the CLI would hang on its interactive menu or refuse to run,
- * and the mod must never pick an account silently. Without a full config the
- * pane degrades to the local-only append with a one-line toast.
+ * `profile` comes from the plugin's userConfig; an empty one is auto-resolved
+ * at pane boot from `tg-messenger profiles` — exactly one valid saved profile
+ * is picked (logged + shown in the header), zero or several is a refusal. The
+ * mod never picks an account silently. Without a full config the pane
+ * degrades to the local-only append with a one-line toast.
  *
  * The transport lives in this same file on purpose: the engine follows `$`
  * only into functions declared here, never across an import.
@@ -393,10 +394,43 @@ function parseMediaCommand(
 // --- pane --------------------------------------------------------------------
 
 /**
- * Reads the `userConfig` options. `profile` is REQUIRED (the mod must never
- * pick an account silently); `dialog` is a marked numeric id or `@username`.
- * `ready: false` → the mod stays in the dead-safe no-send mode; `reason` is
- * the one-line explanation.
+ * Parses `tg-messenger profiles` stdout into the VALID profile names
+ * (`<name> ✓ ok`; a `✗ broken` session is never auto-picked). The greeting
+ * line ("No profiles yet — run: …") matches nothing.
+ */
+export function parseValidProfiles(stdout: string): string[] {
+  const out: string[] = []
+  for (const raw of stdout.split('\n')) {
+    const name = /^(\S+) ✓ ok$/.exec(raw.trim())?.[1]
+    if (name) out.push(name)
+  }
+  return out
+}
+
+/**
+ * Resolves the account when `profile` is not configured: exactly one valid
+ * saved profile is picked (logged, and shown in the header — never silent);
+ * zero or several stays a refusal with the fix in the message.
+ */
+async function resolveProfile($: EngineInterface, cfg: ModConfig): Promise<void> {
+  if (cfg.profile) return
+  const { stdout } = await runCli($, ['profiles'])
+  const valid = parseValidProfiles(stdout)
+  if (valid.length === 1) {
+    cfg.profile = valid[0] as string // length checked just above
+    $.ui.log(`tg-messenger: profile auto-resolved: ${valid[0]}`)
+    return
+  }
+  if (valid.length === 0)
+    throw new Error('no valid profile — run: tg-messenger login  (or claude plugin configure tg-messenger)')
+  throw new Error(`several profiles (${valid.join(', ')}) — pick one: claude plugin configure tg-messenger`)
+}
+
+/**
+ * Reads the `userConfig` options. `profile` is optional — an empty one is
+ * auto-resolved from the saved sessions at boot (`resolveProfile`); `dialog`
+ * is a marked numeric id or `@username`. `ready: false` → the mod stays in
+ * the dead-safe no-send mode; `reason` is the one-line explanation.
  */
 function readConfig(options: Readonly<Record<string, unknown>>): {
   cfg: ModConfig
@@ -412,8 +446,7 @@ function readConfig(options: Readonly<Record<string, unknown>>): {
   const target = pick('dialog') || pick('dialogId')
   const cfg: ModConfig = { profile, target, resolvedId: '', isGroup: false }
   let reason = ''
-  if (!profile) reason = 'profile not configured — claude plugin configure tg-messenger'
-  else if (!target) reason = 'dialog not configured — claude plugin configure tg-messenger'
+  if (!target) reason = 'dialog not configured — claude plugin configure tg-messenger'
   else if (!/^-?\d+$/.test(target) && !target.startsWith('@'))
     reason = `invalid dialog "${target}" — expected a numeric id or @username`
   return { cfg, ready: reason === '', reason, target }
@@ -432,6 +465,7 @@ async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reas
     return
   }
   try {
+    await resolveProfile($, cfg)
     await resolveDialog($, cfg)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
@@ -521,7 +555,7 @@ export const register: Register = (on, options) => {
           <Text bold>tg-messenger</Text>
           {chat ? (
             <>
-              <Text>{ready ? `— ${cfg.profile} · ${cfg.target}` : <Text dimColor>— {reason}</Text>}</Text>
+              <Text>{ready ? `— ${[cfg.profile, cfg.target].filter(Boolean).join(' · ')}` : <Text dimColor>— {reason}</Text>}</Text>
               {ready && (
                 <Button
                   onPress={() => {

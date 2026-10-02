@@ -65,9 +65,12 @@ declares it); every call is one child process over an argv array.
 
 Two options (`claude plugin configure tg-messenger`):
 
-- **profile** (required) — the saved tg-messenger profile to use. Required on
-  purpose: with several saved profiles the CLI would hang on its interactive
-  menu, and the mod must never pick an account silently.
+- **profile** (optional) — the saved tg-messenger profile to use. When empty,
+  the pane resolves it at boot from `tg-messenger profiles`: exactly one valid
+  (`✓ ok`) saved profile is picked and shown in the header; zero valid → a
+  clear "run `tg-messenger login`" error; several valid → the list plus a hint
+  to configure. The mod never picks an account silently — the single-profile
+  pick is logged and rendered.
 - **dialog** — which dialog the pane talks to: a marked numeric dialog id
   (negative for groups, as shown by `tg-messenger dialogs`) or `@username`
   (resolved once per pane open via the cached dialog list — never per
