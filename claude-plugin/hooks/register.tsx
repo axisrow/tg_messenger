@@ -407,7 +407,9 @@ function readConfig(options: Readonly<Record<string, unknown>>): {
   const pick = (name: string): string =>
     typeof options[name] === 'string' ? (options[name] as string).trim() : ''
   const profile = pick('profile')
-  const target = pick('dialog')
+  // `dialogId` is the pre-#248 spelling — honor it so an old config degrades
+  // to a clear toast instead of "dialog not configured"
+  const target = pick('dialog') || pick('dialogId')
   const cfg: ModConfig = { profile, target, resolvedId: '', isGroup: false }
   let reason = ''
   if (!profile) reason = 'profile not configured — claude plugin configure tg-messenger'
