@@ -384,6 +384,10 @@ class FakeTelethonClient:
                 return d.entity
         return FakeUser(id=int(peer))
 
+    async def get_input_entity(self, peer):
+        # the fake's entity cache is always warm (unlike a fresh StringSession)
+        return int(peer)
+
     # --- sending ---
     async def send_message(self, peer, text, reply_to=None, schedule=None):
         if self.send_message_raises is not None:

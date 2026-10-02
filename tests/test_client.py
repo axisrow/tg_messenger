@@ -56,6 +56,96 @@ def _build(fake_client, **kw):
     )
 
 
+class _UnresolvedIterator:
+    """Page iterator over a peer whose entity is not in the fresh-process
+    cache: floodgate validates the callable `.client` first, the resolution
+    error surfaces at the first __anext__ — like real Telethon."""
+
+    def __init__(self, peer: int):
+        self._peer = peer
+
+    def client(self, request):
+        return None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise ValueError(
+            f"Could not find the input entity for PeerUser(user_id={self._peer})"
+        )
+
+
+class _FreshSessionTelethon:
+    """StringSession semantics in a fresh process: the entity cache is empty
+    until THIS process has iterated dialogs once — get_input_entity and any
+    request built from a bare peer id raise the live
+    ``Could not find the input entity for PeerUser(...)``. This is the CLI's
+    one-process-per-command pattern (and the /tg mod's transport): a numeric
+    id that `dialogs` printed a second ago does not resolve here."""
+
+    def __init__(self):
+        self.dialogs_fetches = 0
+        self.dialogs = []
+        self.messages = {}
+
+    async def get_input_entity(self, peer):
+        if not self.dialogs_fetches:
+            raise ValueError(f"Could not find the input entity for {peer!r}")
+        return int(peer)
+
+    def iter_dialogs(self, *a, **k):
+        self.dialogs_fetches += 1
+
+        async def gen():
+            for d in self.dialogs:
+                yield d
+
+        return gen()
+
+    def iter_messages(self, peer, limit=50, ids=None, search=None, min_id=0, **k):
+        if not self.dialogs_fetches:
+            return _UnresolvedIterator(int(peer))
+        return FakeMessagesIterator(self.messages.get(int(peer), [])[:limit])
+
+    async def send_message(self, peer, text, reply_to=None, schedule=None):
+        self._need_warm(peer)
+        return FakeMessage(id=999, sender_id=1, text=text, out=True, peer_id=int(peer),
+                           reply_to=reply_to)
+
+    def _need_warm(self, peer):
+        if not self.dialogs_fetches:
+            raise ValueError(
+                f"Could not find the input entity for PeerUser(user_id={int(peer)})"
+            )
+
+
+def _seed_fresh(inner):
+    inner.dialogs = [
+        FakeDialog(FakeUser(id=5146088037, first_name="Alexey", username="automatketppc"),
+                   name="Alexey"),
+    ]
+    inner.messages[5146088037] = [FakeMessage(id=10, sender_id=5146088037, text="hello")]
+
+
+async def test_numeric_peer_resolves_in_fresh_process_history(session_dir):
+    inner = _FreshSessionTelethon()
+    _seed_fresh(inner)
+    client = _build(inner, session_dir=session_dir)
+    msgs = await client.history(5146088037, limit=5)
+    assert [m.id for m in msgs] == [10]
+    assert inner.dialogs_fetches == 1  # exactly one warm-up fetch, no storm
+
+
+async def test_numeric_peer_resolves_in_fresh_process_send(session_dir):
+    inner = _FreshSessionTelethon()
+    _seed_fresh(inner)
+    client = _build(inner, session_dir=session_dir)
+    msg = await client.send_text(5146088037, "hi")
+    assert msg.id == 999
+    assert inner.dialogs_fetches == 1
+
+
 def _seed_dm(fake_client):
     ann = FakeUser(id=7, first_name="Ann", username="ann")
     bob = FakeUser(id=8, first_name="Bob")

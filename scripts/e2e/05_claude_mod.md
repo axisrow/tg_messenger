@@ -10,31 +10,24 @@ Safety rules, non-negotiable:
   code, never touch any personal account.
 - Test messages go **only to test/self dialogs** — Saved Messages of the test
   account. Never send to real people.
-- The operator needs a second logged-in client of the same test account
-  (phone/desktop) to produce an incoming message.
+- Independent verification runs through the same CLI the mod uses:
+  `tg-messenger --profile <test-profile> read <dialog> --limit 3`.
 
 ## Prerequisites
 
-```bash
-# fresh code under test (this checkout), throwaway password for the run
-TG_WEB_PASS=<throwaway> PYTHONPATH="$PWD/src" \
-  tg-messenger --profile <test-profile> serve --port 18090
-```
-
-- `TG_WEB_PASS` set to a **throwaway** value for the run (serve refuses
-  non-localhost without it; the value must never appear in output).
-- Plugin configured in Claude Code:
+- `tg-messenger` installed and the test profile already logged in
+  (`tg-messenger profiles` shows `name ✓ ok`).
+- Plugin configured in Claude Code (no passwords involved):
 
 ```bash
 CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude
 # then, inside the session (or via the CLI):
-claude plugin configure tg-messenger   # serveUrl, webPass, dialog
+claude plugin configure tg-messenger   # profile, dialog
 ```
 
-  - `serveUrl` = `http://127.0.0.1:18090`
-  - `webPass` = the throwaway `TG_WEB_PASS`
+  - `profile` = the test profile name (e.g. `default`);
   - `dialog` = the numeric Saved Messages id of the test account
-    (its own user id; same value discipline as `E2E_SAVED_ID` in `README.md`)
+    (its own user id; same value discipline as `E2E_SAVED_ID` in `README.md`).
 
 - Start the session with the mod loaded:
 
@@ -49,60 +42,68 @@ Record PASS / FAIL / SKIP for each; any FAIL blocks the epic.
 
 ### 1. Transport up
 
-- [ ] serve starts and stays up on the chosen port
-- [ ] `/tg` opens the pane without errors; header shows the live dialog
-      (not the dimmed "set the dialog" line)
+- [ ] `/tg` opens the pane without errors; header shows `<profile> · <dialog>`
+      (not the dimmed "not configured" line)
+- [ ] recent history of the dialog appears in the pane within seconds
+      (the mod runs `read --limit 50` on open)
 
 ### 2. Incoming (real event → pane, within seconds)
 
-- [ ] from the second client, post a short marked message to the test
-      account's Saved Messages (e.g. `e2e-mod-in-<timestamp>`)
+- [ ] from a second client of the SAME test account, post a short marked
+      message to the test account's Saved Messages (e.g.
+      `e2e-mod-in-<timestamp>`)
 - [ ] the message appears in the pane **within ~5 s**, no manual refresh
+      (the pane's `listen --out` child prints it as a `→` line)
 
 ### 3. Outgoing (pane → Telegram)
 
 - [ ] type a reply in the pane composer (e.g. `e2e-mod-out-<timestamp>`)
       and send
-- [ ] the message arrives in the Telegram dialog (verify in the second
-      client), and shows as sent in the pane
-- [ ] clean up: delete both e2e messages from Saved Messages afterwards
+- [ ] the message arrives in the Telegram dialog — verify independently:
+      `tg-messenger --profile <test-profile> read <dialog> --limit 3`
+- [ ] clean up: delete both e2e messages afterwards
+      (`tg-messenger --profile <test-profile> delete <dialog> <ids> --yes`)
 
-### 4. Explicit-send only
+### 4. Media (@path)
+
+- [ ] `@/tmp/e2e-mod.txt hello from e2e` in the composer sends the file
+      (verify: the CLI `read` shows the media message)
+
+### 5. Explicit-send only
 
 - [ ] with the pane open and idle, **nothing** is ever sent without the
       operator submitting the composer (watch the dialog for a minute)
 
-### 5. Secret hygiene
+### 6. Secret hygiene
 
-- [ ] the pane output contains neither `TG_WEB_PASS` nor any phone number
-      nor any session string
-- [ ] serve log (`~/.tg_messenger/logs/`) for the run contains neither
-- [ ] the Claude session transcript/pane copy contains neither
-      (the password reaches the host only via stdin to `curl`, never argv)
+- [ ] the pane output contains no session strings or phone numbers (there is
+      no password in this transport at all — nothing to leak)
 
 ## Parity stubs (deliberately not checked here)
 
-- **Group chats** — v1 targets a single dialog id; group pane behavior
-  (mentions, admin actions) is out of scope.
-- **Media** — composer `@path` sends exist (#256) but real-account media
-  round-trip is covered by `02_saved_messages.sh`, not this checklist.
+- **Group chats (live)** — `listen` streams DMs only; a group dialog is
+  history-only with a one-line toast. Group live feed is a follow-up.
+- **Incoming reactions display** — the CLI does not stream reactions; the
+  pane shows only reactions this mod itself attached. Send (`react`) works.
 - **Reconnect under network loss** — killing the network mid-stream and
-  watching SSE resume is a separate guided scenario; the pane keeps its
-  last state and the operator can reopen `/tg`.
-- **`@username` dialog targeting** — rejected by design in v1 (#248);
-  a toast path, not an acceptance item.
+  watching the pane resume is a separate guided scenario; the pane keeps its
+  last state (the `listen` child reconnects with backoff) and the operator
+  can reopen `/tg`.
+- **Voice/video-note sends** — the composer exposes only `@path [caption]`;
+  the voice/video-note flags of `send` are not exposed (v1).
 
 ## Results template
 
 ```
 date:
 profile: <test account, NOT any personal account>
-serve commit: <git rev-parse HEAD>
+mod commit: <git rev-parse HEAD>
 1 transport: PASS/FAIL
 2 incoming:  PASS/FAIL   latency: <s>
 3 outgoing:  PASS/FAIL
-4 explicit-send: PASS/FAIL
-5 secrets:   PASS/FAIL
+4 media:     PASS/FAIL
+5 explicit-send: PASS/FAIL
+6 secrets:   PASS/FAIL
 notes:
 ```
 

@@ -39,32 +39,38 @@ This repo is a Claude Code **marketplace** (`.claude-plugin/marketplace.json` at
 ```bash
 claude plugin marketplace add axisrow/tg_messenger
 claude plugin install tg-messenger@tg-messenger
+claude plugin configure tg-messenger   # profile + dialog
 ```
 
 Function hooks are early access — until that changes, the installing user needs
-`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` in their environment (see above). Plugin
-options (the serve URL / password when the bridge lands) are set with
-`claude plugin configure tg-messenger`.
+`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` in their environment (see above).
 
-## Transport (issues #246, #247)
+## Transport
 
-With `serveUrl` / `webPass` / `dialog` configured (`claude plugin configure
-tg-messenger`; values arrive as the `options` argument of `register`), the
-pane is live: the composer POSTs to `tg-messenger serve` (`/login` → HMAC
-cookie, `POST /send`) and the dialog's SSE stream (`/stream/{id}`) appends
-incoming lines. Without config the pane degrades to a local-only scratchpad
-with a one-line toast. The transport lives in `hooks/register.tsx` (the
-engine follows `$` only within the file that declares it) — one host `curl`
-child per call, no dependencies; the password never appears in argv or logs.
+The pane drives the project's own CLI (`tg-messenger`) — no HTTP, no secrets:
 
-## Dialog targeting (#248)
+- **history** — `--profile P read <id> --limit 50` on pane open;
+- **live** — one long-running `--profile P listen --ids --out` child (incoming
+  DMs + own messages from other devices), reconnected with backoff;
+- **send** — `--profile P send <id> <text>`, media via `send <id> --file …`;
+- **react** — `--profile P react <id> <msg-id> <emoji>`.
 
-The `dialog` option picks which Telegram dialog the pane talks to: a marked
-numeric dialog id (negative for groups, as shown by `tg-messenger` dialogs).
-`@usernames` are accepted syntactically but **not resolvable in v1** — serve
-has no dialog-list endpoint the mod could resolve against (and per-message
-resolving would break flood discipline), so a username is rejected with a
-clear toast and the pane stays in the dead-safe no-send mode (composer
-visible, sends fail fast, nothing auto-retries). The same applies to any
-malformed value; with the option unset the pane header shows how to set it.
-The pre-#248 `dialogId` option spelling still works.
+`tg-messenger` must be installed and logged in for the configured profile
+(`tg-messenger login --profile P`). Without a full config the pane degrades to
+a local-only scratchpad with a one-line toast. The transport lives in
+`hooks/register.tsx` (the engine follows `$` only within the file that
+declares it); every call is one child process over an argv array.
+
+## Config (#248)
+
+Two options (`claude plugin configure tg-messenger`):
+
+- **profile** (required) — the saved tg-messenger profile to use. Required on
+  purpose: with several saved profiles the CLI would hang on its interactive
+  menu, and the mod must never pick an account silently.
+- **dialog** — which dialog the pane talks to: a marked numeric dialog id
+  (negative for groups, as shown by `tg-messenger dialogs`) or `@username`
+  (resolved once per pane open via the cached dialog list — never per
+  message). Group dialogs are history-only: the CLI's `listen` streams DMs
+  only (v1). Anything malformed → clear toast, dead-safe no-send mode.
+

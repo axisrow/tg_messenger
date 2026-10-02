@@ -737,6 +737,40 @@ def test_listen_stops_and_disconnects_on_ctrl_c(runner):
     assert stub.connected is False
 
 
+def test_listen_default_line_format_unchanged(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["listen"])
+    assert result.exit_code == 0
+    assert "← [7] ping" in result.output
+    assert "[10]" not in result.output  # no message id without --ids
+
+
+def test_listen_ids_flag_prints_message_id(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["listen", "--ids"])
+    assert result.exit_code == 0
+    assert "← [7] [10] ping" in result.output
+
+
+def test_listen_out_flag_prints_own_messages(runner, monkeypatch):
+    r, stub = runner
+    stub.listen_interrupt = False  # incoming idles; the outgoing stream stops the run
+
+    async def outgoing_once():
+        yield OutgoingEvent(
+            dialog_id=7,
+            message=Message(id=11, dialog_id=7, sender_id=1, out=True, text="from-phone",
+                            date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+        )
+        raise KeyboardInterrupt  # emulate Ctrl+C after the first event
+
+    monkeypatch.setattr(stub, "listen_outgoing", outgoing_once)
+    result = r.invoke(cli_main.cli, ["listen", "--out", "--ids"])
+    assert result.exit_code == 0
+    assert "→ [7] [11] from-phone" in result.output
+    assert stub.connected is False
+
+
 def test_chat_sends_and_disconnects_on_eof(runner):
     r, stub = runner
     stub.listen_interrupt = False  # printer just idles; EOF on stdin ends the REPL

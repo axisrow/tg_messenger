@@ -1,25 +1,29 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { TgMessage } from '../types'
+import type { TgDialog, TgMessage } from '../types'
 
 /**
- * tg-messenger mod — pane with a real serve transport (issues #246, #247, #248).
+ * tg-messenger mod — pane over the tg-messenger CLI.
  *
  * `/tg` opens a bottom pane (the cc-arcade kind): `$.ui.open` asks for it,
  * a `ui.render` hook on `{component: 'Pane', requestId}` draws it with JSX.
- * With `serveUrl`/`webPass`/`dialog` (a numeric dialog id) configured the composer POSTs to
- * `tg-messenger serve` (`/login` → HMAC cookie, `POST /send`) and the pane
- * follows the dialog's SSE stream; without them it degrades to the old
- * local-only append with a one-line toast.
+ * The transport is the project's own CLI (`tg-messenger …`) spawned per call
+ * through `$.process.spawn` — no HTTP, no passwords, nothing in argv but a
+ * profile name and a dialog id:
+ *
+ *   history   `--profile P read <id> --limit 50`   (once per pane open)
+ *   live      `--profile P listen --ids --out`     (one long-running child)
+ *   send      `--profile P send <id> <text> | send <id> --file <path>`
+ *   react     `--profile P react <id> <msg-id> <emoji>`
+ *
+ * `profile` comes from the plugin's userConfig and is REQUIRED — with several
+ * saved profiles the CLI would hang on its interactive menu or refuse to run,
+ * and the mod must never pick an account silently. Without a full config the
+ * pane degrades to the local-only append with a one-line toast.
  *
  * The transport lives in this same file on purpose: the engine follows `$`
- * only into functions declared here, never across an import. Every call is
- * one host `curl` child through `$.process.spawn`, because `$.http.fetch`
- * reads the whole body before resolving and so can neither carry the login
- * 303 (cookie) nor hold the endless SSE stream. The password never appears
- * in argv (the form body goes to curl over stdin) and neither it nor the
- * cookie is ever logged.
+ * only into functions declared here, never across an import.
  */
 
 const PANE = 'tg'
@@ -29,211 +33,293 @@ const draft = atom({ plugin: 'tg-messenger', key: 'draft' } as const, 0)
 // message id whose reaction palette is open (-1 = none) — the web's toggle pattern
 const paletteFor = atom({ plugin: 'tg-messenger', key: 'paletteFor' } as const, -1)
 
-// the same 4 presets as web/TUI REACTION_PRESETS; also names this pane to the
-// serve echo-suppression buckets, so our own reactions come back suppressed
+// the same 4 presets as web/TUI REACTION_PRESETS
 const REACTION_PRESETS = ['👍', '❤️', '🔥', '😂'] as const
-const WEB_CLIENT_ID = 'cc-pane'
 
-const messages = atom(
-  { plugin: 'tg-messenger', key: 'messages' } as const,
-  [{ text: 'hello world — the bridge lands here', out: false }] as TgMessage[],
-)
+const messages = atom({ plugin: 'tg-messenger', key: 'messages' } as const, [] as TgMessage[])
 
 // #256: text of a FAILED send, restored into the composer until the first
 // keystroke touches it (cleared in onInput). Rendered as `value` only while
 // non-empty, so stream-frame redraws never clobber live typing.
 const pendingSend = atom({ plugin: 'tg-messenger', key: 'pendingSend' } as const, '')
 
-// --- serve transport ---------------------------------------------------------
+// pane view: the open dialog or the dialog picker; null list = not loaded yet
+const view = atom({ plugin: 'tg-messenger', key: 'view' } as const, 'chat' as 'chat' | 'dialogs')
+const dialogList = atom({ plugin: 'tg-messenger', key: 'dialogList' } as const, null as TgDialog[] | null)
 
-type ServeConfig = { serveUrl: string; webPass: string; dialogId: string }
+// message ids this mod itself sent (for `--out` echo suppression) — the TUI's
+// `_sent_ids` pattern: membership-only, never popped (a pop would re-duplicate
+// a reconnect re-echo), bounded FIFO
+const sentIds = new Set<number>()
 
-/**
- * Reads the `userConfig` options (#248). `dialog` is a marked numeric id
- * (negative for groups); `@username` needs a resolve endpoint serve does not
- * expose yet, so v1 is id-only — a username is rejected up front, never
- * resolved per message (flood discipline). `ready: false` → the mod stays in
- * the dead-safe no-send mode; `reason` is the full one-line explanation.
- */
-function readConfig(options: Readonly<Record<string, unknown>>): {
-  cfg: ServeConfig
-  ready: boolean
-  reason: string
+function rememberSent(id: number): void {
+  sentIds.add(id)
+  if (sentIds.size > 500) sentIds.delete(sentIds.values().next().value as number)
+}
+
+// --- CLI transport -----------------------------------------------------------
+
+type ModConfig = {
+  profile: string
+  /** what the user configured (numeric id or @username) — shown in the header */
   target: string
-} {
-  const pick = (name: string): string =>
-    typeof options[name] === 'string' ? (options[name] as string).trim() : ''
-  const serveUrl = pick('serveUrl').replace(/\/+$/, '')
-  const webPass = pick('webPass')
-  // `dialogId` is the pre-#248 spelling — honor it if the new option is unset
-  const target = pick('dialog') || pick('dialogId')
-  let dialogId = ''
-  let problem = ''
-  if (!target) problem = 'dialog not set — claude plugin configure tg-messenger'
-  else if (/^-?\d+$/.test(target)) dialogId = target
-  else if (target.startsWith('@'))
-    problem = `cannot resolve ${target} in v1 — set the numeric dialog id`
-  else problem = `invalid dialog "${target}" — expected a numeric dialog id`
-  const missing = !serveUrl ? 'serveUrl' : !webPass ? 'webPass' : ''
-  const ready = missing === '' && problem === ''
-  const reason = missing ? `${missing} not configured` : problem
-  return { cfg: { serveUrl, webPass, dialogId }, ready, reason, target }
+  /** resolved numeric dialog id (set by `bootPane`), '' until then */
+  resolvedId: string
+  /** true when the resolved dialog is a group/channel (marked negative) */
+  isGroup: boolean
 }
 
-// HMAC cookie of the current serve session ("tg_session=…"). Module state: per
-// activation — a reload (a config change included) simply logs in again.
-let cookie = ''
+type CliResult = { stdout: string; stderr: string }
 
-type CurlResponse = { status: number; setCookie: string; body: string }
-
-/** Runs one curl child to completion and parses its `-i` response. */
-async function curlOnce(
-  $: EngineInterface,
-  argv: readonly string[],
-  input?: string,
-): Promise<CurlResponse> {
-  let out = ''
-  let err = ''
-  for await (const chunk of $.process.spawn({ argv, input })) {
-    if (chunk.stream === 'stdout') out += chunk.text
-    else err += chunk.text
+/** Runs one `tg-messenger` child to completion and collects its streams. */
+async function runCli($: EngineInterface, args: readonly string[]): Promise<CliResult> {
+  let stdout = ''
+  let stderr = ''
+  for await (const chunk of $.process.spawn({ argv: ['tg-messenger', ...args] })) {
+    if (chunk.stream === 'stdout') stdout += chunk.text
+    else stderr += chunk.text
   }
-  if (!out && err.trim()) throw new Error(err.trim().slice(0, 200))
-  const sep = out.indexOf('\r\n\r\n')
-  const head = sep >= 0 ? out.slice(0, sep) : out
-  const lines = head.split('\r\n')
-  const status = Number.parseInt(lines[0]?.split(' ')[1] ?? '', 10) || 0
-  const setCookie =
-    lines.find(l => l.toLowerCase().startsWith('set-cookie:'))?.slice('set-cookie:'.length).trim() ??
-    ''
-  return { status, setCookie, body: sep >= 0 ? out.slice(sep + 4) : '' }
+  return { stdout, stderr }
 }
 
-/** POSTs the login form (password over stdin) and keeps the HMAC cookie in module state. */
-async function ensureLogin($: EngineInterface, cfg: ServeConfig): Promise<void> {
-  if (cookie) return
-  const res = await curlOnce(
-    $,
-    [
-      'curl',
-      '-isS',
-      '-X',
-      'POST',
-      '-H',
-      'content-type: application/x-www-form-urlencoded',
-      '--data-binary',
-      '@-',
-      `${cfg.serveUrl}/login`,
-    ],
-    `password=${encodeURIComponent(cfg.webPass)}`,
-  )
-  // the pair up to the first attribute ("tg_session=…") is the whole Cookie header
-  const pair = res.setCookie.split(';')[0] ?? ''
-  if (!pair.startsWith('tg_session=')) {
-    throw new Error(`login failed (HTTP ${res.status})`)
+/** Click's failure line (`Error: <text>` on stderr, exit 1) — or null on success. */
+function cliError(stderr: string): string | null {
+  const m = /^Error: (.*)$/m.exec(stderr)
+  return m ? m[1] : null
+}
+
+/** `read` line: `← [123] text` / `→ [124] my own` (core `message_line`). */
+const HISTORY_LINE = /^([←→]) \[(\d+)\] (.*)$/
+
+/**
+ * Parses `read` stdout. Multiline bodies hang-indent under the text column by
+ * exactly the prefix width — continuation lines are re-joined onto their
+ * message. ponytail: a message whose continuation line is shorter than the
+ * indent is joined verbatim (leading spaces lost) — text-format ambiguity.
+ */
+function parseHistory(stdout: string): TgMessage[] {
+  const out: TgMessage[] = []
+  let prefixLen = 0
+  for (const raw of stdout.split('\n')) {
+    const m = HISTORY_LINE.exec(raw)
+    if (m) {
+      out.push({ id: Number(m[2]), text: m[3], out: m[1] === '→' })
+      prefixLen = m[1].length + m[2].length + 4 // `← [123] ` = arrow+space+[+id+]+space
+      continue
+    }
+    if (out.length && raw.startsWith(' '.repeat(Math.min(prefixLen, raw.length)))) {
+      out[out.length - 1].text += `\n${raw.slice(prefixLen)}`
+    }
   }
-  cookie = pair
-}
-
-/** One POST /send attempt with the current cookie. */
-function postSend($: EngineInterface, cfg: ServeConfig, text: string): Promise<CurlResponse> {
-  return curlOnce(
-    $,
-    [
-      'curl',
-      '-isS',
-      '-X',
-      'POST',
-      '-H',
-      'content-type: application/x-www-form-urlencoded',
-      '-H',
-      'x-tg-messenger-csrf: 1',
-      '-H',
-      `Cookie: ${cookie}`,
-      '--data-binary',
-      '@-',
-      `${cfg.serveUrl}/send`,
-    ],
-    `dialog_id=${encodeURIComponent(cfg.dialogId)}&text=${encodeURIComponent(text)}`,
-  )
+  return out
 }
 
 /**
- * POSTs the outgoing message to /send (form dialog_id+text, the server's
- * same-origin header, cookie). Resolves only after the server answered with
- * the sent-bubble fragment; anything else (error fragment, a redirect to the
- * login wizard when the Telegram session itself is logged out) throws.
+ * Reads recent history of the dialog and replaces the pane content.
+ * Status noise (`Loading history…`) rides stderr — only Click's `Error:`
+ * line means failure.
  */
-async function sendText($: EngineInterface, cfg: ServeConfig, text: string): Promise<void> {
-  await ensureLogin($, cfg)
-  let res = await postSend($, cfg, text)
-  if (res.status === 401) {
-    // a serve restart regenerates its cookie key — the kept cookie is dead:
-    // re-login once and retry before giving up
-    forgetCookie()
-    await ensureLogin($, cfg)
-    res = await postSend($, cfg, text)
-  }
-  if (res.status !== 200 || !res.body.startsWith('<div class="msg ')) {
-    // the server's error fragment text ("Select a dialog first.", read-only
-    // chat, …) beats a bare status in the toast
-    const detail = /<div class="error"[^>]*>([\s\S]*?)<\/div>/.exec(res.body)?.[1]
-    throw new Error(detail ? `send failed: ${detail}` : `send failed (HTTP ${res.status})`)
-  }
-}
-
-/** One POST /dialogs/{id}/reaction attempt with the current cookie. */
-function postReaction(
-  $: EngineInterface,
-  cfg: ServeConfig,
-  messageId: number,
-  emoticon: string,
-): Promise<CurlResponse> {
-  return curlOnce(
-    $,
-    [
-      'curl',
-      '-isS',
-      '-X',
-      'POST',
-      '-H',
-      'content-type: application/x-www-form-urlencoded',
-      '-H',
-      'x-tg-messenger-csrf: 1',
-      '-H',
-      `Cookie: ${cookie}`,
-      '--data-binary',
-      '@-',
-      `${cfg.serveUrl}/dialogs/${cfg.dialogId}/reaction`,
-    ],
-    `message_id=${messageId}&emoticon=${encodeURIComponent(emoticon)}&web_client_id=${WEB_CLIENT_ID}`,
-  )
+async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
+  const { stdout, stderr } = await runCli($, [
+    '--profile',
+    cfg.profile,
+    'read',
+    cfg.resolvedId,
+    '--limit',
+    '50',
+  ])
+  const err = cliError(stderr)
+  if (err) throw new Error(err)
+  await update($, messages, () => parseHistory(stdout) as TgMessage[])
 }
 
 /**
- * POSTs a reaction. The server remembers (dialog, message, emoticon) under
- * `web_client_id` and suppresses that frame from the SSE stream opened with
- * the same `?client_id=` — the echo dedup is server-side, as for a browser
- * tab. A repeated emoticon toggles the reaction off server-side (no removal
- * frame), so callers must not append it a second time locally.
+ * `listen` line with ids: `← [DIALOG] [MSG] text` (incoming, DMs only) or
+ * `→ [DIALOG] [MSG] text` (own messages from any device, `--out`). Preamble
+ * and unknown lines are ignored.
  */
+const STREAM_LINE = /^([←→]) \[(\d+)\] \[(\d+)\] (.*)$/
+
+async function handleStreamLine($: EngineInterface, cfg: ModConfig, line: string): Promise<void> {
+  const m = STREAM_LINE.exec(line)
+  if (!m || m[2] !== cfg.resolvedId) return
+  const mid = Number(m[3])
+  if (m[1] === '→' && sentIds.has(mid)) return // this mod's own send, echoed
+  await update(
+    $,
+    messages,
+    all => [...all, { id: mid, text: m[4], out: m[1] === '→' }].slice(-100) as TgMessage[],
+  )
+}
+
+// one live subscription per activation: pane reopen and session re-seat
+// reuse it instead of stacking another `listen` child on a quiet dialog
+let streamAlive = false
+
+const startStream = ($: EngineInterface, cfg: ModConfig) => {
+  if (streamAlive) return
+  streamAlive = true
+  void (async () => {
+    try {
+      await runStream($, cfg)
+    } finally {
+      // any escape from the loop must leave the bridge revivable by the next /tg
+      streamAlive = false
+    }
+  })()
+}
+
+async function runStream($: EngineInterface, cfg: ModConfig): Promise<never> {
+  let backoff = 1000
+  let lost = false // the panel line is on state change, not every retry
+  while (true) {
+    try {
+      let buffer = ''
+      for await (const chunk of $.process.spawn({
+        argv: ['tg-messenger', '--profile', cfg.profile, 'listen', '--ids', '--out'],
+      })) {
+        if (chunk.stream === 'stderr') continue // status noise ("Listening for…")
+        buffer += chunk.text
+        let nl: number
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, nl)
+          buffer = buffer.slice(nl + 1)
+          await handleStreamLine($, cfg, line)
+        }
+        backoff = 1000 // a live line proves the link works
+        lost = false
+      }
+    } catch (error) {
+      $.ui.log(`tg-messenger: stream error: ${String(error)}`)
+      if (!lost) {
+        lost = true
+        const message = error instanceof Error ? error.message : String(error)
+        await update($, messages, all =>
+          [...all, { text: `bridge error: ${message}`, out: false, system: true }].slice(-100) as TgMessage[],
+        )
+      }
+    }
+    if (!lost) {
+      lost = true
+      const wait = Math.round(backoff / 1000)
+      await update($, messages, all =>
+        [...all, { text: `stream lost — retrying in ${wait} s`, out: false, system: true }].slice(-100) as TgMessage[],
+      )
+    }
+    await $.clock.sleep(backoff)
+    backoff = Math.min(backoff * 2, 30000)
+  }
+}
+
+/**
+ * Resolves the configured target to a numeric dialog id. Numeric passes
+ * through; `@username` resolves ONCE here via the cached dialog list —
+ * never per message (flood discipline).
+ */
+async function resolveDialog($: EngineInterface, cfg: ModConfig): Promise<void> {
+  if (/^-?\d+$/.test(cfg.target)) {
+    cfg.resolvedId = cfg.target
+    cfg.isGroup = cfg.target.startsWith('-')
+    return
+  }
+  const { stdout, stderr } = await runCli($, [
+    '--profile',
+    cfg.profile,
+    'dialogs',
+    '--find',
+    cfg.target,
+  ])
+  const err = cliError(stderr)
+  if (err) throw new Error(err)
+  // rows are `id\ttitle…` — a numeric guard keeps any odd stdout line out
+  const line = stdout.split('\n').find(l => /^\d+\t/.test(l))
+  if (!line) throw new Error(`dialog ${cfg.target} not found`)
+  cfg.resolvedId = line.slice(0, line.indexOf('\t'))
+  cfg.isGroup = cfg.resolvedId.startsWith('-')
+}
+
+/** Loads the DM list for the picker (`dialogs`, DMs only — groups are history-only). */
+async function loadDialogList($: EngineInterface, cfg: ModConfig): Promise<void> {
+  const { stdout, stderr } = await runCli($, ['--profile', cfg.profile, 'dialogs'])
+  const err = cliError(stderr)
+  if (err) throw new Error(err)
+  const list = stdout
+    .split('\n')
+    .map(l => /^(\d+)\t(.+?)(?: \((\d+) unread\))?$/.exec(l))
+    .filter(m => m !== null)
+    .map(m => ({ id: m[1], title: m[2], unread: Number(m[3] ?? 0) }))
+  await update($, dialogList, () => list as TgDialog[] | null)
+}
+
+/** Switches the pane to another dialog: history re-reads, the live stream just re-filters. */
+async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Promise<void> {
+  cfg.target = id
+  cfg.resolvedId = id
+  cfg.isGroup = id.startsWith('-')
+  void update($, view, () => 'chat' as const)
+  void update($, paletteFor, () => -1)
+  if (cfg.isGroup)
+    $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
+  try {
+    await loadHistory($, cfg)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    $.ui.toast(`tg-messenger: ${message}`)
+  }
+  startStream($, cfg)
+}
+
+// --- outgoing ------------------------------------------------------------------
+
+/** Sends text; returns the new message id when the CLI reported one. */
+async function sendText($: EngineInterface, cfg: ModConfig, text: string): Promise<number | undefined> {
+  const { stdout, stderr } = await runCli($, [
+    '--profile',
+    cfg.profile,
+    'send',
+    cfg.resolvedId,
+    text,
+  ])
+  const err = cliError(stderr)
+  if (err) throw new Error(err)
+  const m = /sent\. \[id=(\d+)\]/.exec(stdout)
+  const id = m ? Number(m[1]) : undefined
+  if (id != null) rememberSent(id)
+  return id
+}
+
+/** Sends a file (`@PATH [caption]` composer syntax → `send --file/--caption`). */
+async function sendMedia($: EngineInterface, cfg: ModConfig, path: string, caption: string | null): Promise<number | undefined> {
+  const args = ['--profile', cfg.profile, 'send', cfg.resolvedId, '--file', path]
+  if (caption) args.push('--caption', caption)
+  const { stdout, stderr } = await runCli($, args)
+  const err = cliError(stderr)
+  if (err) throw new Error(err)
+  // media prints the same `sent. [id=N]` — record it so the `--out` echo
+  // (text `<media>`/caption) is suppressed next to the optimistic `@path` line
+  const m = /sent\. \[id=(\d+)\]/.exec(stdout)
+  const id = m ? Number(m[1]) : undefined
+  if (id != null) rememberSent(id)
+  return id
+}
+
+/** Reacts to a message (`react DIALOG MSG_ID EMOTICON`). */
 async function sendReaction(
   $: EngineInterface,
-  cfg: ServeConfig,
+  cfg: ModConfig,
   messageId: number,
   emoticon: string,
 ): Promise<void> {
-  await ensureLogin($, cfg)
-  let res = await postReaction($, cfg, messageId, emoticon)
-  if (res.status === 401) {
-    forgetCookie()
-    await ensureLogin($, cfg)
-    res = await postReaction($, cfg, messageId, emoticon)
-  }
-  if (res.status !== 204) {
-    const detail = /<div class="error"[^>]*>([\s\S]*?)<\/div>/.exec(res.body)?.[1]
-    throw new Error(detail ? `reaction failed: ${detail}` : `reaction failed (HTTP ${res.status})`)
-  }
+  const { stderr } = await runCli($, [
+    '--profile',
+    cfg.profile,
+    'react',
+    cfg.resolvedId,
+    String(messageId),
+    emoticon,
+  ])
+  const err = cliError(stderr)
+  if (err) throw new Error(err)
 }
 
 /** Attaches one emoticon under its target message, skipping a duplicate. */
@@ -243,15 +329,6 @@ function withReaction(all: TgMessage[], id: number, emoticon: string): TgMessage
       ? { ...m, reactions: [...(m.reactions ?? []), emoticon] }
       : m,
   )
-}
-
-type StreamFrame = {
-  id?: number
-  text?: string
-  out?: boolean
-  type?: string
-  message_id?: number
-  emoticon?: string
 }
 
 // --- media command (#250) -----------------------------------------------------
@@ -313,191 +390,75 @@ function parseMediaCommand(
   return { path: first.token, caption: first.rest.trim() || null }
 }
 
-/** One multipart POST /dialogs/{id}/media attempt with the current cookie. */
-function postMedia(
-  $: EngineInterface,
-  cfg: ServeConfig,
-  path: string,
-  caption: string | null,
-): Promise<CurlResponse> {
-  return curlOnce($, [
-    'curl',
-    '-isS',
-    '-X',
-    'POST',
-    '-H',
-    'x-tg-messenger-csrf: 1',
-    '-H',
-    `Cookie: ${cookie}`,
-    '-F',
-    `file=@${path}`,
-    // --form-string: the caption is literal text — `-F caption=@x` would attach
-    // a local file's contents, `<x` read one, `;x` truncate at it
-    ...(caption ? ['--form-string', `caption=${caption}`] : []),
-    `${cfg.serveUrl}/dialogs/${cfg.dialogId}/media`,
-  ])
-}
-
-/** POSTs the file to the media route; success/failure contract as `sendText`. */
-async function sendMedia(
-  $: EngineInterface,
-  cfg: ServeConfig,
-  path: string,
-  caption: string | null,
-): Promise<void> {
-  // curl -F parses `;`/`=` inside the value as part parameters — refuse instead
-  // of silently uploading a truncated filename
-  if (/[;]/.test(path)) throw new Error(`media path contains ';' (unsupported)`)
-  await ensureLogin($, cfg)
-  let res = await postMedia($, cfg, path, caption)
-  if (res.status === 401) {
-    forgetCookie()
-    await ensureLogin($, cfg)
-    res = await postMedia($, cfg, path, caption)
-  }
-  if (res.status !== 200 || !res.body.startsWith('<div class="msg ')) {
-    // a missing file dies in curl's stderr (thrown above); server-side
-    // rejections (too large, empty, read-only chat) come as the error fragment
-    const detail = /<div class="error"[^>]*>([\s\S]*?)<\/div>/.exec(res.body)?.[1]
-    throw new Error(detail ? `media failed: ${detail}` : `media failed (HTTP ${res.status})`)
-  }
-}
-
-
-/** Drops the cookie so the next `ensureLogin` starts a fresh serve session. */
-function forgetCookie(): void {
-  cookie = ''
-}
-
-/**
- * Subscribes to GET /stream/{dialog} and yields parsed `data:` frames until
- * the stream drops (server restart, network, `-f` on a bad status). The
- * caller reconnects with backoff and a fresh login per attempt.
- */
-async function* streamFrames(
-  $: EngineInterface,
-  cfg: ServeConfig,
-): AsyncGenerator<StreamFrame> {
-  await ensureLogin($, cfg)
-  // ponytail: the cookie rides argv (visible in this Mac's ps); move to
-  // `curl -H @file` if another local user ever becomes a real threat model
-  const child = $.process.spawn({
-    argv: [
-      'curl',
-      '-NsSf',
-      '-H',
-      `Cookie: ${cookie}`,
-      '-H',
-      'Accept: text/event-stream',
-      // ?client_id= picks the server's echo-suppression bucket: the same one
-      // sendReaction registers our (dialog, message, emoticon) keys under
-      `${cfg.serveUrl}/stream/${cfg.dialogId}?client_id=${WEB_CLIENT_ID}`,
-    ],
-  })
-  let buffer = ''
-  for await (const chunk of child) {
-    if (chunk.stream === 'stderr') {
-      $.ui.log(`tg-messenger: stream: ${chunk.text.trim()}`)
-      continue
-    }
-    buffer += chunk.text
-    let end: number
-    while ((end = buffer.indexOf('\n\n')) >= 0) {
-      const raw = buffer.slice(0, end)
-      buffer = buffer.slice(end + 2)
-      const data = raw
-        .split('\n')
-        .filter(l => l.startsWith('data:'))
-        .map(l => l.slice('data:'.length).trim())
-        .join('\n')
-      if (!data) continue
-      try {
-        yield JSON.parse(data) as StreamFrame
-      } catch {
-        // a frame we cannot read is not ours — skip it
-      }
-    }
-  }
-}
-
 // --- pane --------------------------------------------------------------------
 
-// one live SSE subscription per activation: pane reopen and session re-seat
-// reuse it instead of stacking another curl child on a quiet dialog
-let streamAlive = false
-
-const startStream = ($: EngineInterface, cfg: ServeConfig) => {
-  if (streamAlive) return
-  streamAlive = true
-  void (async () => {
-    try {
-      await runStream($, cfg)
-    } finally {
-      // any escape from the loop (an unprotected state write or sleep
-      // rejecting) must leave the bridge revivable by the next /tg
-      streamAlive = false
-    }
-  })()
-}
-
-async function runStream($: EngineInterface, cfg: ServeConfig): Promise<never> {
-  let backoff = 1000
-  let lost = false // the panel line is on state change, not every retry
-  while (true) {
-    try {
-      // a fresh login per attempt: a serve restart invalidates its cookies
-      forgetCookie()
-      for await (const frame of streamFrames($, cfg)) {
-        backoff = 1000 // a live frame proves the link works
-        lost = false
-        // a reaction lands as an accumulating line UNDER its target message
-        // (the web/TUI convention); our own sends are suppressed server-side
-        if (frame.type === 'reaction') {
-          if (frame.message_id && frame.emoticon) {
-            const mid = frame.message_id
-            const emoticon = frame.emoticon
-            await update($, messages, all => withReaction(all, mid, emoticon))
-          }
-          continue
-        }
-        // other typed frames (translation) and our own echoes are not pane
-        // lines — the composer already appended what this mod itself sent
-        if (frame.type || frame.out || !frame.text) continue
-        const text = frame.text
-        const id = frame.id
-        await update($, messages, all => [...all, { id, text, out: false }].slice(-100) as TgMessage[])
-      }
-    } catch (error) {
-      $.ui.log(`tg-messenger: stream error: ${String(error)}`)
-      if (!lost) {
-        lost = true
-        const message = error instanceof Error ? error.message : String(error)
-        await update($, messages, all =>
-          [...all, { text: `bridge error: ${message}`, out: false, system: true }].slice(-100) as TgMessage[],
-        )
-      }
-    }
-    if (!lost) {
-      lost = true
-      const wait = Math.round(backoff / 1000)
-      await update($, messages, all =>
-        [...all, { text: `stream lost — retrying in ${wait} s`, out: false, system: true }].slice(-100) as TgMessage[],
-      )
-    }
-    await $.clock.sleep(backoff)
-    backoff = Math.min(backoff * 2, 30000)
-  }
+/**
+ * Reads the `userConfig` options. `profile` is REQUIRED (the mod must never
+ * pick an account silently); `dialog` is a marked numeric id or `@username`.
+ * `ready: false` → the mod stays in the dead-safe no-send mode; `reason` is
+ * the one-line explanation.
+ */
+function readConfig(options: Readonly<Record<string, unknown>>): {
+  cfg: ModConfig
+  ready: boolean
+  reason: string
+  target: string
+} {
+  const pick = (name: string): string =>
+    typeof options[name] === 'string' ? (options[name] as string).trim() : ''
+  const profile = pick('profile')
+  // `dialogId` is the pre-#248 spelling — honor it so an old config degrades
+  // to a clear toast instead of "dialog not configured"
+  const target = pick('dialog') || pick('dialogId')
+  const cfg: ModConfig = { profile, target, resolvedId: '', isGroup: false }
+  let reason = ''
+  if (!profile) reason = 'profile not configured — claude plugin configure tg-messenger'
+  else if (!target) reason = 'dialog not configured — claude plugin configure tg-messenger'
+  else if (!/^-?\d+$/.test(target) && !target.startsWith('@'))
+    reason = `invalid dialog "${target}" — expected a numeric id or @username`
+  return { cfg, ready: reason === '', reason, target }
 }
 
 /**
- * Opens the pane; a set-but-unusable dialog gets its toast right here (#248).
+ * Opens the pane and boots the transport: resolve → history → live stream.
+ * A set-but-unusable config gets its toast right here (#248).
  * Top-level declaration: the engine's static checks only let `$` be passed to
  * functions declared at the top of the file.
  */
-function openPane($: EngineInterface, cfg: ServeConfig, ready: boolean, reason: string, target: string) {
+async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reason: string, target: string) {
   void $.ui.open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
-  if (!ready && target) $.ui.toast(`tg-messenger: ${reason}`)
-  if (ready) startStream($, cfg)
+  if (!ready) {
+    if (target) $.ui.toast(`tg-messenger: ${reason}`)
+    return
+  }
+  try {
+    await resolveDialog($, cfg)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    $.ui.toast(`tg-messenger: ${message}`)
+    await update($, messages, all =>
+      [...all, { text: message, out: false, system: true }].slice(-100) as TgMessage[],
+    )
+    return
+  }
+  // history is best-effort: a failure (e.g. Telegram unreachable) must not
+  // kill the bridge — the live stream retries with backoff and self-heals
+  try {
+    await loadHistory($, cfg)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    $.ui.toast(`tg-messenger: ${message}`)
+    await update($, messages, all =>
+      [...all, { text: message, out: false, system: true }].slice(-100) as TgMessage[],
+    )
+  }
+  if (cfg.isGroup)
+    $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
+  else startStream($, cfg)
+}
+
+function openPane($: EngineInterface, cfg: ModConfig, ready: boolean, reason: string, target: string) {
+  void bootPane($, cfg, ready, reason, target)
 }
 
 export const register: Register = (on, options) => {
@@ -532,41 +493,81 @@ export const register: Register = (on, options) => {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
     const list = await read($, messages)
     const openPalette = await read($, paletteFor)
-    // body height of the pane (docked panes are full-height): diff reads e.props.scroll.bodyRows
+    const draftLen = await read($, draft)
+    const viewName = await read($, view)
+    const dialogs = await read($, dialogList)
+    // pane geometry: diff reads e.props.scroll.bodyRows/bodyColumns
     const props = (e as { props?: { scroll?: { bodyRows?: number }; bodyColumns?: number } }).props
-    const rows = props?.scroll?.bodyRows ?? e.viewport?.rows ?? 20
     const cols = (props?.bodyColumns ?? e.viewport?.columns ?? 80) - 2
+    const chat = viewName === 'chat'
+    const composerRows = chat
+      ? Math.min(5, Math.max(1, Math.ceil((draftLen + 1) / Math.max(4, cols - 4))))
+      : 0
+    // the engine (2.1.287) stopped stretching docked panes, so flexGrow alone
+    // left the composer floating mid-pane: size the list area EXPLICITLY
+    // from the pane's body height (fixed spend: top padding + header + gaps
+    // (+ separator + composer in chat); bottom padding is 0 — verified flush
+    // at 200x60 and 110x40). Falls back to flex when the engine reports no
+    // body height.
+    const fixed = chat ? 5 : 3
+    const listRows = props?.scroll?.bodyRows
+      ? Math.max(1, props.scroll.bodyRows - fixed - composerRows)
+      : undefined
     const shown = list.slice(-50)
 
     return (
       <Box flexDirection="column" flexGrow={1} gap={1} padding={1} paddingBottom={0}>
         <Box gap={2}>
           <Text bold>tg-messenger</Text>
-          {ready ? (
-            <Text>— {target}</Text>
-          ) : target ? (
-            // rejected (@username/malformed): dim so it never reads as a live dialog
-            <Text dimColor>— {target} (invalid — not sending)</Text>
+          {chat ? (
+            <>
+              <Text>{ready ? `— ${cfg.profile} · ${cfg.target}` : <Text dimColor>— {reason}</Text>}</Text>
+              {ready && (
+                <Button
+                  onPress={() => {
+                    void update($, view, () => 'dialogs' as const)
+                    if (dialogs === null)
+                      void loadDialogList($, cfg).catch(error =>
+                        $.ui.toast(`tg-messenger: ${error instanceof Error ? error.message : String(error)}`),
+                      )
+                  }}
+                >
+                  диалоги
+                </Button>
+              )}
+            </>
           ) : (
-            <Text dimColor>— set the dialog: claude plugin configure tg-messenger</Text>
+            <>
+              <Text>— диалоги</Text>
+              <Button onPress={() => void update($, view, () => 'chat' as const)}>← назад</Button>
+            </>
           )}
           <Button role="dismiss" onPress={() => $.ui.close({ id: PANE })}>
             close
           </Button>
         </Box>
-        <Box flexDirection="column" flexGrow={1} justifyContent="flex-end" overflow="hidden">
+        {chat ? (
+        <>
+        <Box
+          flexDirection="column"
+          flexGrow={1}
+          justifyContent="flex-end"
+          overflow="hidden"
+          height={listRows}
+        >
+          {shown.length === 0 && (
+            <Text dimColor>{ready ? 'loading history…' : 'not configured — see the header'}</Text>
+          )}
           {shown.map((m, i) => {
             const canReact = ready && !m.out && !m.system && m.id != null
             const react = (emoticon: string) => {
               const id = m.id as number
               void update($, paletteFor, () => -1)
-              // a repeat pick would toggle the reaction OFF server-side (with
-              // no removal frame coming back) — the pane has no remove UI, so
-              // an already-shown emoticon is a no-op instead of a divergence
+              // a repeat pick is a no-op: the CLI toggle would turn the
+              // reaction off and nothing would come back to redraw it
               if (m.reactions?.includes(emoticon)) return
               void (async () => {
                 try {
-                  // optimistic attach — the server suppresses our own SSE echo
                   await sendReaction($, cfg, id, emoticon)
                   await update($, messages, all => withReaction(all, id, emoticon))
                 } catch (error) {
@@ -608,10 +609,7 @@ export const register: Register = (on, options) => {
         </Box>
         <Box flexDirection="column" gap={0}>
           <Text dimColor>{'─'.repeat(Math.max(1, cols))}</Text>
-          <Box
-            height={Math.min(5, Math.max(1, Math.ceil(((await read($, draft)) + 1) / Math.max(4, cols - 4))))}
-            overflow="hidden"
-          >
+          <Box height={composerRows} overflow="hidden">
             <Input
             key="composer"
             placeholder={ready ? 'сообщение, @/path/to/file [caption]' : 'сообщение (уйдёт в никуда)'}
@@ -635,18 +633,24 @@ export const register: Register = (on, options) => {
                 return
               }
 
-              // #250: @PATH [caption] routes to the media upload; plain text to /send
+              // #250: @PATH [caption] routes to the media upload; plain text to send
               const media = parseMediaCommand(text)
 
               void (async () => {
                 try {
-                  if (media) await sendMedia($, cfg, media.path, media.caption)
-                  else await sendText($, cfg, text)
+                  let id: number | undefined
+                  if (media) {
+                    id = await sendMedia($, cfg, media.path, media.caption)
+                  } else {
+                    id = await sendText($, cfg, text)
+                  }
                   // #256: the restored text was resubmitted unchanged (no
                   // onInput fired) — the restore is consumed, don't re-draw it
                   void update($, pendingSend, () => '')
                   const shown = media ? `@${media.path}` : text
-                  await update($, messages, all => [...all, { text: shown, out: true }].slice(-100) as TgMessage[])
+                  await update($, messages, all =>
+                    [...all, { id, text: shown, out: true }].slice(-100) as TgMessage[],
+                  )
                 } catch (error) {
                   const message = error instanceof Error ? error.message : String(error)
                   $.ui.toast(`tg-messenger: ${message}`)
@@ -663,6 +667,20 @@ export const register: Register = (on, options) => {
             />
           </Box>
         </Box>
+        </>
+        ) : (
+          <Box flexDirection="column" flexGrow={1} overflow="hidden" height={listRows}>
+            {dialogs === null || dialogs.length === 0 ? (
+              <Text dimColor>{dialogs === null ? 'loading dialogs…' : 'no dialogs'}</Text>
+            ) : (
+              dialogs.map(d => (
+                <Button key={d.id} onPress={() => void switchDialog($, cfg, d.id)}>
+                  {`${d.title}${d.unread ? ` (${d.unread})` : ''}`}
+                </Button>
+              ))
+            )}
+          </Box>
+        )}
       </Box>
     )
   })
