@@ -162,7 +162,7 @@ class StubClient:
         return "My Group"
 
     # username (#22): override .occupied to mark names taken
-    occupied: set = frozenset()
+    occupied: set = set()
     set_username_to = None
     cleared = False
 
@@ -382,6 +382,22 @@ def test_dialogs_find_username_is_one_rpc(runner):
     assert stub.resolved_usernames == ["@ann"]
     assert stub.dialogs_calls == 0  # the full list was never fetched
     assert "7\tAnn" in result.output
+
+
+def test_dialogs_find_username_with_groups_keeps_local_filter(runner):
+    # #269 review: --groups must not silently gain a fast path that ignores the flag
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--groups", "--find", "@ann"])
+    assert result.exit_code == 0, result.output
+    assert stub.resolved_usernames == []
+
+
+def test_bad_numeric_dialog_id_is_a_clean_click_error(runner):
+    # #269 review: a free-form str argument must not raise a bare ValueError traceback
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["send", "12a4", "hello"])
+    assert result.exit_code != 0
+    assert "not a valid dialog id" in result.output
 
 
 def test_send_file_voice_flag(runner, tmp_path):
@@ -3938,7 +3954,7 @@ def test_tui_defers_to_screen_when_multi_profile_interactive(monkeypatch, tmp_pa
     assert deps_calls == []  # built lazily inside the TUI, not up front
     cap = _FakeTUIAllKwargs.captured
     assert cap.get("client") is None
-    assert sorted(cap.get("profiles")) == ["alice", "bob"]
+    assert sorted(cap.get("profiles") or []) == ["alice", "bob"]
     assert cap.get("deps_factory") is not None
     # the factory routes to make_tui_deps for the chosen profile
     cap["deps_factory"]("bob")

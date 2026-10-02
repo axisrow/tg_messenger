@@ -22,7 +22,11 @@ async def _dialog_arg(client, value: str) -> int:
     """
     if value.startswith("@"):
         return (await client.resolve_username(value)).id
-    return int(value)
+    try:
+        return int(value)
+    except ValueError as exc:
+        # free-form str argument: keep click's clean usage error, not a traceback
+        raise click.ClickException(f"'{value}' is not a valid dialog id or @username") from exc
 
 
 @click.command()
@@ -39,7 +43,7 @@ def dialogs(session: str, groups: bool, find: str | None) -> None:
     """
     from tg_messenger.core.search import filter_dialogs
 
-    fast_resolve = find is not None and find.startswith("@")
+    fast_resolve = find is not None and find.startswith("@") and not groups
 
     async def _do(client):
         if fast_resolve:

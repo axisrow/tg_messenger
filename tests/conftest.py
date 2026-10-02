@@ -115,9 +115,10 @@ class FakeChannel:
 
     def __init__(self, id, title=None, username=None, broadcast=False, *,
                  creator=False, admin_rights=None, default_banned_rights=None,
-                 banned_rights=None, left=False):
+                 banned_rights=None, left=False, lang_code=None):
         self.id = id
         self.title = title
+        self.lang_code = lang_code
         self.username = username
         self.broadcast = broadcast
         self.creator = creator
