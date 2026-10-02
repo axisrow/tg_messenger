@@ -396,10 +396,18 @@ async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reas
   }
   try {
     await resolveDialog($, cfg)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    $.ui.toast(`tg-messenger: ${message}`)
+    await update($, messages, all =>
+      [...all, { text: message, out: false, system: true }].slice(-100) as TgMessage[],
+    )
+    return
+  }
+  // history is best-effort: a failure (e.g. Telegram unreachable) must not
+  // kill the bridge — the live stream retries with backoff and self-heals
+  try {
     await loadHistory($, cfg)
-    if (cfg.isGroup)
-      $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
-    else startStream($, cfg)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     $.ui.toast(`tg-messenger: ${message}`)
@@ -407,6 +415,9 @@ async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reas
       [...all, { text: message, out: false, system: true }].slice(-100) as TgMessage[],
     )
   }
+  if (cfg.isGroup)
+    $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
+  else startStream($, cfg)
 }
 
 function openPane($: EngineInterface, cfg: ModConfig, ready: boolean, reason: string, target: string) {
