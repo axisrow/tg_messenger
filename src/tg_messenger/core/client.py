@@ -430,6 +430,7 @@ class StandaloneTelegramClient:
 
     async def entity_title(self, peer: int) -> str:
         """Human-readable name of a user/group/channel (group title wins)."""
+        await self._warm_entity(peer)
         entity = await run_with_flood_wait_retry(
             lambda: self._client.get_entity(int(peer)), operation="entity_title"
         )
@@ -537,6 +538,24 @@ class StandaloneTelegramClient:
         )
         return list(msgs)
 
+    async def _warm_entity(self, peer: int) -> None:
+        """Resolve a bare numeric peer in a fresh process.
+
+        StringSession carries NO entity cache across processes, so a marked
+        dialog id printed by an earlier command (``dialogs``, a live event, the
+        /tg pane) cannot resolve here — Telethon raises ``Could not find the
+        input entity``. One TTL-cached dialogs fetch warms Telethon's in-memory
+        entity map, then resolution retries. This makes the documented contract
+        (``Dialog.id`` accepted by history/send) true for the CLI's
+        one-process-per-command pattern. Free when the cache is already warm.
+        """
+        pid = int(peer)
+        try:
+            await self._client.get_input_entity(pid)
+        except ValueError:
+            await self.dialogs()
+            await self._client.get_input_entity(pid)
+
     async def _fetch_history(self, peer, limit, offset_id) -> list[Message]:
         raw = await run_with_flood_wait_retry(
             lambda: self._collect_history(peer, limit, offset_id), operation="history"
@@ -544,6 +563,7 @@ class StandaloneTelegramClient:
         return [self._to_message(m, dialog_id=int(peer)) for m in reversed(raw)]
 
     async def _collect_history(self, peer, limit, offset_id) -> list:
+        await self._warm_entity(peer)
         return [m async for m in self._iter_messages(peer, limit=limit, offset_id=offset_id)]
 
     async def history_since(self, peer: int, min_id: int = 0, limit: int = 50) -> list[Message]:
@@ -558,6 +578,7 @@ class StandaloneTelegramClient:
         return [self._to_message(m, dialog_id=int(peer)) for m in reversed(raw)]
 
     async def _collect_history_since(self, peer, min_id, limit) -> list:
+        await self._warm_entity(peer)
         return [m async for m in self._iter_messages(peer, limit=limit, min_id=min_id)]
 
     def _invalidate_history(self, peer: int) -> None:
@@ -577,6 +598,7 @@ class StandaloneTelegramClient:
         return [self._to_message(m, dialog_id=int(peer)) for m in raw]
 
     async def _collect_search(self, peer, query, limit) -> list:
+        await self._warm_entity(peer)
         return [m async for m in self._iter_messages(peer, search=query, limit=limit)]
 
     # --- sending ---
@@ -588,6 +610,7 @@ class StandaloneTelegramClient:
         schedule: timedelta | datetime | None = None,
     ) -> Message:
         """Send ``text`` to ``peer``; ``schedule`` (a delay or absolute time) defers it server-side."""
+        await self._warm_entity(peer)
         await self._send_bucket.acquire()  # global outgoing cap (#25), before the retry loop
         try:
             msg = await self._run_gated(
@@ -606,6 +629,8 @@ class StandaloneTelegramClient:
         Invalidates the history cache of BOTH peers (source can change too via
         Telegram's own behaviour, and the destination gains the new messages).
         """
+        await self._warm_entity(from_peer)
+        await self._warm_entity(to_peer)
         await self._send_bucket.acquire()  # global outgoing cap (#25)
         sent = await self._run_gated(
             lambda: self._client.forward_messages(to_peer, message_ids, from_peer),
@@ -626,6 +651,7 @@ class StandaloneTelegramClient:
         return [self._to_message(m, dialog_id=int(to_peer)) for m in raw_sent if m is not None]
 
     async def edit_text(self, peer: int, message_id: int, text: str) -> Message:
+        await self._warm_entity(peer)
         msg = await self._run_gated(
             lambda: self._client.edit_message(peer, int(message_id), text),
             operation="edit_text",
@@ -670,6 +696,7 @@ class StandaloneTelegramClient:
                 )
 
     async def _collect_messages_by_ids(self, peer, message_ids) -> list:
+        await self._warm_entity(peer)
         return [m async for m in self._iter_messages(peer, ids=message_ids)]
 
     async def mute_user(self, peer: int, user_id: int, until_sec: int) -> None:
@@ -680,6 +707,7 @@ class StandaloneTelegramClient:
         revoked for the future ``until_date``. The moderator engine calls it.
         Flood-wait retried.
         """
+        await self._warm_entity(peer)
         until_date = datetime.now(timezone.utc) + timedelta(seconds=int(until_sec))
         await run_with_flood_wait_retry(
             lambda: self._client.edit_permissions(
@@ -700,6 +728,7 @@ class StandaloneTelegramClient:
 
     async def ban_user(self, peer: int, user_id: int) -> None:
         """Ban a user from ``peer`` (revoke view_messages — kicks and blocks re-entry)."""
+        await self._warm_entity(peer)
         await run_with_flood_wait_retry(
             lambda: self._client.edit_permissions(peer, int(user_id), view_messages=False),
             operation="ban_user",
@@ -712,6 +741,7 @@ class StandaloneTelegramClient:
         logged — never raises. The moderator uses it to disable rules in chats we
         can't act on instead of crashing.
         """
+        await self._warm_entity(peer)
         try:
             me = await run_with_flood_wait_retry(lambda: self._client.get_me(), operation="is_admin_me")
             perms = await run_with_flood_wait_retry(
@@ -735,6 +765,7 @@ class StandaloneTelegramClient:
 
     async def mark_read(self, peer: int, max_id: int | None = None) -> None:
         """Mark a dialog read (clears its unread counter), routed through flood retry."""
+        await self._warm_entity(peer)
         await run_with_flood_wait_retry(
             lambda: self._client.send_read_acknowledge(peer, max_id=max_id),
             operation="mark_read",
@@ -801,6 +832,7 @@ class StandaloneTelegramClient:
         if not path.is_file():
             raise ValueError(f"file not found: {file_path}")
         await self._send_bucket.acquire()  # global outgoing cap (#25), after the cheap path check
+        await self._warm_entity(peer)
         try:
             msg = await self._run_gated(
                 lambda: self._client.send_file(
@@ -817,6 +849,7 @@ class StandaloneTelegramClient:
 
     async def send_reaction(self, peer: int, message_id: int, emoticon: str) -> None:
         """React to a message with a standard emoji, routed through flood-wait retry."""
+        await self._warm_entity(peer)
         await self._send_bucket.acquire()  # global outgoing cap (#25)
         try:
             await run_with_flood_wait_retry(
