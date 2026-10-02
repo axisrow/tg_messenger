@@ -1,3 +1,5 @@
+export type TgDialog = { id: string; title: string; unread: number }
+
 export type TgMessage = {
   text: string
   out: boolean
@@ -8,6 +10,13 @@ export type TgMessage = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'tg-messenger': { messages: TgMessage[]; draft: number; pendingSend: string; paletteFor: number }
+    'tg-messenger': {
+      messages: TgMessage[]
+      draft: number
+      pendingSend: string
+      paletteFor: number
+      view: 'chat' | 'dialogs'
+      dialogList: TgDialog[] | null
+    }
   }
 }

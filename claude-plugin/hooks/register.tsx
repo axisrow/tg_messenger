@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { TgMessage } from '../types'
+import type { TgDialog, TgMessage } from '../types'
 
 /**
  * tg-messenger mod — pane over the tg-messenger CLI.
@@ -42,6 +42,10 @@ const messages = atom({ plugin: 'tg-messenger', key: 'messages' } as const, [] a
 // keystroke touches it (cleared in onInput). Rendered as `value` only while
 // non-empty, so stream-frame redraws never clobber live typing.
 const pendingSend = atom({ plugin: 'tg-messenger', key: 'pendingSend' } as const, '')
+
+// pane view: the open dialog or the dialog picker; null list = not loaded yet
+const view = atom({ plugin: 'tg-messenger', key: 'view' } as const, 'chat' as 'chat' | 'dialogs')
+const dialogList = atom({ plugin: 'tg-messenger', key: 'dialogList' } as const, null as TgDialog[] | null)
 
 // message ids this mod itself sent (for `--out` echo suppression) — the TUI's
 // `_sent_ids` pattern: membership-only, never popped (a pop would re-duplicate
@@ -232,6 +236,37 @@ async function resolveDialog($: EngineInterface, cfg: ModConfig): Promise<void> 
   if (!line) throw new Error(`dialog ${cfg.target} not found`)
   cfg.resolvedId = line.slice(0, line.indexOf('\t'))
   cfg.isGroup = cfg.resolvedId.startsWith('-')
+}
+
+/** Loads the DM list for the picker (`dialogs`, DMs only — groups are history-only). */
+async function loadDialogList($: EngineInterface, cfg: ModConfig): Promise<void> {
+  const { stdout, stderr } = await runCli($, ['--profile', cfg.profile, 'dialogs'])
+  const err = cliError(stderr)
+  if (err) throw new Error(err)
+  const list = stdout
+    .split('\n')
+    .map(l => /^(\d+)\t(.+?)(?: \((\d+) unread\))?$/.exec(l))
+    .filter(m => m !== null)
+    .map(m => ({ id: m[1], title: m[2], unread: Number(m[3] ?? 0) }))
+  await update($, dialogList, () => list as TgDialog[] | null)
+}
+
+/** Switches the pane to another dialog: history re-reads, the live stream just re-filters. */
+async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Promise<void> {
+  cfg.target = id
+  cfg.resolvedId = id
+  cfg.isGroup = id.startsWith('-')
+  void update($, view, () => 'chat' as const)
+  void update($, paletteFor, () => -1)
+  if (cfg.isGroup)
+    $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
+  try {
+    await loadHistory($, cfg)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    $.ui.toast(`tg-messenger: ${message}`)
+  }
+  startStream($, cfg)
 }
 
 // --- outgoing ------------------------------------------------------------------
@@ -457,18 +492,24 @@ export const register: Register = (on, options) => {
     const list = await read($, messages)
     const openPalette = await read($, paletteFor)
     const draftLen = await read($, draft)
+    const viewName = await read($, view)
+    const dialogs = await read($, dialogList)
     // pane geometry: diff reads e.props.scroll.bodyRows/bodyColumns
     const props = (e as { props?: { scroll?: { bodyRows?: number }; bodyColumns?: number } }).props
     const cols = (props?.bodyColumns ?? e.viewport?.columns ?? 80) - 2
-    const composerRows = Math.min(5, Math.max(1, Math.ceil((draftLen + 1) / Math.max(4, cols - 4))))
+    const chat = viewName === 'chat'
+    const composerRows = chat
+      ? Math.min(5, Math.max(1, Math.ceil((draftLen + 1) / Math.max(4, cols - 4))))
+      : 0
     // the engine (2.1.287) stopped stretching docked panes, so flexGrow alone
-    // left the composer floating mid-pane: size the message area EXPLICITLY
-    // from the pane's body height (fixed spend: top padding + header + 2 gaps
-    // + separator + composer; bottom padding is 0 — verified flush at 200x60
-    // and 110x40). Falls back to flex when
-    // the engine reports no body height.
+    // left the composer floating mid-pane: size the list area EXPLICITLY
+    // from the pane's body height (fixed spend: top padding + header + gaps
+    // (+ separator + composer in chat); bottom padding is 0 — verified flush
+    // at 200x60 and 110x40). Falls back to flex when the engine reports no
+    // body height.
+    const fixed = chat ? 5 : 3
     const listRows = props?.scroll?.bodyRows
-      ? Math.max(1, props.scroll.bodyRows - 5 - composerRows)
+      ? Math.max(1, props.scroll.bodyRows - fixed - composerRows)
       : undefined
     const shown = list.slice(-50)
 
@@ -476,17 +517,35 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column" flexGrow={1} gap={1} padding={1} paddingBottom={0}>
         <Box gap={2}>
           <Text bold>tg-messenger</Text>
-          {ready ? (
-            <Text>
-              — {cfg.profile} · {target}
-            </Text>
+          {chat ? (
+            <>
+              <Text>{ready ? `— ${cfg.profile} · ${cfg.target}` : <Text dimColor>— {reason}</Text>}</Text>
+              {ready && (
+                <Button
+                  onPress={() => {
+                    void update($, view, () => 'dialogs' as const)
+                    if (dialogs === null)
+                      void loadDialogList($, cfg).catch(error =>
+                        $.ui.toast(`tg-messenger: ${error instanceof Error ? error.message : String(error)}`),
+                      )
+                  }}
+                >
+                  диалоги
+                </Button>
+              )}
+            </>
           ) : (
-            <Text dimColor>— {reason}</Text>
+            <>
+              <Text>— диалоги</Text>
+              <Button onPress={() => void update($, view, () => 'chat' as const)}>← назад</Button>
+            </>
           )}
           <Button role="dismiss" onPress={() => $.ui.close({ id: PANE })}>
             close
           </Button>
         </Box>
+        {chat ? (
+        <>
         <Box
           flexDirection="column"
           flexGrow={1}
@@ -606,6 +665,20 @@ export const register: Register = (on, options) => {
             />
           </Box>
         </Box>
+        </>
+        ) : (
+          <Box flexDirection="column" flexGrow={1} overflow="hidden" height={listRows}>
+            {dialogs === null || dialogs.length === 0 ? (
+              <Text dimColor>{dialogs === null ? 'loading dialogs…' : 'no dialogs'}</Text>
+            ) : (
+              dialogs.map(d => (
+                <Button key={d.id} onPress={() => void switchDialog($, cfg, d.id)}>
+                  {`${d.title}${d.unread ? ` (${d.unread})` : ''}`}
+                </Button>
+              ))
+            )}
+          </Box>
+        )}
       </Box>
     )
   })

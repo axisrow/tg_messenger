@@ -1,6 +1,6 @@
 {
   "name": "tg-messenger",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Telegram inside Claude Code: /tg opens a pane driven by the tg-messenger CLI.",
   "author": {
     "name": "axisrow"
