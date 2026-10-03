@@ -166,21 +166,18 @@ async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
 
 /**
  * `listen` line with ids: `← [DIALOG] [MSG] text` (incoming, DMs only) or
- * `→ [DIALOG] [MSG] text` (own messages from any device, `--out`). Preamble
- * and unknown lines are ignored.
+ * `→ [DIALOG] [MSG] text` (own messages from any device, `--out`). Returns
+ * null for preamble and unknown lines and for this mod's own send echoes.
+ * Pure — the caller merges a whole burst into ONE state update.
  */
 const STREAM_LINE = /^([←→]) \[(\d+)\] \[(\d+)\] (.*)$/
 
-async function handleStreamLine($: EngineInterface, cfg: ModConfig, line: string): Promise<void> {
+function parseStreamLine(cfg: ModConfig, line: string): TgMessage | null {
   const m = STREAM_LINE.exec(line)
-  if (!m || m[2] !== cfg.resolvedId) return
+  if (!m || m[2] !== cfg.resolvedId) return null
   const mid = Number(m[3])
-  if (m[1] === '→' && sentIds.has(mid)) return // this mod's own send, echoed
-  await update(
-    $,
-    messages,
-    all => [...all, { id: mid, text: m[4], out: m[1] === '→' }].slice(-100) as TgMessage[],
-  )
+  if (m[1] === '→' && sentIds.has(mid)) return null // this mod's own send, echoed
+  return { id: mid, text: m[4], out: m[1] === '→' }
 }
 
 // one live subscription per activation: pane reopen and session re-seat
@@ -212,11 +209,19 @@ async function runStream($: EngineInterface, cfg: ModConfig): Promise<never> {
         if (chunk.stream === 'stderr') continue // status noise ("Listening for…")
         buffer += chunk.text
         let nl: number
+        const batch: TgMessage[] = []
         while ((nl = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, nl)
           buffer = buffer.slice(nl + 1)
-          await handleStreamLine($, cfg, line)
+          const msg = parseStreamLine(cfg, line)
+          if (msg) batch.push(msg)
         }
+        // one update per burst — a burst of per-message updates would trigger
+        // just as many renders
+        if (batch.length)
+          await update($, messages, all =>
+            [...all, ...batch].slice(-100) as TgMessage[],
+          )
         backoff = 1000 // a live line proves the link works
         lost = false
       }
@@ -562,7 +567,17 @@ export const register: Register = (on, options) => {
     return { text: 'tg-messenger: pane opened below the prompt.' }
   })
 
+  // one draw at a time: the hook is async (every atom read is an await point),
+  // so a burst of state updates — a stream burst, a send's echo — starts
+  // overlapping renders, and their interleaved output splices wrapped lines of
+  // DIFFERENT messages together (панель черепком). The gate serializes draws;
+  // a queued render re-reads all atoms fresh, only its geometry snapshot may
+  // be a few ms stale.
+  let renderBusy = false
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    while (renderBusy) await $.clock.sleep(10)
+    renderBusy = true
+    try {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
     const list = await read($, messages)
     const openPalette = await read($, paletteFor)
@@ -773,5 +788,8 @@ export const register: Register = (on, options) => {
         )}
       </Box>
     )
+    } finally {
+      renderBusy = false
+    }
   })
 }
