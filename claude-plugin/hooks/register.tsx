@@ -635,9 +635,15 @@ export const register: Register = (on, options) => {
             return (
               <Box flexDirection="column" key={m.id ?? `i${i}`}>
                 <Box gap={1}>
-                  <Text dimColor={!m.out} wrap="wrap">
-                    {m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`}
-                  </Text>
+                  {/* shrink-wrapped Box: without flex constraints ink lays the
+                      Text out at its full single-line width and the list's
+                      overflow=hidden clips the tail — long messages lost their
+                      ends next to the reaction button */}
+                  <Box flexGrow={1} flexShrink={1}>
+                    <Text dimColor={!m.out} wrap="wrap">
+                      {m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`}
+                    </Text>
+                  </Box>
                   {canReact && (
                     <Button
                       plain
