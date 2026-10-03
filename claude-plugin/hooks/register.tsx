@@ -574,7 +574,7 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column" flexGrow={1} gap={1} padding={1} paddingBottom={0}>
         <Box gap={2}>
-          <Text bold>tg-messenger</Text>
+          <Text bold>tg</Text>
           {chat ? (
             <>
               <Text>{ready ? `— ${[cfg.profile, cfg.target].filter(Boolean).join(' · ')}` : <Text dimColor>— {reason}</Text>}</Text>
