@@ -44,6 +44,8 @@ class StubClient:
         self.send_media_raises = None
         self.send_reaction_raises = None
         self.dialogs_calls = 0  # count dialog-list fetches (F-cli-preflight regression)
+        self.dialogs_limit = None  # --limit threading (#270 lazy dialog load)
+        self.group_dialogs_limit = None
         self.resolved_usernames = []  # @username refs resolved through #268's cheap path
 
     async def resolve_username(self, username):
@@ -82,8 +84,9 @@ class StubClient:
         yield MessageReadEvent(dialog_id=7, max_id=10, outbox=True)
         await asyncio.Event().wait()
 
-    async def dialogs(self, dm_only=True):
+    async def dialogs(self, dm_only=True, limit=None):
         self.dialogs_calls += 1
+        self.dialogs_limit = limit
         dms = [Dialog(id=7, title="Ann", username="ann", unread=2)]
         if dm_only:
             return dms
@@ -94,8 +97,9 @@ class StubClient:
             Dialog(id=9, title="HelperBot", kind="bot"),
         ]
 
-    async def group_dialogs(self):
-        return [d for d in await self.dialogs(dm_only=False) if d.kind != "dm"]
+    async def group_dialogs(self, limit=None):
+        self.group_dialogs_limit = limit
+        return [d for d in await self.dialogs(dm_only=False, limit=limit) if d.kind != "dm"]
 
     async def history(self, peer, limit=50, offset_id=0):
         if self.history_items is not None:
@@ -357,6 +361,21 @@ def test_send_file_caption_option(runner, tmp_path):
 
 
 # #268: @username dialog refs resolve with one RPC instead of a cold-session crawl
+
+
+def test_dialogs_limit_reaches_client(runner):
+    # the pane picker on a factory-sized account: --limit must cut the crawl
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--limit", "50"])
+    assert result.exit_code == 0, result.output
+    assert stub.dialogs_limit == 50
+
+
+def test_dialogs_limit_with_groups_reaches_client(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["dialogs", "--groups", "--limit", "10"])
+    assert result.exit_code == 0, result.output
+    assert stub.group_dialogs_limit == 10
 
 
 def test_send_accepts_username(runner):
@@ -1810,7 +1829,7 @@ def test_revoked_session_mid_command_gives_hint(runner, monkeypatch):
 
     r, stub = runner
 
-    async def boom(dm_only=True):
+    async def boom(dm_only=True, limit=None):
         raise AuthKeyUnregisteredError(None)
 
     monkeypatch.setattr(stub, "dialogs", boom)
@@ -2952,7 +2971,7 @@ def test_serve_missing_creds_gives_friendly_hint_not_traceback(tmp_path, monkeyp
 def test_unexpected_error_hint_instead_of_traceback(runner, monkeypatch):
     r, stub = runner
 
-    async def boom(dm_only=True):
+    async def boom(dm_only=True, limit=None):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(stub, "dialogs", boom)
@@ -2968,7 +2987,7 @@ def test_unexpected_error_traceback_lands_in_log_file(runner, monkeypatch):
 
     r, stub = runner
 
-    async def boom(dm_only=True):
+    async def boom(dm_only=True, limit=None):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(stub, "dialogs", boom)
@@ -2988,7 +3007,7 @@ def test_unexpected_error_empty_message_falls_back_to_class_name(runner, monkeyp
     class SilentError(Exception):
         pass
 
-    async def boom(dm_only=True):
+    async def boom(dm_only=True, limit=None):
         raise SilentError()  # str(SilentError()) == ""
 
     monkeypatch.setattr(stub, "dialogs", boom)

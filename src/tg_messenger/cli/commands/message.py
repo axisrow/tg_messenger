@@ -34,12 +34,15 @@ async def _dialog_arg(client, value: str) -> int:
 @click.option("--groups", is_flag=True, help="List groups/channels/bots instead of DMs.")
 @click.option("--find", "find", default=None,
               help="Filter dialogs locally by title/username/id (no network).")
-def dialogs(session: str, groups: bool, find: str | None) -> None:
+@click.option("--limit", type=int, default=None,
+              help="Only the most recent N dialogs — lazy-load for huge accounts.")
+def dialogs(session: str, groups: bool, find: str | None, limit: int | None) -> None:
     """List your dialogs (DMs by default; --groups for groups/channels/bots).
 
     The first (tab-separated) column is the DIALOG_ID other commands (read/send/react/…)
     need. ``--find`` filters the already-fetched list locally (title substring, username
-    with/without @, or id) — no extra request.
+    with/without @, or id) — no extra request. ``--limit`` fetches only the most
+    recent N dialogs (a full crawl on a huge account takes minutes and floods).
     """
     from tg_messenger.core.search import filter_dialogs
 
@@ -50,7 +53,9 @@ def dialogs(session: str, groups: bool, find: str | None) -> None:
             # one ResolveUsername RPC — fetching the whole list to filter it
             # locally would crawl/flood on a big account (#268)
             return [await client.resolve_username(find)]
-        return await (client.group_dialogs() if groups else client.dialogs())
+        if groups:
+            return await client.group_dialogs(limit)
+        return await client.dialogs(limit=limit)
 
     click.echo("Loading dialogs…", err=True)  # #187: a one-line status before the blocking fetch
     items = cli_main._run(cli_main._with_client(session, _do), session=session)

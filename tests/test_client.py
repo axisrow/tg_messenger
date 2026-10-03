@@ -2552,3 +2552,26 @@ async def test_resolve_username_maps_one_row_dialog():
     assert d.id == 5146088037
     assert d.kind == "dm"
     assert d.title == "Ann"
+
+
+async def test_dialogs_limit_skips_cache(fake_client):
+    """#270: a limited fetch bypasses the TTL cache — the cache holds ONE full
+    list, and a truncated snapshot must never be served to unlimited callers."""
+
+    original = fake_client.iter_dialogs
+
+    async def limited(*a, **k):
+        if k.get("limit") == 5:
+            fake_client.iter_dialogs_calls += 1
+            return
+            yield  # pragma: no cover — makes this an async generator
+        async for d in original(*a, **k):
+            yield d
+
+    fake_client.iter_dialogs = limited
+    client = _build(fake_client)
+    await client.connect()
+    await client.dialogs(limit=5)
+    await client.dialogs()  # full — must fetch fresh, not the truncated list
+    await client.dialogs()  # now served from the cache
+    assert fake_client.iter_dialogs_calls == 2

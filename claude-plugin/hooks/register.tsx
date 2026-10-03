@@ -254,9 +254,16 @@ async function resolveDialog($: EngineInterface, cfg: ModConfig): Promise<void> 
   cfg.isGroup = cfg.resolvedId.startsWith('-')
 }
 
-/** Loads the DM list for the picker (`dialogs`, DMs only — groups are history-only). */
+/** Loads the DM list for the picker — the 100 most recent dialogs (#270): a full
+ * crawl on a huge account takes minutes and floods. */
 async function loadDialogList($: EngineInterface, cfg: ModConfig): Promise<void> {
-  const { stdout, stderr } = await runCli($, ['--profile', cfg.profile, 'dialogs'])
+  const { stdout, stderr } = await runCli($, [
+    '--profile',
+    cfg.profile,
+    'dialogs',
+    '--limit',
+    '100',
+  ])
   const err = cliError(stderr)
   if (err) throw new Error(err)
   const list = stdout
