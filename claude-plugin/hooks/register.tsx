@@ -53,33 +53,17 @@ const pendingSend = atom({ plugin: 'tg-messenger', key: 'pendingSend' } as const
 const view = atom({ plugin: 'tg-messenger', key: 'view' } as const, 'chat' as 'chat' | 'dialogs')
 const dialogList = atom({ plugin: 'tg-messenger', key: 'dialogList' } as const, null as TgDialog[] | null)
 
-// loading indicator: what is being fetched right now + the spinner frame the
-// ticker advances (~120 ms); both live in $.state so a reload mid-load resets
-// cleanly (register() clears `loading`, the ticker itself dies with the module)
+// loading indicator: what is being fetched right now. Deliberately STATIC — an
+// animated ticker (~120 ms redraws) made the async render hook overlap itself
+// and the interleaved output tore wrapped lines of different messages together.
+// register() clears the atom: a reload mid-load must not leave it stuck.
 const loading = atom({ plugin: 'tg-messenger', key: 'loading' } as const, null as 'history' | 'dialogs' | null)
-const spinner = atom({ plugin: 'tg-messenger', key: 'spinner' } as const, 0)
-
-const SPIN_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
-
-// module-scope: one ticker serves both loaders; a second concurrent load's
-// finally also stops it — the spinner freezing early is cosmetic, not a hang
-let tickerRunning = false
 
 async function spinWhile($: EngineInterface, kind: 'history' | 'dialogs', run: () => Promise<unknown>): Promise<void> {
   await update($, loading, () => kind)
-  if (!tickerRunning) {
-    tickerRunning = true
-    void (async () => {
-      while (tickerRunning) {
-        await $.clock.sleep(120)
-        await update($, spinner, f => (f + 1) % SPIN_FRAMES.length)
-      }
-    })()
-  }
   try {
     await run()
   } finally {
-    tickerRunning = false
     await update($, loading, () => null)
   }
 }
@@ -312,8 +296,8 @@ async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Pro
   cfg.isGroup = id.startsWith('-')
   void update($, view, () => 'chat' as const)
   void update($, paletteFor, () => -1)
-  // drop the previous dialog's text at once — the spinner replaces it, stale
-  // content of another dialog must not linger while the fetch runs
+  // drop the previous dialog's text at once — the loading marker replaces it,
+  // stale content of another dialog must not linger while the fetch runs
   void update($, messages, () => [] as TgMessage[])
   if (cfg.isGroup)
     $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
@@ -552,7 +536,7 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     // a reload mid-load kills the ticker but leaves the atom set — a frozen
-    // spinner must not survive into the fresh module
+    // loading marker must not survive into the fresh module
     void update($, loading, () => null)
     try {
       await $.command.register({
@@ -586,7 +570,6 @@ export const register: Register = (on, options) => {
     const viewName = await read($, view)
     const dialogs = await read($, dialogList)
     const loadingNow = await read($, loading)
-    const spinnerFrame = await read($, spinner)
     // pane geometry: diff reads e.props.scroll.bodyRows/bodyColumns
     const props = (e as { props?: { scroll?: { bodyRows?: number }; bodyColumns?: number } }).props
     const cols = (props?.bodyColumns ?? e.viewport?.columns ?? 80) - 2
@@ -653,7 +636,7 @@ export const register: Register = (on, options) => {
             <Text dimColor>{ready ? 'loading history…' : 'not configured — see the header'}</Text>
           )}
           {loadingNow === 'history' && (
-            <Text dimColor>{`${SPIN_FRAMES[spinnerFrame % SPIN_FRAMES.length]} загружаю историю…`}</Text>
+            <Text dimColor>⏳ загружаю историю…</Text>
           )}
           {shown.map((m, i) => {
             const canReact = ready && !m.out && !m.system && m.id != null
@@ -776,7 +759,7 @@ export const register: Register = (on, options) => {
             {dialogs === null || dialogs.length === 0 ? (
               <Text dimColor>
                 {loadingNow === 'dialogs'
-                  ? `${SPIN_FRAMES[spinnerFrame % SPIN_FRAMES.length]} загружаю диалоги…`
+                  ? '⏳ загружаю диалоги…'
                   : dialogs === null ? 'loading dialogs…' : 'no dialogs'}
               </Text>
             ) : (

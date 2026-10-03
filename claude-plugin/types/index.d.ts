@@ -18,7 +18,6 @@ declare module 'claude-code' {
       view: 'chat' | 'dialogs'
       dialogList: TgDialog[] | null
       loading: 'history' | 'dialogs' | null
-      spinner: number
     }
   }
 }
