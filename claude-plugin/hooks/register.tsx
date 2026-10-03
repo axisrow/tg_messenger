@@ -53,6 +53,37 @@ const pendingSend = atom({ plugin: 'tg-messenger', key: 'pendingSend' } as const
 const view = atom({ plugin: 'tg-messenger', key: 'view' } as const, 'chat' as 'chat' | 'dialogs')
 const dialogList = atom({ plugin: 'tg-messenger', key: 'dialogList' } as const, null as TgDialog[] | null)
 
+// loading indicator: what is being fetched right now + the spinner frame the
+// ticker advances (~120 ms); both live in $.state so a reload mid-load resets
+// cleanly (register() clears `loading`, the ticker itself dies with the module)
+const loading = atom({ plugin: 'tg-messenger', key: 'loading' } as const, null as 'history' | 'dialogs' | null)
+const spinner = atom({ plugin: 'tg-messenger', key: 'spinner' } as const, 0)
+
+const SPIN_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
+
+// module-scope: one ticker serves both loaders; a second concurrent load's
+// finally also stops it — the spinner freezing early is cosmetic, not a hang
+let tickerRunning = false
+
+async function spinWhile($: EngineInterface, kind: 'history' | 'dialogs', run: () => Promise<unknown>): Promise<void> {
+  await update($, loading, () => kind)
+  if (!tickerRunning) {
+    tickerRunning = true
+    void (async () => {
+      while (tickerRunning) {
+        await $.clock.sleep(120)
+        await update($, spinner, f => (f + 1) % SPIN_FRAMES.length)
+      }
+    })()
+  }
+  try {
+    await run()
+  } finally {
+    tickerRunning = false
+    await update($, loading, () => null)
+  }
+}
+
 // message ids this mod itself sent (for `--out` echo suppression) — the TUI's
 // `_sent_ids` pattern: membership-only, never popped (a pop would re-duplicate
 // a reconnect re-echo), bounded FIFO
@@ -281,14 +312,15 @@ async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Pro
   cfg.isGroup = id.startsWith('-')
   void update($, view, () => 'chat' as const)
   void update($, paletteFor, () => -1)
+  // drop the previous dialog's text at once — the spinner replaces it, stale
+  // content of another dialog must not linger while the fetch runs
+  void update($, messages, () => [] as TgMessage[])
   if (cfg.isGroup)
     $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
-  try {
-    await loadHistory($, cfg)
-  } catch (error) {
+  await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
     const message = error instanceof Error ? error.message : String(error)
     $.ui.toast(`tg-messenger: ${message}`)
-  }
+  }))
   startStream($, cfg)
 }
 
@@ -499,15 +531,13 @@ async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reas
   }
   // history is best-effort: a failure (e.g. Telegram unreachable) must not
   // kill the bridge — the live stream retries with backoff and self-heals
-  try {
-    await loadHistory($, cfg)
-  } catch (error) {
+  await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
     const message = error instanceof Error ? error.message : String(error)
     $.ui.toast(`tg-messenger: ${message}`)
-    await update($, messages, all =>
+    return update($, messages, all =>
       [...all, { text: message, out: false, system: true }].slice(-100) as TgMessage[],
     )
-  }
+  }))
   if (cfg.isGroup)
     $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
   else startStream($, cfg)
@@ -521,6 +551,9 @@ export const register: Register = (on, options) => {
   const { cfg, ready, reason, target } = readConfig(options)
 
   on('session.start', async ($, e, next) => {
+    // a reload mid-load kills the ticker but leaves the atom set — a frozen
+    // spinner must not survive into the fresh module
+    void update($, loading, () => null)
     try {
       await $.command.register({
         name: 'tg',
@@ -552,6 +585,8 @@ export const register: Register = (on, options) => {
     const draftLen = await read($, draft)
     const viewName = await read($, view)
     const dialogs = await read($, dialogList)
+    const loadingNow = await read($, loading)
+    const spinnerFrame = await read($, spinner)
     // pane geometry: diff reads e.props.scroll.bodyRows/bodyColumns
     const props = (e as { props?: { scroll?: { bodyRows?: number }; bodyColumns?: number } }).props
     const cols = (props?.bodyColumns ?? e.viewport?.columns ?? 80) - 2
@@ -590,9 +625,9 @@ export const register: Register = (on, options) => {
               onPress={() => {
                 void update($, view, () => 'dialogs' as const)
                 if (dialogs === null)
-                  void loadDialogList($, cfg).catch(error =>
+                  void spinWhile($, 'dialogs', () => loadDialogList($, cfg).catch(error =>
                     $.ui.toast(`tg-messenger: ${error instanceof Error ? error.message : String(error)}`),
-                  )
+                  ))
               }}
             >
               диалоги
@@ -614,8 +649,11 @@ export const register: Register = (on, options) => {
           overflow="hidden"
           height={listRows}
         >
-          {shown.length === 0 && (
+          {shown.length === 0 && !loading && (
             <Text dimColor>{ready ? 'loading history…' : 'not configured — see the header'}</Text>
+          )}
+          {loadingNow === 'history' && (
+            <Text dimColor>{`${SPIN_FRAMES[spinnerFrame % SPIN_FRAMES.length]} загружаю историю…`}</Text>
           )}
           {shown.map((m, i) => {
             const canReact = ready && !m.out && !m.system && m.id != null
@@ -736,7 +774,11 @@ export const register: Register = (on, options) => {
         ) : (
           <Box flexDirection="column" flexGrow={1} overflow="hidden" height={listRows}>
             {dialogs === null || dialogs.length === 0 ? (
-              <Text dimColor>{dialogs === null ? 'loading dialogs…' : 'no dialogs'}</Text>
+              <Text dimColor>
+                {loadingNow === 'dialogs'
+                  ? `${SPIN_FRAMES[spinnerFrame % SPIN_FRAMES.length]} загружаю диалоги…`
+                  : dialogs === null ? 'loading dialogs…' : 'no dialogs'}
+              </Text>
             ) : (
               dialogs.map(d => (
                 <Button key={d.id} onPress={() => void switchDialog($, cfg, d.id)}>
