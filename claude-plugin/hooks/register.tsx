@@ -573,30 +573,33 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column" flexGrow={1} gap={1} padding={1} paddingBottom={0}>
+        {/* No <> fragments among the row children: the engine does NOT flatten
+            them — a Fragment renders as one node stacking its children
+            vertically, which kept the диалоги/назад buttons on their own line
+            under the middle text no matter the widths. Every element is a
+            direct child of the row; JSX false/undefined children are skipped. */}
         <Box gap={2}>
           <Text bold>tg</Text>
           {chat ? (
-            <>
-              <Text>{ready ? `— ${[cfg.profile, cfg.target].filter(Boolean).join(' · ')}` : <Text dimColor>— {reason}</Text>}</Text>
-              {ready && (
-                <Button
-                  onPress={() => {
-                    void update($, view, () => 'dialogs' as const)
-                    if (dialogs === null)
-                      void loadDialogList($, cfg).catch(error =>
-                        $.ui.toast(`tg-messenger: ${error instanceof Error ? error.message : String(error)}`),
-                      )
-                  }}
-                >
-                  диалоги
-                </Button>
-              )}
-            </>
+            <Text>{ready ? `— ${[cfg.profile, cfg.target].filter(Boolean).join(' · ')}` : <Text dimColor>— {reason}</Text>}</Text>
           ) : (
-            <>
-              <Text>— диалоги</Text>
-              <Button onPress={() => void update($, view, () => 'chat' as const)}>← назад</Button>
-            </>
+            <Text>— диалоги</Text>
+          )}
+          {chat && ready && (
+            <Button
+              onPress={() => {
+                void update($, view, () => 'dialogs' as const)
+                if (dialogs === null)
+                  void loadDialogList($, cfg).catch(error =>
+                    $.ui.toast(`tg-messenger: ${error instanceof Error ? error.message : String(error)}`),
+                  )
+              }}
+            >
+              диалоги
+            </Button>
+          )}
+          {!chat && (
+            <Button onPress={() => void update($, view, () => 'chat' as const)}>← назад</Button>
           )}
           <Button role="dismiss" onPress={() => $.ui.close({ id: PANE })}>
             close
