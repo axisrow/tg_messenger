@@ -702,6 +702,10 @@ export const register: Register = (on, options) => {
           )}
           {shown.map((m, i) => {
             const canReact = ready && !m.out && !m.system && m.id != null
+            // a bracketed button (the header style, `[ диалоги ]`) = label
+            // cells + 4 + the 1-col gap; a bare plain 🙂 read as message
+            // CONTENT — nothing told the user it opens the reaction palette
+            const w = cols - (canReact ? 8 : 0)
             const react = (emoticon: string) => {
               const id = m.id as number
               void update($, paletteFor, () => -1)
@@ -718,31 +722,28 @@ export const register: Register = (on, options) => {
                 }
               })()
             }
+            const body = padLines(
+              wrapText(
+                m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`,
+                w,
+              ),
+              w,
+            )
             return (
               <Box flexDirection="column" key={m.id ?? `i${i}`}>
                 <Box gap={1}>
                   {/* the engine's Text does not re-wrap to the pane width —
                       long lines are painted clipped at the edge (tree holds the
                       text, screen loses the tail), so wrap BEFORE drawing.
-                      canReact rows share the line with the 🙂 button — reserve
-                      its columns; the rest use the full width. */}
+                      canReact rows share the line with the [ 🙂 ] button —
+                      reserve its columns; the rest use the full width. */}
                   <Box flexGrow={1} flexShrink={1}>
                     <Text dimColor={!m.out} wrap="wrap">
-                      {(() => {
-                        const w = cols - (canReact ? 4 : 0)
-                        return padLines(
-                          wrapText(
-                            m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`,
-                            w,
-                          ),
-                          w,
-                        )
-                      })()}
+                      {body}
                     </Text>
                   </Box>
                   {canReact && (
                     <Button
-                      plain
                       onPress={() =>
                         void update($, paletteFor, open => (open === m.id ? -1 : (m.id as number)))
                       }
@@ -751,11 +752,13 @@ export const register: Register = (on, options) => {
                     </Button>
                   )}
                 </Box>
-                {m.reactions?.length ? <Text dimColor>{`  ${m.reactions.join(' ')}`}</Text> : null}
+                {m.reactions?.length ? (
+                  <Text dimColor>{padLines(`  ${m.reactions.join(' ')}`, w)}</Text>
+                ) : null}
                 {canReact && openPalette === m.id && (
                   <Box gap={1}>
                     {REACTION_PRESETS.map(emoji => (
-                      <Button plain key={emoji} onPress={() => react(emoji)}>
+                      <Button key={emoji} onPress={() => react(emoji)}>
                         {emoji}
                       </Button>
                     ))}
