@@ -1238,6 +1238,17 @@ async def test_history_refetches_after_ttl(fake_client):
     assert fake_client.iter_messages_calls == 2
 
 
+async def test_history_fresh_bypasses_cache(fake_client):
+    # the /tg pane's warm poll hits the daemon's history route with fresh=True:
+    # a sub-TTL poll must still see new messages, so fresh never serves the cache
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10, fresh=True)
+    await client.history(7, limit=10, fresh=True)
+    assert fake_client.iter_messages_calls == 2
+
+
 async def test_history_returns_copy(fake_client):
     _seed_dm(fake_client)
     client = _build(fake_client)

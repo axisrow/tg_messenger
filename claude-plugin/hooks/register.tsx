@@ -88,6 +88,10 @@ type ModConfig = {
   resolvedId: string
   /** true when the resolved dialog is a group/channel (marked negative) */
   isGroup: boolean
+  /** history re-read interval (ms) — the live stream's safety net; kit tests pass a small one */
+  pollMs: number
+  /** port of the warm `serve` daemon (set by `ensureDaemon`); unset = cold CLI path */
+  daemonPort?: number
 }
 
 /**
@@ -119,6 +123,121 @@ function cliError(stderr: string): string | null {
   return m ? m[1] : null
 }
 
+// --- warm daemon transport ----------------------------------------------------
+//
+// A cold CLI child per action costs seconds (python boot + a full MTProto
+// handshake — measured 6.2 s on this machine's lossy route, vs 1.1 s for one
+// RPC on a live connection and ~1 ms cached). So the pane keeps ONE `serve`
+// daemon per profile and reads/sends over localhost HTTP; every warm call
+// falls back to the cold CLI path when the daemon is not (yet) answering. The
+// daemon is a child of the pane's environment — teardown cancels it like the
+// stream, and the catch guards below keep that cancellation off the worker.
+
+/** Deterministic per-profile port: two panes on one account share the daemon. */
+function daemonPortFor(profile: string): number {
+  let h = 0
+  for (let i = 0; i < profile.length; i++) h = (h * 31 + profile.charCodeAt(i)) >>> 0
+  return 18080 + (h % 1000)
+}
+
+const WARM_POLL_MS = 4000
+
+/** Ports with a daemon boot in flight — keyed by port so panes on different
+ * profiles never block each other's warm path. */
+const daemonBooting = new Set<number>()
+
+/** One curl to the daemon; null = no daemon / request failed (caller falls
+ * back to the CLI). `statusOnly` swaps the body for the HTTP code — a 204
+ * success and a -f swallowed error are otherwise indistinguishable. */
+async function runApiRaw(
+  $: EngineInterface,
+  port: number | undefined,
+  method: 'GET' | 'POST',
+  path: string,
+  form: readonly string[] = [],
+  statusOnly = false,
+): Promise<string | null> {
+  if (!port) return null
+  const argv = [
+    'curl', '-sf', '-m', '20', '-X', method,
+    '-H', 'x-tg-messenger-csrf: 1',
+    '-H', 'Accept: application/json',
+  ]
+  if (statusOnly) argv.push('-o', '/dev/null', '-w', '%{http_code}')
+  for (const pair of form) argv.push('--data-urlencode', pair)
+  argv.push(`http://127.0.0.1:${port}${path}`)
+  let stdout = ''
+  try {
+    for await (const chunk of $.process.spawn({ argv })) {
+      if (chunk.stream === 'stdout') stdout += chunk.text
+    }
+  } catch {
+    return null
+  }
+  return stdout
+}
+
+/** JSON GET against the daemon's API; null = no daemon / not JSON. */
+async function runApiJson($: EngineInterface, cfg: ModConfig, path: string): Promise<unknown | null> {
+  const body = await runApiRaw($, cfg.daemonPort, 'GET', path)
+  if (body === null || body.trim() === '') return null
+  try {
+    return JSON.parse(body)
+  } catch {
+    return null
+  }
+}
+
+/** True when the daemon on `port` serves OUR profile — /api/health answers
+ * the profile name, so a port collision with another account's daemon never
+ * adopts the wrong one. Cheaper than a data route: no client calls at all. */
+async function daemonAlive($: EngineInterface, port: number, profile: string): Promise<boolean> {
+  const body = await runApiRaw($, port, 'GET', '/api/health')
+  if (body === null) return false
+  try {
+    return (JSON.parse(body) as Record<string, unknown>).profile === profile
+  } catch {
+    return false
+  }
+}
+
+/** Adopts an already-running daemon for this profile — one fast probe, safe
+ * to await on the boot path (fails in milliseconds when nothing listens). */
+async function ensureDaemon($: EngineInterface, cfg: ModConfig): Promise<void> {
+  if (cfg.daemonPort || !cfg.profile) return
+  const port = daemonPortFor(cfg.profile)
+  if (!daemonBooting.has(port) && await daemonAlive($, port, cfg.profile)) cfg.daemonPort = port
+}
+
+/** Spawns the profile's daemon and waits (bounded, detached) for it to come
+ * up; a real daemon needs its own connect (~seconds) before serving, and the
+ * cold CLI path covers that window. An EADDRINUSE race against a sibling
+ * pane's daemon is fine: the probe adopts whichever wins the port. */
+async function startDaemon($: EngineInterface, cfg: ModConfig): Promise<void> {
+  if (!cfg.profile) return
+  const port = daemonPortFor(cfg.profile)
+  if (cfg.daemonPort || daemonBooting.has(port)) return
+  daemonBooting.add(port)
+  try {
+    void (async () => {
+      for await (const chunk of $.process.spawn({
+        argv: ['tg-messenger', '--profile', cfg.profile, 'serve', '--host', '127.0.0.1', '--port', String(port)],
+      })) {
+        if (chunk.stream === 'stderr') continue // uvicorn logs
+      }
+    })().catch(() => {}) // teardown cancellation must not escape a detached task
+    for (let i = 0; i < 40; i++) {
+      await waitMs($, 500)
+      if (await daemonAlive($, port, cfg.profile)) {
+        cfg.daemonPort = port
+        return
+      }
+    }
+  } finally {
+    daemonBooting.delete(port)
+  }
+}
+
 /** `read` line: `← [123] text` / `→ [124] my own` (core `message_line`). */
 const HISTORY_LINE = /^([←→]) \[(\d+)\] (.*)$/
 
@@ -143,6 +262,26 @@ function parseHistory(stdout: string): TgMessage[] {
     }
   }
   return out
+}
+
+/** Maps one core `Message` JSON row onto a pane message; null skips junk. */
+function messageFromApi(raw: unknown): TgMessage | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const m = raw as Record<string, unknown>
+  if (typeof m.id !== 'number') return null
+  return {
+    id: m.id,
+    text: typeof m.text === 'string' ? m.text : '[медиа]',
+    out: m.out === true,
+  }
+}
+
+/** Maps one core `Dialog` JSON row onto a picker row; null skips junk. */
+function dialogFromApi(raw: unknown): TgDialog | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const d = raw as Record<string, unknown>
+  if (typeof d.id !== 'number' || typeof d.title !== 'string') return null
+  return { id: String(d.id), title: d.title, unread: typeof d.unread === 'number' ? d.unread : 0 }
 }
 
 /**
@@ -194,10 +333,20 @@ export function padLines(text: string, width: number): string {
 
 /**
  * Reads recent history of the dialog and replaces the pane content.
+ * Warm path first: the daemon's JSON API with `fresh=1` (the poll runs at a
+ * sub-TTL cadence, the daemon's own live-event invalidations can't be relied
+ * on when the transport drops updates). Falls back to the cold CLI read.
  * Status noise (`Loading history…`) rides stderr — only Click's `Error:`
  * line means failure.
  */
 async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
+  const api = await runApiJson($, cfg, `/api/dialogs/${cfg.resolvedId}/messages?limit=50&fresh=1`)
+  if (Array.isArray(api)) {
+    await update($, messages, () =>
+      api.map(messageFromApi).filter((m): m is TgMessage => m !== null),
+    )
+    return
+  }
   const { stdout, stderr } = await runCli($, [
     '--profile',
     cfg.profile,
@@ -237,6 +386,9 @@ const startStream = ($: EngineInterface, cfg: ModConfig) => {
   void (async () => {
     try {
       await runStream($, cfg)
+    } catch {
+      // environment teardown (reload, pane re-open) cancels the loop's pending
+      // waits; a rejection escaping a detached task crashes the hooks worker
     } finally {
       // any escape from the loop must leave the bridge revivable by the next /tg
       streamAlive = false
@@ -289,9 +441,48 @@ async function runStream($: EngineInterface, cfg: ModConfig): Promise<never> {
         [...all, { text: `stream lost — retrying in ${wait} s`, out: false, system: true }].slice(-100) as TgMessage[],
       )
     }
-    await $.clock.sleep(backoff)
+    await waitMs($, backoff)
     backoff = Math.min(backoff * 2, 30000)
   }
+}
+
+// the live stream's safety net: on some networks the engine never receives
+// server-initiated updates (reproduced on a bare CLI: a connected `listen`
+// child stays silent even for cross-account incoming). The pane still
+// converges by re-reading history on an interval — same one-per-activation
+// guard as the stream; a failed re-read is logged, never fatal.
+let pollAlive = false
+
+const startPolling = ($: EngineInterface, cfg: ModConfig) => {
+  if (pollAlive) return
+  pollAlive = true
+  void (async () => {
+    try {
+      while (true) {
+        try {
+          // a warm read is one RPC (~1 s), so the poll can tick 4× faster than
+          // the cold CLI ever could; cfg.daemonPort is read live — the poll
+          // speeds up on its own once the daemon is adopted
+          await waitMs($, cfg.daemonPort ? WARM_POLL_MS : cfg.pollMs)
+        } catch (error) {
+          // a dead wait kills the loop — polling without it would hot-spin the
+          // CLI read; say so and stop (the next /tg revives it)
+          $.ui.log(`tg-messenger: history poll stopped: ${String(error)}`)
+          return
+        }
+        try {
+          await loadHistory($, cfg)
+        } catch (error) {
+          $.ui.log(`tg-messenger: history poll failed: ${String(error)}`)
+        }
+      }
+    } catch {
+      // same as startStream: teardown cancellation must not escape a detached
+      // task — an unhandled rejection crashes the hooks worker
+    } finally {
+      pollAlive = false
+    }
+  })()
 }
 
 /**
@@ -322,8 +513,16 @@ async function resolveDialog($: EngineInterface, cfg: ModConfig): Promise<void> 
 }
 
 /** Loads the DM list for the picker — the 100 most recent dialogs (#270): a full
- * crawl on a huge account takes minutes and floods. */
+ * crawl on a huge account takes minutes and floods. Warm daemon first, cold CLI
+ * fallback. */
 async function loadDialogList($: EngineInterface, cfg: ModConfig): Promise<void> {
+  const api = await runApiJson($, cfg, '/api/dialogs?tab=dm')
+  if (Array.isArray(api)) {
+    await update($, dialogList, () =>
+      api.map(dialogFromApi).filter((d): d is TgDialog => d !== null),
+    )
+    return
+  }
   const { stdout, stderr } = await runCli($, [
     '--profile',
     cfg.profile,
@@ -346,6 +545,7 @@ async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Pro
   cfg.target = id
   cfg.resolvedId = id
   cfg.isGroup = id.startsWith('-')
+  void ensureDaemon($, cfg) // no-op once adopted or while a spawn is in flight
   void update($, view, () => 'chat' as const)
   void update($, paletteFor, () => -1)
   // drop the previous dialog's text at once — the loading marker replaces it,
@@ -358,12 +558,32 @@ async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Pro
     $.ui.toast(`tg-messenger: ${message}`)
   }))
   startStream($, cfg)
+  startPolling($, cfg)
 }
 
 // --- outgoing ------------------------------------------------------------------
 
-/** Sends text; returns the new message id when the CLI reported one. */
+/** Sends text; returns the new message id when the transport reported one.
+ * Warm path: POST /send on the daemon with `Accept: application/json`
+ * (answered `{"id": N}`), then a warm history redraw — one RPC each, no cold
+ * child. */
 async function sendText($: EngineInterface, cfg: ModConfig, text: string): Promise<number | undefined> {
+  const body = await runApiRaw($, cfg.daemonPort, 'POST', '/send', [
+    `dialog_id=${cfg.resolvedId}`,
+    `text=${text}`,
+  ])
+  if (body !== null && body.trim() !== '') {
+    let id: number | undefined
+    try {
+      const parsed = JSON.parse(body) as Record<string, unknown>
+      id = typeof parsed.id === 'number' ? parsed.id : undefined
+    } catch {
+      id = undefined
+    }
+    if (id != null) rememberSent(id)
+    await loadHistory($, cfg)
+    return id
+  }
   const { stdout, stderr } = await runCli($, [
     '--profile',
     cfg.profile,
@@ -394,13 +614,35 @@ async function sendMedia($: EngineInterface, cfg: ModConfig, path: string, capti
   return id
 }
 
-/** Reacts to a message (`react DIALOG MSG_ID EMOTICON`). */
+// Wait `ms` by spawning the platform `sleep`: the kit's hook realm never
+// pumps host timers and its $ carries no clock (probed — setTimeout callbacks
+// never run, $.clock absent), so the only wait that exists in BOTH realms is
+// a child process. In the engine it is a real /bin/sleep; in the kit the
+// test's spawn stub answers it and paces time itself.
+async function waitMs($: EngineInterface, ms: number): Promise<void> {
+  for await (const _ of $.process.spawn({ argv: ['sleep', String(ms / 1000)] })) {
+    void _
+  }
+}
+
+/** Reacts to a message (`react DIALOG MSG_ID EMOTICON`). Warm POST first —
+ * `statusOnly` tells a 204 success from a swallowed 4xx (then the cold CLI
+ * re-runs and surfaces Click's error properly). */
 async function sendReaction(
   $: EngineInterface,
   cfg: ModConfig,
   messageId: number,
   emoticon: string,
 ): Promise<void> {
+  const code = await runApiRaw(
+    $,
+    cfg.daemonPort,
+    'POST',
+    `/dialogs/${cfg.resolvedId}/reaction`,
+    [`message_id=${messageId}`, `emoticon=${emoticon}`],
+    true,
+  )
+  if (code !== null && code.startsWith('2')) return
   const { stderr } = await runCli($, [
     '--profile',
     cfg.profile,
@@ -534,7 +776,8 @@ function readConfig(options: Readonly<Record<string, unknown>>): {
   // `dialogId` is the pre-#248 spelling — honor it so an old config degrades
   // to a clear toast instead of "dialog not configured"
   const target = pick('dialog') || pick('dialogId')
-  const cfg: ModConfig = { profile, target, resolvedId: '', isGroup: false }
+  const pollMs = typeof options.pollMs === 'number' && options.pollMs > 0 ? options.pollMs : 15000
+  const cfg: ModConfig = { profile, target, resolvedId: '', isGroup: false, pollMs }
   let reason = ''
   if (!target) reason = 'dialog not configured — claude plugin configure tg-messenger'
   else if (!/^-?\d+$/.test(target) && !target.startsWith('@'))
@@ -549,7 +792,9 @@ function readConfig(options: Readonly<Record<string, unknown>>): {
  * functions declared at the top of the file.
  */
 async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reason: string, target: string) {
-  void $.ui.open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
+  $.ui
+    .open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
+    .catch((error: unknown) => $.ui.log(`tg-messenger: open failed: ${String(error)}`))
   if (!ready) {
     if (target) $.ui.toast(`tg-messenger: ${reason}`)
     return
@@ -565,6 +810,11 @@ async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reas
     )
     return
   }
+  // adopt an already-running daemon (one fast probe — a pane reopen or a
+  // second pane on the account then boots warm); none answering → spawn one
+  // in the background, the cold CLI path covers the warm-up window
+  await ensureDaemon($, cfg)
+  if (!cfg.daemonPort) void startDaemon($, cfg).catch(() => {})
   // history is best-effort: a failure (e.g. Telegram unreachable) must not
   // kill the bridge — the live stream retries with backoff and self-heals
   await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
@@ -576,11 +826,16 @@ async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reas
   }))
   if (cfg.isGroup)
     $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
-  else startStream($, cfg)
+  else {
+    startStream($, cfg)
+    startPolling($, cfg)
+  }
 }
 
 function openPane($: EngineInterface, cfg: ModConfig, ready: boolean, reason: string, target: string) {
-  void bootPane($, cfg, ready, reason, target)
+  // a dead environment mid-boot rejects the whole chain; a detached rejection
+  // crashes the hooks worker, so the boot is guarded like the loops above
+  void bootPane($, cfg, ready, reason, target).catch(() => {})
 }
 
 export const register: Register = (on, options) => {
@@ -620,10 +875,18 @@ export const register: Register = (on, options) => {
   // DIFFERENT messages together (панель черепком). The gate serializes draws;
   // a queued render re-reads all atoms fresh, only its geometry snapshot may
   // be a few ms stale.
-  let renderBusy = false
+  // promise-gate mutex: every render waits for the previous one and releases
+  // the next in a finally. (A busy-wait flag starved the very I/O completions
+  // the holder awaited.) $ stays in the hook's own scope — the engine's static
+  // checks reject it inside a nested closure.
+  let renderGate = Promise.resolve()
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    while (renderBusy) await $.clock.sleep(10)
-    renderBusy = true
+    const prev = renderGate
+    let release: () => void = () => {}
+    renderGate = new Promise<void>(done => {
+      release = done
+    })
+    await prev
     try {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
     const list = await read($, messages)
@@ -874,7 +1137,7 @@ export const register: Register = (on, options) => {
       </Box>
     )
     } finally {
-      renderBusy = false
+      release()
     }
   })
 }

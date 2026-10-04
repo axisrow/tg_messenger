@@ -576,6 +576,30 @@ def build_app(
             "".join(_message_div(m, show_author=is_group and not m.out) for m in items)
         )
 
+    @app.get("/api/health")
+    async def api_health():
+        # the /tg pane's daemon probe: IDENTITY, not readiness — adopting a
+        # daemon of another profile would cross accounts, so the profile name
+        # is the whole contract (and it never touches the client)
+        return JSONResponse({"profile": session_name})
+
+    @app.get("/api/dialogs")
+    async def api_dialogs(request: Request, tab: str = "dm"):
+        # JSON surface for the /tg pane's warm daemon (a localhost `serve` the
+        # pane spawns): same data as the HTML page, no fragments, no translation
+        client = request.app.state.client
+        items = await (client.group_dialogs() if tab == "groups" else client.dialogs())
+        return JSONResponse([d.model_dump(mode="json") for d in items])
+
+    @app.get("/api/dialogs/{dialog_id}/messages")
+    async def api_messages(request: Request, dialog_id: int, limit: int = 50, fresh: bool = False):
+        # fresh skips the TTL cache — the pane's sub-15s poll must still see
+        # new messages (the daemon's own live events only invalidate the cache
+        # when the transport delivers updates, which it doesn't on some networks)
+        client = request.app.state.client
+        items = await client.history(dialog_id, limit=min(limit, 200), fresh=fresh)
+        return JSONResponse([m.model_dump(mode="json") for m in items])
+
     @app.post("/dialogs/{dialog_id}/read", response_class=HTMLResponse)
     async def mark_read(request: Request, dialog_id: int, max_id: str = Form("")):
         # #195 round 2: client-confirmed read — fired only after an ACCEPTED (non-stale) history
@@ -625,6 +649,10 @@ def build_app(
             msg = await coordinator.send_original(dialog_id_int, text, _send_fn)
         sent_ids = _sent_bucket(request.app.state.sent_ids_by_client, web_client_id)
         _remember_sent(sent_ids, dialog_id_int, msg.id)  # suppress only this client's SSE echo
+        # machine callers (the /tg pane's warm daemon path) take JSON — no
+        # HTML fragment to scrape the id out of
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse({"id": msg.id})
         return HTMLResponse(_message_div(msg))
 
     @app.post("/dialogs/{dialog_id}/reaction", response_class=HTMLResponse)

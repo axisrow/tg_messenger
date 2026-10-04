@@ -569,18 +569,25 @@ class StandaloneTelegramClient:
     async def _collect_dialogs(self, *, archived: bool = False, limit: int | None = None) -> list:
         return [d async for d in self._client.iter_dialogs(archived=archived, limit=limit)]
 
-    async def history(self, peer: int, limit: int = 50, offset_id: int = 0) -> list[Message]:
+    async def history(
+        self, peer: int, limit: int = 50, offset_id: int = 0, *, fresh: bool = False
+    ) -> list[Message]:
         """Return messages in chronological order (oldest first), TTL-cached.
 
         Telethon yields newest-first; reversed here so UIs can render top-down
         and append live messages at the bottom. Cached per ``(peer, limit,
         offset_id)``; the cache is invalidated for a peer on every write and live
         event so freshly-sent/received messages never go missing. Returns a copy.
+        ``fresh=True`` skips the cache entirely (the /tg pane's warm-daemon poll:
+        a sub-TTL poll must still see new messages) and does not seed it.
         """
         key = (int(peer), int(limit), int(offset_id))
-        msgs = await self._history_cache.get_or_fetch(
-            key, lambda: self._fetch_history(peer, limit, offset_id)
-        )
+        if fresh:
+            msgs = await self._fetch_history(peer, limit, offset_id)
+        else:
+            msgs = await self._history_cache.get_or_fetch(
+                key, lambda: self._fetch_history(peer, limit, offset_id)
+            )
         return list(msgs)
 
     async def _warm_entity(self, peer: int) -> None:

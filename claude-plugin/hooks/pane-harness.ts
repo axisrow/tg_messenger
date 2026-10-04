@@ -14,19 +14,21 @@ export const OPEN_PLACEMENT = {
   view: {},
 }
 
+// The kit's `$` carries NO clock (verified: the property is absent, not merely
+// untyped), so tests pace time with a plain runtime timer, present in every
+// JS engine. The tsconfig lib excludes timer types — hence the cast, kept in
+// exactly this one place.
+export const sleep = (ms: number): Promise<void> =>
+  new Promise(done => {
+    ;(globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => void }).setTimeout(done, ms)
+  })
+
 // `find` RESOLVES undefined when nothing matches — a resolution alone proves
 // nothing: bounded poll until the element IS in the drawn tree, else fail.
-// The runtime Engine has a real clock; the kit's `Engine` type just doesn't
-// name it, hence the one structural cast here and nowhere else.
-export async function until(
-  engine: object,
-  $el: () => unknown,
-  what: string,
-): Promise<void> {
-  const { clock } = engine as { clock: { sleep: (ms: number) => Promise<void> } }
+export async function until($el: () => unknown, what: string): Promise<void> {
   for (let i = 0; i < 100; i++) {
     if (await $el()) return
-    await clock.sleep(20)
+    await sleep(20)
   }
   throw new Error(`never drawn: ${what}`)
 }

@@ -24,7 +24,15 @@ test('pressing a palette preset spawns the react CLI call', { options: { profile
       return { value: { code: 0, signal: null } }
     }
     if (/ listen /.test(argv)) await new Promise(() => {})
-    yield { stream: 'stdout', text: '' }
+    if (/^sleep /.test(argv)) {
+      // every wait hangs: the poll/probe loops must settle SUSPENDED on a spawn
+      await new Promise(() => {})
+      yield { stream: 'stdout', text: '.' }
+      return { value: { code: 0, signal: null } }
+    }
+    // non-empty: the kit rejects empty-text yields, and the boot's daemon
+    // probe (curl) lands here — a blank body reads as "no daemon", cold path
+    yield { stream: 'stdout', text: ' ' }
     return { value: { code: 0, signal: null } }
   })
   on('ui.open', async () => OPENED)
@@ -44,17 +52,17 @@ test('pressing a palette preset spawns the react CLI call', { options: { profile
     origin: { kind: 'plugin', name: 'tg-messenger' },
     presentation: { isFullscreen: false, columns: 80 },
   })
-  await until($, async () => (await mounted.find({ type: 'Text', text: /До 20кг/ })) !== undefined, 'history')
+  await until(async () => (await mounted.find({ type: 'Text', text: /До 20кг/ })) !== undefined, 'history')
 
   // click [+] → the palette opens under that message; the trigger is keyed
   // per message ("react-<id>"), the first incoming row is 101
   await mounted.press({ key: 'react-101' })
-  await until($, async () => (await mounted.find({ type: 'Button', text: '👍' })) !== undefined, 'palette')
+  await until(async () => (await mounted.find({ type: 'Button', text: '👍' })) !== undefined, 'palette')
 
   // pick 👍 → the pick must reach the transport: a `react` child with the
   // peer, the message id and the emoticon in argv
   await mounted.press({ key: '👍' })
-  await until($, () => spawns.some(s => / react /.test(s)), 'react spawn')
+  await until(() => spawns.some(s => / react /.test(s)), 'react spawn')
   const reactArgs = spawns.find(s => / react /.test(s)) ?? ''
   expect(reactArgs, 'preset press spawns tg-messenger react').toContain(' react ')
   expect(reactArgs).toContain('999')

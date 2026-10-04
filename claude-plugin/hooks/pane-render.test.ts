@@ -25,7 +25,15 @@ test('pane renders every history message and every multiline tail', { options: {
       return { value: { code: 0, signal: null } }
     }
     if (/ listen /.test(argv)) await new Promise(() => {})
-    yield { stream: 'stdout', text: '' }
+    if (/^sleep /.test(argv)) {
+      // every wait hangs: the poll/probe loops must settle SUSPENDED on a spawn
+      await new Promise(() => {})
+      yield { stream: 'stdout', text: '.' }
+      return { value: { code: 0, signal: null } }
+    }
+    // non-empty: the kit rejects empty-text yields, and the boot's daemon
+    // probe (curl) lands here — a blank body reads as "no daemon", cold path
+    yield { stream: 'stdout', text: ' ' }
     return { value: { code: 0, signal: null } }
   })
   on('ui.open', async () => OPENED)
@@ -51,7 +59,6 @@ test('pane renders every history message and every multiline tail', { options: {
   const GROUND_TRUTH = [/А ну ещё гантель/, /Выглядит тяжелой/, /До 20кг/, /Неа/]
   for (const rx of GROUND_TRUTH)
     await until(
-      $,
       async () => (await mounted.find({ type: 'Text', text: rx })) !== undefined,
       String(rx),
     )
