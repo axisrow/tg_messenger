@@ -744,6 +744,7 @@ export const register: Register = (on, options) => {
                   </Box>
                   {canReact && (
                     <Button
+                      key={`react-${m.id}`}
                       plain
                       dimColor
                       onPress={() =>

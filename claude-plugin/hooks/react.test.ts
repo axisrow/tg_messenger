@@ -2,9 +2,8 @@ import { expect, test } from 'claude-code/testing'
 
 import { OPENED, OPEN_PLACEMENT, until } from './pane-harness'
 
-// Synthetic history in the exact shape the CLI prints it: arrows, a multiline
-// message hang-indented by 8 spaces ('← [103] ' for a 3-digit id), an emoji.
-// No private text — same structure as the real dialog that rendered torn.
+// Synthetic history (same shape as pane-render.test.ts): ids 101..105,
+// incoming 101/103/105 carry the [+] trigger. No private text.
 const DUMP = [
   '← [101] Неа',
   '→ [102] а где ты работаешь?',
@@ -15,10 +14,10 @@ const DUMP = [
   '',
 ].join('\n')
 
-test('pane renders every history message and every multiline tail', { options: { profile: 'p', dialog: '999' } }, async ($, on) => {
-  // stand where the engine's real spawn would be: `read` yields the dump,
-  // `listen` hangs for its life like a real bridge, everything else is empty
+test('pressing a palette preset spawns the react CLI call', { options: { profile: 'p', dialog: '999' } }, async ($, on) => {
+  const spawns: string[] = []
   on('process.spawn', async function* ($, e) {
+    spawns.push(e.argv.join(' '))
     const argv = e.argv.join(' ')
     if (/ read /.test(argv)) {
       yield { stream: 'stdout', text: DUMP }
@@ -45,15 +44,20 @@ test('pane renders every history message and every multiline tail', { options: {
     origin: { kind: 'plugin', name: 'tg-messenger' },
     presentation: { isFullscreen: false, columns: 80 },
   })
+  await until($, async () => (await mounted.find({ type: 'Text', text: /До 20кг/ })) !== undefined, 'history')
 
-  // the RED suspects from the real pane: the multiline tail and whole
-  // messages went missing on screen while the parsed state held all of them
-  const GROUND_TRUTH = [/А ну ещё гантель/, /Выглядит тяжелой/, /До 20кг/, /Неа/]
-  for (const rx of GROUND_TRUTH)
-    await until(
-      $,
-      async () => (await mounted.find({ type: 'Text', text: rx })) !== undefined,
-      String(rx),
-    )
-  expect(GROUND_TRUTH.length, 'all ground-truth texts drawn').toBe(4)
+  // click [+] → the palette opens under that message; the trigger is keyed
+  // per message ("react-<id>"), the first incoming row is 101
+  await mounted.press({ key: 'react-101' })
+  await until($, async () => (await mounted.find({ type: 'Button', text: '👍' })) !== undefined, 'palette')
+
+  // pick 👍 → the pick must reach the transport: a `react` child with the
+  // peer, the message id and the emoticon in argv
+  await mounted.press({ key: '👍' })
+  await until($, () => spawns.some(s => / react /.test(s)), 'react spawn')
+  const reactArgs = spawns.find(s => / react /.test(s)) ?? ''
+  expect(reactArgs, 'preset press spawns tg-messenger react').toContain(' react ')
+  expect(reactArgs).toContain('999')
+  expect(reactArgs).toContain('101')
+  expect(reactArgs).toContain('👍')
 })
