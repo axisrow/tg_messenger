@@ -649,7 +649,24 @@ export const register: Register = (on, options) => {
     const listRows = props?.scroll?.bodyRows
       ? Math.max(1, props.scroll.bodyRows - fixed - composerRows)
       : undefined
-    const shown = list.slice(-50)
+    // The engine's pointer map follows the FULL list layout, not the clipped
+    // flex-end view: an overflowing list puts every click rows off (proven on
+    // a live pane — header buttons press, body buttons never do). Show only
+    // what fits, so the drawn layout IS the pointer layout.
+    const perRows = (m: TgMessage): number => {
+      const prefix = m.out ? '→ ' : m.system ? '· ' : '← '
+      const lines = wrapText(prefix + m.text, Math.max(2, cols - 4)).split('\n').length
+      return lines + (m.reactions?.length ? 1 : 0)
+    }
+    const budget = Math.max(1, (listRows ?? 35) - 2) // headroom: the open palette row
+    const shown: TgMessage[] = []
+    let used = 0
+    for (let i = list.length - 1; i >= 0 && used < budget; i--) {
+      const rows = perRows(list[i] as TgMessage)
+      if (used + rows > budget) break
+      shown.unshift(list[i] as TgMessage)
+      used += rows
+    }
 
     return (
       <Box flexDirection="column" flexGrow={1} gap={1} padding={1} paddingBottom={0}>
@@ -730,7 +747,10 @@ export const register: Register = (on, options) => {
               w,
             )
             return (
-              <Box flexDirection="column" key={m.id ?? `i${i}`}>
+              <Box flexDirection="column" key={String(m.id ?? `i${i}`)}>
+                {/* scope key MUST be a plain string: a numeric key names no
+                    scope and the pointer goes inert over everything inside,
+                    the [+] trigger included (engine d.ts, Box key docs) */}
                 <Box gap={1}>
                   {/* the engine's Text does not re-wrap to the pane width —
                       long lines are painted clipped at the edge (tree holds the
@@ -743,15 +763,17 @@ export const register: Register = (on, options) => {
                     </Text>
                   </Box>
                   {canReact && (
+                    // NOT plain: a plain button draws its label alone and the
+                    // terminal's pointer hit-test never fires it (proven on a
+                    // live pane — SGR click); the drawn form is `[ + ]`
                     <Button
                       key={`react-${m.id}`}
-                      plain
                       dimColor
                       onPress={() =>
                         void update($, paletteFor, open => (open === m.id ? -1 : (m.id as number)))
                       }
                     >
-                      [+]
+                      +
                     </Button>
                   )}
                 </Box>
