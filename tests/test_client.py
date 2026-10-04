@@ -1238,6 +1238,17 @@ async def test_history_refetches_after_ttl(fake_client):
     assert fake_client.iter_messages_calls == 2
 
 
+async def test_history_fresh_bypasses_cache(fake_client):
+    # the /tg pane's warm poll hits the daemon's history route with fresh=True:
+    # a sub-TTL poll must still see new messages, so fresh never serves the cache
+    _seed_dm(fake_client)
+    client = _build(fake_client)
+    await client.connect()
+    await client.history(7, limit=10, fresh=True)
+    await client.history(7, limit=10, fresh=True)
+    assert fake_client.iter_messages_calls == 2
+
+
 async def test_history_returns_copy(fake_client):
     _seed_dm(fake_client)
     client = _build(fake_client)
@@ -1703,6 +1714,21 @@ async def test_send_reaction_sends_request(fake_client):
     reactions = sent[-1].reaction or []
     assert reactions and isinstance(reactions[0], ReactionEmoji)
     assert reactions[0].emoticon == "👍"
+
+
+async def test_send_reaction_strips_variation_selector(fake_client):
+    # Telegram rejects a reaction whose emoji carries U+FE0F with
+    # ReactionInvalidError ("only emoji are allowed") — the canonical reaction
+    # form is the bare codepoint ('❤️' on the presets must go out as '❤').
+    from telethon.tl.functions.messages import SendReactionRequest
+
+    client = _build(fake_client)
+    await client.connect()
+    await client.send_reaction(7, 55, "❤️")
+    sent = [r for r in fake_client.requests if isinstance(r, SendReactionRequest)]
+    reactions = sent[-1].reaction or []
+    assert reactions and reactions[0].emoticon == "❤"
+    await client.disconnect()
 
 
 async def test_send_reaction_flood_is_handled(fake_client, monkeypatch):
@@ -2552,3 +2578,26 @@ async def test_resolve_username_maps_one_row_dialog():
     assert d.id == 5146088037
     assert d.kind == "dm"
     assert d.title == "Ann"
+
+
+async def test_dialogs_limit_skips_cache(fake_client):
+    """#270: a limited fetch bypasses the TTL cache — the cache holds ONE full
+    list, and a truncated snapshot must never be served to unlimited callers."""
+
+    original = fake_client.iter_dialogs
+
+    async def limited(*a, **k):
+        if k.get("limit") == 5:
+            fake_client.iter_dialogs_calls += 1
+            return
+            yield  # pragma: no cover — makes this an async generator
+        async for d in original(*a, **k):
+            yield d
+
+    fake_client.iter_dialogs = limited
+    client = _build(fake_client)
+    await client.connect()
+    await client.dialogs(limit=5)
+    await client.dialogs()  # full — must fetch fresh, not the truncated list
+    await client.dialogs()  # now served from the cache
+    assert fake_client.iter_dialogs_calls == 2

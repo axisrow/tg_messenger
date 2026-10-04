@@ -31,7 +31,7 @@ class WebStubClient:
     async def disconnect(self):
         pass
 
-    async def dialogs(self, dm_only=True):
+    async def dialogs(self, dm_only=True, limit=None):
         # повторяет контракт core: dm_only=False — все диалоги с kind и marked id
         dms = [Dialog(id=7, title="Ann", username="ann", unread=1, telegram_lang_code="en")]
         if dm_only:
@@ -42,8 +42,8 @@ class WebStubClient:
             Dialog(id=9, title="HelperBot", kind="bot"),
         ]
 
-    async def group_dialogs(self):
-        return [d for d in await self.dialogs(dm_only=False) if d.kind != "dm"]
+    async def group_dialogs(self, limit=None):
+        return [d for d in await self.dialogs(dm_only=False, limit=limit) if d.kind != "dm"]
 
     async def history(self, peer, limit=50, offset_id=0):
         return [Message(id=1, dialog_id=peer, sender_id=peer, out=False, text="hi",
@@ -100,7 +100,7 @@ class WebStubClient:
 
 
 class FailingDialogsClient(WebStubClient):
-    async def dialogs(self, dm_only=True):
+    async def dialogs(self, dm_only=True, limit=None):
         raise RuntimeError("dialogs unavailable")
 
 
@@ -891,7 +891,7 @@ async def test_unauthorized_session_redirects_to_tg_login():
 
     stub = WebStubClient()
 
-    async def boom(dm_only=True):
+    async def boom(dm_only=True, limit=None):
         raise AuthKeyUnregisteredError(None)
 
     stub.dialogs = boom
@@ -908,7 +908,7 @@ async def test_unauthorized_session_redirects_to_tg_login():
 async def test_unhandled_error_returns_500_fragment_and_is_logged(caplog):
     stub = WebStubClient()
 
-    async def boom(dm_only=True):
+    async def boom(dm_only=True, limit=None):
         raise RuntimeError("kaboom")
 
     stub.dialogs = boom
@@ -930,7 +930,7 @@ async def test_flood_wait_returns_503_with_hint():
 
     stub = WebStubClient()
 
-    async def boom(dm_only=True):
+    async def boom(dm_only=True, limit=None):
         raise HandledFloodWaitError("dialogs", 100)
 
     stub.dialogs = boom
@@ -1586,9 +1586,9 @@ async def test_outbound_endpoint_blank_text_is_invalid_empty():
     dialog_calls = []
     original_dialogs = stub.dialogs
 
-    async def counting_dialogs(dm_only=True):
+    async def counting_dialogs(dm_only=True, limit=None):
         dialog_calls.append(dm_only)
-        return await original_dialogs(dm_only=dm_only)
+        return await original_dialogs(dm_only=dm_only, limit=limit)
 
     stub.dialogs = counting_dialogs
     outbound = WebOutboundRecordingHint()
@@ -2893,7 +2893,7 @@ async def test_unauthorized_routes_redirect_to_tg_login():
 
     stub = WebStubClient()
 
-    async def boom(dm_only=True):
+    async def boom(dm_only=True, limit=None):
         raise AuthKeyUnregisteredError(None)
 
     stub.dialogs = boom

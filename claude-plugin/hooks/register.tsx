@@ -53,6 +53,21 @@ const pendingSend = atom({ plugin: 'tg-messenger', key: 'pendingSend' } as const
 const view = atom({ plugin: 'tg-messenger', key: 'view' } as const, 'chat' as 'chat' | 'dialogs')
 const dialogList = atom({ plugin: 'tg-messenger', key: 'dialogList' } as const, null as TgDialog[] | null)
 
+// loading indicator: what is being fetched right now. Deliberately STATIC — an
+// animated ticker (~120 ms redraws) made the async render hook overlap itself
+// and the interleaved output tore wrapped lines of different messages together.
+// register() clears the atom: a reload mid-load must not leave it stuck.
+const loading = atom({ plugin: 'tg-messenger', key: 'loading' } as const, null as 'history' | 'dialogs' | null)
+
+async function spinWhile($: EngineInterface, kind: 'history' | 'dialogs', run: () => Promise<unknown>): Promise<void> {
+  await update($, loading, () => kind)
+  try {
+    await run()
+  } finally {
+    await update($, loading, () => null)
+  }
+}
+
 // message ids this mod itself sent (for `--out` echo suppression) — the TUI's
 // `_sent_ids` pattern: membership-only, never popped (a pop would re-duplicate
 // a reconnect re-echo), bounded FIFO
@@ -73,6 +88,10 @@ type ModConfig = {
   resolvedId: string
   /** true when the resolved dialog is a group/channel (marked negative) */
   isGroup: boolean
+  /** history re-read interval (ms) — the live stream's safety net; kit tests pass a small one */
+  pollMs: number
+  /** port of the warm `serve` daemon (set by `ensureDaemon`); unset = cold CLI path */
+  daemonPort?: number
 }
 
 /**
@@ -104,6 +123,124 @@ function cliError(stderr: string): string | null {
   return m ? m[1] : null
 }
 
+// --- warm daemon transport ----------------------------------------------------
+//
+// A cold CLI child per action costs seconds (python boot + a full MTProto
+// handshake — measured 6.2 s on this machine's lossy route, vs 1.1 s for one
+// RPC on a live connection and ~1 ms cached). So the pane keeps ONE `serve`
+// daemon per profile and reads/sends over localhost HTTP; every warm call
+// falls back to the cold CLI path when the daemon is not (yet) answering. The
+// daemon is a child of the pane's environment — teardown cancels it like the
+// stream, and the catch guards below keep that cancellation off the worker.
+
+/** Deterministic per-profile port: two panes on one account share the daemon.
+ * A wide band keeps two DIFFERENT profiles from colliding — a collision can
+ * never go warm (the identity probe rejects the foreign daemon), so it is
+ * worth making astronomically unlikely. */
+function daemonPortFor(profile: string): number {
+  let h = 0
+  for (let i = 0; i < profile.length; i++) h = (h * 31 + profile.charCodeAt(i)) >>> 0
+  return 18080 + (h % 40000)
+}
+
+const WARM_POLL_MS = 4000
+
+/** Ports with a daemon boot in flight — keyed by port so panes on different
+ * profiles never block each other's warm path. */
+const daemonBooting = new Set<number>()
+
+/** One curl to the daemon; null = no daemon / request failed (caller falls
+ * back to the CLI). `statusOnly` swaps the body for the HTTP code — a 204
+ * success and a -f swallowed error are otherwise indistinguishable. */
+async function runApiRaw(
+  $: EngineInterface,
+  port: number | undefined,
+  method: 'GET' | 'POST',
+  path: string,
+  form: readonly string[] = [],
+  statusOnly = false,
+): Promise<string | null> {
+  if (!port) return null
+  const argv = [
+    'curl', '-sf', '-m', '20', '-X', method,
+    '-H', 'x-tg-messenger-csrf: 1',
+    '-H', 'Accept: application/json',
+  ]
+  if (statusOnly) argv.push('-o', '/dev/null', '-w', '%{http_code}')
+  for (const pair of form) argv.push('--data-urlencode', pair)
+  argv.push(`http://127.0.0.1:${port}${path}`)
+  let stdout = ''
+  try {
+    for await (const chunk of $.process.spawn({ argv })) {
+      if (chunk.stream === 'stdout') stdout += chunk.text
+    }
+  } catch {
+    return null
+  }
+  return stdout
+}
+
+/** JSON GET against the daemon's API; null = no daemon / not JSON. */
+async function runApiJson($: EngineInterface, cfg: ModConfig, path: string): Promise<unknown | null> {
+  const body = await runApiRaw($, cfg.daemonPort, 'GET', path)
+  if (body === null || body.trim() === '') return null
+  try {
+    return JSON.parse(body)
+  } catch {
+    return null
+  }
+}
+
+/** True when the daemon on `port` serves OUR profile — /api/health answers
+ * the profile name, so a port collision with another account's daemon never
+ * adopts the wrong one. Cheaper than a data route: no client calls at all. */
+async function daemonAlive($: EngineInterface, port: number, profile: string): Promise<boolean> {
+  const body = await runApiRaw($, port, 'GET', '/api/health')
+  if (body === null) return false
+  try {
+    return (JSON.parse(body) as Record<string, unknown>).profile === profile
+  } catch {
+    return false
+  }
+}
+
+/** Adopts an already-running daemon for this profile — one fast probe, safe
+ * to await on the boot path (fails in milliseconds when nothing listens). */
+async function ensureDaemon($: EngineInterface, cfg: ModConfig): Promise<void> {
+  if (cfg.daemonPort || !cfg.profile) return
+  const port = daemonPortFor(cfg.profile)
+  if (!daemonBooting.has(port) && await daemonAlive($, port, cfg.profile)) cfg.daemonPort = port
+}
+
+/** Spawns the profile's daemon and waits (bounded, detached) for it to come
+ * up; a real daemon needs its own connect (~seconds) before serving, and the
+ * cold CLI path covers that window. An EADDRINUSE race against a sibling
+ * pane's daemon is fine: the probe adopts whichever wins the port. */
+async function startDaemon($: EngineInterface, cfg: ModConfig): Promise<void> {
+  if (!cfg.profile) return
+  const port = daemonPortFor(cfg.profile)
+  if (cfg.daemonPort || daemonBooting.has(port)) return
+  daemonBooting.add(port)
+  try {
+    void (async () => {
+      for await (const chunk of $.process.spawn({
+        argv: ['tg-messenger', '--profile', cfg.profile, 'serve', '--host', '127.0.0.1', '--port', String(port)],
+      })) {
+        if (chunk.stream === 'stderr') continue // uvicorn logs
+      }
+    })().catch(() => {}) // teardown cancellation must not escape a detached task
+    for (let i = 0; i < 40; i++) {
+      await waitMs($, 500)
+      if (await daemonAlive($, port, cfg.profile)) {
+        cfg.daemonPort = port
+        return
+      }
+    }
+  } finally {
+    daemonBooting.delete(port)
+  }
+}
+
 /** `read` line: `← [123] text` / `→ [124] my own` (core `message_line`). */
 const HISTORY_LINE = /^([←→]) \[(\d+)\] (.*)$/
 
@@ -130,12 +267,89 @@ function parseHistory(stdout: string): TgMessage[] {
   return out
 }
 
+/** Maps one core `Message` JSON row onto a pane message; null skips junk. */
+function messageFromApi(raw: unknown): TgMessage | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const m = raw as Record<string, unknown>
+  if (typeof m.id !== 'number') return null
+  return {
+    id: m.id,
+    text: typeof m.text === 'string' ? m.text : '[медиа]',
+    out: m.out === true,
+  }
+}
+
+/** Maps one core `Dialog` JSON row onto a picker row; null skips junk. */
+function dialogFromApi(raw: unknown): TgDialog | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const d = raw as Record<string, unknown>
+  if (typeof d.id !== 'number' || typeof d.title !== 'string') return null
+  return { id: String(d.id), title: d.title, unread: typeof d.unread === 'number' ? d.unread : 0 }
+}
+
+/**
+ * Greedy word-wrap at `width` columns. The engine's Text does not re-wrap long
+ * lines to the pane width — the paint layer clips them at the edge (the tree
+ * holds the full text, the screen loses the tail), so the pane wraps BEFORE
+ * drawing and there is never a line wider than the pane. Emoji count as 2
+ * UTF-16 units but ≤2 terminal cells, so measuring by JS length errs short —
+ * a line may wrap early, never clip.
+ */
+export function wrapText(text: string, width: number): string {
+  const w = Math.max(2, width)
+  const out: string[] = []
+  for (const para of text.split('\n')) {
+    let line = ''
+    for (const word of para.split(' ')) {
+      // a word longer than the whole width (a URL) hard-breaks at the column
+      for (let k = 0; k < word.length; k += w) {
+        const piece = word.slice(k, k + w)
+        if (!line) line = piece
+        else if (line.length + 1 + piece.length <= w) line += ` ${piece}`
+        else {
+          out.push(line)
+          line = piece
+        }
+      }
+    }
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
+/**
+ * Pads every line with trailing spaces to `width`. FACT: the CLI dump and the
+ * parsed tree are clean, while the screen glues fragments of OLDER frames
+ * after a row whose new content is shorter — the engine's repaint overwrites
+ * a shrunken row without clearing its stale tail, and the damage is stable
+ * across repaints (diff baseline poisoned). Padding every drawn line to the
+ * full budget makes a repaint overwrite the whole row — there is no stale
+ * tail left to preserve. Screen-level, so the test kit (tree-only) can't
+ * assert it; the transform itself is unit-tested.
+ */
+export function padLines(text: string, width: number): string {
+  return text
+    .split('\n')
+    .map(l => (l.length < width ? l + ' '.repeat(width - l.length) : l))
+    .join('\n')
+}
+
 /**
  * Reads recent history of the dialog and replaces the pane content.
+ * Warm path first: the daemon's JSON API with `fresh=1` (the poll runs at a
+ * sub-TTL cadence, the daemon's own live-event invalidations can't be relied
+ * on when the transport drops updates). Falls back to the cold CLI read.
  * Status noise (`Loading history…`) rides stderr — only Click's `Error:`
  * line means failure.
  */
 async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
+  const api = await runApiJson($, cfg, `/api/dialogs/${cfg.resolvedId}/messages?limit=50&fresh=1`)
+  if (Array.isArray(api)) {
+    await update($, messages, () =>
+      api.map(messageFromApi).filter((m): m is TgMessage => m !== null),
+    )
+    return
+  }
   const { stdout, stderr } = await runCli($, [
     '--profile',
     cfg.profile,
@@ -151,21 +365,18 @@ async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
 
 /**
  * `listen` line with ids: `← [DIALOG] [MSG] text` (incoming, DMs only) or
- * `→ [DIALOG] [MSG] text` (own messages from any device, `--out`). Preamble
- * and unknown lines are ignored.
+ * `→ [DIALOG] [MSG] text` (own messages from any device, `--out`). Returns
+ * null for preamble and unknown lines and for this mod's own send echoes.
+ * Pure — the caller merges a whole burst into ONE state update.
  */
 const STREAM_LINE = /^([←→]) \[(\d+)\] \[(\d+)\] (.*)$/
 
-async function handleStreamLine($: EngineInterface, cfg: ModConfig, line: string): Promise<void> {
+function parseStreamLine(cfg: ModConfig, line: string): TgMessage | null {
   const m = STREAM_LINE.exec(line)
-  if (!m || m[2] !== cfg.resolvedId) return
+  if (!m || m[2] !== cfg.resolvedId) return null
   const mid = Number(m[3])
-  if (m[1] === '→' && sentIds.has(mid)) return // this mod's own send, echoed
-  await update(
-    $,
-    messages,
-    all => [...all, { id: mid, text: m[4], out: m[1] === '→' }].slice(-100) as TgMessage[],
-  )
+  if (m[1] === '→' && sentIds.has(mid)) return null // this mod's own send, echoed
+  return { id: mid, text: m[4], out: m[1] === '→' }
 }
 
 // one live subscription per activation: pane reopen and session re-seat
@@ -178,6 +389,9 @@ const startStream = ($: EngineInterface, cfg: ModConfig) => {
   void (async () => {
     try {
       await runStream($, cfg)
+    } catch {
+      // environment teardown (reload, pane re-open) cancels the loop's pending
+      // waits; a rejection escaping a detached task crashes the hooks worker
     } finally {
       // any escape from the loop must leave the bridge revivable by the next /tg
       streamAlive = false
@@ -197,11 +411,19 @@ async function runStream($: EngineInterface, cfg: ModConfig): Promise<never> {
         if (chunk.stream === 'stderr') continue // status noise ("Listening for…")
         buffer += chunk.text
         let nl: number
+        const batch: TgMessage[] = []
         while ((nl = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, nl)
           buffer = buffer.slice(nl + 1)
-          await handleStreamLine($, cfg, line)
+          const msg = parseStreamLine(cfg, line)
+          if (msg) batch.push(msg)
         }
+        // one update per burst — a burst of per-message updates would trigger
+        // just as many renders
+        if (batch.length)
+          await update($, messages, all =>
+            [...all, ...batch].slice(-100) as TgMessage[],
+          )
         backoff = 1000 // a live line proves the link works
         lost = false
       }
@@ -222,9 +444,48 @@ async function runStream($: EngineInterface, cfg: ModConfig): Promise<never> {
         [...all, { text: `stream lost — retrying in ${wait} s`, out: false, system: true }].slice(-100) as TgMessage[],
       )
     }
-    await $.clock.sleep(backoff)
+    await waitMs($, backoff)
     backoff = Math.min(backoff * 2, 30000)
   }
+}
+
+// the live stream's safety net: on some networks the engine never receives
+// server-initiated updates (reproduced on a bare CLI: a connected `listen`
+// child stays silent even for cross-account incoming). The pane still
+// converges by re-reading history on an interval — same one-per-activation
+// guard as the stream; a failed re-read is logged, never fatal.
+let pollAlive = false
+
+const startPolling = ($: EngineInterface, cfg: ModConfig) => {
+  if (pollAlive) return
+  pollAlive = true
+  void (async () => {
+    try {
+      while (true) {
+        try {
+          // a warm read is one RPC (~1 s), so the poll can tick 4× faster than
+          // the cold CLI ever could; cfg.daemonPort is read live — the poll
+          // speeds up on its own once the daemon is adopted
+          await waitMs($, cfg.daemonPort ? WARM_POLL_MS : cfg.pollMs)
+        } catch (error) {
+          // a dead wait kills the loop — polling without it would hot-spin the
+          // CLI read; say so and stop (the next /tg revives it)
+          $.ui.log(`tg-messenger: history poll stopped: ${String(error)}`)
+          return
+        }
+        try {
+          await loadHistory($, cfg)
+        } catch (error) {
+          $.ui.log(`tg-messenger: history poll failed: ${String(error)}`)
+        }
+      }
+    } catch {
+      // same as startStream: teardown cancellation must not escape a detached
+      // task — an unhandled rejection crashes the hooks worker
+    } finally {
+      pollAlive = false
+    }
+  })()
 }
 
 /**
@@ -254,9 +515,24 @@ async function resolveDialog($: EngineInterface, cfg: ModConfig): Promise<void> 
   cfg.isGroup = cfg.resolvedId.startsWith('-')
 }
 
-/** Loads the DM list for the picker (`dialogs`, DMs only — groups are history-only). */
+/** Loads the DM list for the picker — the 100 most recent dialogs (#270): a full
+ * crawl on a huge account takes minutes and floods. Warm daemon first, cold CLI
+ * fallback. */
 async function loadDialogList($: EngineInterface, cfg: ModConfig): Promise<void> {
-  const { stdout, stderr } = await runCli($, ['--profile', cfg.profile, 'dialogs'])
+  const api = await runApiJson($, cfg, '/api/dialogs?tab=dm')
+  if (Array.isArray(api)) {
+    await update($, dialogList, () =>
+      api.map(dialogFromApi).filter((d): d is TgDialog => d !== null),
+    )
+    return
+  }
+  const { stdout, stderr } = await runCli($, [
+    '--profile',
+    cfg.profile,
+    'dialogs',
+    '--limit',
+    '100',
+  ])
   const err = cliError(stderr)
   if (err) throw new Error(err)
   const list = stdout
@@ -272,23 +548,45 @@ async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Pro
   cfg.target = id
   cfg.resolvedId = id
   cfg.isGroup = id.startsWith('-')
+  void ensureDaemon($, cfg) // no-op once adopted or while a spawn is in flight
   void update($, view, () => 'chat' as const)
   void update($, paletteFor, () => -1)
+  // drop the previous dialog's text at once — the loading marker replaces it,
+  // stale content of another dialog must not linger while the fetch runs
+  void update($, messages, () => [] as TgMessage[])
   if (cfg.isGroup)
     $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
-  try {
-    await loadHistory($, cfg)
-  } catch (error) {
+  await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
     const message = error instanceof Error ? error.message : String(error)
     $.ui.toast(`tg-messenger: ${message}`)
-  }
+  }))
   startStream($, cfg)
+  startPolling($, cfg)
 }
 
 // --- outgoing ------------------------------------------------------------------
 
-/** Sends text; returns the new message id when the CLI reported one. */
+/** Sends text; returns the new message id when the transport reported one.
+ * Warm path: POST /send on the daemon with `Accept: application/json`
+ * (answered `{"id": N}`), then a warm history redraw — one RPC each, no cold
+ * child. */
 async function sendText($: EngineInterface, cfg: ModConfig, text: string): Promise<number | undefined> {
+  const body = await runApiRaw($, cfg.daemonPort, 'POST', '/send', [
+    `dialog_id=${cfg.resolvedId}`,
+    `text=${text}`,
+  ])
+  if (body !== null && body.trim() !== '') {
+    let id: number | undefined
+    try {
+      const parsed = JSON.parse(body) as Record<string, unknown>
+      id = typeof parsed.id === 'number' ? parsed.id : undefined
+    } catch {
+      id = undefined
+    }
+    if (id != null) rememberSent(id)
+    await loadHistory($, cfg)
+    return id
+  }
   const { stdout, stderr } = await runCli($, [
     '--profile',
     cfg.profile,
@@ -319,13 +617,35 @@ async function sendMedia($: EngineInterface, cfg: ModConfig, path: string, capti
   return id
 }
 
-/** Reacts to a message (`react DIALOG MSG_ID EMOTICON`). */
+// Wait `ms` by spawning the platform `sleep`: the kit's hook realm never
+// pumps host timers and its $ carries no clock (probed — setTimeout callbacks
+// never run, $.clock absent), so the only wait that exists in BOTH realms is
+// a child process. In the engine it is a real /bin/sleep; in the kit the
+// test's spawn stub answers it and paces time itself.
+async function waitMs($: EngineInterface, ms: number): Promise<void> {
+  for await (const _ of $.process.spawn({ argv: ['sleep', String(ms / 1000)] })) {
+    void _
+  }
+}
+
+/** Reacts to a message (`react DIALOG MSG_ID EMOTICON`). Warm POST first —
+ * `statusOnly` tells a 204 success from a swallowed 4xx (then the cold CLI
+ * re-runs and surfaces Click's error properly). */
 async function sendReaction(
   $: EngineInterface,
   cfg: ModConfig,
   messageId: number,
   emoticon: string,
 ): Promise<void> {
+  const code = await runApiRaw(
+    $,
+    cfg.daemonPort,
+    'POST',
+    `/dialogs/${cfg.resolvedId}/reaction`,
+    [`message_id=${messageId}`, `emoticon=${emoticon}`],
+    true,
+  )
+  if (code !== null && code.startsWith('2')) return
   const { stderr } = await runCli($, [
     '--profile',
     cfg.profile,
@@ -459,7 +779,8 @@ function readConfig(options: Readonly<Record<string, unknown>>): {
   // `dialogId` is the pre-#248 spelling — honor it so an old config degrades
   // to a clear toast instead of "dialog not configured"
   const target = pick('dialog') || pick('dialogId')
-  const cfg: ModConfig = { profile, target, resolvedId: '', isGroup: false }
+  const pollMs = typeof options.pollMs === 'number' && options.pollMs > 0 ? options.pollMs : 15000
+  const cfg: ModConfig = { profile, target, resolvedId: '', isGroup: false, pollMs }
   let reason = ''
   if (!target) reason = 'dialog not configured — claude plugin configure tg-messenger'
   else if (!/^-?\d+$/.test(target) && !target.startsWith('@'))
@@ -474,7 +795,9 @@ function readConfig(options: Readonly<Record<string, unknown>>): {
  * functions declared at the top of the file.
  */
 async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reason: string, target: string) {
-  void $.ui.open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
+  $.ui
+    .open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
+    .catch((error: unknown) => $.ui.log(`tg-messenger: open failed: ${String(error)}`))
   if (!ready) {
     if (target) $.ui.toast(`tg-messenger: ${reason}`)
     return
@@ -490,30 +813,41 @@ async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reas
     )
     return
   }
+  // adopt an already-running daemon (one fast probe — a pane reopen or a
+  // second pane on the account then boots warm); none answering → spawn one
+  // in the background, the cold CLI path covers the warm-up window
+  await ensureDaemon($, cfg)
+  if (!cfg.daemonPort) void startDaemon($, cfg).catch(() => {})
   // history is best-effort: a failure (e.g. Telegram unreachable) must not
   // kill the bridge — the live stream retries with backoff and self-heals
-  try {
-    await loadHistory($, cfg)
-  } catch (error) {
+  await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
     const message = error instanceof Error ? error.message : String(error)
     $.ui.toast(`tg-messenger: ${message}`)
-    await update($, messages, all =>
+    return update($, messages, all =>
       [...all, { text: message, out: false, system: true }].slice(-100) as TgMessage[],
     )
-  }
+  }))
   if (cfg.isGroup)
     $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
-  else startStream($, cfg)
+  else {
+    startStream($, cfg)
+    startPolling($, cfg)
+  }
 }
 
 function openPane($: EngineInterface, cfg: ModConfig, ready: boolean, reason: string, target: string) {
-  void bootPane($, cfg, ready, reason, target)
+  // a dead environment mid-boot rejects the whole chain; a detached rejection
+  // crashes the hooks worker, so the boot is guarded like the loops above
+  void bootPane($, cfg, ready, reason, target).catch(() => {})
 }
 
 export const register: Register = (on, options) => {
   const { cfg, ready, reason, target } = readConfig(options)
 
   on('session.start', async ($, e, next) => {
+    // a reload mid-load kills the ticker but leaves the atom set — a frozen
+    // loading marker must not survive into the fresh module
+    void update($, loading, () => null)
     try {
       await $.command.register({
         name: 'tg',
@@ -538,13 +872,32 @@ export const register: Register = (on, options) => {
     return { text: 'tg-messenger: pane opened below the prompt.' }
   })
 
+  // one draw at a time: the hook is async (every atom read is an await point),
+  // so a burst of state updates — a stream burst, a send's echo — starts
+  // overlapping renders, and their interleaved output splices wrapped lines of
+  // DIFFERENT messages together (панель черепком). The gate serializes draws;
+  // a queued render re-reads all atoms fresh, only its geometry snapshot may
+  // be a few ms stale.
+  // promise-gate mutex: every render waits for the previous one and releases
+  // the next in a finally. (A busy-wait flag starved the very I/O completions
+  // the holder awaited.) $ stays in the hook's own scope — the engine's static
+  // checks reject it inside a nested closure.
+  let renderGate = Promise.resolve()
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const prev = renderGate
+    let release: () => void = () => {}
+    renderGate = new Promise<void>(done => {
+      release = done
+    })
+    await prev
+    try {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
     const list = await read($, messages)
     const openPalette = await read($, paletteFor)
     const draftLen = await read($, draft)
     const viewName = await read($, view)
     const dialogs = await read($, dialogList)
+    const loadingNow = await read($, loading)
     // pane geometry: diff reads e.props.scroll.bodyRows/bodyColumns
     const props = (e as { props?: { scroll?: { bodyRows?: number }; bodyColumns?: number } }).props
     const cols = (props?.bodyColumns ?? e.viewport?.columns ?? 80) - 2
@@ -562,34 +915,64 @@ export const register: Register = (on, options) => {
     const listRows = props?.scroll?.bodyRows
       ? Math.max(1, props.scroll.bodyRows - fixed - composerRows)
       : undefined
-    const shown = list.slice(-50)
+    // The engine's pointer map follows the FULL list layout, not the clipped
+    // flex-end view: an overflowing list puts every click rows off (proven on
+    // a live pane — header buttons press, body buttons never do). Show only
+    // what fits, so the drawn layout IS the pointer layout.
+    const perRows = (m: TgMessage): number => {
+      const prefix = m.out ? '→ ' : m.system ? '· ' : '← '
+      const lines = wrapText(prefix + m.text, Math.max(2, cols - 4)).split('\n').length
+      return lines + (m.reactions?.length ? 1 : 0)
+    }
+    const budget = Math.max(1, (listRows ?? 35) - 2) // headroom: the open palette row
+    const shown: TgMessage[] = []
+    let used = 0
+    for (let i = list.length - 1; i >= 0 && used < budget; i--) {
+      const m = list[i] as TgMessage
+      const rows = perRows(m)
+      if (used + rows > budget) {
+        if (i !== list.length - 1) break
+        // a single message taller than the whole pane: draw its TAIL — the
+        // newest row must always render, an empty list would sit here showing
+        // "loading history…" forever (already-loaded history!)
+        const tail = wrapText(m.text, Math.max(2, cols - 4)).split('\n').slice(-(budget - 1)).join('\n')
+        shown.unshift({ ...m, text: tail })
+        used = budget
+        break
+      }
+      shown.unshift(m)
+      used += rows
+    }
 
     return (
       <Box flexDirection="column" flexGrow={1} gap={1} padding={1} paddingBottom={0}>
+        {/* No <> fragments among the row children: the engine does NOT flatten
+            them — a Fragment renders as one node stacking its children
+            vertically, which kept the диалоги/назад buttons on their own line
+            under the middle text no matter the widths. Every element is a
+            direct child of the row; JSX false/undefined children are skipped. */}
         <Box gap={2}>
-          <Text bold>tg-messenger</Text>
+          <Text bold>tg</Text>
           {chat ? (
-            <>
-              <Text>{ready ? `— ${[cfg.profile, cfg.target].filter(Boolean).join(' · ')}` : <Text dimColor>— {reason}</Text>}</Text>
-              {ready && (
-                <Button
-                  onPress={() => {
-                    void update($, view, () => 'dialogs' as const)
-                    if (dialogs === null)
-                      void loadDialogList($, cfg).catch(error =>
-                        $.ui.toast(`tg-messenger: ${error instanceof Error ? error.message : String(error)}`),
-                      )
-                  }}
-                >
-                  диалоги
-                </Button>
-              )}
-            </>
+            <Text>{ready ? `— ${[cfg.profile, cfg.target].filter(Boolean).join(' · ')}` : <Text dimColor>— {reason}</Text>}</Text>
           ) : (
-            <>
-              <Text>— диалоги</Text>
-              <Button onPress={() => void update($, view, () => 'chat' as const)}>← назад</Button>
-            </>
+            <Text>— диалоги</Text>
+          )}
+          {chat && ready && (
+            <Button
+              onPress={() => {
+                void update($, view, () => 'dialogs' as const)
+                if (dialogs === null)
+                  void spinWhile($, 'dialogs', () => loadDialogList($, cfg).catch(error =>
+                    $.ui.toast(`tg-messenger: ${error instanceof Error ? error.message : String(error)}`),
+                  ))
+              }}
+            >
+              диалоги
+            </Button>
+          )}
+          {!chat && (
+            <Button onPress={() => void update($, view, () => 'chat' as const)}>← назад</Button>
           )}
           <Button role="dismiss" onPress={() => $.ui.close({ id: PANE })}>
             close
@@ -604,11 +987,18 @@ export const register: Register = (on, options) => {
           overflow="hidden"
           height={listRows}
         >
-          {shown.length === 0 && (
+          {shown.length === 0 && !loading && (
             <Text dimColor>{ready ? 'loading history…' : 'not configured — see the header'}</Text>
+          )}
+          {loadingNow === 'history' && (
+            <Text dimColor>⏳ загружаю историю…</Text>
           )}
           {shown.map((m, i) => {
             const canReact = ready && !m.out && !m.system && m.id != null
+            // the trigger is a plain Button whose LABEL is the literal "[+]"
+            // (plain draws the label alone) — dim at rest, inverted under the
+            // pointer; 3 cells + the 1-col gap
+            const w = cols - (canReact ? 4 : 0)
             const react = (emoticon: string) => {
               const id = m.id as number
               void update($, paletteFor, () => -1)
@@ -625,28 +1015,51 @@ export const register: Register = (on, options) => {
                 }
               })()
             }
+            const body = padLines(
+              wrapText(
+                m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`,
+                w,
+              ),
+              w,
+            )
             return (
-              <Box flexDirection="column" key={m.id ?? `i${i}`}>
+              <Box flexDirection="column" key={String(m.id ?? `i${i}`)}>
+                {/* scope key MUST be a plain string: a numeric key names no
+                    scope and the pointer goes inert over everything inside,
+                    the [+] trigger included (engine d.ts, Box key docs) */}
                 <Box gap={1}>
-                  <Text dimColor={!m.out} wrap="wrap">
-                    {m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`}
-                  </Text>
+                  {/* the engine's Text does not re-wrap to the pane width —
+                      long lines are painted clipped at the edge (tree holds the
+                      text, screen loses the tail), so wrap BEFORE drawing.
+                      canReact rows share the line with the [ 🙂 ] button —
+                      reserve its columns; the rest use the full width. */}
+                  <Box flexGrow={1} flexShrink={1}>
+                    <Text dimColor={!m.out} wrap="wrap">
+                      {body}
+                    </Text>
+                  </Box>
                   {canReact && (
+                    // NOT plain: a plain button draws its label alone and the
+                    // terminal's pointer hit-test never fires it (proven on a
+                    // live pane — SGR click); the drawn form is `[ + ]`
                     <Button
-                      plain
+                      key={`react-${m.id}`}
+                      dimColor
                       onPress={() =>
                         void update($, paletteFor, open => (open === m.id ? -1 : (m.id as number)))
                       }
                     >
-                      🙂
+                      +
                     </Button>
                   )}
                 </Box>
-                {m.reactions?.length ? <Text dimColor>{`  ${m.reactions.join(' ')}`}</Text> : null}
+                {m.reactions?.length ? (
+                  <Text dimColor>{padLines(`  ${m.reactions.join(' ')}`, w)}</Text>
+                ) : null}
                 {canReact && openPalette === m.id && (
                   <Box gap={1}>
                     {REACTION_PRESETS.map(emoji => (
-                      <Button plain key={emoji} onPress={() => react(emoji)}>
+                      <Button key={emoji} onPress={() => react(emoji)}>
                         {emoji}
                       </Button>
                     ))}
@@ -720,7 +1133,11 @@ export const register: Register = (on, options) => {
         ) : (
           <Box flexDirection="column" flexGrow={1} overflow="hidden" height={listRows}>
             {dialogs === null || dialogs.length === 0 ? (
-              <Text dimColor>{dialogs === null ? 'loading dialogs…' : 'no dialogs'}</Text>
+              <Text dimColor>
+                {loadingNow === 'dialogs'
+                  ? '⏳ загружаю диалоги…'
+                  : dialogs === null ? 'loading dialogs…' : 'no dialogs'}
+              </Text>
             ) : (
               dialogs.map(d => (
                 <Button key={d.id} onPress={() => void switchDialog($, cfg, d.id)}>
@@ -732,5 +1149,8 @@ export const register: Register = (on, options) => {
         )}
       </Box>
     )
+    } finally {
+      release()
+    }
   })
 }
