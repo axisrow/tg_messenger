@@ -702,10 +702,10 @@ export const register: Register = (on, options) => {
           )}
           {shown.map((m, i) => {
             const canReact = ready && !m.out && !m.system && m.id != null
-            // a bracketed button (the header style, `[ диалоги ]`) = label
-            // cells + 4 + the 1-col gap; a bare plain 🙂 read as message
-            // CONTENT — nothing told the user it opens the reaction palette
-            const w = cols - (canReact ? 8 : 0)
+            // the trigger is a plain Button whose LABEL is the literal "[+]"
+            // (plain draws the label alone) — dim at rest, inverted under the
+            // pointer; 3 cells + the 1-col gap
+            const w = cols - (canReact ? 4 : 0)
             const react = (emoticon: string) => {
               const id = m.id as number
               void update($, paletteFor, () => -1)
@@ -744,11 +744,13 @@ export const register: Register = (on, options) => {
                   </Box>
                   {canReact && (
                     <Button
+                      plain
+                      dimColor
                       onPress={() =>
                         void update($, paletteFor, open => (open === m.id ? -1 : (m.id as number)))
                       }
                     >
-                      🙂
+                      [+]
                     </Button>
                   )}
                 </Box>
