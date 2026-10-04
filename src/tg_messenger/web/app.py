@@ -584,11 +584,16 @@ def build_app(
         return JSONResponse({"profile": session_name})
 
     @app.get("/api/dialogs")
-    async def api_dialogs(request: Request, tab: str = "dm"):
+    async def api_dialogs(request: Request, tab: str = "dm", limit: int = 100):
         # JSON surface for the /tg pane's warm daemon (a localhost `serve` the
-        # pane spawns): same data as the HTML page, no fragments, no translation
+        # pane spawns): same data as the HTML page, no fragments, no translation.
+        # limit bounded like the CLI's --limit (#270) — a full crawl on a huge
+        # account takes minutes and floods.
         client = request.app.state.client
-        items = await (client.group_dialogs() if tab == "groups" else client.dialogs())
+        bounded = min(limit, 500)
+        items = await (
+            client.group_dialogs(limit=bounded) if tab == "groups" else client.dialogs(limit=bounded)
+        )
         return JSONResponse([d.model_dump(mode="json") for d in items])
 
     @app.get("/api/dialogs/{dialog_id}/messages")

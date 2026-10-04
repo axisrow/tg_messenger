@@ -133,11 +133,14 @@ function cliError(stderr: string): string | null {
 // daemon is a child of the pane's environment — teardown cancels it like the
 // stream, and the catch guards below keep that cancellation off the worker.
 
-/** Deterministic per-profile port: two panes on one account share the daemon. */
+/** Deterministic per-profile port: two panes on one account share the daemon.
+ * A wide band keeps two DIFFERENT profiles from colliding — a collision can
+ * never go warm (the identity probe rejects the foreign daemon), so it is
+ * worth making astronomically unlikely. */
 function daemonPortFor(profile: string): number {
   let h = 0
   for (let i = 0; i < profile.length; i++) h = (h * 31 + profile.charCodeAt(i)) >>> 0
-  return 18080 + (h % 1000)
+  return 18080 + (h % 40000)
 }
 
 const WARM_POLL_MS = 4000
@@ -925,9 +928,19 @@ export const register: Register = (on, options) => {
     const shown: TgMessage[] = []
     let used = 0
     for (let i = list.length - 1; i >= 0 && used < budget; i--) {
-      const rows = perRows(list[i] as TgMessage)
-      if (used + rows > budget) break
-      shown.unshift(list[i] as TgMessage)
+      const m = list[i] as TgMessage
+      const rows = perRows(m)
+      if (used + rows > budget) {
+        if (i !== list.length - 1) break
+        // a single message taller than the whole pane: draw its TAIL — the
+        // newest row must always render, an empty list would sit here showing
+        // "loading history…" forever (already-loaded history!)
+        const tail = wrapText(m.text, Math.max(2, cols - 4)).split('\n').slice(-(budget - 1)).join('\n')
+        shown.unshift({ ...m, text: tail })
+        used = budget
+        break
+      }
+      shown.unshift(m)
       used += rows
     }
 

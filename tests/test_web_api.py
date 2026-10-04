@@ -16,6 +16,11 @@ class RecordingStub(WebStubClient):
     def __init__(self):
         super().__init__()
         self.history_kwargs: list[dict] = []
+        self.dialogs_kwargs: list[dict] = []
+
+    async def dialogs(self, dm_only=True, limit=None):
+        self.dialogs_kwargs.append({"dm_only": dm_only, "limit": limit})
+        return await super().dialogs(dm_only=dm_only, limit=limit)
 
     async def history(self, peer, limit=50, offset_id=0, fresh=False):
         self.history_kwargs.append({"peer": peer, "limit": limit, "fresh": fresh})
@@ -44,13 +49,15 @@ async def test_api_health_reports_profile(api_app):
 
 
 async def test_api_dialogs_returns_json(api_app):
-    ac, _ = api_app
+    ac, stub = api_app
     r = await ac.get("/api/dialogs")
     assert r.status_code == 200
     rows = r.json()
     assert [d["id"] for d in rows] == [7]
     assert rows[0]["title"] == "Ann"
     assert rows[0]["unread"] == 1
+    # bounded like the CLI --limit (#270): the warm path must not full-crawl
+    assert stub.dialogs_kwargs == [{"dm_only": True, "limit": 100}]
 
 
 async def test_api_dialogs_groups_tab(api_app):
