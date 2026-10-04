@@ -146,6 +146,36 @@ function parseHistory(stdout: string): TgMessage[] {
 }
 
 /**
+ * Greedy word-wrap at `width` columns. The engine's Text does not re-wrap long
+ * lines to the pane width — the paint layer clips them at the edge (the tree
+ * holds the full text, the screen loses the tail), so the pane wraps BEFORE
+ * drawing and there is never a line wider than the pane. Emoji count as 2
+ * UTF-16 units but ≤2 terminal cells, so measuring by JS length errs short —
+ * a line may wrap early, never clip.
+ */
+export function wrapText(text: string, width: number): string {
+  const w = Math.max(2, width)
+  const out: string[] = []
+  for (const para of text.split('\n')) {
+    let line = ''
+    for (const word of para.split(' ')) {
+      // a word longer than the whole width (a URL) hard-breaks at the column
+      for (let k = 0; k < word.length; k += w) {
+        const piece = word.slice(k, k + w)
+        if (!line) line = piece
+        else if (line.length + 1 + piece.length <= w) line += ` ${piece}`
+        else {
+          out.push(line)
+          line = piece
+        }
+      }
+    }
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
+/**
  * Reads recent history of the dialog and replaces the pane content.
  * Status noise (`Loading history…`) rides stderr — only Click's `Error:`
  * line means failure.
@@ -674,13 +704,17 @@ export const register: Register = (on, options) => {
             return (
               <Box flexDirection="column" key={m.id ?? `i${i}`}>
                 <Box gap={1}>
-                  {/* shrink-wrapped Box: without flex constraints ink lays the
-                      Text out at its full single-line width and the list's
-                      overflow=hidden clips the tail — long messages lost their
-                      ends next to the reaction button */}
+                  {/* the engine's Text does not re-wrap to the pane width —
+                      long lines are painted clipped at the edge (tree holds the
+                      text, screen loses the tail), so wrap BEFORE drawing.
+                      canReact rows share the line with the 🙂 button — reserve
+                      its columns; the rest use the full width. */}
                   <Box flexGrow={1} flexShrink={1}>
                     <Text dimColor={!m.out} wrap="wrap">
-                      {m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`}
+                      {wrapText(
+                        m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`,
+                        cols - (canReact ? 4 : 0),
+                      )}
                     </Text>
                   </Box>
                   {canReact && (
