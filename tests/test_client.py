@@ -1705,6 +1705,21 @@ async def test_send_reaction_sends_request(fake_client):
     assert reactions[0].emoticon == "👍"
 
 
+async def test_send_reaction_strips_variation_selector(fake_client):
+    # Telegram rejects a reaction whose emoji carries U+FE0F with
+    # ReactionInvalidError ("only emoji are allowed") — the canonical reaction
+    # form is the bare codepoint ('❤️' on the presets must go out as '❤').
+    from telethon.tl.functions.messages import SendReactionRequest
+
+    client = _build(fake_client)
+    await client.connect()
+    await client.send_reaction(7, 55, "❤️")
+    sent = [r for r in fake_client.requests if isinstance(r, SendReactionRequest)]
+    reactions = sent[-1].reaction or []
+    assert reactions and reactions[0].emoticon == "❤"
+    await client.disconnect()
+
+
 async def test_send_reaction_flood_is_handled(fake_client, monkeypatch):
     from tg_messenger.core.flood import HandledFloodWaitError
 

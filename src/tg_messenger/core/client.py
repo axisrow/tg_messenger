@@ -896,6 +896,9 @@ class StandaloneTelegramClient:
         """React to a message with a standard emoji, routed through flood-wait retry."""
         await self._warm_entity(peer)
         await self._send_bucket.acquire()  # global outgoing cap (#25)
+        # Telegram rejects reactions carrying U+FE0F (ReactionInvalidError) —
+        # the canonical reaction form is the bare codepoint ('❤️' -> '❤').
+        emoticon = emoticon.replace("️", "")
         try:
             await run_with_flood_wait_retry(
                 lambda: self._client(
