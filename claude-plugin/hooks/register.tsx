@@ -176,6 +176,23 @@ export function wrapText(text: string, width: number): string {
 }
 
 /**
+ * Pads every line with trailing spaces to `width`. FACT: the CLI dump and the
+ * parsed tree are clean, while the screen glues fragments of OLDER frames
+ * after a row whose new content is shorter — the engine's repaint overwrites
+ * a shrunken row without clearing its stale tail, and the damage is stable
+ * across repaints (diff baseline poisoned). Padding every drawn line to the
+ * full budget makes a repaint overwrite the whole row — there is no stale
+ * tail left to preserve. Screen-level, so the test kit (tree-only) can't
+ * assert it; the transform itself is unit-tested.
+ */
+export function padLines(text: string, width: number): string {
+  return text
+    .split('\n')
+    .map(l => (l.length < width ? l + ' '.repeat(width - l.length) : l))
+    .join('\n')
+}
+
+/**
  * Reads recent history of the dialog and replaces the pane content.
  * Status noise (`Loading history…`) rides stderr — only Click's `Error:`
  * line means failure.
@@ -711,10 +728,16 @@ export const register: Register = (on, options) => {
                       its columns; the rest use the full width. */}
                   <Box flexGrow={1} flexShrink={1}>
                     <Text dimColor={!m.out} wrap="wrap">
-                      {wrapText(
-                        m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`,
-                        cols - (canReact ? 4 : 0),
-                      )}
+                      {(() => {
+                        const w = cols - (canReact ? 4 : 0)
+                        return padLines(
+                          wrapText(
+                            m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`,
+                            w,
+                          ),
+                          w,
+                        )
+                      })()}
                     </Text>
                   </Box>
                   {canReact && (
