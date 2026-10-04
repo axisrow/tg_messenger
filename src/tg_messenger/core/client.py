@@ -469,17 +469,31 @@ class StandaloneTelegramClient:
         )
 
     # --- dialogs / history ---
-    async def dialogs(self, dm_only: bool = True) -> list[Dialog]:
+    async def _dialogs_full(self, limit: int | None = None) -> list[Dialog]:
+        """The every-kind dialog list: TTL-cached when full, fresh when limited.
+
+        A ``limit`` fetch is a one-page read of the most recent dialogs — it
+        bypasses the cache, which holds ONE full list and must not serve a
+        truncated snapshot to unlimited callers (#270).
+        """
+        if limit is None:
+            return await self._dialogs_cache.get_or_fetch(
+                _DIALOGS_CACHE_KEY, lambda: self._fetch_dialogs(archived=False)
+            )
+        return await self._fetch_dialogs(archived=False, limit=limit)
+
+    async def dialogs(self, dm_only: bool = True, limit: int | None = None) -> list[Dialog]:
         """Mapped dialog list, served from a short-TTL cache.
 
         The cache holds ONE full list (every kind); ``dm_only`` filters from it,
         so tab switching after the first load makes zero network calls.
         Concurrent first-loads coalesce (single-flight). The returned list is a
         fresh copy — the cached models are shared (UIs render, never mutate).
+        ``limit`` returns only the most recent N dialogs and skips the cache —
+        the lazy-load path for huge accounts (a full crawl there takes minutes
+        and floods).
         """
-        full = await self._dialogs_cache.get_or_fetch(
-            _DIALOGS_CACHE_KEY, lambda: self._fetch_dialogs(archived=False)
-        )
+        full = await self._dialogs_full(limit)
         if dm_only:
             return [d for d in full if d.kind == "dm"]
         return list(full)
@@ -491,15 +505,14 @@ class StandaloneTelegramClient:
         )
         return list(full)
 
-    async def group_dialogs(self) -> list[Dialog]:
+    async def group_dialogs(self, limit: int | None = None) -> list[Dialog]:
         """Every non-DM dialog (groups, supergroups, channels, bots).
 
         The "Группы" tab in every UI — same cache as ``dialogs()``, filtered the
         opposite way, so the kind filter lives in one place, not in each front-end.
+        ``limit`` means the most recent N of every kind, then the DM filter.
         """
-        full = await self._dialogs_cache.get_or_fetch(
-            _DIALOGS_CACHE_KEY, lambda: self._fetch_dialogs(archived=False)
-        )
+        full = await self._dialogs_full(limit)
         return [d for d in full if d.kind != "dm"]
 
     async def can_post_to(self, dialog_id: int) -> bool:
@@ -521,9 +534,9 @@ class StandaloneTelegramClient:
             return True
         return can_send_in(dialogs, dialog_id)
 
-    async def _fetch_dialogs(self, *, archived: bool = False) -> list[Dialog]:
+    async def _fetch_dialogs(self, *, archived: bool = False, limit: int | None = None) -> list[Dialog]:
         raw = await run_with_flood_wait_retry(
-            lambda: self._collect_dialogs(archived=archived),
+            lambda: self._collect_dialogs(archived=archived, limit=limit),
             operation="archived_dialogs" if archived else "dialogs",
         )
         result = []
@@ -553,8 +566,8 @@ class StandaloneTelegramClient:
             )
         return result
 
-    async def _collect_dialogs(self, *, archived: bool = False) -> list:
-        return [d async for d in self._client.iter_dialogs(archived=archived)]
+    async def _collect_dialogs(self, *, archived: bool = False, limit: int | None = None) -> list:
+        return [d async for d in self._client.iter_dialogs(archived=archived, limit=limit)]
 
     async def history(self, peer: int, limit: int = 50, offset_id: int = 0) -> list[Message]:
         """Return messages in chronological order (oldest first), TTL-cached.

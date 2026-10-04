@@ -53,6 +53,21 @@ const pendingSend = atom({ plugin: 'tg-messenger', key: 'pendingSend' } as const
 const view = atom({ plugin: 'tg-messenger', key: 'view' } as const, 'chat' as 'chat' | 'dialogs')
 const dialogList = atom({ plugin: 'tg-messenger', key: 'dialogList' } as const, null as TgDialog[] | null)
 
+// loading indicator: what is being fetched right now. Deliberately STATIC — an
+// animated ticker (~120 ms redraws) made the async render hook overlap itself
+// and the interleaved output tore wrapped lines of different messages together.
+// register() clears the atom: a reload mid-load must not leave it stuck.
+const loading = atom({ plugin: 'tg-messenger', key: 'loading' } as const, null as 'history' | 'dialogs' | null)
+
+async function spinWhile($: EngineInterface, kind: 'history' | 'dialogs', run: () => Promise<unknown>): Promise<void> {
+  await update($, loading, () => kind)
+  try {
+    await run()
+  } finally {
+    await update($, loading, () => null)
+  }
+}
+
 // message ids this mod itself sent (for `--out` echo suppression) — the TUI's
 // `_sent_ids` pattern: membership-only, never popped (a pop would re-duplicate
 // a reconnect re-echo), bounded FIFO
@@ -131,6 +146,53 @@ function parseHistory(stdout: string): TgMessage[] {
 }
 
 /**
+ * Greedy word-wrap at `width` columns. The engine's Text does not re-wrap long
+ * lines to the pane width — the paint layer clips them at the edge (the tree
+ * holds the full text, the screen loses the tail), so the pane wraps BEFORE
+ * drawing and there is never a line wider than the pane. Emoji count as 2
+ * UTF-16 units but ≤2 terminal cells, so measuring by JS length errs short —
+ * a line may wrap early, never clip.
+ */
+export function wrapText(text: string, width: number): string {
+  const w = Math.max(2, width)
+  const out: string[] = []
+  for (const para of text.split('\n')) {
+    let line = ''
+    for (const word of para.split(' ')) {
+      // a word longer than the whole width (a URL) hard-breaks at the column
+      for (let k = 0; k < word.length; k += w) {
+        const piece = word.slice(k, k + w)
+        if (!line) line = piece
+        else if (line.length + 1 + piece.length <= w) line += ` ${piece}`
+        else {
+          out.push(line)
+          line = piece
+        }
+      }
+    }
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
+/**
+ * Pads every line with trailing spaces to `width`. FACT: the CLI dump and the
+ * parsed tree are clean, while the screen glues fragments of OLDER frames
+ * after a row whose new content is shorter — the engine's repaint overwrites
+ * a shrunken row without clearing its stale tail, and the damage is stable
+ * across repaints (diff baseline poisoned). Padding every drawn line to the
+ * full budget makes a repaint overwrite the whole row — there is no stale
+ * tail left to preserve. Screen-level, so the test kit (tree-only) can't
+ * assert it; the transform itself is unit-tested.
+ */
+export function padLines(text: string, width: number): string {
+  return text
+    .split('\n')
+    .map(l => (l.length < width ? l + ' '.repeat(width - l.length) : l))
+    .join('\n')
+}
+
+/**
  * Reads recent history of the dialog and replaces the pane content.
  * Status noise (`Loading history…`) rides stderr — only Click's `Error:`
  * line means failure.
@@ -151,21 +213,18 @@ async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
 
 /**
  * `listen` line with ids: `← [DIALOG] [MSG] text` (incoming, DMs only) or
- * `→ [DIALOG] [MSG] text` (own messages from any device, `--out`). Preamble
- * and unknown lines are ignored.
+ * `→ [DIALOG] [MSG] text` (own messages from any device, `--out`). Returns
+ * null for preamble and unknown lines and for this mod's own send echoes.
+ * Pure — the caller merges a whole burst into ONE state update.
  */
 const STREAM_LINE = /^([←→]) \[(\d+)\] \[(\d+)\] (.*)$/
 
-async function handleStreamLine($: EngineInterface, cfg: ModConfig, line: string): Promise<void> {
+function parseStreamLine(cfg: ModConfig, line: string): TgMessage | null {
   const m = STREAM_LINE.exec(line)
-  if (!m || m[2] !== cfg.resolvedId) return
+  if (!m || m[2] !== cfg.resolvedId) return null
   const mid = Number(m[3])
-  if (m[1] === '→' && sentIds.has(mid)) return // this mod's own send, echoed
-  await update(
-    $,
-    messages,
-    all => [...all, { id: mid, text: m[4], out: m[1] === '→' }].slice(-100) as TgMessage[],
-  )
+  if (m[1] === '→' && sentIds.has(mid)) return null // this mod's own send, echoed
+  return { id: mid, text: m[4], out: m[1] === '→' }
 }
 
 // one live subscription per activation: pane reopen and session re-seat
@@ -197,11 +256,19 @@ async function runStream($: EngineInterface, cfg: ModConfig): Promise<never> {
         if (chunk.stream === 'stderr') continue // status noise ("Listening for…")
         buffer += chunk.text
         let nl: number
+        const batch: TgMessage[] = []
         while ((nl = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, nl)
           buffer = buffer.slice(nl + 1)
-          await handleStreamLine($, cfg, line)
+          const msg = parseStreamLine(cfg, line)
+          if (msg) batch.push(msg)
         }
+        // one update per burst — a burst of per-message updates would trigger
+        // just as many renders
+        if (batch.length)
+          await update($, messages, all =>
+            [...all, ...batch].slice(-100) as TgMessage[],
+          )
         backoff = 1000 // a live line proves the link works
         lost = false
       }
@@ -254,9 +321,16 @@ async function resolveDialog($: EngineInterface, cfg: ModConfig): Promise<void> 
   cfg.isGroup = cfg.resolvedId.startsWith('-')
 }
 
-/** Loads the DM list for the picker (`dialogs`, DMs only — groups are history-only). */
+/** Loads the DM list for the picker — the 100 most recent dialogs (#270): a full
+ * crawl on a huge account takes minutes and floods. */
 async function loadDialogList($: EngineInterface, cfg: ModConfig): Promise<void> {
-  const { stdout, stderr } = await runCli($, ['--profile', cfg.profile, 'dialogs'])
+  const { stdout, stderr } = await runCli($, [
+    '--profile',
+    cfg.profile,
+    'dialogs',
+    '--limit',
+    '100',
+  ])
   const err = cliError(stderr)
   if (err) throw new Error(err)
   const list = stdout
@@ -274,14 +348,15 @@ async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Pro
   cfg.isGroup = id.startsWith('-')
   void update($, view, () => 'chat' as const)
   void update($, paletteFor, () => -1)
+  // drop the previous dialog's text at once — the loading marker replaces it,
+  // stale content of another dialog must not linger while the fetch runs
+  void update($, messages, () => [] as TgMessage[])
   if (cfg.isGroup)
     $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
-  try {
-    await loadHistory($, cfg)
-  } catch (error) {
+  await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
     const message = error instanceof Error ? error.message : String(error)
     $.ui.toast(`tg-messenger: ${message}`)
-  }
+  }))
   startStream($, cfg)
 }
 
@@ -492,15 +567,13 @@ async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reas
   }
   // history is best-effort: a failure (e.g. Telegram unreachable) must not
   // kill the bridge — the live stream retries with backoff and self-heals
-  try {
-    await loadHistory($, cfg)
-  } catch (error) {
+  await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
     const message = error instanceof Error ? error.message : String(error)
     $.ui.toast(`tg-messenger: ${message}`)
-    await update($, messages, all =>
+    return update($, messages, all =>
       [...all, { text: message, out: false, system: true }].slice(-100) as TgMessage[],
     )
-  }
+  }))
   if (cfg.isGroup)
     $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
   else startStream($, cfg)
@@ -514,6 +587,9 @@ export const register: Register = (on, options) => {
   const { cfg, ready, reason, target } = readConfig(options)
 
   on('session.start', async ($, e, next) => {
+    // a reload mid-load kills the ticker but leaves the atom set — a frozen
+    // loading marker must not survive into the fresh module
+    void update($, loading, () => null)
     try {
       await $.command.register({
         name: 'tg',
@@ -538,13 +614,24 @@ export const register: Register = (on, options) => {
     return { text: 'tg-messenger: pane opened below the prompt.' }
   })
 
+  // one draw at a time: the hook is async (every atom read is an await point),
+  // so a burst of state updates — a stream burst, a send's echo — starts
+  // overlapping renders, and their interleaved output splices wrapped lines of
+  // DIFFERENT messages together (панель черепком). The gate serializes draws;
+  // a queued render re-reads all atoms fresh, only its geometry snapshot may
+  // be a few ms stale.
+  let renderBusy = false
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    while (renderBusy) await $.clock.sleep(10)
+    renderBusy = true
+    try {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
     const list = await read($, messages)
     const openPalette = await read($, paletteFor)
     const draftLen = await read($, draft)
     const viewName = await read($, view)
     const dialogs = await read($, dialogList)
+    const loadingNow = await read($, loading)
     // pane geometry: diff reads e.props.scroll.bodyRows/bodyColumns
     const props = (e as { props?: { scroll?: { bodyRows?: number }; bodyColumns?: number } }).props
     const cols = (props?.bodyColumns ?? e.viewport?.columns ?? 80) - 2
@@ -566,30 +653,33 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column" flexGrow={1} gap={1} padding={1} paddingBottom={0}>
+        {/* No <> fragments among the row children: the engine does NOT flatten
+            them — a Fragment renders as one node stacking its children
+            vertically, which kept the диалоги/назад buttons on their own line
+            under the middle text no matter the widths. Every element is a
+            direct child of the row; JSX false/undefined children are skipped. */}
         <Box gap={2}>
-          <Text bold>tg-messenger</Text>
+          <Text bold>tg</Text>
           {chat ? (
-            <>
-              <Text>{ready ? `— ${[cfg.profile, cfg.target].filter(Boolean).join(' · ')}` : <Text dimColor>— {reason}</Text>}</Text>
-              {ready && (
-                <Button
-                  onPress={() => {
-                    void update($, view, () => 'dialogs' as const)
-                    if (dialogs === null)
-                      void loadDialogList($, cfg).catch(error =>
-                        $.ui.toast(`tg-messenger: ${error instanceof Error ? error.message : String(error)}`),
-                      )
-                  }}
-                >
-                  диалоги
-                </Button>
-              )}
-            </>
+            <Text>{ready ? `— ${[cfg.profile, cfg.target].filter(Boolean).join(' · ')}` : <Text dimColor>— {reason}</Text>}</Text>
           ) : (
-            <>
-              <Text>— диалоги</Text>
-              <Button onPress={() => void update($, view, () => 'chat' as const)}>← назад</Button>
-            </>
+            <Text>— диалоги</Text>
+          )}
+          {chat && ready && (
+            <Button
+              onPress={() => {
+                void update($, view, () => 'dialogs' as const)
+                if (dialogs === null)
+                  void spinWhile($, 'dialogs', () => loadDialogList($, cfg).catch(error =>
+                    $.ui.toast(`tg-messenger: ${error instanceof Error ? error.message : String(error)}`),
+                  ))
+              }}
+            >
+              диалоги
+            </Button>
+          )}
+          {!chat && (
+            <Button onPress={() => void update($, view, () => 'chat' as const)}>← назад</Button>
           )}
           <Button role="dismiss" onPress={() => $.ui.close({ id: PANE })}>
             close
@@ -604,11 +694,18 @@ export const register: Register = (on, options) => {
           overflow="hidden"
           height={listRows}
         >
-          {shown.length === 0 && (
+          {shown.length === 0 && !loading && (
             <Text dimColor>{ready ? 'loading history…' : 'not configured — see the header'}</Text>
+          )}
+          {loadingNow === 'history' && (
+            <Text dimColor>⏳ загружаю историю…</Text>
           )}
           {shown.map((m, i) => {
             const canReact = ready && !m.out && !m.system && m.id != null
+            // the trigger is a plain Button whose LABEL is the literal "[+]"
+            // (plain draws the label alone) — dim at rest, inverted under the
+            // pointer; 3 cells + the 1-col gap
+            const w = cols - (canReact ? 4 : 0)
             const react = (emoticon: string) => {
               const id = m.id as number
               void update($, paletteFor, () => -1)
@@ -625,28 +722,45 @@ export const register: Register = (on, options) => {
                 }
               })()
             }
+            const body = padLines(
+              wrapText(
+                m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`,
+                w,
+              ),
+              w,
+            )
             return (
               <Box flexDirection="column" key={m.id ?? `i${i}`}>
                 <Box gap={1}>
-                  <Text dimColor={!m.out} wrap="wrap">
-                    {m.out ? `→ ${m.text}` : m.system ? `· ${m.text}` : `← ${m.text}`}
-                  </Text>
+                  {/* the engine's Text does not re-wrap to the pane width —
+                      long lines are painted clipped at the edge (tree holds the
+                      text, screen loses the tail), so wrap BEFORE drawing.
+                      canReact rows share the line with the [ 🙂 ] button —
+                      reserve its columns; the rest use the full width. */}
+                  <Box flexGrow={1} flexShrink={1}>
+                    <Text dimColor={!m.out} wrap="wrap">
+                      {body}
+                    </Text>
+                  </Box>
                   {canReact && (
                     <Button
                       plain
+                      dimColor
                       onPress={() =>
                         void update($, paletteFor, open => (open === m.id ? -1 : (m.id as number)))
                       }
                     >
-                      🙂
+                      [+]
                     </Button>
                   )}
                 </Box>
-                {m.reactions?.length ? <Text dimColor>{`  ${m.reactions.join(' ')}`}</Text> : null}
+                {m.reactions?.length ? (
+                  <Text dimColor>{padLines(`  ${m.reactions.join(' ')}`, w)}</Text>
+                ) : null}
                 {canReact && openPalette === m.id && (
                   <Box gap={1}>
                     {REACTION_PRESETS.map(emoji => (
-                      <Button plain key={emoji} onPress={() => react(emoji)}>
+                      <Button key={emoji} onPress={() => react(emoji)}>
                         {emoji}
                       </Button>
                     ))}
@@ -720,7 +834,11 @@ export const register: Register = (on, options) => {
         ) : (
           <Box flexDirection="column" flexGrow={1} overflow="hidden" height={listRows}>
             {dialogs === null || dialogs.length === 0 ? (
-              <Text dimColor>{dialogs === null ? 'loading dialogs…' : 'no dialogs'}</Text>
+              <Text dimColor>
+                {loadingNow === 'dialogs'
+                  ? '⏳ загружаю диалоги…'
+                  : dialogs === null ? 'loading dialogs…' : 'no dialogs'}
+              </Text>
             ) : (
               dialogs.map(d => (
                 <Button key={d.id} onPress={() => void switchDialog($, cfg, d.id)}>
@@ -732,5 +850,8 @@ export const register: Register = (on, options) => {
         )}
       </Box>
     )
+    } finally {
+      renderBusy = false
+    }
   })
 }
