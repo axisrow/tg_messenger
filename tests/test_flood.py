@@ -65,11 +65,13 @@ async def test_non_flood_error_propagates():
 
 
 # telethon-floodgate budget accounting (0.1.3): each retry costs
-# wait + RETRY_BUFFER_SEC (1s); the budget check is inclusive (equality retries).
+# wait + RETRY_BUFFER_SEC (1s); the budget check is inclusive (equality
+# retries); waits coerce to min 1s, waits above 60 never retry.
 @pytest.mark.parametrize(
     "wait,budget,calls,sleeps",
     [
         (60, 122, 3, [61.0, 61.0]),
+        (59, 120, 3, [60.0, 60.0]),
         (60, 120, 2, [61.0]),
         (61, 120, 1, []),
         (2, 1, 1, []),
