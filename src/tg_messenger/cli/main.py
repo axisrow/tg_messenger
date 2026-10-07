@@ -22,6 +22,7 @@ import contextlib
 import logging
 import os
 import sys
+import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,7 +104,45 @@ def _chat_line_reader():
     else:
 
         async def reader(prompt: str) -> str:
-            return await asyncio.to_thread(input, prompt)
+            # #276: run input() on a daemon thread OUTSIDE the default executor —
+            # asyncio.run's shutdown_default_executor joins executor threads, so a
+            # Ctrl+C while a line was being read hung the process until stdin
+            # delivered data (PEP 475 retries the interrupted read). A plain thread
+            # is never joined: cancelling the await below cancels only the future,
+            # instantly, and the parked daemon dies with the process.
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+
+            def _settle(value) -> None:
+                # runs in the loop thread; a cancelled read is an expected drop
+                if fut.done():
+                    return
+                if isinstance(value, BaseException):
+                    fut.set_exception(value)
+                else:
+                    fut.set_result(value)
+
+            def _post(value) -> None:
+                # the loop may already be closed (a line typed in the post-Ctrl+C
+                # window) — dropping it is the intended outcome, not a failure
+                try:
+                    loop.call_soon_threadsafe(_settle, value)
+                except RuntimeError:
+                    logger.debug("chat stdin line arrived after loop close — dropped")
+
+            def _run() -> None:
+                # input() can fail with more than EOFError (invalid-UTF-8 piped
+                # bytes, a closed fd) — settle whatever it raised, never leave the
+                # waiting read parked
+                try:
+                    line = input(prompt)
+                except BaseException as exc:
+                    _post(exc)
+                else:
+                    _post(line)
+
+            threading.Thread(target=_run, daemon=True, name="chat-stdin").start()
+            return await fut
 
         return reader, contextlib.nullcontext
 
@@ -957,80 +996,69 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             outbound = make_optional_outbound(store, storage)
             await store.connect()
             store_task = asyncio.create_task(store.run())
-            from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
-            from tg_messenger.agent.outbound_coordinator import OutboundError
-
-            telegram_lang_code = None
-            # #199: whether this peer is a BOT. In a bot dialog the slash IS the payload
-            # (/start, /settings, /cancel …), so the #187 unknown-slash guard below must not
-            # fire — it only protects irreversible sends to a real person. Unknown until the
-            # one-time dialog read resolves it (fail-safe: treated as non-bot / guard active).
-            dialog_kind = None
-            # read the dialog once: kind (#199 bot-slash), telegram_lang_code (outbound) AND
-            # can_send (read-only gate)
-            try:
-                for dialog in await client.dialogs(dm_only=False):
-                    if dialog.id == dialog_id:
-                        dialog_kind = getattr(dialog, "kind", None)
-                        telegram_lang_code = getattr(dialog, "telegram_lang_code", None)
-                        if not getattr(dialog, "can_send", True):
-                            # #187: English like the rest of the CLI REPL
-                            click.echo("This chat is read-only — sending is disabled.", err=True)
-                        break
-            except Exception:
-                logger.warning("failed to read dialogs for the chat REPL", exc_info=True)
-
-            async def _send_or_warn(coro):
-                """Run a send; on a rights rejection warn and return None so the REPL
-                keeps running instead of the whole session exiting (F3)."""
-                try:
-                    return await coro
-                except SendForbiddenError as exc:
-                    # surface Telegram's specific reason (#92); keep the REPL alive (F3)
-                    logger.warning(
-                        "send rejected (rights) in chat REPL (dialog %s): %s", dialog_id, exc
-                    )
-                    click.echo(str(exc), err=True)
-                    return None
 
             # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();
             # skip them so our own input isn't printed back. Bounded (deque).
             sent_ids: deque[tuple[int, int]] = deque(maxlen=200)
 
-            # #162: outbound translation goes through the same coordinator the TUI/web use — it owns
-            # the prepare timeout, the variant token lifecycle and source recording. The REPL only
-            # presents the picker. Built once (None when outbound isn't configured).
-            coordinator = make_outbound_coordinator(outbound, store) if outbound is not None else None
+            # #276: echo the original FIRST and translate in a background task (the
+            # web's #69 pattern) — a cancellation (EOF/Ctrl+C) mid-translation must
+            # never swallow an already-received event, and a failing translator must
+            # not kill the printer stream (it's logged, never raised here).
+            bg_tasks: set[asyncio.Task] = set()
+            max_inflight_translations = 4  # mirrors the web's cap
+            backlog_warned = False
+            failure_warned = False
 
-            async def _coord_send(peer, body):
-                """SendFn for the coordinator: send + return the Message; a rights rejection is
-                surfaced (like _send_or_warn) but RE-RAISED so the coordinator restores its token
-                and the REPL loop can skip this line without sending."""
-                try:
-                    return await client.send_text(peer, body)
-                except SendForbiddenError as exc:
-                    logger.warning(
-                        "send rejected (rights) in chat REPL (dialog %s): %s", peer, exc
-                    )
-                    click.echo(str(exc), err=True)
-                    raise
+            def _spawn_translation(message):
+                nonlocal backlog_warned
+                if translator is None:
+                    return
+                # a burst of foreign-language messages must not fan out unbounded
+                # LLM calls (the web skips with a log when its cap is full too);
+                # done-but-not-yet-discarded tasks don't occupy slots
+                if sum(not t.done() for t in bg_tasks) >= max_inflight_translations:
+                    logger.warning("translation backlog full — line printed untranslated")
+                    if not backlog_warned:
+                        backlog_warned = True
+                        click.echo("translation backlog — showing untranslated", err=True)
+                    return
+
+                async def _echo_translation():
+                    nonlocal failure_warned
+                    try:
+                        translated = await _maybe_translate_message(translator, message)
+                        if translated.translated_text:
+                            # inside the try: a failing echo (closed pipe) is the
+                            # same logged-and-dropped class as a translate failure
+                            click.echo(f"  ↳ {translated.translated_text}")
+                    except Exception:
+                        # the stream must survive a broken translator (a dead model
+                        # used to kill it); the console learns once, the file in full
+                        logger.exception("inbound translation failed in chat REPL")
+                        if not failure_warned:
+                            failure_warned = True
+                            click.echo(
+                                "translation failed — showing untranslated (details in log)",
+                                err=True,
+                            )
+
+                t = asyncio.create_task(_echo_translation())
+                bg_tasks.add(t)
+                t.add_done_callback(bg_tasks.discard)
 
             async def printer():
                 async for ev in client.listen():
                     if ev.dialog_id == dialog_id:
-                        msg = await _maybe_translate_message(translator, ev.message)
-                        click.echo(f"\n← {msg.text or '<media>'}")
-                        if msg.translated_text:
-                            click.echo(f"  ↳ {msg.translated_text}")
+                        click.echo(f"\n← {ev.message.text or '<media>'}")
+                        _spawn_translation(ev.message)
 
             async def printer_outgoing():
                 # our own messages sent from another device (phone/web/CLI elsewhere)
                 async for ev in client.listen_outgoing():
                     if ev.dialog_id == dialog_id and (ev.dialog_id, ev.message.id) not in sent_ids:
-                        msg = await _maybe_translate_message(translator, ev.message)
-                        click.echo(f"\n→ {msg.text or '<media>'}")
-                        if msg.translated_text:
-                            click.echo(f"  ↳ {msg.translated_text}")
+                        click.echo(f"\n→ {ev.message.text or '<media>'}")
+                        _spawn_translation(ev.message)
 
             async def printer_reactions():
                 async for ev in client.listen_reactions():
@@ -1039,28 +1067,84 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                             f"\n* reaction [{ev.message_id}]: {_reaction_emoticon(ev.emoticon)}"
                         )
 
+            # #276: the printers start BEFORE the one-time dialogs read below — a bus
+            # publish with no subscriber is a silent no-op, so events arriving during
+            # that 0.5-3s round trip were dropped. The one tick gives each printer its
+            # first step (the bus subscribe); the same tick is the #274 guarantee (the
+            # printers' first step happens before the first input read).
             tasks = [
                 asyncio.create_task(printer()),
                 asyncio.create_task(printer_outgoing()),
                 asyncio.create_task(printer_reactions()),
             ]
-            # #215: read the REPL through a redraw-safe line reader. On a real TTY the loop is
-            # wrapped in patch_stdout() so background echoes redraw the in-flight input buffer
-            # instead of corrupting it; piped/non-interactive stdin falls back to plain input()
-            # (no cursor to corrupt, patch_stdout is a no-op there).
-            read_line, redraw_ctx = _chat_line_reader()
-            click.echo(CHAT_REPL_COMMANDS)  # #187: announce slash-commands + exit on start
+            await asyncio.sleep(0)
             try:
+                # #277 review: the whole setup AND the read loop live inside
+                # this try, so the finally below cancels (and reports) the
+                # printers no matter where the setup fails — they must never
+                # outlive their teardown on a crash path.
+
+                from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
+                from tg_messenger.agent.outbound_coordinator import OutboundError
+
+                telegram_lang_code = None
+                # #199: whether this peer is a BOT. In a bot dialog the slash IS the payload
+                # (/start, /settings, /cancel …), so the #187 unknown-slash guard below must not
+                # fire — it only protects irreversible sends to a real person. Unknown until the
+                # one-time dialog read resolves it (fail-safe: treated as non-bot / guard active).
+                dialog_kind = None
+                # read the dialog once: kind (#199 bot-slash), telegram_lang_code (outbound) AND
+                # can_send (read-only gate)
+                try:
+                    for dialog in await client.dialogs(dm_only=False):
+                        if dialog.id == dialog_id:
+                            dialog_kind = getattr(dialog, "kind", None)
+                            telegram_lang_code = getattr(dialog, "telegram_lang_code", None)
+                            if not getattr(dialog, "can_send", True):
+                                # #187: English like the rest of the CLI REPL
+                                click.echo("This chat is read-only — sending is disabled.", err=True)
+                            break
+                except Exception:
+                    logger.warning("failed to read dialogs for the chat REPL", exc_info=True)
+
+                async def _send_or_warn(coro):
+                    """Run a send; on a rights rejection warn and return None so the REPL
+                    keeps running instead of the whole session exiting (F3)."""
+                    try:
+                        return await coro
+                    except SendForbiddenError as exc:
+                        # surface Telegram's specific reason (#92); keep the REPL alive (F3)
+                        logger.warning(
+                            "send rejected (rights) in chat REPL (dialog %s): %s", dialog_id, exc
+                        )
+                        click.echo(str(exc), err=True)
+                        return None
+
+                # #162: outbound translation goes through the same coordinator the TUI/web use — it owns
+                # the prepare timeout, the variant token lifecycle and source recording. The REPL only
+                # presents the picker. Built once (None when outbound isn't configured).
+                coordinator = make_outbound_coordinator(outbound, store) if outbound is not None else None
+
+                async def _coord_send(peer, body):
+                    """SendFn for the coordinator: send + return the Message; a rights rejection is
+                    surfaced (like _send_or_warn) but RE-RAISED so the coordinator restores its token
+                    and the REPL loop can skip this line without sending."""
+                    try:
+                        return await client.send_text(peer, body)
+                    except SendForbiddenError as exc:
+                        logger.warning(
+                            "send rejected (rights) in chat REPL (dialog %s): %s", peer, exc
+                        )
+                        click.echo(str(exc), err=True)
+                        raise
+
+                # #215: read the REPL through a redraw-safe line reader. On a real TTY the loop is
+                # wrapped in patch_stdout() so background echoes redraw the in-flight input buffer
+                # instead of corrupting it; piped/non-interactive stdin falls back to plain input()
+                # (no cursor to corrupt, patch_stdout is a no-op there).
+                read_line, redraw_ctx = _chat_line_reader()
+                click.echo(CHAT_REPL_COMMANDS)  # #187: announce slash-commands + exit on start
                 with redraw_ctx():
-                    # One tick before the first read: EOF from an already-closed stdin can
-                    # resume the input reader while the printers' first steps are still
-                    # queued (a ready-queue dump shows the resume landing without draining
-                    # them), and the finally-cancel then kills the tasks before their
-                    # first event prints (#274). The tick guarantees the first step, not
-                    # every print — residual windows (events arriving before the printers
-                    # subscribe, translator-suspended echoes, EOF at the confirm/picker
-                    # prompts) are tracked in #276.
-                    await asyncio.sleep(0)
                     while True:
                         try:
                             line = await read_line("> ")
@@ -1074,7 +1158,12 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 continue
                             if first == "/react":
                                 parts = line.split(maxsplit=2)
-                                if len(parts) != 3 or not parts[1].isdigit():
+                                # isascii: '²'.isdigit() is True yet int() rejects
+                                # it — a unicode-digit "id" is a usage error, not
+                                # a crash of the whole REPL
+                                if len(parts) != 3 or not (
+                                    parts[1].isascii() and parts[1].isdigit()
+                                ):
                                     click.echo("usage: /react MESSAGE_ID EMOTICON", err=True)
                                     continue
                                 await _send_or_warn(
@@ -1219,6 +1308,19 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                             if msg is not None:
                                 sent_ids.append((dialog_id, msg.id))  # suppress this line's echo
             finally:
+                # #276: a bounded drain before the cancel — an event queued while the
+                # REPL sat in its last read has its wakeup sitting in the ready
+                # queue; bare cancel() would poison that wakeup with CancelledError
+                # and lose it. Tick 1 guarantees the printer's resume (the echo);
+                # tick 2 is best-effort for a translation that already FINISHED
+                # (nothing left to await). A translation still in flight (storage
+                # or LLM) cannot complete inside a tick and is cancelled as
+                # cosmetic — the original already printed. Known cosmetic
+                # residuals: a late `↳` may land under a newer `←` line (the echo
+                # carries no message id), and the backlog cap may skip a
+                # translation (logged when it does).
+                for _ in range(2):
+                    await asyncio.sleep(0)
                 for t in tasks:
                     t.cancel()
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1227,6 +1329,12 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     if isinstance(r, Exception):
                         logger.error("chat listener failed", exc_info=r)
                         click.echo(f"listener failed: {r}", err=True)
+                if bg_tasks:
+                    for t in bg_tasks:
+                        t.cancel()
+                    # retrieve every result so nothing lingers as "exception never
+                    # retrieved"; failures are already logged inside _echo_translation
+                    await asyncio.gather(*bg_tasks, return_exceptions=True)
                 if store_task is not None:
                     store_task.cancel()
                     store_results = await asyncio.gather(store_task, return_exceptions=True)
