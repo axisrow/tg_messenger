@@ -22,6 +22,7 @@ import contextlib
 import logging
 import os
 import sys
+import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,7 +104,33 @@ def _chat_line_reader():
     else:
 
         async def reader(prompt: str) -> str:
-            return await asyncio.to_thread(input, prompt)
+            # #276: run input() on a daemon thread OUTSIDE the default executor —
+            # asyncio.run's shutdown_default_executor joins executor threads, so a
+            # Ctrl+C while a line was being read hung the process until stdin
+            # delivered data (PEP 475 retries the interrupted read). A plain thread
+            # is never joined: cancelling the await below cancels only the future,
+            # instantly, and the parked daemon dies with the process.
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+
+            def _settle(value) -> None:
+                if fut.done():
+                    return  # cancelled while the thread was parked — expected drop
+                if isinstance(value, EOFError):
+                    fut.set_exception(value)
+                else:
+                    fut.set_result(value)
+
+            def _run() -> None:
+                try:
+                    line = input(prompt)
+                except EOFError as exc:
+                    loop.call_soon_threadsafe(_settle, exc)
+                else:
+                    loop.call_soon_threadsafe(_settle, line)
+
+            threading.Thread(target=_run, daemon=True, name="chat-stdin").start()
+            return await fut
 
         return reader, contextlib.nullcontext
 
@@ -957,6 +984,65 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             outbound = make_optional_outbound(store, storage)
             await store.connect()
             store_task = asyncio.create_task(store.run())
+
+            # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();
+            # skip them so our own input isn't printed back. Bounded (deque).
+            sent_ids: deque[tuple[int, int]] = deque(maxlen=200)
+
+            # #276: echo the original FIRST and translate in a background task (the
+            # web's #69 pattern) — a cancellation (EOF/Ctrl+C) mid-translation must
+            # never swallow an already-received event, and a failing translator must
+            # not kill the printer stream (it's logged, never raised here).
+            bg_tasks: set[asyncio.Task] = set()
+
+            def _spawn_translation(message):
+                async def _echo_translation():
+                    try:
+                        translated = await _maybe_translate_message(translator, message)
+                    except Exception:
+                        logger.exception("inbound translation failed in chat REPL")
+                        return
+                    if translated.translated_text:
+                        click.echo(f"  ↳ {translated.translated_text}")
+
+                t = asyncio.create_task(_echo_translation())
+                bg_tasks.add(t)
+                t.add_done_callback(bg_tasks.discard)
+
+            async def printer():
+                async for ev in client.listen():
+                    if ev.dialog_id == dialog_id:
+                        click.echo(f"\n← {ev.message.text or '<media>'}")
+                        if translator is not None:
+                            _spawn_translation(ev.message)
+
+            async def printer_outgoing():
+                # our own messages sent from another device (phone/web/CLI elsewhere)
+                async for ev in client.listen_outgoing():
+                    if ev.dialog_id == dialog_id and (ev.dialog_id, ev.message.id) not in sent_ids:
+                        click.echo(f"\n→ {ev.message.text or '<media>'}")
+                        if translator is not None:
+                            _spawn_translation(ev.message)
+
+            async def printer_reactions():
+                async for ev in client.listen_reactions():
+                    if ev.dialog_id == dialog_id:
+                        click.echo(
+                            f"\n* reaction [{ev.message_id}]: {_reaction_emoticon(ev.emoticon)}"
+                        )
+
+            # #276: the printers start BEFORE the one-time dialogs read below — a bus
+            # publish with no subscriber is a silent no-op, so events arriving during
+            # that 0.5-3s round trip were dropped. The one tick gives each printer its
+            # first step (the bus subscribe); the same tick is the #274 guarantee (the
+            # printers' first step happens before the first input read).
+            tasks = [
+                asyncio.create_task(printer()),
+                asyncio.create_task(printer_outgoing()),
+                asyncio.create_task(printer_reactions()),
+            ]
+            await asyncio.sleep(0)
+
             from tg_messenger.agent.outbound import set_dialog_lang, set_outbound_enabled
             from tg_messenger.agent.outbound_coordinator import OutboundError
 
@@ -993,10 +1079,6 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     click.echo(str(exc), err=True)
                     return None
 
-            # (dialog_id, message_id) keys we sent from this REPL echo on listen_outgoing();
-            # skip them so our own input isn't printed back. Bounded (deque).
-            sent_ids: deque[tuple[int, int]] = deque(maxlen=200)
-
             # #162: outbound translation goes through the same coordinator the TUI/web use — it owns
             # the prepare timeout, the variant token lifecycle and source recording. The REPL only
             # presents the picker. Built once (None when outbound isn't configured).
@@ -1015,35 +1097,6 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     click.echo(str(exc), err=True)
                     raise
 
-            async def printer():
-                async for ev in client.listen():
-                    if ev.dialog_id == dialog_id:
-                        msg = await _maybe_translate_message(translator, ev.message)
-                        click.echo(f"\n← {msg.text or '<media>'}")
-                        if msg.translated_text:
-                            click.echo(f"  ↳ {msg.translated_text}")
-
-            async def printer_outgoing():
-                # our own messages sent from another device (phone/web/CLI elsewhere)
-                async for ev in client.listen_outgoing():
-                    if ev.dialog_id == dialog_id and (ev.dialog_id, ev.message.id) not in sent_ids:
-                        msg = await _maybe_translate_message(translator, ev.message)
-                        click.echo(f"\n→ {msg.text or '<media>'}")
-                        if msg.translated_text:
-                            click.echo(f"  ↳ {msg.translated_text}")
-
-            async def printer_reactions():
-                async for ev in client.listen_reactions():
-                    if ev.dialog_id == dialog_id:
-                        click.echo(
-                            f"\n* reaction [{ev.message_id}]: {_reaction_emoticon(ev.emoticon)}"
-                        )
-
-            tasks = [
-                asyncio.create_task(printer()),
-                asyncio.create_task(printer_outgoing()),
-                asyncio.create_task(printer_reactions()),
-            ]
             # #215: read the REPL through a redraw-safe line reader. On a real TTY the loop is
             # wrapped in patch_stdout() so background echoes redraw the in-flight input buffer
             # instead of corrupting it; piped/non-interactive stdin falls back to plain input()
@@ -1052,15 +1105,6 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             click.echo(CHAT_REPL_COMMANDS)  # #187: announce slash-commands + exit on start
             try:
                 with redraw_ctx():
-                    # One tick before the first read: EOF from an already-closed stdin can
-                    # resume the input reader while the printers' first steps are still
-                    # queued (a ready-queue dump shows the resume landing without draining
-                    # them), and the finally-cancel then kills the tasks before their
-                    # first event prints (#274). The tick guarantees the first step, not
-                    # every print — residual windows (events arriving before the printers
-                    # subscribe, translator-suspended echoes, EOF at the confirm/picker
-                    # prompts) are tracked in #276.
-                    await asyncio.sleep(0)
                     while True:
                         try:
                             line = await read_line("> ")
@@ -1219,6 +1263,15 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                             if msg is not None:
                                 sent_ids.append((dialog_id, msg.id))  # suppress this line's echo
             finally:
+                # #276: a bounded drain before the cancel — an event queued while the
+                # REPL sat in its last read (or an already-finished translation) has
+                # its wakeup sitting in the ready queue; bare cancel() would poison
+                # that wakeup with CancelledError and lose it. Two ticks: the
+                # printer's resume (echo), then the background translation's echo.
+                # NOT a full drain — a still-running LLM translation is cosmetic now
+                # (the original already printed) and is simply cancelled below.
+                for _ in range(2):
+                    await asyncio.sleep(0)
                 for t in tasks:
                     t.cancel()
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1227,6 +1280,11 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                     if isinstance(r, Exception):
                         logger.error("chat listener failed", exc_info=r)
                         click.echo(f"listener failed: {r}", err=True)
+                if bg_tasks:
+                    for t in bg_tasks:
+                        t.cancel()
+                    # failures were already logged inside _echo_translation
+                    await asyncio.gather(*bg_tasks, return_exceptions=True)
                 if store_task is not None:
                     store_task.cancel()
                     store_results = await asyncio.gather(store_task, return_exceptions=True)

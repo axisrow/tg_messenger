@@ -1477,6 +1477,190 @@ def test_chat_does_not_echo_back_our_own_input(runner, monkeypatch):
     assert "→ hello" not in result.output
 
 
+# --- #276: the REPL event-lifecycle windows (startup, translate-before-echo,
+# EOF-at-later-reads, executor-pinning Ctrl+C hang) ---
+
+
+def test_chat_event_during_dialogs_read_is_printed(runner, monkeypatch):
+    """#276: the printers must subscribe BEFORE the one-time dialogs read — an
+    event published while it runs (0.5-3s of network) must be queued and printed,
+    not dropped into an unsubscribed bus (a no-op publish by contract)."""
+    r, stub = runner
+    stub.listen_interrupt = False
+    sub: list[asyncio.Queue] = []
+
+    def push(ev):
+        if not sub:
+            return  # real-bus contract: a publish with no subscriber is a silent no-op
+        sub[0].put_nowait(ev)
+
+    async def listen():
+        q = asyncio.Queue()
+        sub.append(q)
+        try:
+            while True:
+                yield await q.get()
+        finally:
+            sub.clear()
+
+    async def dialogs(dm_only=True, limit=None):
+        stub.dialogs_calls += 1
+        push(IncomingEvent(dialog_id=7, message=Message(
+            id=11, dialog_id=7, sender_id=7, out=False, text="early",
+            date=datetime(2024, 1, 1, tzinfo=timezone.utc))))
+        return [Dialog(id=7, title="Ann", username="ann", unread=2)]
+
+    monkeypatch.setattr(stub, "listen", listen)
+    monkeypatch.setattr(stub, "dialogs", dialogs)
+    # one empty Enter before EOF: the loop gets a turn while parked in the first
+    # read, so this test isolates the SUBSCRIPTION window from the drain-on-exit
+    # behaviour (pinned separately below)
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="\n")
+    assert result.exit_code == 0, result.output
+    assert "← early" in result.output
+
+
+def test_chat_echo_precedes_translation_when_translator_hangs(runner, monkeypatch):
+    """#276: the original line must print BEFORE the translation awaits — EOF (or
+    Ctrl+C) while a slow translation is in flight must not swallow the received
+    event (the printer used to consume it mid-translate and lose it unprinted)."""
+    r, stub = runner
+    stub.listen_interrupt = False
+    hang = asyncio.Event()
+
+    class HangingTranslator:
+        async def translate_message(self, message):
+            await hang.wait()  # never released: the translation never completes
+            return message
+
+    monkeypatch.setattr(cli_main, "make_optional_translator",
+                        lambda storage: HangingTranslator())
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="")
+    assert result.exit_code == 0, result.output
+    assert "← ping" in result.output  # the original echoed even though translation hung
+    assert "↳" not in result.output  # the translation never arrived — nothing printed for it
+
+
+def test_chat_drains_queued_event_on_eof(runner, monkeypatch):
+    """#276: an event queued while the REPL sat in its LAST read must print before
+    teardown — the finally runs a bounded drain (lets the queued printer wakeup
+    execute) BEFORE cancelling, instead of poisoning the pending wakeup with
+    CancelledError and losing the event."""
+    import contextlib
+
+    r, stub = runner
+    stub.listen_interrupt = False
+    sub: list[asyncio.Queue] = []
+
+    def push(ev):
+        sub[0].put_nowait(ev)
+
+    async def listen():
+        q = asyncio.Queue()
+        sub.append(q)
+        try:
+            while True:
+                yield await q.get()
+        finally:
+            sub.clear()
+
+    monkeypatch.setattr(stub, "listen", listen)
+
+    calls = {"n": 0}
+
+    async def fake_read_line(prompt):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # the wakeup for this event lands in the ready queue BEFORE EOFError
+            # raises — without the drain, cancel() poisons it and the event is lost
+            sub[0].put_nowait(IncomingEvent(dialog_id=7, message=Message(
+                id=12, dialog_id=7, sender_id=7, out=False, text="late",
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc))))
+            raise EOFError
+        return "hi"
+
+    async def send_text(peer, text, reply_to=None, schedule=None):
+        stub.sent.append((peer, text, reply_to, schedule))
+        return Message(id=99, dialog_id=peer, sender_id=1, out=True, text=text,
+                       date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    monkeypatch.setattr(stub, "send_text", send_text)
+    monkeypatch.setattr(cli_main, "_chat_line_reader",
+                        lambda: (fake_read_line, contextlib.nullcontext))
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="")
+    assert result.exit_code == 0, result.output
+    assert "← late" in result.output
+
+
+def test_chat_translation_printed_after_original_when_it_completes(runner, monkeypatch):
+    """#276 companion: an instant translation still prints (after the original, via
+    the exit drain + bg-task teardown) — echoing first must not drop the second
+    line for translations that DO finish."""
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    class InstantTranslator:
+        async def translate_message(self, message):
+            message.translated_text = "транслейт"
+            return message
+
+    monkeypatch.setattr(cli_main, "make_optional_translator",
+                        lambda storage: InstantTranslator())
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="")
+    assert result.exit_code == 0, result.output
+    assert "← ping" in result.output
+    assert "↳ транслейт" in result.output
+    assert result.output.index("← ping") < result.output.index("↳ транслейт")
+
+
+def test_chat_non_tty_reader_does_not_pin_the_executor(monkeypatch):
+    """#276: the non-TTY reader must not park a default-executor thread inside
+    input() — asyncio.run joins executor threads on shutdown, so a Ctrl+C while a
+    line was being read hung the process until stdin delivered data. The reader
+    must run input() on a daemon thread OUTSIDE the executor and settle a plain
+    future, so cancelling the read is instant and shutdown has nothing to join."""
+    import contextlib
+    import threading
+
+    monkeypatch.setattr(cli_main.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(cli_main.sys.stdout, "isatty", lambda: False)
+    read_line, _ = cli_main._chat_line_reader()
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_input(prompt=""):
+        started.set()
+        release.wait()  # parked mid-input() — the Ctrl+C shape
+
+    monkeypatch.setattr("builtins.input", blocking_input)
+
+    async def scenario():
+        task = asyncio.create_task(read_line("> "))
+        for _ in range(500):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "reader thread never parked inside input()"
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        # the exact hang: asyncio.run calls shutdown_default_executor after the
+        # coroutine dies; with the reader parked in an executor thread the join
+        # never finishes (bounded here at 1s). asyncio.run runs its own shutdown
+        # right after this — unblock the fake input() on timeout so that cleanup
+        # join completes instead of wedging the test runner.
+        try:
+            await asyncio.wait_for(
+                asyncio.get_running_loop().shutdown_default_executor(), 1
+            )
+        except TimeoutError:
+            release.set()
+            raise
+
+    asyncio.run(scenario())
+
+
 class FakeInnerLoginClient:
     """Stands in for the raw Telethon client used by LoginFlow."""
 
