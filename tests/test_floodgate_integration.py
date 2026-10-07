@@ -64,7 +64,11 @@ def offline_client(tmp_path):
     client = StandaloneTelegramClient(
         1, "test", client_factory=lambda *args: raw, session_dir=tmp_path, clock=clock, sleep=clock.sleep,
     )
-    client._gate = TelegramRateLimitGate(category_limits={"history": RateLimitSpec(1, 10)}, time_func=clock)
+    client._gate = TelegramRateLimitGate(
+        category_limits={"history": RateLimitSpec(1, 10)},
+        time_func=clock,
+        jitter_func=lambda low, high: 0,  # exact defer math asserted below
+    )
     return client, raw, clock
 
 
@@ -122,7 +126,11 @@ async def test_every_send_retry_is_gated_unless_opted_out(
         1, "test", client_factory=lambda *args: fake_client, session_dir=tmp_path,
         clock=clock, sleep=clock.sleep, send_rate_per_min=send_rate,
     )
-    client._gate = TelegramRateLimitGate(category_limits={"send": RateLimitSpec(1, 10)}, time_func=clock)
+    client._gate = TelegramRateLimitGate(
+        category_limits={"send": RateLimitSpec(1, 10)},
+        time_func=clock,
+        jitter_func=lambda low, high: 0,  # exact defer math asserted below
+    )
     original = getattr(fake_client, method)
     attempts = []
 
