@@ -149,6 +149,7 @@ async def test_default_bucket_and_gate_share_injected_time(fake_client, tmp_path
     clock = Clock()
     client = StandaloneTelegramClient(
         1, "test", client_factory=lambda *args: fake_client, session_dir=tmp_path, clock=clock, sleep=clock.sleep,
+        gate_jitter_func=lambda low, high: 0,  # exact defer math below
     )
     for i in range(31):
         await client.send_text(7, str(i))

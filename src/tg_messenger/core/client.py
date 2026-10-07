@@ -337,6 +337,7 @@ class StandaloneTelegramClient:
         send_rate_per_min: float = 20.0,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        gate_jitter_func: Callable[[float, float], float] | None = None,
     ):
         # #188 Axis B: fail with the friendly, actionable hint BEFORE Telethon sees
         # empty creds (its own ValueError points at telethon.rtfd.io — useless to a
@@ -374,7 +375,14 @@ class StandaloneTelegramClient:
         )
         # #252: proactive per-category pacing (telethon-floodgate) around the
         # history/send call sites; package defaults — see _gate_acquire.
-        self._gate = TelegramRateLimitGate(time_func=clock)
+        # gate_jitter_func mirrors clock/sleep: deterministic defers for tests,
+        # package-default jitter otherwise.
+        self._gate = TelegramRateLimitGate(
+            time_func=clock,
+            **(
+                {"jitter_func": gate_jitter_func} if gate_jitter_func is not None else {}
+            ),
+        )
         self._sleep = sleep
 
     async def _gate_acquire(self, operation: str) -> None:
