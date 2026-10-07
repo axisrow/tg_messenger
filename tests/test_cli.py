@@ -1115,6 +1115,25 @@ def test_chat_outbound_timeout_sends_original(runner, monkeypatch):
     assert "Translation timed out" in result.output
 
 
+def test_chat_eof_at_confirm_prompt_exits_cleanly(runner, monkeypatch):
+    """#277 review coverage: EOF landing on the nested 'send original?' confirm
+    must exit cleanly through the REAL thread reader (the _settle(EOFError) path
+    and the teardown drain), not just through the fake reader the drain test
+    uses — stdin ends right after the line that triggered the confirm."""
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    class FakeOutbound:
+        async def prepare_variants(self, dialog_id, text, *, telegram_lang_code=None):
+            raise TimeoutError
+
+    monkeypatch.setattr(cli_main, "make_optional_outbound", lambda s, storage: FakeOutbound())
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="привет\n")
+    assert result.exit_code == 0, result.output
+    assert "Translation timed out" in result.output
+    assert stub.sent == []  # EOF at the confirm defaults to NO (nothing sent)
+
+
 # --- #162: the chat REPL drives the outbound flow through make_outbound_coordinator ---
 
 
@@ -1637,11 +1656,9 @@ def test_chat_non_tty_reader_does_not_pin_the_executor(monkeypatch):
 
     async def scenario():
         task = asyncio.create_task(read_line("> "))
-        for _ in range(500):
-            if started.is_set():
-                break
-            await asyncio.sleep(0.01)
-        assert started.is_set(), "reader thread never parked inside input()"
+        # event-driven wait for the fake input() to park — no real-sleep polling
+        parked = await asyncio.to_thread(started.wait, 5)
+        assert parked, "reader thread never parked inside input()"
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -1657,6 +1674,29 @@ def test_chat_non_tty_reader_does_not_pin_the_executor(monkeypatch):
         except TimeoutError:
             release.set()
             raise
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+
+
+def test_chat_non_tty_reader_surfaces_read_errors(monkeypatch):
+    """#277 review: input() can fail with more than EOFError (invalid-UTF-8 piped
+    bytes, a closed stdin fd) — the reader must settle the exception onto the
+    waiting read instead of leaving it parked forever (a silent REPL hang)."""
+    monkeypatch.setattr(cli_main.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(cli_main.sys.stdout, "isatty", lambda: False)
+    read_line, _ = cli_main._chat_line_reader()
+
+    def broken_input(prompt=""):
+        raise OSError("stdin fd closed")
+
+    monkeypatch.setattr("builtins.input", broken_input)
+
+    async def scenario():
+        with pytest.raises(OSError):
+            await asyncio.wait_for(read_line("> "), 2)
 
     asyncio.run(scenario())
 
