@@ -1,4 +1,4 @@
-"""Storage — stdlib sqlite3 behind asyncio.to_thread, WAL, versioned migrations, kv helpers.
+"""Storage — thread-offloaded sqlite3, WAL, versioned migrations, kv helpers.
 
 Everything runs on tmp paths (no network, no real ~/.tg_messenger). Concurrency is
 exercised with asyncio.gather, never a real sleep. The cache does NOT live here —
@@ -9,6 +9,7 @@ suggester style profiles, heartbeat schedules, action logs (#16/#17/#19).
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 
 import pytest
@@ -135,6 +136,7 @@ async def test_failing_migration_rolls_back(tmp_path):
     ])
     with pytest.raises(Exception):
         await storage.connect()
+    assert storage._conn is None
     await storage.close()
     # version did not advance past the good migration's failure boundary
     s2 = Storage(tmp_path / "m.db")
@@ -192,6 +194,150 @@ async def test_close_waits_for_in_flight_operation(tmp_path, monkeypatch):
     release.set()
     await op
     await close_task
+    assert storage._conn is None
+
+
+@pytest.mark.parametrize("method,args", [
+    ("execute", ("SELECT 1",)),
+    ("fetchone", ("SELECT 1",)),
+    ("fetchall", ("SELECT 1",)),
+    ("user_version", ()),
+    ("_apply_pending_migrations", ()),
+])
+async def test_cancelled_operation_holds_lock_until_worker_finishes(tmp_path, monkeypatch, method, args):
+    storage = Storage(tmp_path / "cancel.db")
+    await storage.connect()
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    require_conn = storage._require_conn
+    calls = 0
+
+    def blocked_connection():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5)
+        return require_conn()
+
+    monkeypatch.setattr(storage, "_require_conn", blocked_connection)
+    operation = asyncio.create_task(getattr(storage, method)(*args))
+    tasks = [operation]
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        for _ in range(2):
+            operation.cancel()
+            await asyncio.sleep(0)
+        following = asyncio.create_task(storage.fetchone("SELECT 7"))
+        closing = asyncio.create_task(storage.close())
+        tasks.extend([following, closing])
+        await asyncio.sleep(0)
+        assert not operation.done()
+        assert not following.done()
+        assert not closing.done()
+        assert calls == 1
+    finally:
+        # On the unfixed implementation, finish close before releasing the stub
+        # so this regression reports an assertion rather than racing real SQLite.
+        if operation.done():
+            await asyncio.gather(*tasks[1:], return_exceptions=True)
+        release.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        await storage.close()
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert results[1:] == [(7,), None]
+
+
+async def test_worker_failure_during_cancellation_is_logged(tmp_path, monkeypatch, caplog):
+    async with Storage(tmp_path / "failure.db") as storage:
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        release = threading.Event()
+
+        def fail(sql, params):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5)
+            raise RuntimeError("worker failed")
+
+        monkeypatch.setattr(storage, "_execute_sync", fail)
+        operation = asyncio.create_task(storage.execute("SELECT 1"))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            operation.cancel()
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+            results = await asyncio.gather(operation, return_exceptions=True)
+        assert isinstance(results[0], asyncio.CancelledError)
+        assert any(record.exc_info and "worker failed" in str(record.exc_info[1]) for record in caplog.records)
+
+
+@pytest.mark.parametrize("stage", ["_open", "_migrate_sync"])
+async def test_cancelled_connect_closes_opened_connection(tmp_path, monkeypatch, stage):
+    storage = Storage(tmp_path / "opening.db")
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    opened = []
+    operation = getattr(storage, stage)
+
+    def blocked_opening():
+        conn = operation() if stage == "_open" else storage._require_conn()
+        opened.append(conn)
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(5)
+            return conn if stage == "_open" else operation()
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(storage, stage, blocked_opening)
+    opening = asyncio.create_task(storage.connect())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        for _ in range(2):
+            opening.cancel()
+            await asyncio.sleep(0)
+    finally:
+        release.set()
+        results = await asyncio.gather(opening, return_exceptions=True)
+        assert await asyncio.to_thread(finished.wait, 5)
+    try:
+        assert isinstance(results[0], asyncio.CancelledError)
+        assert storage._conn is None
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            opened[0].execute("SELECT 1")
+    finally:
+        await storage.close()
+
+
+async def test_cancelled_close_finishes_and_can_be_repeated(tmp_path, monkeypatch):
+    storage = Storage(tmp_path / "closing.db")
+    await storage.connect()
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    close = storage._close_sync
+
+    def blocked_close():
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(5)
+        close()
+
+    monkeypatch.setattr(storage, "_close_sync", blocked_close)
+    closing = asyncio.create_task(storage.close())
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        closing.cancel()
+        await asyncio.sleep(0)
+        assert not closing.done()
+    finally:
+        release.set()
+        results = await asyncio.gather(closing, return_exceptions=True)
+        await storage.close()
+    assert isinstance(results[0], asyncio.CancelledError)
     assert storage._conn is None
 
 
