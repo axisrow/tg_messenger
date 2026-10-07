@@ -153,14 +153,33 @@ async def test_every_send_retry_is_gated_unless_opted_out(
     assert clock.sleeps == ([2, 8] if send_rate else [2])
 
 
-async def test_default_bucket_and_gate_share_injected_time(fake_client, tmp_path):
+async def test_send_bucket_and_gate_share_injected_time(fake_client, tmp_path):
     clock = Clock()
     client = StandaloneTelegramClient(
         1, "test", client_factory=lambda *args: fake_client, session_dir=tmp_path, clock=clock, sleep=clock.sleep,
-        gate_jitter_func=lambda low, high: 0,  # exact defer math below
+    )
+    # pin the send spec: the exact schedule below must not shift when the
+    # package retunes its defaults (0.1.3 already retuned history this way)
+    client._gate = TelegramRateLimitGate(
+        category_limits={"send": RateLimitSpec(30, 60)},
+        time_func=clock,
+        jitter_func=lambda low, high: 0,  # exact defer math asserted below
     )
     for i in range(31):
         await client.send_text(7, str(i))
     assert len(fake_client.sent) == 31
     assert clock.sleeps == [3] * 11 + [27]  # 20-token burst, then 30/min sliding-window gate
     assert clock.now == 60
+
+
+def test_gate_jitter_func_threads_to_the_gate(fake_client, tmp_path):
+    clock = Clock()
+
+    def jitter(low, high):
+        return 0
+
+    client = StandaloneTelegramClient(
+        1, "test", client_factory=lambda *args: fake_client, session_dir=tmp_path, clock=clock, sleep=clock.sleep,
+        gate_jitter_func=jitter,
+    )
+    assert client._gate._jitter_func is jitter

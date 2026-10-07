@@ -376,13 +376,8 @@ class StandaloneTelegramClient:
         # #252: proactive per-category pacing (telethon-floodgate) around the
         # history/send call sites; package defaults — see _gate_acquire.
         # gate_jitter_func mirrors clock/sleep: deterministic defers for tests,
-        # package-default jitter otherwise.
-        self._gate = TelegramRateLimitGate(
-            time_func=clock,
-            **(
-                {"jitter_func": gate_jitter_func} if gate_jitter_func is not None else {}
-            ),
-        )
+        # None = the gate's own default jitter (floodgate >= 0.1.3).
+        self._gate = TelegramRateLimitGate(time_func=clock, jitter_func=gate_jitter_func)
         self._sleep = sleep
 
     async def _gate_acquire(self, operation: str) -> None:
