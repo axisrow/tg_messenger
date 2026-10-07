@@ -860,6 +860,17 @@ def test_chat_react_command_does_not_send_text(runner):
     assert stub.sent == []
 
 
+def test_chat_react_rejects_unicode_digit_id(runner):
+    # #277 review r2: '²'.isdigit() is True but int('²') raises ValueError — a
+    # unicode-digit "id" must hit the usage message, not crash the whole REPL
+    r, stub = runner
+    stub.listen_interrupt = False
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="/react ² 👍\n")
+    assert result.exit_code == 0, result.output
+    assert "usage: /react" in result.output
+    assert stub.reactions == []
+
+
 # --- #187: REPL slash-command discoverability + unknown-command guard (HIGH/MEDIUM) ---
 
 
@@ -1630,6 +1641,78 @@ def test_chat_translation_printed_after_original_when_it_completes(runner, monke
     assert "← ping" in result.output
     assert "↳ транслейт" in result.output
     assert result.output.index("← ping") < result.output.index("↳ транслейт")
+
+
+def test_chat_translation_backlog_skips_with_console_notice(runner, monkeypatch):
+    """#277 review r2: when the inflight cap skips a translation, the console must
+    say so — the line alone (untranslated) reads as native text; the skip may only
+    live in the file log."""
+    import contextlib
+
+    r, stub = runner
+    stub.listen_interrupt = False
+    hang = asyncio.Event()
+
+    class HangingTranslator:
+        async def translate_message(self, message):
+            await hang.wait()  # all four inflight slots park here forever
+            return message
+
+    monkeypatch.setattr(cli_main, "make_optional_translator",
+                        lambda storage: HangingTranslator())
+    sub: list[asyncio.Queue] = []
+
+    def push(ev):
+        sub[0].put_nowait(ev)
+
+    async def listen():
+        q = asyncio.Queue()
+        sub.append(q)
+        try:
+            while True:
+                yield await q.get()
+        finally:
+            sub.clear()
+
+    monkeypatch.setattr(stub, "listen", listen)
+
+    calls = {"n": 0}
+
+    async def fake_read_line(prompt):
+        calls["n"] += 1
+        n = calls["n"]
+        if n <= 5:
+            push(IncomingEvent(dialog_id=7, message=Message(
+                id=60 + n, dialog_id=7, sender_id=7, out=False, text=f"m{n}",
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc))))
+            await asyncio.sleep(0)  # let the printer consume this one
+            return ""
+        raise EOFError
+
+    monkeypatch.setattr(cli_main, "_chat_line_reader",
+                        lambda: (fake_read_line, contextlib.nullcontext))
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="")
+    assert result.exit_code == 0, result.output
+    assert result.output.count("translation backlog") == 1
+
+
+def test_chat_translation_failure_warns_on_console(runner, monkeypatch):
+    """#277 review r2: a broken translator (bad model, dead provider) must be
+    visible on the console — untranslated output alone reads as 'translation is
+    off'; the details stay in the file log."""
+    r, stub = runner
+    stub.listen_interrupt = False
+
+    class BrokenTranslator:
+        async def translate_message(self, message):
+            raise RuntimeError("model not found")
+
+    monkeypatch.setattr(cli_main, "make_optional_translator",
+                        lambda storage: BrokenTranslator())
+    result = r.invoke(cli_main.cli, ["chat", "7"], input="\n")
+    assert result.exit_code == 0, result.output
+    assert "← ping" in result.output
+    assert "translation failed" in result.output
 
 
 def test_chat_non_tty_reader_does_not_pin_the_executor(monkeypatch):

@@ -1007,17 +1007,25 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             # not kill the printer stream (it's logged, never raised here).
             bg_tasks: set[asyncio.Task] = set()
             max_inflight_translations = 4  # mirrors the web's cap
+            backlog_warned = False
+            failure_warned = False
 
             def _spawn_translation(message):
+                nonlocal backlog_warned
                 if translator is None:
                     return
                 # a burst of foreign-language messages must not fan out unbounded
-                # LLM calls (the web skips with a log when its cap is full too)
-                if len(bg_tasks) >= max_inflight_translations:
+                # LLM calls (the web skips with a log when its cap is full too);
+                # done-but-not-yet-discarded tasks don't occupy slots
+                if sum(not t.done() for t in bg_tasks) >= max_inflight_translations:
                     logger.warning("translation backlog full — line printed untranslated")
+                    if not backlog_warned:
+                        backlog_warned = True
+                        click.echo("translation backlog — showing untranslated", err=True)
                     return
 
                 async def _echo_translation():
+                    nonlocal failure_warned
                     try:
                         translated = await _maybe_translate_message(translator, message)
                         if translated.translated_text:
@@ -1025,7 +1033,15 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                             # same logged-and-dropped class as a translate failure
                             click.echo(f"  ↳ {translated.translated_text}")
                     except Exception:
+                        # the stream must survive a broken translator (a dead model
+                        # used to kill it); the console learns once, the file in full
                         logger.exception("inbound translation failed in chat REPL")
+                        if not failure_warned:
+                            failure_warned = True
+                            click.echo(
+                                "translation failed — showing untranslated (details in log)",
+                                err=True,
+                            )
 
                 t = asyncio.create_task(_echo_translation())
                 bg_tasks.add(t)
@@ -1129,163 +1145,168 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                 read_line, redraw_ctx = _chat_line_reader()
                 click.echo(CHAT_REPL_COMMANDS)  # #187: announce slash-commands + exit on start
                 with redraw_ctx():
-                        while True:
-                            try:
-                                line = await read_line("> ")
-                            except EOFError:
-                                break
-                            if line.strip():
-                                first = line.split(maxsplit=1)[0]
-                                if first == "/help":
-                                    # #187: /help must NOT be sent to the contact — print the hint
-                                    click.echo(CHAT_REPL_COMMANDS)
-                                    continue
-                                if first == "/react":
-                                    parts = line.split(maxsplit=2)
-                                    if len(parts) != 3 or not parts[1].isdigit():
-                                        click.echo("usage: /react MESSAGE_ID EMOTICON", err=True)
-                                        continue
-                                    await _send_or_warn(
-                                        client.send_reaction(dialog_id, int(parts[1]), parts[2])
-                                    )
-                                    continue
-                                if (
-                                    first != "/lang"
-                                    and first.startswith("/")
-                                    and dialog_kind != "bot"
+                    while True:
+                        try:
+                            line = await read_line("> ")
+                        except EOFError:
+                            break
+                        if line.strip():
+                            first = line.split(maxsplit=1)[0]
+                            if first == "/help":
+                                # #187: /help must NOT be sent to the contact — print the hint
+                                click.echo(CHAT_REPL_COMMANDS)
+                                continue
+                            if first == "/react":
+                                parts = line.split(maxsplit=2)
+                                # isascii: '²'.isdigit() is True yet int() rejects
+                                # it — a unicode-digit "id" is a usage error, not
+                                # a crash of the whole REPL
+                                if len(parts) != 3 or not (
+                                    parts[1].isascii() and parts[1].isdigit()
                                 ):
-                                    # #187 HIGH: an unknown /command (a typo like /langs or /halp, or a
-                                    # user hunting for the exit) must NOT be sent verbatim to a real
-                                    # person. Reject it, keep the draft-less loop alive, send nothing.
-                                    # #199: a BOT dialog is exempt — there the slash IS the payload
-                                    # (/start, /settings, /cancel …), so it falls through to be sent.
-                                    # /help//react//lang stay reserved for every kind (handled above).
-                                    click.echo(
-                                        f"unknown command: {first} (type /help)", err=True
-                                    )
+                                    click.echo("usage: /react MESSAGE_ID EMOTICON", err=True)
                                     continue
-                                if first == "/lang":
-                                    parts = line.split(maxsplit=1)
-                                    if len(parts) != 2 or not parts[1].strip():
-                                        click.echo("usage: /lang CODE|auto|on|off", err=True)
-                                        continue
-                                    if outbound is None:
-                                        click.echo("outbound translation is not configured.", err=True)
-                                        continue
-                                    value = parts[1].strip().lower()
-                                    try:
-                                        if value == "auto":
-                                            await set_dialog_lang(outbound.storage, dialog_id, None)
-                                        elif value == "on":
-                                            await set_outbound_enabled(outbound.storage, dialog_id, True)
-                                        elif value == "off":
-                                            await set_outbound_enabled(outbound.storage, dialog_id, False)
-                                        else:
-                                            await set_dialog_lang(
-                                                outbound.storage,
-                                                dialog_id,
-                                                value,
-                                                source="manual",
-                                            )
-                                    except ValueError as exc:
-                                        click.echo(str(exc), err=True)
-                                        continue
-                                    except Exception as exc:
-                                        logger.exception("dialog language command failed")
-                                        click.echo(f"language setting failed: {exc}", err=True)
-                                        continue
-                                    click.echo("language setting saved.")
+                                await _send_or_warn(
+                                    client.send_reaction(dialog_id, int(parts[1]), parts[2])
+                                )
+                                continue
+                            if (
+                                first != "/lang"
+                                and first.startswith("/")
+                                and dialog_kind != "bot"
+                            ):
+                                # #187 HIGH: an unknown /command (a typo like /langs or /halp, or a
+                                # user hunting for the exit) must NOT be sent verbatim to a real
+                                # person. Reject it, keep the draft-less loop alive, send nothing.
+                                # #199: a BOT dialog is exempt — there the slash IS the payload
+                                # (/start, /settings, /cancel …), so it falls through to be sent.
+                                # /help//react//lang stay reserved for every kind (handled above).
+                                click.echo(
+                                    f"unknown command: {first} (type /help)", err=True
+                                )
+                                continue
+                            if first == "/lang":
+                                parts = line.split(maxsplit=1)
+                                if len(parts) != 2 or not parts[1].strip():
+                                    click.echo("usage: /lang CODE|auto|on|off", err=True)
                                     continue
-                                if coordinator is not None:
-                                    # prepare → (REPL picker) → send, all via the coordinator. It owns the
-                                    # timeout, the variant token and source recording; the REPL only presents
-                                    # the picker and tracks sent_ids for the echo dedup.
-                                    result = await coordinator.prepare(
-                                        dialog_id, line, telegram_lang_code=telegram_lang_code,
-                                        owner_id=str(dialog_id),
-                                    )
-                                    if result.status in {"disabled", "not_applicable", "invalid_empty"}:
-                                        # translation doesn't apply (or the line is blank) → send the original
-                                        try:
-                                            msg = await coordinator.send_original(dialog_id, line, _coord_send)
-                                        except SendForbiddenError:
-                                            continue
-                                        sent_ids.append((dialog_id, msg.id))
-                                        continue
-                                    if result.status == "error":
-                                        # prepare timed out or failed — surface why, then offer the original
-                                        # (the coordinator collapses timeout and other failures into "error").
-                                        # The "send original?" question lives in the prompt below, not here,
-                                        # so the line isn't asked twice.
-                                        click.echo(result.error or "translation failed", err=True)
-                                        try:
-                                            confirm = await read_line("send original? [y/N] ")
-                                        except EOFError:
-                                            break  # input exhausted mid-flow: exit like the top-level read
-                                        # the prompt is English [y/N] now, so accept only y/yes
-                                        if confirm.strip().lower() not in {"y", "yes"}:
-                                            continue
-                                        try:
-                                            msg = await coordinator.send_original(dialog_id, line, _coord_send)
-                                        except SendForbiddenError:
-                                            continue
-                                        sent_ids.append((dialog_id, msg.id))
-                                        continue
-                                    # status == "ready": present the REPL picker (the one CLI-specific part)
-                                    variants = result.variants
-                                    for idx, variant in enumerate(variants, start=1):
-                                        click.echo(_picker_line(f"[{idx}]", variant))
-                                    original_idx = len(variants) + 1
-                                    click.echo(_picker_line(f"[{original_idx}] original:", line))
-                                    click.echo("[0] cancel")
-                                    try:
-                                        choice = (await read_line("variant> ")).strip()
-                                    except EOFError:
-                                        break  # input exhausted mid-flow: exit like the top-level read
-                                    if not choice or choice == "0":
-                                        continue
-                                    if choice == str(original_idx):
-                                        try:
-                                            msg = await coordinator.send_original(dialog_id, line, _coord_send)
-                                        except SendForbiddenError:
-                                            continue
-                                        sent_ids.append((dialog_id, msg.id))
-                                        continue
-                                    try:
-                                        idx = int(choice)
-                                    except ValueError:
-                                        click.echo("cancelled.", err=True)
-                                        continue
-                                    # require an in-range 1-based index — negative ints index from the end
-                                    # in Python (variants[-2] etc.), so guard the bound explicitly
-                                    if not 1 <= idx <= len(variants):
-                                        click.echo("cancelled.", err=True)
-                                        continue
-                                    picked = variants[idx - 1]
-                                    try:
-                                        msg = await coordinator.send_variant(
-                                            dialog_id, result.token, picked, _coord_send,
-                                            owner_id=str(dialog_id),
+                                if outbound is None:
+                                    click.echo("outbound translation is not configured.", err=True)
+                                    continue
+                                value = parts[1].strip().lower()
+                                try:
+                                    if value == "auto":
+                                        await set_dialog_lang(outbound.storage, dialog_id, None)
+                                    elif value == "on":
+                                        await set_outbound_enabled(outbound.storage, dialog_id, True)
+                                    elif value == "off":
+                                        await set_outbound_enabled(outbound.storage, dialog_id, False)
+                                    else:
+                                        await set_dialog_lang(
+                                            outbound.storage,
+                                            dialog_id,
+                                            value,
+                                            source="manual",
                                         )
+                                except ValueError as exc:
+                                    click.echo(str(exc), err=True)
+                                    continue
+                                except Exception as exc:
+                                    logger.exception("dialog language command failed")
+                                    click.echo(f"language setting failed: {exc}", err=True)
+                                    continue
+                                click.echo("language setting saved.")
+                                continue
+                            if coordinator is not None:
+                                # prepare → (REPL picker) → send, all via the coordinator. It owns the
+                                # timeout, the variant token and source recording; the REPL only presents
+                                # the picker and tracks sent_ids for the echo dedup.
+                                result = await coordinator.prepare(
+                                    dialog_id, line, telegram_lang_code=telegram_lang_code,
+                                    owner_id=str(dialog_id),
+                                )
+                                if result.status in {"disabled", "not_applicable", "invalid_empty"}:
+                                    # translation doesn't apply (or the line is blank) → send the original
+                                    try:
+                                        msg = await coordinator.send_original(dialog_id, line, _coord_send)
                                     except SendForbiddenError:
                                         continue
-                                    except OutboundError:
-                                        logger.warning(
-                                            "outbound token rejected in chat REPL (dialog %s)", dialog_id
-                                        )
-                                        # #187: actionable English, aligned with the TUI's hint (which
-                                        # says "expired — pick again") instead of a bare Russian line.
-                                        click.echo(
-                                            "Translation choice expired — type the message again to retry.",
-                                            err=True,
-                                        )
+                                    sent_ids.append((dialog_id, msg.id))
+                                    continue
+                                if result.status == "error":
+                                    # prepare timed out or failed — surface why, then offer the original
+                                    # (the coordinator collapses timeout and other failures into "error").
+                                    # The "send original?" question lives in the prompt below, not here,
+                                    # so the line isn't asked twice.
+                                    click.echo(result.error or "translation failed", err=True)
+                                    try:
+                                        confirm = await read_line("send original? [y/N] ")
+                                    except EOFError:
+                                        break  # input exhausted mid-flow: exit like the top-level read
+                                    # the prompt is English [y/N] now, so accept only y/yes
+                                    if confirm.strip().lower() not in {"y", "yes"}:
+                                        continue
+                                    try:
+                                        msg = await coordinator.send_original(dialog_id, line, _coord_send)
+                                    except SendForbiddenError:
                                         continue
                                     sent_ids.append((dialog_id, msg.id))
-                                    click.echo(f"  ↳ {line}")  # show the original under the sent variant
                                     continue
-                                msg = await _send_or_warn(client.send_text(dialog_id, line))
-                                if msg is not None:
-                                    sent_ids.append((dialog_id, msg.id))  # suppress this line's echo
+                                # status == "ready": present the REPL picker (the one CLI-specific part)
+                                variants = result.variants
+                                for idx, variant in enumerate(variants, start=1):
+                                    click.echo(_picker_line(f"[{idx}]", variant))
+                                original_idx = len(variants) + 1
+                                click.echo(_picker_line(f"[{original_idx}] original:", line))
+                                click.echo("[0] cancel")
+                                try:
+                                    choice = (await read_line("variant> ")).strip()
+                                except EOFError:
+                                    break  # input exhausted mid-flow: exit like the top-level read
+                                if not choice or choice == "0":
+                                    continue
+                                if choice == str(original_idx):
+                                    try:
+                                        msg = await coordinator.send_original(dialog_id, line, _coord_send)
+                                    except SendForbiddenError:
+                                        continue
+                                    sent_ids.append((dialog_id, msg.id))
+                                    continue
+                                try:
+                                    idx = int(choice)
+                                except ValueError:
+                                    click.echo("cancelled.", err=True)
+                                    continue
+                                # require an in-range 1-based index — negative ints index from the end
+                                # in Python (variants[-2] etc.), so guard the bound explicitly
+                                if not 1 <= idx <= len(variants):
+                                    click.echo("cancelled.", err=True)
+                                    continue
+                                picked = variants[idx - 1]
+                                try:
+                                    msg = await coordinator.send_variant(
+                                        dialog_id, result.token, picked, _coord_send,
+                                        owner_id=str(dialog_id),
+                                    )
+                                except SendForbiddenError:
+                                    continue
+                                except OutboundError:
+                                    logger.warning(
+                                        "outbound token rejected in chat REPL (dialog %s)", dialog_id
+                                    )
+                                    # #187: actionable English, aligned with the TUI's hint (which
+                                    # says "expired — pick again") instead of a bare Russian line.
+                                    click.echo(
+                                        "Translation choice expired — type the message again to retry.",
+                                        err=True,
+                                    )
+                                    continue
+                                sent_ids.append((dialog_id, msg.id))
+                                click.echo(f"  ↳ {line}")  # show the original under the sent variant
+                                continue
+                            msg = await _send_or_warn(client.send_text(dialog_id, line))
+                            if msg is not None:
+                                sent_ids.append((dialog_id, msg.id))  # suppress this line's echo
             finally:
                 # #276: a bounded drain before the cancel — an event queued while the
                 # REPL sat in its last read has its wakeup sitting in the ready
@@ -1311,17 +1332,9 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                 if bg_tasks:
                     for t in bg_tasks:
                         t.cancel()
-                    bg_results = await asyncio.gather(*bg_tasks, return_exceptions=True)
-                    for res in bg_results:
-                        # Exception paths are already logged inside
-                        # _echo_translation; this surfaces the exotic rest
-                        # (BaseException that is neither CancelledError nor
-                        # Exception would otherwise vanish into the discarded
-                        # results)
-                        if isinstance(res, BaseException) and not isinstance(
-                            res, (Exception, asyncio.CancelledError)
-                        ):
-                            logger.error("chat translation task failed", exc_info=res)
+                    # retrieve every result so nothing lingers as "exception never
+                    # retrieved"; failures are already logged inside _echo_translation
+                    await asyncio.gather(*bg_tasks, return_exceptions=True)
                 if store_task is not None:
                     store_task.cancel()
                     store_results = await asyncio.gather(store_task, return_exceptions=True)
