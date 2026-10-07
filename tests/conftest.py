@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import socket
 from datetime import datetime, timezone
@@ -248,6 +249,23 @@ def make_sent_code(kind: str = "App", phone_code_hash: str = "hash123",
     if next_kind is not None:
         attrs["next_type"] = type(f"CodeType{next_kind}", (), {})()
     return type("Sent", (), attrs)()
+
+
+def reap_ki_task_log():
+    """Kill the unretrieved-KI task INSIDE the test that owns it.
+
+    The Ctrl+C-emulating tests (``listen_interrupt`` → a stub stream raises
+    KeyboardInterrupt inside ``asyncio.run``) leave the run's main task holding an
+    unretrieved KeyboardInterrupt; when that task is GC'd later, asyncio logs
+    "Task exception was never retrieved" — at an arbitrary moment. Under
+    pytest-randomly that moment can land inside ANOTHER test's CliRunner capture
+    and break its exact-output asserts (a stray ``watch.py:100> `` line counted
+    as a second ``> `` prompt). Collect right after the invoke so the log lands
+    in the owner's own (indifferent) capture. Call it after the invoke in every
+    test asserting "stopped."; a per-test autouse gc.collect() was tried and
+    tripled the suite time — this is the cheap targeted version.
+    """
+    gc.collect()
 
 
 class FakeTelethonClient:

@@ -10,6 +10,7 @@ import sys
 
 from click.testing import CliRunner
 
+from tests.conftest import reap_ki_task_log
 from tg_messenger.cli import main as cli_main
 
 
@@ -120,6 +121,7 @@ def test_worker_ctrl_c_says_stopped(monkeypatch, tmp_path):
 
     monkeypatch.setattr(StubWorker, "__init__", _init)
     result = CliRunner().invoke(cli_main.cli, ["worker", "--factory-url", "http://f"])
+    reap_ki_task_log()  # the KI task dies in OUR capture, not a neighbour's
     assert "stopped." in result.output
 
 
@@ -147,6 +149,7 @@ def test_worker_flushes_traces_on_ctrl_c(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(cli_main, "flush_tracers", lambda: calls.append(1))
     result = CliRunner().invoke(cli_main.cli, ["worker", "--factory-url", "http://f"])
+    reap_ki_task_log()  # the KI task dies in OUR capture, not a neighbour's
     assert "stopped." in result.output
     assert calls == [1]  # flush still runs in the finally on Ctrl+C
 

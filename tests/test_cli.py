@@ -8,7 +8,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from tests.conftest import make_sent_code
+from tests.conftest import make_sent_code, reap_ki_task_log
 from tg_messenger.cli import main as cli_main
 from tg_messenger.core.client import MissingCredentialsError, SendForbiddenError
 from tg_messenger.core.flood import HandledFloodWaitError
@@ -1977,6 +1977,7 @@ def test_listen_without_login_gives_hint(runner):
 def test_watch_notifies_saved_messages(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["watch"])
+    reap_ki_task_log()  # the KI task dies in OUR capture, not a neighbour's
     assert result.exit_code == 0
     assert "Watching" in result.output
     (peer, text, _reply, _schedule), = stub.sent
@@ -2069,6 +2070,7 @@ def test_moderate_rules_add_rejects_bad_json(mod_runner, tmp_path):
 def test_moderate_runs_and_stops_on_ctrl_c(mod_runner):
     r, stub, _tp, _, _seen = mod_runner
     result = r.invoke(cli_main.cli, ["moderate"])
+    reap_ki_task_log()  # the KI task dies in OUR capture, not a neighbour's
     assert result.exit_code == 0
     assert "dry-run" in result.output
     assert "stopped." in result.output
@@ -2229,6 +2231,7 @@ def test_ghostwrite_runs_and_stops_on_ctrl_c(gw_runner):
     r, stub, _tp, _seen = gw_runner
     r.invoke(cli_main.cli, ["ghostwrite-dialogs", "enable", "7"])
     result = r.invoke(cli_main.cli, ["ghostwrite"])
+    reap_ki_task_log()  # the KI task dies in OUR capture, not a neighbour's
     assert result.exit_code == 0, result.output
     assert "dry-run" in result.output
     assert "stopped." in result.output
@@ -2392,6 +2395,7 @@ def test_heartbeat_run_stops_on_ctrl_c(hb_runner, monkeypatch):
 
     monkeypatch.setattr(stub, "history", boom)
     result = r.invoke(cli_main.cli, ["heartbeat", "run"])
+    reap_ki_task_log()  # the KI task dies in OUR capture, not a neighbour's
     assert result.exit_code == 0, result.output
     assert "stopped." in result.output
     assert stub.connected is False
