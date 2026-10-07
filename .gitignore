@@ -7,6 +7,9 @@ __pycache__/
 .ruff_cache/
 dist/
 build/
+# runtime data (per-profile message stores / sessions live in ~/.tg_messenger,
+# but any local data/ scratch must never reach git)
+data/
 uv.lock
 agent.json
 AGENTS.md
