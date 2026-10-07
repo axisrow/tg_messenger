@@ -1044,6 +1044,12 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                 asyncio.create_task(printer_outgoing()),
                 asyncio.create_task(printer_reactions()),
             ]
+            # EOF from an already-closed stdin can resume the input reader while the
+            # printers' first steps are still queued (a ready-queue dump shows the
+            # resume landing without draining them), so their first events die
+            # unprinted in the finally-cancel. One tick prints the buffered events
+            # before the first read even starts (#274).
+            await asyncio.sleep(0)
             # #215: read the REPL through a redraw-safe line reader. On a real TTY the loop is
             # wrapped in patch_stdout() so background echoes redraw the in-flight input buffer
             # instead of corrupting it; piped/non-interactive stdin falls back to plain input()
