@@ -29,8 +29,10 @@ def agent(ctx: click.Context, session: str, notify_errors: bool) -> None:
         await client.connect()
         try:
             await cli_main._ensure_authorized(client, session)
-            click.echo("Agent is listening for incoming messages (Ctrl+C to stop)...")
-            await runner.run()
+            click.echo("Starting agent...")
+            await runner.run(on_ready=lambda: click.echo(
+                "Agent is listening for incoming messages (Ctrl+C to stop)..."
+            ))
         finally:
             await client.disconnect()
 

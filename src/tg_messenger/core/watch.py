@@ -52,19 +52,31 @@ class DeletionWatcher:
         self._titles: OrderedDict[int, str] = OrderedDict()
         self._self_id: int = 0
 
-    async def run(self) -> None:
+    async def run(self, *, on_ready: Callable[[], None] | None = None) -> None:
         me = await self._client.get_me()
         self._self_id = me.id
+        subscriptions = 0
+
+        def subscribed() -> None:
+            nonlocal subscriptions
+            subscriptions += 1
+            if subscriptions == 2 and on_ready is not None:
+                on_ready()
+
+        kwargs = {"on_subscribed": subscribed} if on_ready is not None else {}
         # gather, не TaskGroup: TaskGroup оборачивает KeyboardInterrupt
         # в BaseExceptionGroup и ломает Ctrl+C-обработку в CLI
-        await asyncio.gather(self._consume_outgoing(), self._consume_deleted())
+        await asyncio.gather(
+            self._consume_outgoing(self._client.listen_outgoing(**kwargs)),
+            self._consume_deleted(self._client.listen_deleted(**kwargs)),
+        )
 
-    async def _consume_outgoing(self) -> None:
-        async for ev in self._client.listen_outgoing():
+    async def _consume_outgoing(self, stream) -> None:
+        async for ev in stream:
             self._remember(ev)
 
-    async def _consume_deleted(self) -> None:
-        async for ev in self._client.listen_deleted():
+    async def _consume_deleted(self, stream) -> None:
+        async for ev in stream:
             await self._handle_deleted(ev)
 
     def _remember(self, ev: OutgoingEvent) -> None:

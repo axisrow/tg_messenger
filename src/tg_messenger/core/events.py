@@ -4,13 +4,14 @@ One Telethon handler publishes; every consumer subscribes independently.
 Publishing never blocks: a full subscriber queue drops its oldest item so a
 slow consumer can't stall the Telethon event loop. Generic over the event
 type — the client runs separate buses for incoming/outgoing/deleted streams.
+Only active subscribers receive events; there is no replay for later subscribers.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Generic, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -52,9 +53,12 @@ class EventBus(Generic[T]):
                     logger.debug("subscriber queue drained concurrently; nothing dropped")
             queue.put_nowait(event)
 
-    async def subscribe(self) -> AsyncIterator[T]:
+    async def subscribe(self, *, on_subscribed: Callable[[], None] | None = None) -> AsyncIterator[T]:
+        """Receive live events; notify synchronously once the queue is registered."""
         queue = self._register()
         try:
+            if on_subscribed is not None:
+                on_subscribed()
             while True:
                 yield await queue.get()
         finally:

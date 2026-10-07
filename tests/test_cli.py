@@ -183,7 +183,9 @@ class StubClient:
     async def clear_username(self):
         self.cleared = True
 
-    async def listen_outgoing(self):
+    async def listen_outgoing(self, *, on_subscribed=None):
+        if on_subscribed is not None:
+            on_subscribed()
         yield OutgoingEvent(
             dialog_id=-100123,
             message=Message(id=10, dialog_id=-100123, sender_id=1, out=True,
@@ -213,7 +215,9 @@ class StubClient:
             yield None
         await asyncio.Event().wait()
 
-    async def listen_deleted(self):
+    async def listen_deleted(self, *, on_subscribed=None):
+        if on_subscribed is not None:
+            on_subscribed()
         for _ in range(10):
             await asyncio.sleep(0)  # дать outgoing-потоку закэшировать сообщение
         yield MessagesDeletedEvent(chat_id=-100123, message_ids=[10])
@@ -2005,12 +2009,27 @@ def test_watch_notifies_saved_messages(runner):
     result = r.invoke(cli_main.cli, ["watch"])
     assert result.exit_code == 0
     assert "Watching" in result.output
+    assert result.output.index("Starting deletion watcher") < result.output.index("Watching")
     (peer, text, _reply, _schedule), = stub.sent
     assert peer == 1  # Saved Messages = собственный id
     assert "удалят меня" in text
     assert "My Group" in text
     assert "stopped." in result.output
     assert stub.connected is False  # disconnect в finally
+
+
+def test_watch_does_not_announce_readiness_when_identity_lookup_fails(runner, monkeypatch):
+    r, stub = runner
+
+    async def fail():
+        raise RuntimeError("identity lookup failed")
+
+    monkeypatch.setattr(stub, "get_me", fail)
+    result = r.invoke(cli_main.cli, ["watch"])
+    assert result.exit_code != 0
+    assert "Starting deletion watcher" in result.output
+    assert "Watching" not in result.output
+    assert stub.connected is False
 
 
 def test_watch_without_login_gives_hint(runner):
@@ -3697,7 +3716,7 @@ def test_global_profile_reaches_direct_client_commands(
     profile_spy, monkeypatch, args, input_text
 ):
     class FakeAgentRunner:
-        async def run(self):
+        async def run(self, *, on_ready=None):
             raise KeyboardInterrupt
 
     monkeypatch.setattr(
@@ -3722,7 +3741,7 @@ def test_global_profile_reaches_direct_client_commands(
 def _run_agent_with_interrupt(monkeypatch):
     """Invoke the `agent` command with a stub client/runner that exits via Ctrl+C."""
     class FakeAgentRunner:
-        async def run(self):
+        async def run(self, *, on_ready=None):
             raise KeyboardInterrupt
 
     monkeypatch.setattr(cli_main, "make_client", lambda **kw: StubClient())
