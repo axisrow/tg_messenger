@@ -1056,7 +1056,7 @@ def test_chat_outbound_variant_sends_pick(runner, monkeypatch):
     assert (7, "hello", None, None) in stub.sent
     # record_outgoing is now owned by the coordinator's send_variant (source recorded once)
     assert store.recorded == [(7, "hello", "привет", "ru")]
-    assert "↳ привет" in result.output
+    assert "↳ [2] привет" in result.output
 
 
 def test_chat_lang_command_is_handled_before_outbound(runner, monkeypatch):
@@ -1197,7 +1197,7 @@ def test_chat_outbound_ready_variant_through_coordinator(runner, monkeypatch):
     # the picked variant is sent via the coordinator's send_variant with the prepare token
     assert coord.sent_variants == [(7, "tok", "hello", "7")]
     assert (7, "hello", None, None) in stub.sent
-    assert "↳ привет" in result.output
+    assert "↳ [2] привет" in result.output
 
 
 def test_chat_outbound_ready_pick_original_through_coordinator(runner, monkeypatch):
@@ -1395,7 +1395,7 @@ def test_chat_prints_own_message_sent_from_another_device(runner, monkeypatch):
     monkeypatch.setattr(stub, "listen_outgoing", outgoing)
     result = r.invoke(cli_main.cli, ["chat", "7"], input="")  # EOF immediately; just watch
     assert result.exit_code == 0
-    assert "→ с телефона" in result.output
+    assert "→ [50] с телефона" in result.output
     assert "в другой чат" not in result.output  # другой диалог
 
 
@@ -1435,7 +1435,7 @@ def test_chat_background_line_prints_without_reprint_on_non_tty(runner, monkeypa
     monkeypatch.setattr(stub, "listen", incoming)
     result = r.invoke(cli_main.cli, ["chat", "7"], input="")
     assert result.exit_code == 0, result.output
-    assert "← ping" in result.output
+    assert "← [60] ping" in result.output
     # only the single initial "> " — no reprint after the background line on non-TTY
     assert result.output.count("> ") == 1
 
@@ -1504,7 +1504,7 @@ def test_chat_does_not_echo_back_our_own_input(runner, monkeypatch):
     result = r.invoke(cli_main.cli, ["chat", "7"], input="hello\n")
     assert result.exit_code == 0
     # our own line must NOT be echoed back via the outgoing printer
-    assert "→ hello" not in result.output
+    assert "→ [99] hello" not in result.output
 
 
 # --- #276: the REPL event-lifecycle windows (startup, translate-before-echo,
@@ -1547,7 +1547,7 @@ def test_chat_event_during_dialogs_read_is_printed(runner, monkeypatch):
     # behaviour (pinned separately below)
     result = r.invoke(cli_main.cli, ["chat", "7"], input="\n")
     assert result.exit_code == 0, result.output
-    assert "← early" in result.output
+    assert "← [11] early" in result.output
 
 
 def test_chat_echo_precedes_translation_when_translator_hangs(runner, monkeypatch):
@@ -1567,7 +1567,7 @@ def test_chat_echo_precedes_translation_when_translator_hangs(runner, monkeypatc
                         lambda storage: HangingTranslator())
     result = r.invoke(cli_main.cli, ["chat", "7"], input="")
     assert result.exit_code == 0, result.output
-    assert "← ping" in result.output  # the original echoed even though translation hung
+    assert "← [10] ping" in result.output  # the original echoed even though translation hung
     assert "↳" not in result.output  # the translation never arrived — nothing printed for it
 
 
@@ -1619,7 +1619,7 @@ def test_chat_drains_queued_event_on_eof(runner, monkeypatch):
                         lambda: (fake_read_line, contextlib.nullcontext))
     result = r.invoke(cli_main.cli, ["chat", "7"], input="")
     assert result.exit_code == 0, result.output
-    assert "← late" in result.output
+    assert "← [12] late" in result.output
 
 
 def test_chat_translation_printed_after_original_when_it_completes(runner, monkeypatch):
@@ -1638,9 +1638,66 @@ def test_chat_translation_printed_after_original_when_it_completes(runner, monke
                         lambda storage: InstantTranslator())
     result = r.invoke(cli_main.cli, ["chat", "7"], input="")
     assert result.exit_code == 0, result.output
-    assert "← ping" in result.output
-    assert "↳ транслейт" in result.output
-    assert result.output.index("← ping") < result.output.index("↳ транслейт")
+    assert "← [10] ping" in result.output
+    assert "↳ [10] транслейт" in result.output
+    assert result.output.index("← [10] ping") < result.output.index("↳ [10] транслейт")
+
+
+@pytest.mark.parametrize("out,stream_name,arrow", [
+    (False, "listen", "←"),
+    (True, "listen_outgoing", "→"),
+])
+def test_chat_out_of_order_translations_keep_message_ids(runner, monkeypatch, out, stream_name, arrow):
+    import contextlib
+
+    r, stub = runner
+    started = {mid: asyncio.Event() for mid in (11, 12)}
+    release = {mid: asyncio.Event() for mid in (11, 12)}
+    printed = {mid: asyncio.Event() for mid in (11, 12)}
+    original_echo = click.echo
+
+    async def idle():
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+    async def messages():
+        for mid, text in ((11, "first"), (12, "second")):
+            message = Message(id=mid, dialog_id=7, sender_id=7, out=out, text=text,
+                              date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+            event_type = OutgoingEvent if out else IncomingEvent
+            yield event_type(dialog_id=7, message=message)
+        await asyncio.Event().wait()
+
+    async def translate(translator, message):
+        started[message.id].set()
+        await release[message.id].wait()
+        return message.model_copy(update={"translated_text": f"translated-{message.id}"})
+
+    def echo(message=None, *args, **kwargs):
+        original_echo(message, *args, **kwargs)
+        for mid in printed:
+            if f"translated-{mid}" in str(message):
+                printed[mid].set()
+
+    async def read_line(prompt):
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started.values())), 1)
+        for mid in (12, 11):
+            release[mid].set()
+            await asyncio.wait_for(printed[mid].wait(), 1)
+        raise EOFError
+
+    monkeypatch.setattr(stub, "listen", idle)
+    monkeypatch.setattr(stub, "listen_outgoing", idle)
+    monkeypatch.setattr(stub, stream_name, messages)
+    monkeypatch.setattr(cli_main, "make_optional_translator", lambda storage: object())
+    monkeypatch.setattr(cli_main, "_maybe_translate_message", translate)
+    monkeypatch.setattr(cli_main, "_chat_line_reader", lambda: (read_line, contextlib.nullcontext))
+    monkeypatch.setattr(click, "echo", echo)
+    result = r.invoke(cli_main.cli, ["chat", "7"])
+    assert result.exit_code == 0, result.output
+    expected = [f"{arrow} [11] first", f"{arrow} [12] second", "↳ [12] translated-12", "↳ [11] translated-11"]
+    positions = [result.output.index(line) for line in expected]
+    assert positions == sorted(positions)
 
 
 def test_chat_translation_backlog_skips_with_console_notice(runner, monkeypatch):
@@ -1711,7 +1768,7 @@ def test_chat_translation_failure_warns_on_console(runner, monkeypatch):
                         lambda storage: BrokenTranslator())
     result = r.invoke(cli_main.cli, ["chat", "7"], input="\n")
     assert result.exit_code == 0, result.output
-    assert "← ping" in result.output
+    assert "← [10] ping" in result.output
     assert "translation failed" in result.output
 
 

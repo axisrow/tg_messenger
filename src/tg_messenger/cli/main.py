@@ -1031,7 +1031,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                         if translated.translated_text:
                             # inside the try: a failing echo (closed pipe) is the
                             # same logged-and-dropped class as a translate failure
-                            click.echo(f"  ↳ {translated.translated_text}")
+                            click.echo(f"  ↳ [{message.id}] {translated.translated_text}")
                     except Exception:
                         # the stream must survive a broken translator (a dead model
                         # used to kill it); the console learns once, the file in full
@@ -1050,14 +1050,14 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             async def printer():
                 async for ev in client.listen():
                     if ev.dialog_id == dialog_id:
-                        click.echo(f"\n← {ev.message.text or '<media>'}")
+                        click.echo(f"\n← [{ev.message.id}] {ev.message.text or '<media>'}")
                         _spawn_translation(ev.message)
 
             async def printer_outgoing():
                 # our own messages sent from another device (phone/web/CLI elsewhere)
                 async for ev in client.listen_outgoing():
                     if ev.dialog_id == dialog_id and (ev.dialog_id, ev.message.id) not in sent_ids:
-                        click.echo(f"\n→ {ev.message.text or '<media>'}")
+                        click.echo(f"\n→ [{ev.message.id}] {ev.message.text or '<media>'}")
                         _spawn_translation(ev.message)
 
             async def printer_reactions():
@@ -1302,7 +1302,7 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                     )
                                     continue
                                 sent_ids.append((dialog_id, msg.id))
-                                click.echo(f"  ↳ {line}")  # show the original under the sent variant
+                                click.echo(f"  ↳ [{msg.id}] {line}")  # original of the sent variant
                                 continue
                             msg = await _send_or_warn(client.send_text(dialog_id, line))
                             if msg is not None:
@@ -1315,10 +1315,8 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                 # tick 2 is best-effort for a translation that already FINISHED
                 # (nothing left to await). A translation still in flight (storage
                 # or LLM) cannot complete inside a tick and is cancelled as
-                # cosmetic — the original already printed. Known cosmetic
-                # residuals: a late `↳` may land under a newer `←` line (the echo
-                # carries no message id), and the backlog cap may skip a
-                # translation (logged when it does).
+                # cosmetic — the original already printed. Late translations
+                # carry the original message id; backlog skips emit a warning.
                 for _ in range(2):
                     await asyncio.sleep(0)
                 for t in tasks:
