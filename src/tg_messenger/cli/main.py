@@ -1044,12 +1044,6 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                 asyncio.create_task(printer_outgoing()),
                 asyncio.create_task(printer_reactions()),
             ]
-            # EOF from an already-closed stdin can resume the input reader while the
-            # printers' first steps are still queued (a ready-queue dump shows the
-            # resume landing without draining them), so their first events die
-            # unprinted in the finally-cancel. One tick prints the buffered events
-            # before the first read even starts (#274).
-            await asyncio.sleep(0)
             # #215: read the REPL through a redraw-safe line reader. On a real TTY the loop is
             # wrapped in patch_stdout() so background echoes redraw the in-flight input buffer
             # instead of corrupting it; piped/non-interactive stdin falls back to plain input()
@@ -1058,6 +1052,15 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
             click.echo(CHAT_REPL_COMMANDS)  # #187: announce slash-commands + exit on start
             try:
                 with redraw_ctx():
+                    # One tick before the first read: EOF from an already-closed stdin can
+                    # resume the input reader while the printers' first steps are still
+                    # queued (a ready-queue dump shows the resume landing without draining
+                    # them), and the finally-cancel then kills the tasks before their
+                    # first event prints (#274). The tick guarantees the first step, not
+                    # every print — residual windows (events arriving before the printers
+                    # subscribe, translator-suspended echoes, EOF at the confirm/picker
+                    # prompts) are tracked in #276.
+                    await asyncio.sleep(0)
                     while True:
                         try:
                             line = await read_line("> ")
@@ -1147,7 +1150,10 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                     # The "send original?" question lives in the prompt below, not here,
                                     # so the line isn't asked twice.
                                     click.echo(result.error or "translation failed", err=True)
-                                    confirm = await read_line("send original? [y/N] ")
+                                    try:
+                                        confirm = await read_line("send original? [y/N] ")
+                                    except EOFError:
+                                        break  # input exhausted mid-flow: exit like the top-level read
                                     # the prompt is English [y/N] now, so accept only y/yes
                                     if confirm.strip().lower() not in {"y", "yes"}:
                                         continue
@@ -1164,7 +1170,10 @@ def chat(ctx: click.Context, dialog_id: int, session: str) -> None:
                                 original_idx = len(variants) + 1
                                 click.echo(_picker_line(f"[{original_idx}] original:", line))
                                 click.echo("[0] cancel")
-                                choice = (await read_line("variant> ")).strip()
+                                try:
+                                    choice = (await read_line("variant> ")).strip()
+                                except EOFError:
+                                    break  # input exhausted mid-flow: exit like the top-level read
                                 if not choice or choice == "0":
                                     continue
                                 if choice == str(original_idx):
