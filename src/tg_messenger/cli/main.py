@@ -799,16 +799,42 @@ async def _with_storage(session, register_fn, fn):
 def _run_interruptible(coro, session: str = "default", *, flush_traces: bool = False) -> None:
     """``_run`` + the long-running commands' Ctrl+C contract (prints "stopped.").
 
+    The wrapper catches the KI INSIDE the task, so the engine task never finishes
+    holding an unretrieved KeyboardInterrupt — the GC-time asyncio log behind
+    #289's pytest-randomly flake (recent CPython no longer logs unretrieved KI
+    at GC, but retrieving it by construction keeps the guarantee everywhere).
+    The outer except keeps covering the Ctrl+C that hits the idle loop in
+    ``select`` and never reaches a coroutine frame.
+
     ``flush_traces`` (set by LLM commands) drains buffered LangSmith traces in the
     ``finally`` — synchronously, after ``asyncio.run`` has returned, so a Ctrl+C or an
     ``asyncio.timeout`` cancellation still gets its run-end events uploaded (#168) instead
     of leaving the run stuck ``pending``.
     """
+
+    async def _drive():
+        try:
+            await coro
+        except KeyboardInterrupt:
+            return True
+        return False
+
+    drive = _drive()
+    stopped = False
     try:
-        _run(coro, session=session)
+        stopped = bool(_run(drive, session=session))
     except KeyboardInterrupt:
-        click.echo("stopped.")
+        stopped = True
     finally:
+        # "stopped." goes out BEFORE the trace flush — flush_tracers' join can
+        # block for seconds and a second Ctrl+C there must not eat the ack.
+        # The close() calls are no-ops once the coroutines ran; they only matter
+        # when the task is cancelled before its first step (then the drive and
+        # the caller's coro are destroyed un-started and GC-warn).
+        if stopped:
+            click.echo("stopped.")
+        drive.close()
+        coro.close()
         if flush_traces:
             flush_tracers()
 
