@@ -799,18 +799,36 @@ async def _with_storage(session, register_fn, fn):
 def _run_interruptible(coro, session: str = "default", *, flush_traces: bool = False) -> None:
     """``_run`` + the long-running commands' Ctrl+C contract (prints "stopped.").
 
+    The wrapper catches the KI INSIDE the task, so the main task never finishes
+    holding an unretrieved KeyboardInterrupt — that would be GC-logged at an
+    arbitrary later moment, which under pytest-randomly can land inside another
+    test's CliRunner capture and break its exact-output asserts. The outer
+    except keeps covering the Ctrl+C that hits the idle loop in ``select`` and
+    never reaches a coroutine frame.
+
     ``flush_traces`` (set by LLM commands) drains buffered LangSmith traces in the
     ``finally`` — synchronously, after ``asyncio.run`` has returned, so a Ctrl+C or an
     ``asyncio.timeout`` cancellation still gets its run-end events uploaded (#168) instead
     of leaving the run stuck ``pending``.
     """
+
+    async def _drive():
+        try:
+            await coro
+        except KeyboardInterrupt:
+            return True
+        return False
+
+    stopped = False
     try:
-        _run(coro, session=session)
+        stopped = bool(_run(_drive(), session=session))
     except KeyboardInterrupt:
-        click.echo("stopped.")
+        stopped = True
     finally:
         if flush_traces:
             flush_tracers()
+    if stopped:
+        click.echo("stopped.")
 
 
 @contextlib.asynccontextmanager

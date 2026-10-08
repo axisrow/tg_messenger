@@ -12,7 +12,6 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
-from tests.conftest import reap_ki_task_log
 from tg_messenger.cli import main as cli_main
 
 # --- factory (нужен установленный agent-extra; без него — skip) ---
@@ -395,7 +394,6 @@ def test_agent_command_ctrl_c_says_stopped(agent_cli):
     r, _, stub_runner = agent_cli
     stub_runner.interrupt = True
     result = r.invoke(cli_main.cli, ["agent"])
-    reap_ki_task_log()  # the KI task dies in OUR capture, not a neighbour's
     assert "stopped." in result.output
 
 
@@ -477,6 +475,5 @@ def test_agent_flushes_traces_on_ctrl_c(agent_cli, monkeypatch):
     calls = []
     monkeypatch.setattr(cli_main, "flush_tracers", lambda: calls.append(1))
     result = r.invoke(cli_main.cli, ["agent"])
-    reap_ki_task_log()  # the KI task dies in OUR capture, not a neighbour's
     assert "stopped." in result.output
     assert calls == [1]  # flush still runs in the finally on Ctrl+C
