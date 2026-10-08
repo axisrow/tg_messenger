@@ -1,8 +1,9 @@
 """Storage — a small SQLite persistence layer for services above the client.
 
-stdlib ``sqlite3`` only; every call hops to a worker thread via ``asyncio.to_thread``
+stdlib ``sqlite3`` only; every call hops to the default executor
 and is serialised by an ``asyncio.Lock`` (one connection, ``check_same_thread=False``)
-so concurrent ``gather`` callers neither race nor deadlock. WAL mode, foreign keys on.
+held until the worker finishes, even on cancellation. A cancelled write may commit;
+cancellation is not a rollback. WAL mode, foreign keys on.
 
 Consumers (moderator #16, suggester #17, heartbeat #19) register their own tables as
 **migrations** (tracked by stable statement ids and applied inside one transaction —
@@ -16,11 +17,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import sqlite3
 from pathlib import Path
 
 from tg_messenger.core.names import sanitize_profile_name
 from tg_messenger.core.paths import tg_home
+
+logger = logging.getLogger(__name__)
 
 # the kv table is always present; consumer migrations start applying on top of it
 _KV_MIGRATION = "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -64,21 +68,65 @@ class Storage:
         self._migrations.extend(statements)
 
     async def connect(self) -> None:
+        async with self._lock:
+            if self._conn is not None:
+                return
+            try:
+                await self._run_locked(self._connect_sync)
+            except BaseException:
+                # __aexit__ is not called if __aenter__ fails or is cancelled.
+                await self._run_locked(self._close_sync)
+                raise
+
+    def _connect_sync(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await asyncio.to_thread(self._open)
-        await self._apply_pending_migrations()
+        self._conn = self._open()
+        self._migrate_sync()
 
     def _open(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     async def close(self) -> None:
+        await self._run(self._close_sync)
+
+    def _close_sync(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    async def _run(self, operation, *args):
         async with self._lock:
-            if self._conn is not None:
-                conn, self._conn = self._conn, None
-                await asyncio.to_thread(conn.close)
+            return await self._run_locked(operation, *args)
+
+    async def _run_locked(self, operation, *args):
+        """Defer cancellation until the worker ends; caller owns the lock.
+
+        Keep an executor Future, not a Task: asyncio.run's task cancellation
+        sweep must not release our lock while the thread still uses SQLite.
+        """
+        future = asyncio.get_running_loop().run_in_executor(None, operation, *args)
+        cancelled = None
+        while True:
+            try:
+                result = await asyncio.shield(future)
+                break
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+            except Exception:
+                if cancelled is None:
+                    raise
+                logger.exception("storage operation failed during cancellation")
+                raise cancelled from None
+        if cancelled is not None:
+            raise cancelled
+        return result
 
     async def __aenter__(self) -> "Storage":
         await self.connect()
@@ -98,8 +146,7 @@ class Storage:
         A failure rolls the whole batch back and leaves migration metadata unchanged, so
         a broken migration never half-applies.
         """
-        async with self._lock:
-            await asyncio.to_thread(self._migrate_sync)
+        await self._run(self._migrate_sync)
 
     def _migrate_sync(self) -> None:
         conn = self._require_conn()
@@ -142,14 +189,10 @@ class Storage:
         return hashlib.sha256(statement.encode("utf-8")).hexdigest()
 
     async def user_version(self) -> int:
-        async with self._lock:
-            return await asyncio.to_thread(
-                lambda: self._require_conn().execute("PRAGMA user_version").fetchone()[0]
-            )
+        return (await self.fetchone("PRAGMA user_version"))[0]
 
     async def execute(self, sql: str, params: tuple = ()) -> int:
-        async with self._lock:
-            return await asyncio.to_thread(self._execute_sync, sql, params)
+        return await self._run(self._execute_sync, sql, params)
 
     def _execute_sync(self, sql: str, params: tuple) -> int:
         conn = self._require_conn()
@@ -158,16 +201,10 @@ class Storage:
         return cursor.rowcount
 
     async def fetchone(self, sql: str, params: tuple = ()):
-        async with self._lock:
-            return await asyncio.to_thread(
-                lambda: self._require_conn().execute(sql, params).fetchone()
-            )
+        return await self._run(lambda: self._require_conn().execute(sql, params).fetchone())
 
     async def fetchall(self, sql: str, params: tuple = ()) -> list:
-        async with self._lock:
-            return await asyncio.to_thread(
-                lambda: self._require_conn().execute(sql, params).fetchall()
-            )
+        return await self._run(lambda: self._require_conn().execute(sql, params).fetchall())
 
     async def set_value(self, key: str, value) -> None:
         """Store a JSON-serialisable value under ``key`` (upsert)."""
