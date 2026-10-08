@@ -1,4 +1,6 @@
 import asyncio
+import gc
+import logging
 import os
 import sys
 from dataclasses import dataclass, field
@@ -806,6 +808,30 @@ def test_listen_stops_and_disconnects_on_ctrl_c(runner):
     assert result.exit_code == 0
     assert "ping" in result.output
     assert stub.connected is False
+
+
+def test_run_interruptible_ki_contract(caplog, capsys, monkeypatch):
+    """#289 Ctrl+C contract: "stopped." first, then the trace flush; no leaks.
+
+    The KI is caught inside the wrapper task, so the engine task never dies
+    holding an unretrieved KeyboardInterrupt — the GC-time asyncio log that
+    seeded #289's pytest-randomly flake. The "never retrieved" assert is a
+    tripwire: recent CPython stopped logging unretrieved KI at GC entirely,
+    so it cannot discriminate on every interpreter — but the wrap retrieves
+    the KI by construction. The echo/flush ORDER is the hard discriminator:
+    "stopped." must reach the terminal BEFORE flush_tracers' blocking join
+    (up to TG_TRACE_FLUSH_TIMEOUT seconds), or a second Ctrl+C eats the ack.
+    """
+
+    async def boom():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_main, "flush_tracers", lambda: print("flushed"))
+    with caplog.at_level(logging.ERROR, logger="asyncio"):
+        cli_main._run_interruptible(boom(), flush_traces=True)
+        gc.collect()
+    assert capsys.readouterr().out == "stopped.\nflushed\n"
+    assert "was never retrieved" not in caplog.text
 
 
 def test_listen_default_line_format_unchanged(runner):
