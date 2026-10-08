@@ -69,8 +69,10 @@ def watch(ctx: click.Context, session: str) -> None:
         await client.connect()
         try:
             await cli_main._ensure_authorized(client, session)
-            click.echo("Watching for deletions of your messages (Ctrl+C to stop)...")
-            await DeletionWatcher(client, echo=click.echo).run()
+            click.echo("Starting deletion watcher...")
+            await DeletionWatcher(client, echo=click.echo).run(on_ready=lambda: click.echo(
+                "Watching for deletions of your messages (Ctrl+C to stop)..."
+            ))
         finally:
             await client.disconnect()
 

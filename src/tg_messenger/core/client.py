@@ -1122,9 +1122,9 @@ class StandaloneTelegramClient:
         reaction = getattr(recent[0], "reaction", None)
         return getattr(reaction, "emoticon", None)  # ReactionCustomEmoji has no .emoticon
 
-    async def listen(self) -> AsyncIterator[IncomingEvent]:
-        """Incoming from private chats only (DMs + bots)."""
-        async for ev in self._bus.subscribe():
+    async def listen(self, *, on_subscribed: Callable[[], None] | None = None) -> AsyncIterator[IncomingEvent]:
+        """Live incoming DMs + bots; on_subscribed runs once the queue is registered."""
+        async for ev in self._bus.subscribe(on_subscribed=on_subscribed):
             yield ev
 
     async def listen_all(self) -> AsyncIterator[IncomingEvent]:
@@ -1132,12 +1132,14 @@ class StandaloneTelegramClient:
         async for ev in self._bus_all.subscribe():
             yield ev
 
-    async def listen_outgoing(self) -> AsyncIterator[OutgoingEvent]:
-        async for ev in self._bus_out.subscribe():
+    async def listen_outgoing(self, *, on_subscribed: Callable[[], None] | None = None) -> AsyncIterator[OutgoingEvent]:
+        async for ev in self._bus_out.subscribe(on_subscribed=on_subscribed):
             yield ev
 
-    async def listen_deleted(self) -> AsyncIterator[MessagesDeletedEvent]:
-        async for ev in self._bus_deleted.subscribe():
+    async def listen_deleted(
+        self, *, on_subscribed: Callable[[], None] | None = None,
+    ) -> AsyncIterator[MessagesDeletedEvent]:
+        async for ev in self._bus_deleted.subscribe(on_subscribed=on_subscribed):
             yield ev
 
     async def listen_chat_actions(self) -> AsyncIterator[ChatActionEvent]:

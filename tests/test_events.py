@@ -1,6 +1,8 @@
 import asyncio
 from datetime import datetime, timezone
 
+import pytest
+
 from tg_messenger.core.events import EventBus
 from tg_messenger.core.models import IncomingEvent, Message
 
@@ -31,6 +33,40 @@ async def test_publish_reaches_all_subscribers():
     r1, r2 = await asyncio.wait_for(asyncio.gather(t1, t2), timeout=1)
     assert r1[0].message.text == "a"
     assert r2[0].message.text == "a"
+
+
+async def test_subscription_signals_readiness_without_replaying_earlier_events():
+    bus = EventBus()
+    bus.publish(_event("before subscription"))
+    callbacks = []
+
+    def ready():
+        callbacks.append(bus.subscriber_count)
+        bus.publish(_event("after subscription"))
+
+    stream = bus.subscribe(on_subscribed=ready)
+    try:
+        event = await asyncio.wait_for(anext(stream), 1)
+        assert event.message.text == "after subscription"
+        assert callbacks == [1]
+        bus.publish(_event("next"))
+        assert (await anext(stream)).message.text == "next"
+        assert callbacks == [1]
+    finally:
+        await stream.aclose()
+    assert bus.subscriber_count == 0
+
+
+async def test_failed_readiness_callback_unregisters_subscription():
+    bus = EventBus()
+
+    def fail():
+        raise RuntimeError("ready callback failed")
+
+    stream = bus.subscribe(on_subscribed=fail)
+    with pytest.raises(RuntimeError, match="ready callback failed"):
+        await anext(stream)
+    assert bus.subscriber_count == 0
 
 
 async def test_unsubscribe_on_cancel_cleans_up():

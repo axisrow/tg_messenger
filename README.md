@@ -137,6 +137,14 @@ asyncio.run(main())
 The public surface (`tg_messenger.__all__`) also exports `SessionStore`, `LoginFlow`,
 `LOGIN_HINT`, `EventBus`, `run_with_flood_wait_retry` and `HandledFloodWaitError`.
 
+Live streams deliver new events to active subscribers; they do not replay events
+from startup, downtime, or a previous subscription. `agent` and `watch` first show
+`Starting...`; their `Listening`/`Watching` message appears only after setup and
+registration of the required subscriptions. Messages received during preparation
+are outside this live-processing window. Queues remain bounded: a slow subscriber
+can lose its oldest queued event, with a warning in the log. Deletion backups are
+best-effort and cover only own messages observed by the running watcher.
+
 ## Search
 
 Every dialog shows its id (`id — title`), and every front-end can search.

@@ -357,8 +357,10 @@ class StubRunner:
         self.runs = 0
         self.interrupt = False
 
-    async def run(self):
+    async def run(self, *, on_ready=None):
         self.runs += 1
+        if on_ready is not None:
+            on_ready()
         if self.interrupt:
             raise KeyboardInterrupt
 
@@ -378,6 +380,7 @@ def test_agent_command_runs_runner_and_disconnects(agent_cli):
     result = r.invoke(cli_main.cli, ["agent"])
     assert result.exit_code == 0
     assert stub_runner.runs == 1
+    assert result.output.index("Starting agent") < result.output.index("Agent is listening")
     assert client.connected is False  # disconnect в finally
 
 
@@ -388,6 +391,20 @@ def test_agent_command_requires_login(agent_cli):
     assert result.exit_code != 0
     assert "login" in result.output
     assert stub_runner.runs == 0
+
+
+def test_agent_does_not_announce_readiness_when_setup_fails(agent_cli, monkeypatch):
+    r, client, stub_runner = agent_cli
+
+    async def fail(*, on_ready=None):
+        raise RuntimeError("setup failed")
+
+    monkeypatch.setattr(stub_runner, "run", fail)
+    result = r.invoke(cli_main.cli, ["agent"])
+    assert result.exit_code != 0
+    assert "Starting agent" in result.output
+    assert "Agent is listening" not in result.output
+    assert client.connected is False
 
 
 def test_agent_command_ctrl_c_says_stopped(agent_cli):

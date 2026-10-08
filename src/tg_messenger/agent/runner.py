@@ -10,6 +10,7 @@ notice is sent back to the dialog.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from tg_messenger.agent.config import AgentConfig
 from tg_messenger.agent.media import download_image
@@ -48,9 +49,11 @@ class AgentRunner:
                     )
         return frozenset(allowed)
 
-    async def run(self) -> None:
+    async def run(self, *, on_ready: Callable[[], None] | None = None) -> None:
+        """Prepare the allowlist, then announce readiness when live listening starts."""
         allowed = None if self._config.allow_all else await self._resolve_allowed_ids()
-        async for event in self._client.listen():
+        kwargs = {"on_subscribed": on_ready} if on_ready is not None else {}
+        async for event in self._client.listen(**kwargs):
             await self._handle_event(event, allowed)
 
     async def _handle_event(self, event: IncomingEvent, allowed: frozenset[int] | None) -> None:
