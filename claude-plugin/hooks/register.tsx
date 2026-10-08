@@ -25,8 +25,9 @@ import type { TgDialog, TgMessage } from '../types'
  * `profile` comes from the plugin's userConfig; an empty one is auto-resolved
  * at pane boot from `tg-messenger profiles` — exactly one valid saved profile
  * is picked (logged + shown in the header), zero or several is a refusal. The
- * mod never picks an account silently. Without a full config the pane
- * degrades to the local-only append with a one-line toast.
+ * mod never picks an account silently. Without a configured dialog the pane
+ * boots into the DIALOG PICKER — the pick completes the setup; an invalid
+ * dialog or an unresolvable profile degrade to the local-only append.
  *
  * The transport lives in this same file on purpose: the engine follows `$`
  * only into functions declared here, never across an import.
@@ -88,6 +89,12 @@ type ModConfig = {
   resolvedId: string
   /** true when the resolved dialog is a group/channel (marked negative) */
   isGroup: boolean
+  /** config validity: a usable target. `switchDialog` flips it when the pick
+   * completes a picker boot — the render reads it LIVE, so the pane comes
+   * alive mid-session without a reopen. */
+  ready: boolean
+  /** why not ready — dim in the header, and the refused-send toast */
+  reason: string
   /** history re-read interval (ms) — the live stream's safety net; kit tests pass a small one */
   pollMs: number
   /** port of the warm `serve` daemon (set by `ensureDaemon`); unset = cold CLI path */
@@ -548,6 +555,10 @@ async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Pro
   cfg.target = id
   cfg.resolvedId = id
   cfg.isGroup = id.startsWith('-')
+  // the pick completes a picker boot: readiness is read live by the render,
+  // so the pane comes alive right here, no reopen needed
+  cfg.ready = true
+  cfg.reason = ''
   void ensureDaemon($, cfg) // no-op once adopted or while a spawn is in flight
   void update($, view, () => 'chat' as const)
   void update($, paletteFor, () => -1)
@@ -762,49 +773,55 @@ async function resolveProfile($: EngineInterface, cfg: ModConfig): Promise<void>
 }
 
 /**
- * Reads the `userConfig` options. `profile` is optional — an empty one is
- * auto-resolved from the saved sessions at boot (`resolveProfile`); `dialog`
- * is a marked numeric id or `@username`. `ready: false` → the mod stays in
- * the dead-safe no-send mode; `reason` is the one-line explanation.
+ * Reads the `userConfig` options into the mutable config. `profile` is
+ * optional — an empty one is auto-resolved from the saved sessions at boot
+ * (`resolveProfile`); `dialog` is a marked numeric id or `@username`. An
+ * ABSENT dialog is not an error: the pane boots into the dialog picker and
+ * `switchDialog` completes the setup (`ready` flips there). Only a
+ * set-but-invalid dialog stays dead (`ready: false` + `reason`).
  */
-function readConfig(options: Readonly<Record<string, unknown>>): {
-  cfg: ModConfig
-  ready: boolean
-  reason: string
-  target: string
-} {
+function readConfig(options: Readonly<Record<string, unknown>>): ModConfig {
   const pick = (name: string): string =>
     typeof options[name] === 'string' ? (options[name] as string).trim() : ''
-  const profile = pick('profile')
   // `dialogId` is the pre-#248 spelling — honor it so an old config degrades
-  // to a clear toast instead of "dialog not configured"
+  // to the picker instead of a dead pane
   const target = pick('dialog') || pick('dialogId')
   const pollMs = typeof options.pollMs === 'number' && options.pollMs > 0 ? options.pollMs : 15000
-  const cfg: ModConfig = { profile, target, resolvedId: '', isGroup: false, pollMs }
   let reason = ''
-  if (!target) reason = 'dialog not configured — claude plugin configure tg-messenger'
+  if (!target) reason = 'dialog not configured — pick one from «диалоги»'
   else if (!/^-?\d+$/.test(target) && !target.startsWith('@'))
     reason = `invalid dialog "${target}" — expected a numeric id or @username`
-  return { cfg, ready: reason === '', reason, target }
+  return {
+    profile: pick('profile'),
+    target,
+    resolvedId: '',
+    isGroup: false,
+    ready: reason === '',
+    reason,
+    pollMs,
+  }
 }
 
 /**
- * Opens the pane and boots the transport: resolve → history → live stream.
- * A set-but-unusable config gets its toast right here (#248).
+ * Opens the pane and boots the transport: resolve → history → live stream —
+ * or, with no dialog configured, straight into the dialog picker (the pick
+ * finishes the boot). A set-but-unusable config gets its toast right here
+ * (#248).
  * Top-level declaration: the engine's static checks only let `$` be passed to
  * functions declared at the top of the file.
  */
-async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reason: string, target: string) {
+async function bootPane($: EngineInterface, cfg: ModConfig) {
   $.ui
     .open({ id: PANE, title: 'tg-messenger', closeOnEscape: true, focus: true })
     .catch((error: unknown) => $.ui.log(`tg-messenger: open failed: ${String(error)}`))
-  if (!ready) {
-    if (target) $.ui.toast(`tg-messenger: ${reason}`)
+  if (!cfg.ready && cfg.target) {
+    // set but unusable (invalid shape): dead-safe, say why
+    $.ui.toast(`tg-messenger: ${cfg.reason}`)
     return
   }
   try {
     await resolveProfile($, cfg)
-    await resolveDialog($, cfg)
+    if (cfg.ready) await resolveDialog($, cfg)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     $.ui.toast(`tg-messenger: ${message}`)
@@ -818,6 +835,15 @@ async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reas
   // in the background, the cold CLI path covers the warm-up window
   await ensureDaemon($, cfg)
   if (!cfg.daemonPort) void startDaemon($, cfg).catch(() => {})
+  if (!cfg.ready) {
+    // no dialog configured: the picker IS the boot; `switchDialog` completes
+    // it — readiness flips there, the stream and the poll start on the pick
+    await update($, view, () => 'dialogs' as const)
+    await spinWhile($, 'dialogs', () => loadDialogList($, cfg).catch(error => {
+      $.ui.toast(`tg-messenger: ${error instanceof Error ? error.message : String(error)}`)
+    }))
+    return
+  }
   // history is best-effort: a failure (e.g. Telegram unreachable) must not
   // kill the bridge — the live stream retries with backoff and self-heals
   await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
@@ -835,14 +861,14 @@ async function bootPane($: EngineInterface, cfg: ModConfig, ready: boolean, reas
   }
 }
 
-function openPane($: EngineInterface, cfg: ModConfig, ready: boolean, reason: string, target: string) {
+function openPane($: EngineInterface, cfg: ModConfig) {
   // a dead environment mid-boot rejects the whole chain; a detached rejection
   // crashes the hooks worker, so the boot is guarded like the loops above
-  void bootPane($, cfg, ready, reason, target).catch(() => {})
+  void bootPane($, cfg).catch(() => {})
 }
 
 export const register: Register = (on, options) => {
-  const { cfg, ready, reason, target } = readConfig(options)
+  const cfg = readConfig(options)
 
   on('session.start', async ($, e, next) => {
     // a reload mid-load kills the ticker but leaves the atom set — a frozen
@@ -861,13 +887,13 @@ export const register: Register = (on, options) => {
     // hot reload: a pane left open keeps the previous drawing — re-seat it
     const panes = await $.ui.panes().catch(() => [])
 
-    if (panes.some(p => p.id === PANE)) openPane($, cfg, ready, reason, target)
+    if (panes.some(p => p.id === PANE)) openPane($, cfg)
 
     return next(e)
   })
 
   on('command.run', { command: 'tg' }, async $ => {
-    openPane($, cfg, ready, reason, target)
+    openPane($, cfg)
 
     return { text: 'tg-messenger: pane opened below the prompt.' }
   })
@@ -954,11 +980,13 @@ export const register: Register = (on, options) => {
         <Box gap={2}>
           <Text bold>tg</Text>
           {chat ? (
-            <Text>{ready ? `— ${[cfg.profile, cfg.target].filter(Boolean).join(' · ')}` : <Text dimColor>— {reason}</Text>}</Text>
+            <Text>{cfg.ready ? `— ${[cfg.profile, cfg.target].filter(Boolean).join(' · ')}` : <Text dimColor>— {cfg.reason}</Text>}</Text>
           ) : (
             <Text>— диалоги</Text>
           )}
-          {chat && ready && (
+          {/* reachable whenever the picker is: a valid configured dialog, or
+              none at all (picker boot) — hidden only in the dead invalid mode */}
+          {chat && (cfg.ready || !cfg.target) && (
             <Button
               onPress={() => {
                 void update($, view, () => 'dialogs' as const)
@@ -988,13 +1016,13 @@ export const register: Register = (on, options) => {
           height={listRows}
         >
           {shown.length === 0 && !loading && (
-            <Text dimColor>{ready ? 'loading history…' : 'not configured — see the header'}</Text>
+            <Text dimColor>{cfg.ready ? 'loading history…' : 'not configured — see the header'}</Text>
           )}
           {loadingNow === 'history' && (
             <Text dimColor>⏳ загружаю историю…</Text>
           )}
           {shown.map((m, i) => {
-            const canReact = ready && !m.out && !m.system && m.id != null
+            const canReact = cfg.ready && !m.out && !m.system && m.id != null
             // the trigger is a plain Button whose LABEL is the literal "[+]"
             // (plain draws the label alone) — dim at rest, inverted under the
             // pointer; 3 cells + the 1-col gap
@@ -1074,7 +1102,7 @@ export const register: Register = (on, options) => {
           <Box height={composerRows} overflow="hidden">
             <Input
             key="composer"
-            placeholder={ready ? 'сообщение, @/path/to/file [caption]' : 'сообщение (уйдёт в никуда)'}
+            placeholder={cfg.ready ? 'сообщение, @/path/to/file [caption]' : 'сообщение (уйдёт в никуда)'}
             submitLabel="send"
             value={(await read($, pendingSend)) || undefined}
             onInput={value => {
@@ -1088,9 +1116,9 @@ export const register: Register = (on, options) => {
 
               if (!text) return
 
-              if (!ready) {
+              if (!cfg.ready) {
                 // degraded, not broken: keep the local append, just say it went nowhere
-                $.ui.toast(`tg-messenger: not sent — ${reason}`)
+                $.ui.toast(`tg-messenger: not sent — ${cfg.reason}`)
                 void update($, messages, all => [...all, { text, out: true }].slice(-100) as TgMessage[])
                 return
               }
