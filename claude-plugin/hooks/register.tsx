@@ -999,7 +999,9 @@ export const register: Register = (on, options) => {
               диалоги
             </Button>
           )}
-          {!chat && (
+          {/* назад only when a dialog is open: in the picker boot's dialogs
+              view there is nothing to go back to (a dead-looking press) */}
+          {!chat && cfg.target && (
             <Button onPress={() => void update($, view, () => 'chat' as const)}>← назад</Button>
           )}
           <Button role="dismiss" onPress={() => $.ui.close({ id: PANE })}>
