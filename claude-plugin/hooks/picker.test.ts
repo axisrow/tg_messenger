@@ -56,6 +56,7 @@ test('pane without a configured dialog opens the picker', { options: { profile: 
     async () => (await mounted.find({ type: 'Button', text: /Тестовый Диалог/ })) !== undefined,
     'picker rows drawn',
   )
+  expect(await mounted.find({ type: 'Button', text: /← назад/ }), 'no «назад» before a pick — nowhere to go back to').toBeUndefined()
 })
 
 test('picking a dialog completes the boot into a ready chat', { options: { profile: 'p', pollMs: 300 } }, async ($, on) => {
