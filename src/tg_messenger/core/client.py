@@ -32,7 +32,7 @@ from telethon.errors import (
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import CheckUsernameRequest, UpdateUsernameRequest
 from telethon.tl.functions.messages import SendReactionRequest
-from telethon.tl.types import PeerChannel, PeerChat, PeerUser, ReactionEmoji, UpdateMessageReactions
+from telethon.tl.types import ReactionEmoji, UpdateMessageReactions
 from telethon_floodgate import TelegramRateLimitGate
 
 from tg_messenger.core.auth import SessionStore, default_session_dir
@@ -456,16 +456,11 @@ class StandaloneTelegramClient:
         )
         kind = _dialog_kind(entity)
         # marked peer id (negative -100… for channels/supergroups) — the same
-        # contract as dialogs()/events (#269 review); utils.get_peer_id does not
-        # take full entities in this telethon, so build the Peer by kind
-        entity_peer = {  # pragma: no branch — kind is always one of the four
-            "dm": PeerUser(entity.id),
-            "bot": PeerUser(entity.id),
-            "group": PeerChat(entity.id),
-            "channel": PeerChannel(entity.id),
-        }[kind]
+        # contract as dialogs()/events (#269 review). Built from the TL type,
+        # NOT the display kind: a megagroup is kind "group" but a Channel, so
+        # its id is -100… (#292). get_peer_id takes full entities on >=1.43.
         return Dialog(
-            id=int(tl_utils.get_peer_id(entity_peer)),
+            id=int(tl_utils.get_peer_id(entity)),
             title=_entity_title(entity),
             kind=kind,
             username=getattr(entity, "username", None),
