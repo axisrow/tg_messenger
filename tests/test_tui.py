@@ -4054,6 +4054,35 @@ async def test_f1_over_another_modal_is_noop():
         assert not isinstance(app.screen, HelpScreen)
 
 
+async def test_help_scroll_reaches_cut_off_commands_in_short_terminal():
+    # #303: at 80×24 the help card is taller than its max-height: 80% cap — with a plain
+    # Vertical the trailing Actions lines were clipped and no key/wheel moved the card. The
+    # card must be a scroll view that takes focus, so End reaches the last commands and
+    # PageUp goes back up.
+    from tg_messenger.tui.app import HelpScreen
+
+    app = MessengerTUI(client=TuiStubClient())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press("f1")
+        await pilot.pause()
+        assert isinstance(app.screen, HelpScreen)
+        box = app.screen.query_one("#help-box", VerticalScroll)
+        # the card really overflows an 80×24 screen (the #303 setup)…
+        assert box.max_scroll_y > 0
+        # …and the scroll view takes focus, so scroll keys reach it, not the background
+        assert app.focused is box
+        await pilot.press("end")
+        await pilot.pause()
+        assert box.scroll_y == box.max_scroll_y  # End lands on the last commands
+        await pilot.press("pageup")
+        await pilot.pause()
+        assert box.scroll_y < box.max_scroll_y  # PageUp moves back up
+        await pilot.press("escape")  # dismissals still work with the card focused
+        await pilot.pause()
+        assert not isinstance(app.screen, HelpScreen)
+
+
 # --- #124: text editing in the Inputs is unaffected by the new up/down bindings ---
 
 
