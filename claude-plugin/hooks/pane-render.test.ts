@@ -64,3 +64,47 @@ test('pane renders every history message and every multiline tail', { options: {
     )
   expect(GROUND_TRUTH.length, 'all ground-truth texts drawn').toBe(4)
 })
+
+// #299: the placeholder guarded itself with the atom DESCRIPTOR (`loading`,
+// always truthy) instead of its current value — `!loading` was always false,
+// so an empty pane drew nothing at all. Empty history + no load in flight
+// must draw the dim hint.
+test('empty history draws the empty-pane placeholder', { options: { profile: 'p', dialog: '999' } }, async ($, on) => {
+  on('process.spawn', async function* ($, e) {
+    const argv = e.argv.join(' ')
+    if (/ read /.test(argv)) {
+      // a non-empty yield (the kit rejects empty text) that parses to ZERO
+      // messages: the history IS loaded, it is just empty
+      yield { stream: 'stdout', text: ' ' }
+      return { value: { code: 0, signal: null } }
+    }
+    if (/ listen /.test(argv)) await new Promise(() => {})
+    if (/^sleep /.test(argv)) await new Promise(() => {})
+    // the boot's daemon probe (curl) lands here — a blank body reads as
+    // "no daemon", cold path
+    yield { stream: 'stdout', text: ' ' }
+    return { value: { code: 0, signal: null } }
+  })
+  on('ui.open', async () => OPENED)
+
+  const mounted = await $.ui.mount({
+    plugin: 'tg-messenger',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'tg',
+    props: OPEN_PLACEMENT,
+  })
+  await $.command.run({
+    command: 'tg',
+    args: '',
+    origin: { kind: 'plugin', name: 'tg-messenger' },
+    presentation: { isFullscreen: false, columns: 80 },
+  })
+
+  // history finished (nothing in flight) and the list is empty → the hint
+  // must sit in the drawn tree (used to never render at all)
+  await until(
+    async () => (await mounted.find({ type: 'Text', text: /loading history…/ })) !== undefined,
+    'empty-pane placeholder',
+  )
+})

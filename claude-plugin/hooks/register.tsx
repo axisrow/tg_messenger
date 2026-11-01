@@ -1004,7 +1004,7 @@ export const register: Register = (on, options) => {
           overflow="hidden"
           height={listRows}
         >
-          {shown.length === 0 && !loading && (
+          {shown.length === 0 && !loadingNow && (
             <Text dimColor>{ready ? 'loading history…' : 'not configured — see the header'}</Text>
           )}
           {loadingNow === 'history' && (
