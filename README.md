@@ -60,6 +60,17 @@ directory you launch from — so `tg-messenger tui` works from anywhere. A `.env
 precedence, highest first, is: real environment variables > cwd `.env` > `~/.tg/.env`
 (each layer only fills in what the higher ones didn't set).
 
+**Connecting through a proxy?** Set `TG_PROXY` (socks5 only) and every command —
+login, TUI, web, agent — tunnels through it:
+
+```bash
+TG_PROXY=socks5://user:pass@127.0.0.1:1080
+```
+
+Reserved characters in the credentials (`@`, `:`, `/`, …) must be percent-encoded
+(`p@ss` → `p%40ss`). HTTP proxies are not supported: MTProto needs a raw-TCP
+tunnel, and an HTTP CONNECT proxy silently kills the handshake.
+
 **You don't have to hand-edit the file.** Save your keys interactively with:
 
 ```bash
