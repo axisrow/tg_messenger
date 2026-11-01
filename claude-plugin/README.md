@@ -49,11 +49,17 @@ Function hooks are early access — until that changes, the installing user need
 
 The pane drives the project's own CLI (`tg-messenger`) — no HTTP, no secrets:
 
-- **history** — `--profile P read <id> --limit 50` on pane open;
+- **history** — `--profile P read --limit 50 -- <id>` on pane open;
 - **live** — one long-running `--profile P listen --ids --out` child (incoming
   DMs + own messages from other devices), reconnected with backoff;
-- **send** — `--profile P send <id> <text>`, media via `send <id> --file …`;
-- **react** — `--profile P react <id> <msg-id> <emoji>`.
+- **send** — `--profile P send -- <id> <text>`, media via
+  `send --file <path> -- <id>`;
+- **react** — `--profile P react -- <id> <msg-id> <emoji>`.
+
+Positionals always ride after the `--` separator: a negative group id or a
+text starting with `-` is a Click option otherwise (#293). A send whose stdout
+carries no `sent.` confirmation line is treated as a failure — never a silent
+message loss.
 
 `tg-messenger` must be installed and logged in for the configured profile
 (`tg-messenger login --profile P`). Without a full config the pane degrades to
