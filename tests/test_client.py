@@ -4,7 +4,7 @@ import logging
 import pytest
 from telethon import events
 from telethon.sessions import StringSession
-from telethon.tl.types import PeerUser, ReactionEmoji
+from telethon.tl.types import Channel, ChatPhotoEmpty, PeerUser, ReactionEmoji
 from telethon.tl.types import User as TlUser
 from telethon_floodgate import TelegramRateLimitGate
 
@@ -2578,6 +2578,42 @@ async def test_resolve_username_maps_one_row_dialog():
     assert d.id == 5146088037
     assert d.kind == "dm"
     assert d.title == "Ann"
+
+
+async def test_resolve_username_marks_ids_by_tl_type():
+    """#292: the marked id must be built from the entity's TL type, not the
+    display kind — a megagroup classifies as "group" but its id is -100…
+    (PeerChannel). Users and bots resolve to positive ids."""
+
+    async def _resolve(entity):
+        class _Raw:
+            async def get_entity(self, ref):
+                return entity
+
+        return await _build(_Raw()).resolve_username("@x")
+
+    mega = Channel(
+        id=1234567, title="Public group", photo=ChatPhotoEmpty(), date=None,
+        megagroup=True, broadcast=False, username="pubgroup", access_hash=1,
+    )
+    broadcast = Channel(
+        id=7654321, title="TV", photo=ChatPhotoEmpty(), date=None,
+        megagroup=False, broadcast=True, username="tv", access_hash=1,
+    )
+    bot = TlUser(id=42, first_name="Assistant", username="assistbot", bot=True)
+    user = TlUser(id=5146088037, first_name="Ann", username="ann")
+
+    mega_d = await _resolve(mega)
+    assert mega_d.id == -1000001234567
+    assert mega_d.kind == "group"  # display kind unchanged — only the id was wrong
+    assert mega_d.title == "Public group"
+
+    broadcast_d = await _resolve(broadcast)
+    assert broadcast_d.id == -1000007654321
+    assert broadcast_d.kind == "channel"
+
+    assert (await _resolve(bot)).id == 42
+    assert (await _resolve(user)).id == 5146088037
 
 
 async def test_dialogs_limit_skips_cache(fake_client):
