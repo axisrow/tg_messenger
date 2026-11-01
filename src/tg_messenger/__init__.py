@@ -1,5 +1,7 @@
 """tg_messenger — standalone reusable Telegram messenger client."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from tg_messenger.core import (
     LOGIN_HINT,
     Dialog,
@@ -15,7 +17,12 @@ from tg_messenger.core import (
     run_with_flood_wait_retry,
 )
 
-__version__ = "0.1.0"
+try:
+    # Single source of truth is the distribution metadata (#296): a stale literal
+    # here shipped 0.1.1 while reporting "0.1.0".
+    __version__ = version("tg-messenger")
+except PackageNotFoundError:  # bare source checkout (PYTHONPATH=src, no install)
+    __version__ = "0.0.0.dev0"
 
 __all__ = [
     "__version__",
