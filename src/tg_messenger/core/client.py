@@ -787,12 +787,13 @@ class StandaloneTelegramClient:
     async def moderation_rights(self, peer: int) -> dict[str, bool]:
         """Moderation-capable rights for OUR account in ``peer``.
 
-        Best-effort: any failure (not a participant, not a group, network) → False,
-        logged — never raises. The moderator uses it to disable rules in chats we
+        Best-effort: any failure (not a participant, not a group, network, peer
+        unresolvable — a chat we left or that was deleted) → False, logged —
+        never raises. The moderator uses it to disable rules in chats we
         can't act on instead of crashing.
         """
-        await self._warm_entity(peer)
         try:
+            await self._warm_entity(peer)  # inside the try: an unresolvable chat (#295)
             me = await run_with_flood_wait_retry(lambda: self._client.get_me(), operation="is_admin_me")
             perms = await run_with_flood_wait_retry(
                 lambda: self._client.get_permissions(peer, me), operation="is_admin"
