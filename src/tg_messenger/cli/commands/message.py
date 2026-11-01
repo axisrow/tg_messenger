@@ -22,6 +22,13 @@ async def _dialog_arg(client, value: str) -> int:
     """
     if value.startswith("@"):
         return (await client.resolve_username(value)).id
+    return _numeric_dialog_id(value)
+
+
+def _numeric_dialog_id(value: str) -> int:
+    """Numeric half of ``_dialog_arg`` (no client needed): id passes through, anything
+    else is a clean click error — also usable before a client exists, e.g. delete's
+    pre-confirm ``--for-me`` guard (#298)."""
     try:
         return int(value)
     except ValueError as exc:
@@ -432,7 +439,7 @@ def delete(dialog_id: str, ids: str, for_me: bool, yes: bool, session: str) -> N
     `tg-messenger dialogs` (or pass an @username) and the IDS from `tg-messenger read`.
     """
     message_ids = cli_main._parse_ids(ids)
-    if for_me and not dialog_id.startswith("@") and is_channel_or_megagroup_id(int(dialog_id)):
+    if for_me and not dialog_id.startswith("@") and is_channel_or_megagroup_id(_numeric_dialog_id(dialog_id)):
         # fail BEFORE the confirm prompt; the @username variant of this guard
         # runs inside _do once the ref is resolved (#268)
         raise click.ClickException(
@@ -461,13 +468,14 @@ def delete(dialog_id: str, ids: str, for_me: bool, yes: bool, session: str) -> N
 
 
 @click.command("mark-read")
-@click.argument("dialog_id", type=int)
+@click.argument("dialog_id", type=str)
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
-def mark_read(dialog_id: int, session: str) -> None:
+def mark_read(dialog_id: str, session: str) -> None:
     """Mark a dialog as read (clears its unread counter)."""
 
     async def _do(client):
-        return await client.mark_read(dialog_id)
+        peer = await _dialog_arg(client, dialog_id)  # @username too, like every peer arg (#298)
+        return await client.mark_read(peer)
 
     cli_main._run(cli_main._with_client(session, _do), session=session)
     click.echo("marked read.")
