@@ -34,12 +34,15 @@ import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from tg_messenger.core.names import sanitize_profile_name
+from tg_messenger.core.paths import tg_home
 from tg_messenger.interop.factory_client import FactoryError
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TYPES = ["dm_reply", "chat_answer"]
 IDLE_SLEEP = 5.0  # seconds between empty polls
+LEGACY_REPORTS_NAME = "interop_reports.json"  # pre-#305: shared by all sessions
 
 _SleepFn = Callable[[float], Awaitable[None]]
 
@@ -85,6 +88,33 @@ class ReportQueue:
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         tmp.write_text(json.dumps(self.items, ensure_ascii=False), "utf-8")
         tmp.replace(self._path)
+
+
+def worker_reports_path(session: str) -> Path:
+    """Per-session durable report queue under :func:`tg_home` (#305).
+
+    ``tg_home()`` is per-TG_HOME, not per-session: one shared file meant two
+    workers (``--session a`` and ``--session b``) overwrote each other's queue —
+    ``ReportQueue._save`` rewrites the whole list, so the last writer dropped
+    the other's unacknowledged reports. Each session now gets
+    ``interop_reports-<session>.json``. The pre-#305 shared file is MOVED into
+    the first starting session's file (once), so reports pending across the
+    upgrade are adopted, not orphaned; move-not-copy so only one session claims
+    them. An existing per-session file always wins over a leftover legacy file.
+    """
+    home = tg_home()
+    path = home / f"interop_reports-{sanitize_profile_name(session)}.json"
+    legacy = home / LEGACY_REPORTS_NAME
+    if not path.exists() and legacy.exists():
+        try:
+            legacy.replace(path)
+        except FileNotFoundError:
+            pass  # a concurrent worker migrated it first — start fresh
+        except OSError:
+            # migration is best-effort: the worker still runs, the legacy file
+            # stays for forensics/retry, it just isn't adopted this run
+            logger.exception("could not migrate legacy report queue %s", legacy)
+    return path
 
 
 async def _default_sleep(seconds: float) -> None:

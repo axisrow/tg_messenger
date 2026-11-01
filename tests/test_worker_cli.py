@@ -55,6 +55,7 @@ class StubWorker:
         self.factory = factory
         self.types = types
         self.agent = agent
+        self.reports_path = reports_path
         self.runs = 0
         self.interrupt = False
         StubWorker.last = self
@@ -158,6 +159,18 @@ def test_worker_types_filter_passed(monkeypatch, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert StubWorker.last.types == ["dm_reply", "fetch_history"]
+
+
+def test_worker_report_queue_is_per_session(monkeypatch, tmp_path):
+    # #305: каждый воркер получает свой файл очереди отчётов — общий файл на
+    # один TG_HOME приводил к перезаписи очереди соседней сессии
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setenv("TG_HOME", str(tmp_path))
+    result = CliRunner().invoke(
+        cli_main.cli, ["worker", "--factory-url", "http://f", "--session", "a"]
+    )
+    assert result.exit_code == 0, result.output
+    assert StubWorker.last.reports_path == tmp_path / "interop_reports-a.json"
 
 
 def test_worker_uses_global_profile(monkeypatch, tmp_path):
