@@ -12,10 +12,14 @@ import type { TgDialog, TgMessage } from '../types'
  * through `$.process.spawn` — no HTTP, no passwords, nothing in argv but a
  * profile name and a dialog id:
  *
- *   history   `--profile P read <id|@user> --limit 50`   (once per pane open)
+ *   history   `--profile P read --limit 50 -- <id|@user>`   (once per pane open)
  *   live      `--profile P listen --ids --out`     (one long-running child)
- *   send      `--profile P send <id|@user> <text> | send <id|@user> --file <path>`
- *   react     `--profile P react <id|@user> <msg-id> <emoji>`
+ *   send      `--profile P send -- <id|@user> <text> | send --file <path> -- <id|@user>`
+ *   react     `--profile P react -- <id|@user> <msg-id> <emoji>`
+ *
+ * Every positional rides AFTER the `--` separator (#293): a negative (group)
+ * dialog id and a text starting with `-` are Click options otherwise, and
+ * `send 777 --help` printed usage with exit 0 — a silent message loss.
  *
  * An `@username` dialog goes to every child VERBATIM (#268): each spawn is a
  * fresh cold process, and a numeric id there makes Telethon page the whole
@@ -354,9 +358,10 @@ async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
     '--profile',
     cfg.profile,
     'read',
-    peerRef(cfg),
     '--limit',
     '50',
+    '--',
+    peerRef(cfg),
   ])
   const err = cliError(stderr)
   if (err) throw new Error(err)
@@ -508,8 +513,9 @@ async function resolveDialog($: EngineInterface, cfg: ModConfig): Promise<void> 
   ])
   const err = cliError(stderr)
   if (err) throw new Error(err)
-  // rows are `id\ttitle…` — a numeric guard keeps any odd stdout line out
-  const line = stdout.split('\n').find(l => /^\d+\t/.test(l))
+  // rows are `id\ttitle…` — a numeric guard keeps any odd stdout line out;
+  // group/channel rows carry a NEGATIVE id (#293) and resolve as well
+  const line = stdout.split('\n').find(l => /^-?\d+\t/.test(l))
   if (!line) throw new Error(`dialog ${cfg.target} not found`)
   cfg.resolvedId = line.slice(0, line.indexOf('\t'))
   cfg.isGroup = cfg.resolvedId.startsWith('-')
@@ -566,6 +572,14 @@ async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Pro
 
 // --- outgoing ------------------------------------------------------------------
 
+/** The CLI's send confirmation line: `sent. [id=N]`, or a bare `sent.` when
+ * no id came back. Null = nothing was sent (#293: e.g. Click ate the text as
+ * an option and printed usage with exit 0) — a failure, never a success. */
+function sentId(stdout: string): number | undefined | null {
+  const m = /^sent\.(?: \[id=(\d+)\])?$/m.exec(stdout)
+  return m === null ? null : m[1] ? Number(m[1]) : undefined
+}
+
 /** Sends text; returns the new message id when the transport reported one.
  * Warm path: POST /send on the daemon with `Accept: application/json`
  * (answered `{"id": N}`), then a warm history redraw — one RPC each, no cold
@@ -591,28 +605,30 @@ async function sendText($: EngineInterface, cfg: ModConfig, text: string): Promi
     '--profile',
     cfg.profile,
     'send',
+    '--',
     peerRef(cfg),
     text,
   ])
   const err = cliError(stderr)
   if (err) throw new Error(err)
-  const m = /sent\. \[id=(\d+)\]/.exec(stdout)
-  const id = m ? Number(m[1]) : undefined
+  const id = sentId(stdout)
+  if (id === null) throw new Error('send failed — the CLI printed no confirmation')
   if (id != null) rememberSent(id)
   return id
 }
 
 /** Sends a file (`@PATH [caption]` composer syntax → `send --file/--caption`). */
 async function sendMedia($: EngineInterface, cfg: ModConfig, path: string, caption: string | null): Promise<number | undefined> {
-  const args = ['--profile', cfg.profile, 'send', peerRef(cfg), '--file', path]
+  const args = ['--profile', cfg.profile, 'send', '--file', path]
   if (caption) args.push('--caption', caption)
+  args.push('--', peerRef(cfg))
   const { stdout, stderr } = await runCli($, args)
   const err = cliError(stderr)
   if (err) throw new Error(err)
   // media prints the same `sent. [id=N]` — record it so the `--out` echo
   // (text `<media>`/caption) is suppressed next to the optimistic `@path` line
-  const m = /sent\. \[id=(\d+)\]/.exec(stdout)
-  const id = m ? Number(m[1]) : undefined
+  const id = sentId(stdout)
+  if (id === null) throw new Error('send failed — the CLI printed no confirmation')
   if (id != null) rememberSent(id)
   return id
 }
@@ -650,6 +666,7 @@ async function sendReaction(
     '--profile',
     cfg.profile,
     'react',
+    '--',
     peerRef(cfg),
     String(messageId),
     emoticon,
