@@ -602,6 +602,25 @@ def test_mark_read_command_marks_read(runner):
     assert stub.read_acks == [(7, None)]
 
 
+def test_mark_read_accepts_username(runner):
+    # #298: mark-read was the one peer command still rejecting @username (#268 leftover)
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["mark-read", "@ann"])
+    assert result.exit_code == 0, result.output
+    assert stub.resolved_usernames == ["@ann"]
+    assert stub.read_acks == [(7, None)]
+
+
+def test_delete_for_me_rejects_bad_dialog_id_cleanly(runner):
+    # #298: the pre-confirm --for-me guard called int() on a free-form str
+    # argument and leaked a ValueError traceback
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["delete", "12a4", "1", "--for-me", "--yes"])
+    assert result.exit_code != 0
+    assert "not a valid dialog id" in result.output
+    assert stub.deleted_calls == []
+
+
 # --- #187: CLI feedback (empty states, id-echo, N-of-M, validation, confirm) ---
 
 
