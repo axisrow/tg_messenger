@@ -2936,6 +2936,70 @@ async def test_tui_open_dialog_live_message_stays_read_and_marks_new_id():
     assert stub.read_acks == [(8, 22)]
 
 
+class UnreadHistoryClient(TuiStubClient):
+    """#304 repro: an opened dialog has unread=2; history has three messages (max id 103)."""
+
+    def __init__(self):
+        super().__init__()
+        self.read_ok = True
+
+    async def dialogs(self, dm_only=True):
+        self.dialogs_calls += 1
+        dms = [
+            Dialog(id=7, title="Ann", username="ann", unread=2, is_contact=True),
+            Dialog(id=8, title="Stranger", username="stranger", unread=0, is_contact=False),
+        ]
+        return dms
+
+    async def history(self, peer, limit=50, offset_id=0):
+        date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        return [
+            Message(id=i, dialog_id=peer, sender_id=peer, out=False, text=f"m{i}", date=date)
+            for i in (101, 102, 103)
+        ]
+
+    async def mark_read(self, peer, max_id=None):
+        if not self.read_ok:
+            raise RuntimeError("read ack failed")
+        self.read_acks.append((peer, max_id))
+
+
+async def test_tui_open_dialog_ack_clears_unread_badge():
+    # #304: after mark_read succeeds for the opened dialog, the sidebar row loses its "(N)"
+    # badge — the local snapshot and the rendered list both update, no network reload.
+    stub = UnreadHistoryClient()
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
+        assert rendered == ["Ann  (2)  #7", "Stranger  #8"]
+        app._open_dialog(7)  # the real Enter path: history load → mark_read(max_id=103)
+        await pilot.pause()
+        await pilot.pause()
+        await pilot.pause()
+        rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
+        snapshot = {d.id: d.unread for d in app._all_dialogs}
+    assert stub.read_acks == [(7, 103)]
+    assert rendered == ["Ann  #7", "Stranger  #8"]
+    assert snapshot == {7: 0, 8: 0}
+
+
+async def test_tui_open_dialog_failed_ack_keeps_unread_badge():
+    # #304: the badge clears only on a SUCCESSFUL ack — a failed mark_read leaves it be.
+    stub = UnreadHistoryClient()
+    stub.read_ok = False
+    app = MessengerTUI(client=stub)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._open_dialog(7)
+        await pilot.pause()
+        await pilot.pause()
+        await pilot.pause()
+        rendered = [str(item.query_one(Static).render()) for item in app.query(DialogItem)]
+    assert stub.read_acks == []
+    assert rendered == ["Ann  (2)  #7", "Stranger  #8"]
+
+
 async def test_tui_live_mark_read_worker_replaces_superseded_calls(monkeypatch):
     stub = IncomingDialogListClient()
     app = MessengerTUI(client=stub)
