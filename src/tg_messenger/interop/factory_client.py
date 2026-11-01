@@ -6,8 +6,9 @@ factory side adjusts to match in its companion issue. A 401 surfaces as a clear
 ``FactoryError`` (never a bare httpx exception).
 
 Resilience (#228): only errors where the request is KNOWN never to have reached
-the factory are retried — ``httpx.ConnectError`` — plus ambiguous read errors
-(ReadError/ReadTimeout/...) for idempotent GETs. Ambiguous errors on POSTs are
+the factory are retried — ``httpx.ConnectError``/``ConnectTimeout``/
+``PoolTimeout`` all fire before anything is sent (#294) — plus ambiguous read
+errors (ReadError/ReadTimeout/...) for idempotent GETs. Ambiguous errors on POSTs are
 NOT retried blindly: the server may have committed the operation while the
 response was lost, so a retry could duplicate a task creation or claim an
 extra task. POST /tasks carries a client-generated ``idempotency_key`` so a
@@ -107,11 +108,15 @@ class FactoryClient:
                     method, path, params=params, json=json, auth=self._auth,
                 )
             except httpx.TransportError as exc:
-                # ConnectError: the request never left — always safe to retry.
-                # Other transport errors (ReadError/ReadTimeout/...) are ambiguous:
-                # the server may have processed the request, so only idempotent
-                # GETs are retried (#228).
-                retryable = isinstance(exc, httpx.ConnectError) or method == "GET"
+                # ConnectError/ConnectTimeout/PoolTimeout: the request never
+                # left — always safe to retry (the timeouts also fire before
+                # anything is sent, #294). Other transport errors
+                # (ReadError/ReadTimeout/...) are ambiguous: the server may
+                # have processed the request, so only idempotent GETs are
+                # retried (#228).
+                retryable = isinstance(
+                    exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+                ) or method == "GET"
                 logger.warning(
                     "factory %s %s network error (attempt %d/%d%s): %s",
                     method, path, attempt, MAX_ATTEMPTS,
