@@ -51,7 +51,7 @@ class El {
   addEventListener(type, fn) { (this._listeners[type] ||= []).push(fn); }
   removeEventListener() {}
   dispatch(type, detail) {
-    const evt = { type, detail, preventDefault() { this.defaultPrevented = true; }, defaultPrevented: false };
+    const evt = { type, detail, target: this, preventDefault() { this.defaultPrevented = true; }, defaultPrevented: false };
     for (const fn of (this._listeners[type] || [])) fn(evt);
     return evt;
   }
@@ -543,6 +543,60 @@ await (async () => {
   await drain(); await drain();
   check("#227 follow-up: A's stale finally does not re-enable Suggest in B",
         suggestBtn.disabled === true);
+})();
+
+// ---- #300 review: a caption edited during a MEDIA UPLOAD survives the upload's completion ----
+// The send path above covers htmx:afterRequest; this covers the OTHER clearComposeState caller,
+// the attach-file change handler (same data-loss class found during the fix). Controlled fetch
+// holds the upload response until the composer has been edited, then releases it.
+await (async () => {
+  const drain = () => new Promise((r) => setTimeout(r, 0));
+  const composerText = el('composer-text');
+  const attachFile = el('attach-file');
+  attachFile.files = [{}];  // a file was picked (the handler only checks truthiness)
+
+  function controlledUpload() {
+    let resolve;
+    const origFetch = sandbox.fetch;
+    sandbox.fetch = (url, opts) => {
+      sandbox.fetch = origFetch;
+      fetchCalls.push({ url, opts });
+      return new Promise((res) => {
+        resolve = () => res({ ok: true, text: () => Promise.resolve('') });
+      });
+    };
+    return () => resolve;
+  }
+
+  await drain();  // flush any microtasks left over from the earlier blocks
+
+  // 1) edited-during-upload: the caption is replaced while the POST is in flight.
+  sandbox.openDialog({ dataset: { dialog: '7', canSend: '1' } });  // activeDialogId = '7'
+  composerText.value = 'caption sent with the file';
+  composerText.dispatch('input');  // state.draft synced, as real typing does
+  let finishUpload = controlledUpload();
+  attachFile.dispatch('change');
+  composerText.value = 'typed while uploading';  // user edits during flight
+  composerText.dispatch('input');                // → state.draft='typed while uploading'
+  finishUpload()();
+  await drain(); await drain();
+  check('#300 media: a draft typed during a media upload survives its completion',
+        composerText.value === 'typed while uploading');
+  // The per-dialog compose state must have kept it too (observable by switching away and back).
+  sandbox.openDialog({ dataset: { dialog: '8', canSend: '1' } });
+  sandbox.openDialog({ dataset: { dialog: '7', canSend: '1' } });
+  check('#300 media: the per-dialog state kept the upload-time draft',
+        composerText.value === 'typed while uploading');
+
+  // 2) control: an unedited caption is cleared when the upload completes.
+  composerText.value = 'clean caption';
+  composerText.dispatch('input');
+  finishUpload = controlledUpload();
+  attachFile.dispatch('change');
+  finishUpload()();
+  await drain(); await drain();
+  check('#300 media: an unedited caption is cleared on upload completion',
+        composerText.value === '');
 })();
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);
