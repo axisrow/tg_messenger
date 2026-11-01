@@ -15,7 +15,7 @@ from typing import TypeVar
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, Static
 
@@ -274,6 +274,9 @@ class HelpScreen(DismissableModal[None]):
     Opened/closed by ? or F1 (toggle, via the app's action_toggle_help) and dismissed by
     Escape too. f1/escape are non-printable so they fire from the modal's own BINDINGS even
     though no Input is focused here; ? works because the modal holds no text field.
+
+    #303: the card scrolls when its content exceeds the max-height cap, so a short terminal
+    (80×24) still reaches every command.
     """
 
     # #116-parity: center the modal card (the box geometry is shaped by App.CSS #help-box).
@@ -286,9 +289,18 @@ class HelpScreen(DismissableModal[None]):
     ]
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="help-box"):
+        # #303: VerticalScroll (not a plain Vertical) — in a short terminal (80×24) the card's
+        # max-height: 80% cap clipped the trailing Actions lines and nothing could scroll them
+        # (a bare Vertical has no scroll bindings). Same shape as the #accounts-box card in
+        # settings.py.
+        with VerticalScroll(id="help-box"):
             yield Label("Keyboard shortcuts", id="help-title")
             yield Static(HELP_TEXT, id="help-body", markup=False)
+
+    def on_mount(self) -> None:
+        # The card holds no focusable widgets; without this the scroll keys fall through to
+        # the screen and the card never moves (#303).
+        self.query_one("#help-box", VerticalScroll).focus()
 
     def action_dismiss(self) -> None:  # type: ignore[override]
         self.dismiss(None)
