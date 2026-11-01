@@ -51,7 +51,7 @@ class El {
   addEventListener(type, fn) { (this._listeners[type] ||= []).push(fn); }
   removeEventListener() {}
   dispatch(type, detail) {
-    const evt = { type, detail, preventDefault() { this.defaultPrevented = true; }, defaultPrevented: false };
+    const evt = { type, detail, target: this, preventDefault() { this.defaultPrevented = true; }, defaultPrevented: false };
     for (const fn of (this._listeners[type] || [])) fn(evt);
     return evt;
   }
@@ -164,7 +164,12 @@ vm.runInContext(pageScript, sandbox, { filename: 'chat.html:inline' });
   composer.dataset.outboundReady = '1';
   // seed compose state so state.outboundReady/draft line up with the short-circuit guard
   composer.dispatch('htmx:confirm', { detail: { issueRequest() {} }, preventDefault() {} });
-  composer.dispatch('htmx:afterRequest', { successful: true, xhr: { status: 200 } });
+  // #300: realistic parameters — htmx serializes the form (text included) when issuing the
+  // POST, so the completion carries what was actually sent.
+  composer.dispatch('htmx:afterRequest', {
+    successful: true, xhr: { status: 200 },
+    requestConfig: { parameters: { dialog_id: '7', text: 'sent text', reply_to: '' } },
+  });
   check('BUG-1: success path still runs on a 2xx (draft cleared)', composerText.value === '');
 
   // a network failure surfaces an error into the composer-error slot
@@ -297,7 +302,7 @@ vm.runInContext(pageScript, sandbox, { filename: 'chat.html:inline' });
   composer.dispatch('htmx:afterRequest', {
     successful: true,
     xhr: { status: 200 },
-    requestConfig: { parameters: { dialog_id: '7', reply_to: '' } },
+    requestConfig: { parameters: { dialog_id: '7', text: 'draft A', reply_to: '' } },
   });
   check("#209: A's completion does not reset the composer while B is open",
         (composer._resetCount || 0) === resetsBefore);
@@ -308,11 +313,50 @@ vm.runInContext(pageScript, sandbox, { filename: 'chat.html:inline' });
   composer.dispatch('htmx:afterRequest', {
     successful: true,
     xhr: { status: 200 },
-    requestConfig: { parameters: { dialog_id: '8', reply_to: '' } },
+    requestConfig: { parameters: { dialog_id: '8', text: 'draft B', reply_to: '' } },
   });
   check("#209: B's own completion clears B's composer", composerText.value === '');
   check("#209: the form still targets B after B's completion", dialogId.value === '8');
   delete composer.dataset.submittingDialogId;
+}
+
+// ---- #300: a send completing must NOT wipe a draft edited while it was in flight ---------------
+// Reproduction of the issue: send "first", then replace the composer contents with a NEW draft
+// before the POST returns. The old afterRequest unconditionally cleared the compose state and
+// composer.reset() — the unsent second text was lost. The fix snapshots the submitted text from
+// the request's own parameters (htmx serializes the form — text included — when the POST is
+// issued) and keeps any draft that no longer matches it, mirroring the #48 reply_to rule.
+{
+  const composerText = el('composer-text');
+  const dialogId = el('dialog_id');
+
+  // Send "first" in dialog 7, then edit the composer while the POST is in flight.
+  dialogId.value = '7';
+  composerText.value = 'first message';
+  composer.dispatch('htmx:confirm', { issueRequest() {} });  // state.draft='first', POST issued
+  composerText.value = 'second draft — not sent yet';        // user replaces the field contents
+  composerText.dispatch('input');                            // → state.draft='second draft…'
+  composer.dispatch('htmx:afterRequest', {
+    successful: true, xhr: { status: 200 },
+    requestConfig: { parameters: { dialog_id: '7', text: 'first message', reply_to: '' } },
+  });
+  check('#300: a draft edited during an in-flight send survives its completion',
+        composerText.value === 'second draft — not sent yet');
+  // The per-dialog compose state must have kept it too (observable by switching away and back:
+  // openDialog saves/restores the draft from the state map).
+  sandbox.openDialog({ dataset: { dialog: '8', canSend: '1' } });
+  sandbox.openDialog({ dataset: { dialog: '7', canSend: '1' } });
+  check('#300: the per-dialog state kept the edited draft',
+        composerText.value === 'second draft — not sent yet');
+
+  // Control: with NO edit during flight, completion still clears the composer as before.
+  composerText.value = 'clean send';
+  composer.dispatch('htmx:confirm', { issueRequest() {} });
+  composer.dispatch('htmx:afterRequest', {
+    successful: true, xhr: { status: 200 },
+    requestConfig: { parameters: { dialog_id: '7', text: 'clean send', reply_to: '' } },
+  });
+  check('#300: an unedited draft is still cleared on completion', composerText.value === '');
 }
 
 // ---- #195 round 2: switch-before-history-response must NOT mark the left dialog read ----------
@@ -499,6 +543,60 @@ await (async () => {
   await drain(); await drain();
   check("#227 follow-up: A's stale finally does not re-enable Suggest in B",
         suggestBtn.disabled === true);
+})();
+
+// ---- #300 review: a caption edited during a MEDIA UPLOAD survives the upload's completion ----
+// The send path above covers htmx:afterRequest; this covers the OTHER clearComposeState caller,
+// the attach-file change handler (same data-loss class found during the fix). Controlled fetch
+// holds the upload response until the composer has been edited, then releases it.
+await (async () => {
+  const drain = () => new Promise((r) => setTimeout(r, 0));
+  const composerText = el('composer-text');
+  const attachFile = el('attach-file');
+  attachFile.files = [{}];  // a file was picked (the handler only checks truthiness)
+
+  function controlledUpload() {
+    let resolve;
+    const origFetch = sandbox.fetch;
+    sandbox.fetch = (url, opts) => {
+      sandbox.fetch = origFetch;
+      fetchCalls.push({ url, opts });
+      return new Promise((res) => {
+        resolve = () => res({ ok: true, text: () => Promise.resolve('') });
+      });
+    };
+    return () => resolve;
+  }
+
+  await drain();  // flush any microtasks left over from the earlier blocks
+
+  // 1) edited-during-upload: the caption is replaced while the POST is in flight.
+  sandbox.openDialog({ dataset: { dialog: '7', canSend: '1' } });  // activeDialogId = '7'
+  composerText.value = 'caption sent with the file';
+  composerText.dispatch('input');  // state.draft synced, as real typing does
+  let finishUpload = controlledUpload();
+  attachFile.dispatch('change');
+  composerText.value = 'typed while uploading';  // user edits during flight
+  composerText.dispatch('input');                // → state.draft='typed while uploading'
+  finishUpload()();
+  await drain(); await drain();
+  check('#300 media: a draft typed during a media upload survives its completion',
+        composerText.value === 'typed while uploading');
+  // The per-dialog compose state must have kept it too (observable by switching away and back).
+  sandbox.openDialog({ dataset: { dialog: '8', canSend: '1' } });
+  sandbox.openDialog({ dataset: { dialog: '7', canSend: '1' } });
+  check('#300 media: the per-dialog state kept the upload-time draft',
+        composerText.value === 'typed while uploading');
+
+  // 2) control: an unedited caption is cleared when the upload completes.
+  composerText.value = 'clean caption';
+  composerText.dispatch('input');
+  finishUpload = controlledUpload();
+  attachFile.dispatch('change');
+  finishUpload()();
+  await drain(); await drain();
+  check('#300 media: an unedited caption is cleared on upload completion',
+        composerText.value === '');
 })();
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);

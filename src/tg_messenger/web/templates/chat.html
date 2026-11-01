@@ -482,9 +482,12 @@
       // upload's own dialog. Both are compared after the await so a dialog switch or a
       // newer reply pick made while the upload was in flight isn't clobbered.
       const uploadReplyTo = replyToInput.value;
+      // #300: snapshot the caption too — an edit made while the upload was in flight is a
+      // newer, unsent draft and must survive the upload's completion.
+      const uploadCaption = document.getElementById('composer-text').value;
       const fd = new FormData();
       fd.append('file', file);
-      fd.append('caption', document.getElementById('composer-text').value);
+      fd.append('caption', uploadCaption);
       fd.append('web_client_id', webClientId);
       const resp = await fetch('/dialogs/' + id + '/media', {
         method: 'POST', body: fd, headers: { 'X-TG-Messenger-CSRF': '1' },
@@ -493,8 +496,9 @@
       if (resp.ok) {
         // Clear THIS upload's compose state (clearComposeState only touches the visible
         // composer when its dialog is still active), never currentState() — a dialog
-        // switch in flight must not erase the newly-active dialog's draft.
-        clearComposeState(stateFor(id));
+        // switch in flight must not erase the newly-active dialog's draft. #300: the caption
+        // snapshot keeps a draft edited during the upload.
+        clearComposeState(stateFor(id), uploadCaption);
         // Append the bubble and clear the visible composer/reply banner only if the user
         // is still on this upload's dialog (otherwise the bubble belongs to another chat,
         // and the visible composer/draft is a later action's, not this upload's).
@@ -503,7 +507,11 @@
           clearComposerError();      // #187: a prior upload error clears on success
           document.getElementById('messages').insertAdjacentHTML('beforeend', html);
           scrollMessagesToEnd();     // #187: the just-uploaded media is the newest — show it
-          document.getElementById('composer-text').value = '';
+          // #300: blank the field only if it still holds this upload's caption — the user
+          // may have typed a new draft while the upload was in flight.
+          if (document.getElementById('composer-text').value === uploadCaption) {
+            document.getElementById('composer-text').value = '';
+          }
           // #48: media carries no reply_to, so clear the stale banner — but only if the
           // user hasn't picked a newer target since this upload started (#89 shared helper).
           clearReplyIfConsumed(uploadReplyTo);
@@ -856,7 +864,15 @@
         hideVariants();
       }
     }
-    function clearComposeState(state) {
+    // #300: `sentText` is the text THIS completed request carried — htmx's parameters snapshot
+    // for a send, the caption snapshot for a media upload. If the draft has changed since, the
+    // user typed while the request was in flight: keep the newer, unsent draft and only retire
+    // the completed attempt's outbound state (same snapshot rule as clearReplyIfConsumed, #48).
+    function clearComposeState(state, sentText) {
+      if (state.draft !== sentText) {
+        clearOutboundState(state);
+        return;
+      }
       state.draft = '';
       clearOutboundState(state);
       if (state.dialogId === activeDialogId) {
@@ -959,14 +975,16 @@
       // #209: identify the completed send by THIS request's own field snapshot (htmx captures
       // the form into requestConfig.parameters when the POST is issued), not by a shared
       // composer.dataset stamp — with two sends in flight across dialogs, the second overwrote
-      // the stamp and A's completion cleared/reset B's compose state. reply_to comes from the
-      // same snapshot (#48: clear the banner only if the user hasn't picked a newer target
-      // while THIS send was in flight).
+      // the stamp and A's completion cleared/reset B's compose state. reply_to and text come
+      // from the same snapshot (#48: clear the banner only if the user hasn't picked a newer
+      // target while THIS send was in flight; #300: clear the draft only if it wasn't edited
+      // to something new while THIS send was in flight).
       const params = (evt.detail.requestConfig && evt.detail.requestConfig.parameters) || {};
       const submittedDialogId = params.dialog_id || activeDialogId;
       const submittedReplyTo = params.reply_to || '';
+      const submittedText = params.text || '';
       if (submittedDialogId) {
-        clearComposeState(stateFor(submittedDialogId));
+        clearComposeState(stateFor(submittedDialogId), submittedText);
       }
       if (submittedDialogId === activeDialogId) {
         // #48: clear the reply only for the dialog whose send just completed AND only if
@@ -975,11 +993,17 @@
         // banner would otherwise desync from what the next send actually carries).
         // Capture the surviving target BEFORE reset() wipes the hidden field.
         const survivingReply = replyToInput.value === submittedReplyTo ? '' : replyToInput.value;
+        // #300: same rule for the draft — capture the newer, unsent text BEFORE reset() wipes
+        // the field (identical idiom to survivingReply above).
+        const survivingDraft = composerText.value === submittedText ? '' : composerText.value;
         clearReplyIfConsumed(submittedReplyTo);  // #89 shared helper — banner gone if consumed
         composer.reset();  // blanks composer-text AND the hidden reply_to field
         dialogInput.value = activeDialogId;
         if (survivingReply) {
           replyToInput.value = survivingReply;  // re-apply the newer target reset() wiped
+        }
+        if (survivingDraft) {
+          composerText.value = survivingDraft;  // #300: re-apply the newer draft reset() wiped
         }
         // #195 round 3: the send was for the dialog the user is still viewing — scroll to the
         // just-appended bubble. If the user already switched away, do NOT scroll the new dialog.

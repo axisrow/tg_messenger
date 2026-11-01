@@ -2087,7 +2087,10 @@ async def test_index_after_request_clears_submitted_dialog_not_active_dialog(cli
         in r.text
     )
     assert "const submittedDialogId = params.dialog_id || activeDialogId;" in r.text
-    assert "clearComposeState(stateFor(submittedDialogId));" in r.text
+    # #300: the submitted TEXT comes from the same snapshot — a draft edited while the send
+    # was in flight must survive the completion.
+    assert "const submittedText = params.text || '';" in r.text
+    assert "clearComposeState(stateFor(submittedDialogId), submittedText);" in r.text
     assert "if (submittedDialogId === activeDialogId)" in r.text
 
 
