@@ -65,7 +65,9 @@ async def run_with_flood_wait_retry(
         # The package logs transient waits at INFO, so an exhausted budget
         # would otherwise never surface above INFO. Blocking waits are already
         # warned by the package itself.
-        if is_transient_flood_wait_seconds(exc.info.wait_seconds):
+        if is_transient_flood_wait_seconds(
+            exc.info.wait_seconds, max_seconds=transient_wait_max_sec
+        ):
             logger.warning(
                 "%s: flood-wait budget exhausted, last transient wait %ss",
                 exc.info.operation,
