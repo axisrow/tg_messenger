@@ -144,6 +144,8 @@ class Worker:
         Unacknowledged reports block new claims (#294): the flush must drain the
         queue before any new irreversible send, so the step is a no-op (returns
         False, the run loop idles and retries) while a report is still pending.
+        A FactoryError from the replay propagates so ``run()`` applies its
+        4xx/5xx contract instead of idling on a permanent error.
         """
         if not await self._flush_reports():
             return False
@@ -168,7 +170,12 @@ class Worker:
 
         A 409 means a conflicting report already won on the factory side — the
         replay can never succeed, so it is dropped (with a loud log) instead of
-        blocking the queue forever.
+        blocking the queue forever. Any other FactoryError is logged and
+        re-raised so ``run()`` applies its contract (a 4xx never succeeds →
+        exit; 5xx/network → log, idle, retry): with claims blocked on a
+        non-empty queue, a silent break here would wedge the worker in an
+        unnoticed wait forever (#294). Unexpected non-factory errors are logged
+        and left queued for the next round.
         """
         while self._reports.items:
             item = self._reports.items[0]
@@ -186,7 +193,16 @@ class Worker:
                     )
                     self._reports.ack()
                     continue
-                break
+                # #294: never break silently — with claims blocked on this
+                # queue, a persistent error would be an infinite unnoticed
+                # wait. Log and let run()'s contract decide: 4xx exits, 5xx/
+                # network idles and retries. The report stays queued either way.
+                logger.error(
+                    "worker: report replay for task %s failed (HTTP %s): %s —"
+                    " report stays queued, new claims stay blocked",
+                    item["task_id"], exc.status_code, exc,
+                )
+                raise
             except Exception:
                 logger.exception("worker: report replay for task %s failed", item["task_id"])
                 break

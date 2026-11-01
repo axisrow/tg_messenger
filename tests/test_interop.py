@@ -573,6 +573,91 @@ async def test_post_retries_pre_request_timeouts():
         assert attempts["n"] == 2  # failed once, retried, succeeded
 
 
+async def test_worker_flush_permanent_4xx_raises_loudly_keeps_report(caplog):
+    """#294 review: a persistent non-409 FactoryError (e.g. 401) during a replay
+    must not become a silent infinite idle — it is logged, propagates (run()
+    exits on 4xx by its contract), the report stays queued, nothing is claimed."""
+    import logging as _logging
+
+    class UnauthorizedReplayFactory(StubFactory):
+        async def complete_task(self, task_id, result_payload):
+            raise FactoryError("returned HTTP 401: bad password", status_code=401)
+
+    factory = UnauthorizedReplayFactory()
+    client = StubCoreClient()
+    factory.enqueue({
+        "id": "t1", "type": "dm_reply",
+        "payload": {"v": 1, "peer": 7, "text": "x"}, "status": "claimed",
+        "result_payload": None,
+    })
+    factory.enqueue({
+        "id": "t2", "type": "dm_reply",
+        "payload": {"v": 1, "peer": 8, "text": "y"}, "status": "claimed",
+        "result_payload": None,
+    })
+    worker = _make_worker(factory, client)
+    await worker.process_once()  # t1 sent; complete got 401 → caught & queued
+    assert factory.claim_calls == 1
+
+    with caplog.at_level(_logging.ERROR, logger="tg_messenger.interop.worker"):
+        with pytest.raises(FactoryError):
+            await worker.process_once()  # replay 401 → logged + raised, not a silent break
+
+    assert any("report replay for task t1 failed" in r.getMessage() for r in caplog.records)
+    assert factory.claim_calls == 1  # t2 was never claimed
+    assert client.sent == [(7, "x")]
+    assert worker._reports.items  # NOT dropped (unlike a 409) — stays durable
+
+    # run() turns it into a loud exit instead of an infinite unnoticed wait
+    with pytest.raises(FactoryError):
+        await worker.run()
+
+
+async def test_worker_flush_transient_5xx_keeps_report_and_loop_alive(caplog):
+    """#294 review: 5xx during a replay is transient — run() logs, idles and
+    retries (no exit); the report stays queued and claims stay blocked."""
+    import logging as _logging
+
+    class ServerErrorReplayFactory(StubFactory):
+        async def complete_task(self, task_id, result_payload):
+            raise FactoryError("returned HTTP 500: factory exploded", status_code=500)
+
+    factory = ServerErrorReplayFactory()
+    factory.enqueue({
+        "id": "t1", "type": "dm_reply",
+        "payload": {"v": 1, "peer": 7, "text": "x"}, "status": "claimed",
+        "result_payload": None,
+    })
+    worker = _make_worker(factory, StubCoreClient())
+    await worker.process_once()  # complete got 500 → caught & queued
+    assert worker._reports.items
+
+    with pytest.raises(FactoryError):
+        await worker.process_once()  # replay 5xx → propagates like a claim error
+    assert factory.claim_calls == 1
+
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        # must really yield, like the real sleep: a no-op fake leaves run() in a
+        # hot loop with no suspension point, so cancel() can never be delivered
+        sleeps.append(seconds)
+        await asyncio.sleep(0)
+
+    worker._sleep = _record_sleep
+    with caplog.at_level(_logging.ERROR, logger="tg_messenger.interop.worker"):
+        run_task = asyncio.create_task(worker.run())
+        for _ in range(6):
+            await asyncio.sleep(0)
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+    assert sleeps  # the loop idled and kept retrying — no exit, no death
+    assert any("poll step failed" in r.getMessage() for r in caplog.records)
+    assert worker._reports.items  # the report survives the retries
+
+
 async def test_worker_run_exits_on_4xx_but_survives_transport_errors(caplog):
     """Bad password (401) exits the loop; an unreachable factory just idles."""
     import logging as _logging
