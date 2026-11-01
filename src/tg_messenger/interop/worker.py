@@ -15,12 +15,16 @@ Executors map a task ``type`` to core-client work:
 ``process_once()`` runs a single claim→execute→report step (no loop) so tests
 drive it directly; ``run()`` is the production loop with an idle ``sleep``.
 
-Report durability (#228): a Telegram send is irreversible, so its completion/
-failure report must never be lost. Failed reports go to a durable on-disk
-queue (``reports_path``; in-memory when None) and are flushed at the start of
-every ``process_once()`` — before any new claim — until the factory acks them.
-The factory treats an identical replay of a terminal report as success and a
-conflicting one as 409 (dropped: the other outcome already won).
+Report durability (#228, #294): a Telegram send is irreversible, so its
+completion/failure report must never be lost. Every report is persisted to a
+durable on-disk queue (``reports_path``; in-memory when None) BEFORE the
+factory ack is awaited — so a cancellation (Ctrl+C, a BaseException) mid-ack
+leaves it queued — and removed only once the factory acks it. The queue is
+flushed at the start of every ``process_once()``; while it is non-empty no new
+work is claimed (#294): the worker must not make more irreversible sends while
+a report is unacknowledged. The factory treats an identical replay of a
+terminal report as success and a conflicting one as 409 (dropped: the other
+outcome already won).
 """
 
 from __future__ import annotations
@@ -135,8 +139,16 @@ class Worker:
                 await self._sleep(self._idle_sleep)
 
     async def process_once(self) -> bool:
-        """One step. Returns True if a task was claimed (success OR handled failure)."""
-        await self._flush_reports()
+        """One step. Returns True if a task was claimed (success OR handled failure).
+
+        Unacknowledged reports block new claims (#294): the flush must drain the
+        queue before any new irreversible send, so the step is a no-op (returns
+        False, the run loop idles and retries) while a report is still pending.
+        A FactoryError from the replay propagates so ``run()`` applies its
+        4xx/5xx contract instead of idling on a permanent error.
+        """
+        if not await self._flush_reports():
+            return False
         task = await self._factory.claim_next(self._types)
         if task is None:
             return False
@@ -150,12 +162,20 @@ class Worker:
         await self._safe_complete_task(task_id, result)
         return True
 
-    async def _flush_reports(self) -> None:
+    async def _flush_reports(self) -> bool:
         """Replay queued reports oldest-first until acked; stop on the first failure.
+
+        Returns True when the queue drained (was empty or became empty) — the
+        caller may claim new work only then.
 
         A 409 means a conflicting report already won on the factory side — the
         replay can never succeed, so it is dropped (with a loud log) instead of
-        blocking the queue forever.
+        blocking the queue forever. Any other FactoryError is logged and
+        re-raised so ``run()`` applies its contract (a 4xx never succeeds →
+        exit; 5xx/network → log, idle, retry): with claims blocked on a
+        non-empty queue, a silent break here would wedge the worker in an
+        unnoticed wait forever (#294). Unexpected non-factory errors are logged
+        and left queued for the next round.
         """
         while self._reports.items:
             item = self._reports.items[0]
@@ -173,26 +193,43 @@ class Worker:
                     )
                     self._reports.ack()
                     continue
-                break
+                # #294: never break silently — with claims blocked on this
+                # queue, a persistent error would be an infinite unnoticed
+                # wait. Log and let run()'s contract decide: 4xx exits, 5xx/
+                # network idles and retries. The report stays queued either way.
+                logger.error(
+                    "worker: report replay for task %s failed (HTTP %s): %s —"
+                    " report stays queued, new claims stay blocked",
+                    item["task_id"], exc.status_code, exc,
+                )
+                raise
             except Exception:
                 logger.exception("worker: report replay for task %s failed", item["task_id"])
                 break
             else:
                 self._reports.ack()
+        return not self._reports.items
 
     async def _safe_complete_task(self, task_id: str, result: dict) -> None:
+        # #294: persist BEFORE awaiting the ack — cancellation (CancelledError is
+        # a BaseException, not caught below) must not lose the report of an
+        # already-sent message. The item is removed only on a confirmed ack.
+        self._reports.add({"kind": "complete", "task_id": task_id, "result_payload": result})
         try:
             await self._factory.complete_task(task_id, result)
         except Exception:
             logger.exception("worker: failed to report task %s completion", task_id)
-            self._reports.add({"kind": "complete", "task_id": task_id, "result_payload": result})
+        else:
+            self._reports.ack()
 
     async def _safe_fail_task(self, task_id: str, error: str) -> None:
+        self._reports.add({"kind": "fail", "task_id": task_id, "error": error})
         try:
             await self._factory.fail_task(task_id, error)
         except Exception:
             logger.exception("worker: failed to report task %s failure", task_id)
-            self._reports.add({"kind": "fail", "task_id": task_id, "error": error})
+        else:
+            self._reports.ack()
 
     async def _execute(self, task: dict) -> dict:
         task_type = task.get("type")
