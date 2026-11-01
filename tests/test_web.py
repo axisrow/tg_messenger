@@ -1,4 +1,5 @@
 import asyncio
+import re
 from datetime import datetime, timezone
 
 import httpx
@@ -225,6 +226,22 @@ async def test_index_has_viewport_meta(client_app):
     ac, _ = client_app
     r = await ac.get("/")
     assert '<meta name="viewport" content="width=device-width, initial-scale=1">' in r.text
+
+
+async def test_index_msg_bubble_css_preserves_newlines(client_app):
+    # #301: newlines in a message body collapsed into spaces — the body is plain text
+    # (escaped markup / textContent) and the bubble's default white-space:normal folds
+    # every \n. The .msg rule itself must carry white-space:pre-wrap: it is the one rule
+    # both rendering paths (server bubbles and SSE bubbles) and both layouts (desktop
+    # and the mobile media query, which only widens max-width) go through.
+    ac, _ = client_app
+    r = await ac.get("/")
+    rule = re.search(r"\.msg\s*\{[^}]*\}", r.text)
+    assert rule, "no .msg CSS rule on the page"
+    assert "white-space: pre-wrap" in rule.group(0)
+    # security: the live SSE body stays a textContent assignment — a newline "fix" that
+    # switches it to innerHTML with <br> surgery would reopen XSS on user text.
+    assert "bodyLine.textContent" in r.text
 
 
 async def test_index_vendors_htmx_locally_not_from_cdn(client_app):
@@ -2551,6 +2568,18 @@ def test_message_div_author_is_html_escaped():
     html = _message_div(m, show_author=True)
     assert "&lt;b&gt;x&lt;/b&gt;" in html
     assert "<b>x</b>" not in html
+
+
+def test_message_div_keeps_source_newlines_in_body():
+    # #301: the server markup keeps the raw \n of the source text (html.escape doesn't
+    # touch newlines) — rendering them as line breaks is the .msg CSS pre-wrap job.
+    # Guards against a "fix" that strips or pre-converts newlines server-side.
+    from tg_messenger.web.app import _message_div
+
+    text = "План встречи:\n1. Обсудить макет\n2. Согласовать сроки"
+    html = _message_div(Message(id=5, dialog_id=7, sender_id=7, out=False, text=text,
+                                date=datetime(2024, 1, 1, tzinfo=timezone.utc)))
+    assert f"[5] {text}" in html
 
 
 async def test_group_history_shows_author_dm_does_not(client_app):
