@@ -115,6 +115,20 @@ async def test_budget_exhaustion_warns_before_raising(caplog):
     assert "history: flood-wait budget exhausted, last transient wait 2s" in caplog.text
 
 
+async def test_custom_transient_max_suppresses_misleading_budget_warning(caplog):
+    import logging
+
+    async def fail():
+        raise flood_wait_error(10)
+
+    # wait 10s is blocking for a caller with max_sec=7: the adapter's
+    # re-classification must not label it "budget exhausted" via the 60s default.
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(HandledFloodWaitError):
+            await run_with_flood_wait_retry(fail, operation="history", transient_wait_max_sec=7)
+    assert "budget exhausted" not in caplog.text
+
+
 async def test_adapter_delegates_policy_and_logger_to_package(monkeypatch):
     import logging
     from unittest.mock import AsyncMock
