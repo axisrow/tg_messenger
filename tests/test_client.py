@@ -2627,6 +2627,24 @@ def test_tg_proxy_env_parsing(monkeypatch):
         parse()
 
 
+def test_tg_proxy_env_percent_decoded_credentials(monkeypatch):
+    """#297: urlparse returns userinfo percent-ENCODED — a password with reserved
+    characters never authenticates unless we unquote before handing to telethon."""
+    monkeypatch.setenv("TG_PROXY", "socks5://us%3Ar:p%40ss%2F@127.0.0.1:1080")
+    assert client_module._proxy_from_env() == dict(
+        proxy_type="SOCKS5", addr="127.0.0.1", port=1080, username="us:r", password="p@ss/"
+    )
+
+
+def test_tg_proxy_env_missing_python_socks_is_actionable(monkeypatch):
+    """#297: without python-socks telethon SILENTLY ignores the proxy and connect
+    dies with ModuleNotFoundError — fail early with an error naming the fix."""
+    monkeypatch.setenv("TG_PROXY", "socks5://127.0.0.1:1080")
+    monkeypatch.setattr(client_module, "_python_socks_missing", lambda: True)
+    with pytest.raises(ValueError, match="python-socks"):
+        client_module._proxy_from_env()
+
+
 async def test_resolve_username_maps_one_row_dialog():
     """#268: resolve_username = ONE get_entity('@x') RPC, mapped to a single-row
     Dialog with the MARKED peer id (#269 review: real TL User — get_peer_id needs it)."""
