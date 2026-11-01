@@ -44,6 +44,14 @@ from tg_messenger.core.models import (
     ReactionEvent,
     User,
 )
+from tg_messenger.core.moderation import (
+    ModerationRule,
+    RuleActions,
+    add_rule,
+    check_admin_rights,
+    register_moderation_migrations,
+)
+from tg_messenger.core.storage import Storage
 
 VALID_SESSION = StringSession().save()  # valid, empty session string
 
@@ -2232,6 +2240,65 @@ async def test_is_admin_false_on_error(fake_client):
     client = _build(fake_client)
     await client.connect()
     assert await client.is_admin(-100200) is False
+
+
+# --- #295: правило для недоступного чата не должно ронять moderate ---
+
+async def _make_peer_unresolvable(fake_client, gone_peer: int) -> None:
+    """A chat the account left / that was deleted: the peer never resolves,
+    even after a dialogs warm-up (dialogs() finds nothing)."""
+
+    async def resolve(peer):
+        if int(peer) == gone_peer:
+            raise ValueError(f"Could not find the input entity for {peer!r}")
+        return int(peer)
+
+    fake_client.get_input_entity = resolve
+    fake_client.dialogs = []
+
+
+async def test_moderation_rights_unresolvable_chat_returns_all_false(fake_client):
+    client = _build(fake_client)
+    await client.connect()
+    await _make_peer_unresolvable(fake_client, -1001)
+
+    rights = await client.moderation_rights(-1001)
+
+    assert rights == {"delete_messages": False, "ban_users": False}
+
+
+async def test_check_admin_rights_disables_only_unresolvable_chat(fake_client, tmp_path):
+    class Perms:
+        is_admin = True
+        delete_messages = True
+        ban_users = True
+
+    async def perms(entity, user=None):
+        return Perms()
+
+    fake_client.get_permissions = perms
+    client = _build(fake_client)
+    await client.connect()
+    await _make_peer_unresolvable(fake_client, -1001)
+
+    storage = Storage(tmp_path / "mod.db")
+    register_moderation_migrations(storage)
+    await storage.connect()
+    try:
+        await add_rule(storage, ModerationRule(
+            chat_id=-1001, name="stale",
+            actions=RuleActions(delete=True),
+        ))
+        await add_rule(storage, ModerationRule(
+            chat_id=-1002, name="live",
+            actions=RuleActions(delete=True),
+        ))
+
+        rights = await check_admin_rights(client, storage)
+
+        assert rights == {-1001: False, -1002: True}
+    finally:
+        await storage.close()
 
 
 async def test_log_out_calls_telethon(fake_client):
