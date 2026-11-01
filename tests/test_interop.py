@@ -482,6 +482,90 @@ def test_report_queue_corrupt_file_is_quarantined(tmp_path):
     assert path.with_suffix(path.suffix + ".corrupt").exists()
 
 
+# --- #305: per-session report queues on one TG_HOME ---
+
+
+async def test_worker_report_queues_are_isolated_per_session(tmp_path, monkeypatch):
+    """Two workers on one TG_HOME must not share the queue file: _save rewrites
+    the whole list, so with a shared path worker B's save drops worker A's
+    unacknowledged reports. Reports queued by A survive B saving its own queue."""
+    import json
+
+    from tg_messenger.interop.worker import worker_reports_path
+
+    monkeypatch.setenv("TG_HOME", str(tmp_path))
+    factory = StubFactory(complete_raises=True)
+    factory.enqueue({
+        "id": "t1", "type": "dm_reply",
+        "payload": {"v": 1, "peer": 7, "text": "x"}, "status": "claimed",
+        "result_payload": None,
+    })
+    worker_a = _make_worker(factory, StubCoreClient(), reports_path=worker_reports_path("a"))
+    await worker_a.process_once()  # send done, completion report failed -> queued
+    queued = [{"kind": "complete", "task_id": "t1", "result_payload": {"sent": 12345}}]
+    assert worker_a._reports.items == queued
+
+    # worker B on another session runs to completion over the same home
+    factory_b = StubFactory()
+    factory_b.enqueue({
+        "id": "t2", "type": "dm_reply",
+        "payload": {"v": 1, "peer": 8, "text": "y"}, "status": "claimed",
+        "result_payload": None,
+    })
+    worker_b = _make_worker(factory_b, StubCoreClient(), reports_path=worker_reports_path("b"))
+    handled = await worker_b.process_once()
+
+    assert handled is True
+    assert factory_b.completed == [("t2", {"sent": 12345})]
+    assert json.loads(worker_reports_path("a").read_text("utf-8")) == queued  # survived
+
+    # ... and a fresh session-a worker still replays the report A queued
+    factory.complete_raises = False
+    fresh = _make_worker(factory, StubCoreClient(), reports_path=worker_reports_path("a"))
+    handled = await fresh.process_once()
+
+    assert handled is False  # the step went to the replay, nothing left to claim
+    assert factory.completed == [("t1", {"sent": 12345})]
+
+
+def test_worker_reports_path_migrates_legacy_queue(tmp_path, monkeypatch):
+    """The pre-#305 shared queue is adopted (moved, once) so pending reports
+    are not orphaned by the upgrade; a second session inherits nothing."""
+    import json
+
+    from tg_messenger.interop.worker import ReportQueue, worker_reports_path
+
+    monkeypatch.setenv("TG_HOME", str(tmp_path))
+    queued = [{"kind": "complete", "task_id": "t9", "result_payload": {"sent": 1}}]
+    (tmp_path / "interop_reports.json").write_text(json.dumps(queued), "utf-8")
+
+    path_a = worker_reports_path("a")
+
+    assert ReportQueue(path_a).items == queued  # adopted...
+    assert not (tmp_path / "interop_reports.json").exists()  # ...by moving, once
+    assert worker_reports_path("b") == tmp_path / "interop_reports-b.json"
+    assert not worker_reports_path("b").exists()  # b starts fresh
+
+
+def test_worker_reports_path_existing_file_wins_over_legacy(tmp_path, monkeypatch):
+    """A session that already has its own queue file must not re-adopt a
+    leftover legacy file (e.g. written by a downgraded worker)."""
+    import json
+
+    from tg_messenger.interop.worker import worker_reports_path
+
+    monkeypatch.setenv("TG_HOME", str(tmp_path))
+    mine = tmp_path / "interop_reports-a.json"
+    mine.write_text(json.dumps([{"kind": "fail", "task_id": "t1", "error": "x"}]), "utf-8")
+    legacy = tmp_path / "interop_reports.json"
+    legacy.write_text(json.dumps([{"kind": "fail", "task_id": "t2", "error": "y"}]), "utf-8")
+
+    assert worker_reports_path("a") == mine
+
+    assert json.loads(mine.read_text("utf-8"))[0]["task_id"] == "t1"  # untouched
+    assert legacy.exists()  # not consumed by a session that already has its own
+
+
 # --- #294: unacked reports block new claims; cancellation can't lose a report ---
 
 

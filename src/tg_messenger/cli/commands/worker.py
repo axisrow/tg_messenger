@@ -35,7 +35,7 @@ def worker(ctx: click.Context, session: str, factory_url: str | None, types: str
             "--factory-url is required (or set TG_FACTORY_URL)."
         )
     try:
-        from tg_messenger.interop.worker import Worker
+        from tg_messenger.interop.worker import Worker, worker_reports_path
     except ImportError as exc:
         raise click.ClickException(
             "interop requires: pip install 'tg-messenger[interop]'"
@@ -62,15 +62,14 @@ def worker(ctx: click.Context, session: str, factory_url: str | None, types: str
             # #125-A6: the factory owns its httpx.AsyncClient (http=None) — close it via
             # `async with` so the process doesn't leak the connection / emit "Unclosed
             # AsyncClient" ResourceWarning on shutdown (mirrors agent/tools.py).
-            from tg_messenger.core.paths import tg_home
-
             async with factory:
                 await Worker(
                     client, factory, types=task_types, sleep=_sleep, idle_sleep=interval,
                     agent=agent,
                     # #228: completion/failure reports survive a crash and are
-                    # replayed before the next claim
-                    reports_path=tg_home() / "interop_reports.json",
+                    # replayed before the next claim; #305: per-session file, so
+                    # workers on one TG_HOME don't overwrite each other's queue
+                    reports_path=worker_reports_path(session),
                 ).run()
         finally:
             await client.disconnect()
