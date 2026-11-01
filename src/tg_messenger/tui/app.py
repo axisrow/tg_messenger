@@ -919,6 +919,15 @@ class MessengerTUI(App):
             await self._client.mark_read(dialog_id, max_id=max_id)
         except Exception:
             logger.warning("mark_read failed (dialog %s) — continuing", dialog_id, exc_info=True)
+            return
+        # #304: the ack succeeded — clear the badge locally too. Both ack paths (history open,
+        # live message in the open dialog) route through here, so one touch updates the snapshot
+        # and redraws; the dialog also drops off the "Unread" tab projection, like a live read.
+        for idx, dialog in enumerate(self._all_dialogs):
+            if dialog.id == dialog_id and dialog.unread:
+                self._all_dialogs[idx] = dialog.model_copy(update={"unread": 0})
+                await self._render_dialogs()
+                break
 
     def _message_bubble_for(self, message, dialog_id: int) -> MessageBubble:
         """Build and index the one TUI bubble representation for a core message."""
