@@ -71,7 +71,7 @@ send_marker_to_peer() {
   id="$(e2e_extract_message_id "$history" "$marker")"
   if [ -z "$id" ]; then
     echo "sent marker was not found in recent history: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   printf '%s\n' "$id"
@@ -103,7 +103,7 @@ step_reply_to_base() {
   REPLY_ID="$(e2e_extract_message_id "$history" "$marker")"
   if [ -z "$REPLY_ID" ]; then
     echo "reply marker was not found: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   e2e_register_message "$SAVED_PEER" "$REPLY_ID" "$marker"
@@ -123,7 +123,7 @@ step_edit_base() {
   history="$(e2e_recent_history "$SAVED_PEER" 20)" || return 1
   if ! printf '%s\n' "$history" | grep -F -- "$EDIT_MARKER" >/dev/null; then
     echo "edited marker was not found: $EDIT_MARKER" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   remember_saved_marker "$EDIT_MARKER"
@@ -162,7 +162,7 @@ step_forward_saved_to_saved() {
   FORWARD_COPY_ID="$(e2e_extract_message_id_except "$history" "$marker" "$FORWARD_SOURCE_ID")"
   if [ -z "$FORWARD_COPY_ID" ]; then
     echo "forwarded copy was not found for marker: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   e2e_register_message "$SAVED_PEER" "$FORWARD_COPY_ID" "$marker"
@@ -189,7 +189,7 @@ step_forward_saved_list_to_saved() {
   FORWARD_LIST_REPLY_ID="$(e2e_extract_message_id "$history" "$reply_marker")"
   if [ -z "$FORWARD_LIST_REPLY_ID" ]; then
     echo "forward list reply source was not found: $reply_marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   e2e_register_message "$SAVED_PEER" "$FORWARD_LIST_REPLY_ID" "$reply_marker"
@@ -203,7 +203,7 @@ step_forward_saved_list_to_saved() {
   FORWARD_LIST_COPY_ID_2="$(e2e_extract_message_id_except "$history" "$reply_marker" "$FORWARD_LIST_REPLY_ID")"
   if [ -z "$FORWARD_LIST_COPY_ID_1" ] || [ -z "$FORWARD_LIST_COPY_ID_2" ]; then
     echo "forwarded list copies were not found" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   e2e_register_message "$SAVED_PEER" "$FORWARD_LIST_COPY_ID_1" "$marker"
@@ -222,7 +222,7 @@ step_send_file_with_caption() {
   FILE_ID="$(e2e_extract_message_id "$history" "$marker")"
   if [ -z "$FILE_ID" ]; then
     echo "file caption marker was not found: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   e2e_register_message "$SAVED_PEER" "$FILE_ID" "$marker"
@@ -241,7 +241,7 @@ step_send_file_with_caption_option() {
   CAPTION_FILE_ID="$(e2e_extract_message_id "$history" "$marker")"
   if [ -z "$CAPTION_FILE_ID" ]; then
     echo "explicit --caption marker was not found: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   e2e_register_message "$SAVED_PEER" "$CAPTION_FILE_ID" "$marker"
@@ -260,7 +260,7 @@ step_send_file_as_file() {
   AS_FILE_ID="$(e2e_extract_message_id "$history" "$marker")"
   if [ -z "$AS_FILE_ID" ]; then
     echo "as-file marker was not found: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   e2e_register_message "$SAVED_PEER" "$AS_FILE_ID" "$marker"
@@ -279,7 +279,7 @@ step_send_voice_file() {
   VOICE_ID="$(e2e_extract_message_id "$history" "$marker")"
   if [ -z "$VOICE_ID" ]; then
     echo "voice marker was not found: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   e2e_register_message "$SAVED_PEER" "$VOICE_ID" "$marker"
@@ -305,16 +305,16 @@ step_delete_for_me_saved() {
   history="$(e2e_recent_history "$SAVED_PEER" 20)" || return 1
   if ! printf '%s\n' "$history" | grep -F -- "$marker" >/dev/null; then
     echo "delete-for-me marker was not visible before deletion: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
-  tg delete "$SAVED_PEER" "$FOR_ME_DELETE_ID" --for-me >/dev/null || return 1
+  tg delete "$SAVED_PEER" "$FOR_ME_DELETE_ID" --for-me --yes >/dev/null || return 1
   e2e_unregister_message "$SAVED_PEER" "$FOR_ME_DELETE_ID"
   e2e_mutation_pause
   after_history="$(e2e_recent_history "$SAVED_PEER" 20)" || return 1
   if printf '%s\n' "$after_history" | grep -F -- "$marker" >/dev/null; then
     echo "delete-for-me marker still visible: $marker" >&2
-    echo "$after_history"
+    e2e_dump_history "$after_history"
     return 1
   fi
 }
@@ -338,7 +338,7 @@ step_reaction_roundtrip() {
   target_id="$(e2e_extract_message_id "$history" "$marker")"
   if [ -z "$target_id" ]; then
     echo "round-trip target was not found: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   e2e_register_message "$peer" "$target_id" "$marker"
@@ -460,7 +460,7 @@ step_verify_saved_markers_gone() {
   for marker in "${SAVED_MARKERS[@]}"; do
     if printf '%s\n' "$history" | grep -F -- "$marker" >/dev/null; then
       echo "marker still visible after cleanup: $marker" >&2
-      echo "$history"
+      e2e_dump_history "$history"
       return 1
     fi
   done

@@ -89,7 +89,7 @@ step_chat_repl_send() {
   id="$(e2e_extract_message_id "$history" "$marker")"
   if [ -z "$id" ]; then
     echo "chat REPL marker was not found: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   e2e_register_message "$SAVED_PEER" "$id" "$marker"

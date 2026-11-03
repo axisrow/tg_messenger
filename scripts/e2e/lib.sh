@@ -189,7 +189,7 @@ e2e_send_marker_to_peer() {
   id="$(e2e_extract_message_id "$history" "$marker")"
   if [ -z "$id" ]; then
     echo "sent marker was not found in recent history: $marker" >&2
-    echo "$history"
+    e2e_dump_history "$history"
     return 1
   fi
   printf '%s\n' "$id"
@@ -233,7 +233,7 @@ e2e_delete_registered_messages() {
     if [ -z "${E2E_CREATED_IDS[$i]}" ]; then
       continue
     fi
-    if tg delete "${E2E_CREATED_PEERS[$i]}" "${E2E_CREATED_IDS[$i]}"; then
+    if tg delete "${E2E_CREATED_PEERS[$i]}" "${E2E_CREATED_IDS[$i]}" --yes; then
       echo "deleted ${E2E_CREATED_PEERS[$i]}:${E2E_CREATED_IDS[$i]}"
       E2E_CREATED_IDS[$i]=""
       e2e_mutation_pause
@@ -252,7 +252,7 @@ e2e_cleanup_created_messages() {
   fi
   for i in "${!E2E_CREATED_IDS[@]}"; do
     if [ -n "${E2E_CREATED_IDS[$i]}" ]; then
-      tg delete "${E2E_CREATED_PEERS[$i]}" "${E2E_CREATED_IDS[$i]}" >/dev/null 2>&1 || true
+      tg delete "${E2E_CREATED_PEERS[$i]}" "${E2E_CREATED_IDS[$i]}" --yes >/dev/null 2>&1 || true
     fi
   done
 }
@@ -261,6 +261,15 @@ e2e_clear_registered_messages() {
   E2E_CREATED_PEERS=()
   E2E_CREATED_IDS=()
   E2E_CREATED_MARKERS=()
+}
+
+e2e_dump_history() {
+  # #272 item 5: on a failed marker check, print only THIS run's marker rows. The
+  # full `tg read` output carries the user's real Saved Messages history (personal
+  # data ended up in step-failure logs during the QA run); non-marker rows are
+  # withheld and just counted as withheld.
+  printf '%s\n' "$1" | grep -F -- "e2e-$E2E_RUN_ID" || true
+  echo "(remaining history rows withheld: may contain personal data)"
 }
 
 e2e_recent_history() {
