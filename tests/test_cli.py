@@ -496,6 +496,20 @@ def test_send_file_conflicting_flags_error(runner, tmp_path):
     assert stub.sent == []
 
 
+def test_send_missing_file_fails_before_client(runner):
+    # #272 item 4: a nonexistent --file path used to be caught only inside
+    # client.send_media — AFTER the CLI had already connected to Telegram
+    # (`Unexpected error: file not found`, exit 1, one wasted connection).
+    # make_client is the network seam in these tests: the command must reject
+    # the path BEFORE any client exists.
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", "/nonexistent/tg-e2e-missing.txt"])
+    assert result.exit_code != 0
+    assert "file not found" in result.output
+    assert "Unexpected error" not in result.output
+    assert stub.sent == []
+
+
 def test_react_command_calls_client(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["react", "7", "10", "👍"])
