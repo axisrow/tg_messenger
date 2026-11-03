@@ -334,6 +334,40 @@ def test_search_command_passes_limit(runner):
     assert stub.searched == [(7, "hi", 3)]
 
 
+# --- #272: the README's documented invocations must actually parse ---
+
+
+def test_readme_negative_id_example_fails_at_option_parse(runner):
+    # #272 item 1: the README documented `search -1001234567 "lunch" --limit 50`.
+    # Click parses the negative group id as an option — the documented command
+    # fails before any client work.
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["search", "-1001234567", "lunch", "--limit", "50"])
+    assert result.exit_code == 2
+    assert "No such option" in result.output
+    assert stub.searched == []
+
+
+def test_negative_group_id_rides_after_separator(runner):
+    # #272 item 1: the corrected README form — options before `--`, the negative
+    # group id (and the query) as positionals.
+    r, stub = runner
+    result = r.invoke(
+        cli_main.cli, ["search", "--limit", "50", "--", "-1001234567", "lunch"]
+    )
+    assert result.exit_code == 0, result.output
+    assert stub.searched == [(-1001234567, "lunch", 50)]
+
+
+def test_chat_without_dialog_id_fails_before_client(runner):
+    # #272 item 6: the README quickstart showed a bare `tg-messenger chat`, but
+    # DIALOG_ID is a required argument — Click rejects it with exit 2.
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["chat"])
+    assert result.exit_code == 2
+    assert "DIALOG_ID" in result.output
+
+
 def test_read_prints_history(runner):
     r, _ = runner
     result = r.invoke(cli_main.cli, ["read", "7"])
