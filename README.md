@@ -103,7 +103,7 @@ moved), so an existing login keeps working.
 **3. Start an interface** — same core, pick whichever you like:
 
 ```bash
-tg-messenger chat            # interactive terminal REPL — see incoming, send replies
+tg-messenger chat 7          # interactive terminal REPL on dialog 7 — see incoming, send replies
 tg-messenger tui             # full-screen Textual UI         (needs [tui])
 tg-messenger serve           # web UI on http://127.0.0.1:8090 (needs [web])
 ```
@@ -175,8 +175,11 @@ type into its search field.
 
 ```bash
 tg-messenger search 7 "invoice"        # last messages in dialog 7 matching "invoice"
-tg-messenger search -1001234567 "lunch" --limit 50
+tg-messenger search --limit 50 -- -1001234567 "lunch"   # negative ids ride after --
 ```
+
+A leading-dash group id (`-100…`) reads as an option to Click unless it comes
+after the `--` separator: put every option BEFORE `--` and the peer id after it.
 
 The web UI exposes the same via `GET /dialogs/{id}/search?q=`. There is intentionally
 no global content search across all chats — that belongs to `tg_content_factory`.
