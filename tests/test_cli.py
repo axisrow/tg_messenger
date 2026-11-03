@@ -496,6 +496,30 @@ def test_send_file_conflicting_flags_error(runner, tmp_path):
     assert stub.sent == []
 
 
+def test_send_missing_file_fails_before_client(runner, monkeypatch):
+    # #272 item 4: a nonexistent --file path used to be caught only inside
+    # client.send_media — AFTER the CLI had already connected to Telegram
+    # (`Unexpected error: file not found`, exit 1, one wasted connection).
+    # Pin the seam: make_client must never run. The output asserts alone can't
+    # tell a pre-connect guard from one moved into _do after connect() (sent
+    # stays empty either way, and _with_client's finally resets stub.connected),
+    # so count client constructions and demand zero.
+    calls = []
+    r, stub = runner
+
+    def _make_client(**kw):
+        calls.append(kw)
+        return stub
+
+    monkeypatch.setattr(cli_main, "make_client", _make_client)
+    result = r.invoke(cli_main.cli, ["send", "7", "--file", "/nonexistent/tg-e2e-missing.txt"])
+    assert result.exit_code != 0
+    assert "file not found" in result.output
+    assert "Unexpected error" not in result.output
+    assert stub.sent == []
+    assert calls == []  # no client constructed — no connect(), no dialogs fetch
+
+
 def test_react_command_calls_client(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["react", "7", "10", "👍"])
@@ -527,16 +551,6 @@ def test_send_does_not_fetch_dialogs(runner):
     assert result.exit_code == 0, result.output
     assert stub.sent == [(7, "hi", None, None)]
     assert stub.dialogs_calls == 0  # no read-side dependency on the send path
-
-
-def test_send_file_missing_path_fails_before_dialogs(runner):
-    # The local path check (ValueError "file not found") must fire first — a typo in
-    # --file no longer burns a network round-trip on a dialog fetch.
-    r, stub = runner
-    stub.send_media_raises = ValueError("file not found: /no/such/file.jpg")
-    result = r.invoke(cli_main.cli, ["send", "7", "--file", "/no/such/file.jpg"])
-    assert result.exit_code != 0
-    assert stub.dialogs_calls == 0
 
 
 def test_send_to_writable_channel_allowed(runner):

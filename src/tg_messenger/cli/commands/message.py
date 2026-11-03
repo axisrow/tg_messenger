@@ -5,6 +5,7 @@ them. Registered onto the root ``cli`` group from main.py via the ``COMMANDS`` l
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import click
 
@@ -329,6 +330,11 @@ def send(dialog_id: str, text: str | None, file_path: str | None, caption: str |
         # #187: `send 7` with no TEXT and no --file would call send_text(7, "") — Telegram
         # rejects it with an opaque "Unexpected error". Validate up front, before the network.
         raise click.ClickException("provide TEXT or --file")
+    if file_path and not Path(file_path).is_file():
+        # #272: the client connects inside _run — a typo'd --file path must fail HERE,
+        # locally, without opening a network connection (the core send_media keeps its
+        # own check for library callers; this is the CLI's pre-connect gate).
+        raise click.ClickException(f"file not found: {file_path}")
 
     async def _do(client):
         # No pre-flight dialog fetch: a one-shot CLI process has a cold cache, so a
