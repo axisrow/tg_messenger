@@ -1010,6 +1010,62 @@ async def test_sse_substream_failure_closes_whole_stream(caplog):
     assert errors and errors[0].exc_info is not None
 
 
+async def test_sse_unread_stream_yields_frame_per_incoming():
+    # #323 slice 1: synthetic events on the existing bus → one typed unread frame per
+    # incoming message, any dialog (no polling, no per-dialog filter).
+    import asyncio
+    import json
+
+    from tg_messenger.web.app import sse_unread_stream
+
+    stub = WebStubClient()
+    gen = sse_unread_stream(stub)
+    task = asyncio.create_task(gen.__anext__())
+    while stub.bus.subscriber_count == 0:  # deterministic: wait until subscribed
+        await asyncio.sleep(0)
+
+    dm = Message(id=10, dialog_id=7, sender_id=7, out=False, text="dm",
+                 date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus.publish(IncomingEvent(dialog_id=7, message=dm))
+    grp = Message(id=11, dialog_id=-100200, sender_id=9, out=False, text="group",
+                  date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus.publish(IncomingEvent(dialog_id=-100200, message=grp))
+
+    first = json.loads((await asyncio.wait_for(task, timeout=2)).removeprefix("data: ").strip())
+    second = json.loads(
+        (await asyncio.wait_for(gen.__anext__(), timeout=2)).removeprefix("data: ").strip())
+    assert first == {"type": "unread", "dialog_id": 7}
+    assert second == {"type": "unread", "dialog_id": -100200}
+    await gen.aclose()
+
+
+async def test_sse_unread_stream_failure_closes_and_logs(caplog):
+    import pytest
+
+    from tg_messenger.web.app import sse_unread_stream
+
+    stub = WebStubClient()
+
+    async def broken_listen():
+        raise RuntimeError("stream blew up")
+        yield  # pragma: no cover
+
+    stub.listen_all = broken_listen
+    gen = sse_unread_stream(stub)
+    with caplog.at_level("ERROR", logger="tg_messenger.web.app"):
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(gen.__anext__(), timeout=2)
+    errors = [rec for rec in caplog.records if rec.levelname == "ERROR"]
+    assert errors and errors[0].exc_info is not None
+
+
+def test_unread_stream_route_registered():
+    from tg_messenger.web.app import build_app
+
+    app = build_app(client=WebStubClient())
+    assert "/stream/unread" in {getattr(r, "path", None) for r in app.routes}
+
+
 async def test_stream_yields_sse_frame():
     # Drive the SSE generator directly: subscribing then publishing must
     # produce one data frame for the matching dialog (and skip others).

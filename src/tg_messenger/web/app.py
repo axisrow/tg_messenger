@@ -295,6 +295,40 @@ async def sse_event_stream(
             task.cancel()
 
 
+async def sse_unread_stream(client):
+    """Yield SSE frames that bump the dialog list's unread badges live (#323 slice 1).
+
+    Reuses the existing event stream — listen_all() — so no polling: every incoming
+    message in ANY chat becomes one typed ``{"type": "unread", "dialog_id": id}`` frame.
+    The count is incremented client-side per badge and re-synced from the server-rendered
+    count on the next /dialogs fetch. The same endpoint later carries deletions and read
+    receipts as further typed frames (the multi-stream race below mirrors sse_event_stream).
+    """
+    iterators = {"incoming": client.listen_all().__aiter__()}
+    pending = {
+        asyncio.create_task(it.__anext__()): kind
+        for kind, it in iterators.items()
+    }
+    try:
+        while pending:
+            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                kind = pending.pop(task)
+                try:
+                    ev = task.result()
+                except StopAsyncIteration:
+                    continue  # that stream ended; nothing else may still run
+                except Exception:
+                    logger.exception("SSE unread stream failed")
+                    return  # close the SSE stream; browser EventSource will reconnect
+                pending[asyncio.create_task(iterators[kind].__anext__())] = kind
+                payload = {"type": "unread", "dialog_id": ev.dialog_id}
+                yield f"data: {json.dumps(payload)}\n\n"
+    finally:
+        for task in pending:
+            task.cancel()
+
+
 async def _mark_read_best_effort(client, dialog_id: int, max_id: int) -> None:
     try:
         await client.mark_read(dialog_id, max_id=max_id)
@@ -967,6 +1001,15 @@ def build_app(
             logger.warning("invalid suggester settings: %s", exc)
             return _error_response(str(exc), 400)
         return HTMLResponse(_suggest_settings_form(await suggester.get_settings()))
+
+    @app.get("/stream/unread")
+    async def unread_stream(request: Request):
+        # #323 slice 1: page-level stream for the sidebar's unread badges — independent of
+        # the per-dialog stream (runs before any dialog is open, survives dialog switches).
+        return StreamingResponse(
+            sse_unread_stream(request.app.state.client),
+            media_type="text/event-stream",
+        )
 
     @app.get("/stream/{dialog_id}")
     async def stream(request: Request, dialog_id: int, client_id: str = ""):
