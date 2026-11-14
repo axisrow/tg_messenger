@@ -93,7 +93,13 @@ const composer = el('composer');
 let messageBubbles = [];
 const document_ = {
   getElementById: (id) => (ids.has(id) ? ids.get(id) : el(id)),
-  querySelector: () => null,
+  // Resolve the sidebar-row selector the unread-badge handler uses (#323); everything
+  // else stays null, as before.
+  querySelector: (sel) => {
+    const m = /^#dialogs li\[data-dialog="([^"]*)"\]$/.exec(sel || '');
+    if (m) return dialogLis.get(m[1]) || null;
+    return null;
+  },
   querySelectorAll: (sel) => {
     if (!sel || !sel.startsWith('#messages .msg[data-id]')) return [];
     // markDialogRead scopes to a specific dialog: '#messages .msg[data-id][data-dialog="<id>"]'
@@ -110,6 +116,10 @@ composer.querySelector = () => ({ disabled: false });
 
 // Record every fetch (so we can assert which dialogs got a /read POST).
 const fetchCalls = [];
+// Every EventSource the page opened (unread stream #323, per-dialog streams).
+const eventSources = [];
+// Fake sidebar rows for the unread-badge handler: dialog id (string) -> li mock.
+const dialogLis = new Map();
 class FakeFormData { constructor() { this._d = {}; } append(k, v) { this._d[k] = v; } get(k) { return this._d[k]; } }
 
 const sandbox = {
@@ -119,7 +129,10 @@ const sandbox = {
   localStorage: { getItem: () => null, setItem: () => {} },
   crypto: { randomUUID: () => 'cid-test' },
   console,
-  EventSource: class { constructor() {} close() {} },
+  EventSource: class {
+    constructor(url) { this.url = url; this.onmessage = null; eventSources.push(this); }
+    close() {}
+  },
   setTimeout: (fn) => { return 0; },  // don't actually schedule debounced work
   clearTimeout: () => {},
   fetch: (url, opts) => {
@@ -598,6 +611,68 @@ await (async () => {
   check('#300 media: an unedited caption is cleared on upload completion',
         composerText.value === '');
 })();
+
+// ---- #323 slice 1: live unread badges from the page-level stream -------------
+{
+  // Fake sidebar rows: dialog 9 with no badge yet, dialog 10 already showing 2.
+  const makeBadge = (dialogId, count) => {
+    const badge = new El('badge-' + dialogId);
+    badge.className = 'unread';
+    badge.textContent = String(count);
+    return badge;
+  };
+  const li9 = new El('li-9');
+  li9.dataset.dialog = '9';
+  li9.querySelector = (sel) => (sel === '.unread' ? li9.children.find((c) => c.className === 'unread') || null : null);
+  dialogLis.set('9', li9);
+  const li10 = new El('li-10');
+  li10.dataset.dialog = '10';
+  const badge10 = makeBadge('10', 2);
+  li10.appendChild(badge10);
+  li10.querySelector = (sel) => (sel === '.unread' ? badge10 : null);
+  dialogLis.set('10', li10);
+
+  const stream = eventSources.find((s) => s.url === '/stream/unread');
+  check('#323: the page opened a /stream/unread EventSource at load', !!stream);
+  check('#323: the unread stream runs regardless of any open dialog', typeof stream.onmessage === 'function');
+
+  const frame = (dialogId) => ({ data: JSON.stringify({ type: 'unread', dialog_id: dialogId }) });
+
+  // First bump on a badge-less row creates the badge at 1.
+  stream.onmessage(frame(9));
+  const badge9 = li9.querySelector('.unread');
+  check('#323: a first incoming message creates the missing badge at 1',
+        !!badge9 && badge9.textContent === '1');
+
+  // Second bump increments the existing badge.
+  stream.onmessage(frame(9));
+  check('#323: further incoming messages increment the badge', badge9.textContent === '2');
+
+  // A row already carrying a server-rendered count increments from it.
+  stream.onmessage(frame(10));
+  check('#323: an existing server count increments (2 → 3)', badge10.textContent === '3');
+
+  // The OPEN dialog never gets a badge bump (it's on screen; /read clears it).
+  el('dialog_id').value = '7';
+  stream.onmessage(frame(7));
+  check('#323: a message in the open dialog does not bump any badge',
+        li9.querySelector('.unread').textContent === '2' && badge10.textContent === '3');
+
+  // A row absent from the current list (other tab / filtered) is skipped, no crash.
+  el('dialog_id').value = '';
+  stream.onmessage(frame(999));
+  check('#323: a frame for a row outside the list is a no-op',
+        li9.querySelector('.unread').textContent === '2' && badge10.textContent === '3');
+
+  // Malformed / foreign frames are ignored.
+  stream.onmessage({ data: 'not json' });
+  stream.onmessage({ data: JSON.stringify({ type: 'deleted', dialog_id: 9 }) });
+  check('#323: malformed and foreign-type frames are ignored',
+        li9.querySelector('.unread').textContent === '2');
+
+  dialogLis.clear();
+  el('dialog_id').value = '';
+}
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
