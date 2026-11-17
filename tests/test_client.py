@@ -555,6 +555,10 @@ async def test_rate_limit_gate_defers_send_then_proceeds(fake_client):
         seen = None
 
         def __init__(self):
+            # 0.1.6+ category_for() is an instance method and reads gate
+            # state; the real constructor also keeps the operation→category
+            # mapping this test pins under the stub.
+            super().__init__()
             self.calls = 0
 
         def try_acquire(self, phone, category, *, slots=1, peer=None):

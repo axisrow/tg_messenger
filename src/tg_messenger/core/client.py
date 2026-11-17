@@ -395,7 +395,7 @@ class StandaloneTelegramClient:
 
     async def _gate_acquire(self, operation: str) -> None:
         """Apply messenger's send opt-out; pacing belongs to the shared package."""
-        category = TelegramRateLimitGate.category_for(operation)
+        category = self._gate.category_for(operation)
         if category == "send" and not self._send_bucket.enabled:
             return  # explicit TG_SEND_RATE=0 opts the whole send category out (#25)
         await self._gate.acquire(self._session_name, category, sleep=self._sleep)
