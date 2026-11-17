@@ -35,9 +35,10 @@ dependencies = [
     # flood-wait handling + proactive rate-limit gate shared with tg_content_factory (#252);
     # >=0.1.4: retry budget counts the real sleep (wait+buffer) — the contract
     # tests/test_flood.py pins (0.1.3 was never published to PyPI).
-    # <0.1.6: 0.1.6+ changed TelegramRateLimitGate.category_for() to require `operation`,
-    # breaking ~60 gate tests (PR #324 CI) — migrate the tests before bumping.
-    "telethon-floodgate>=0.1.4,<0.1.6",
+    # >=0.1.6: category_for() became an instance method taking `operation`
+    # (0.1.5 shipped it as a staticmethod); messenger resolves categories via
+    # the gate instance, matching both.
+    "telethon-floodgate>=0.1.6,<0.2",
     "pydantic>=2",
     "click>=8.1",
     # chat REPL redraw-safe prompt (#215): background echoes redraw above the
