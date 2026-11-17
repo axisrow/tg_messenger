@@ -8,6 +8,7 @@ httpx живёт ТОЛЬКО в interop/ — тесты мокают HTTP че�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import httpx
 import pytest
@@ -765,15 +766,16 @@ async def test_worker_run_exits_on_4xx_but_survives_transport_errors(caplog):
 
     async def _sleep(s):
         sleeps.append(s)
+        await asyncio.sleep(0)  # a real suspension point so run_task.cancel() can land
 
     worker = _make_worker(TransportFailFactory(), StubCoreClient())
     worker._sleep = _sleep
     with caplog.at_level(_logging.ERROR, logger="tg_messenger.interop.worker"):
         run_task = asyncio.create_task(worker.run())
-        await asyncio.sleep(0)
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await asyncio.sleep(0)  # one full idle cycle: claim failed → _sleep ran
         run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
 
     assert len(sleeps) >= 1  # loop survived and idled instead of dying
 

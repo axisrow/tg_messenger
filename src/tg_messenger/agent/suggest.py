@@ -15,6 +15,7 @@ pass on demand keeps it flood-safe.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 
 from pydantic import BaseModel
@@ -266,12 +267,12 @@ def suggester_disabled_reason(*, env=None) -> str | None:
     the CLI wiring (for a loud startup log) and the UIs (to show the user WHY the 💡
     draft feature is silent). Distinguishes the two real cases — the [agent] extra
     missing vs ``TG_AGENT_MODEL`` unset/malformed — so the message is actionable,
-    not a blank "no hint ever appears". The LLM stack is imported LAZILY here so this
-    module stays import-light on a bare ``[dev]`` install.
+    not a blank "no hint ever appears". The [agent] extra's presence is probed via
+    ``find_spec`` (deepagents is the extra's canary package): importing the real
+    LLM stack here would pull langchain/deepagents and block the event loop for
+    many seconds on the TUI startup path (#144 diagnostics must stay cheap).
     """
-    try:
-        import tg_messenger.agent.factory  # noqa: F401  (presence of the [agent] extra)
-    except ImportError:
+    if importlib.util.find_spec("deepagents") is None:
         return 'the [agent] extra is not installed — pip install "tg-messenger[agent]"'
     from tg_messenger.agent.config import AgentConfig
 
