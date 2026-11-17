@@ -429,15 +429,31 @@
       es.onerror = () => setSseStatus('Reconnecting…');
       es.onmessage = (ev) => {
         setSseStatus('');  // frames are flowing again — drop any reconnecting hint
+        let data;
+        // a malformed frame (proxy garbage, partial write) must not abort the handler —
+        // same guard the /stream/unread reader has
+        try { data = JSON.parse(ev.data); } catch (err) { return; }
         const messagesEl = document.getElementById('messages');
         const wasAtBottom = isAtBottom(messagesEl);
-        const data = JSON.parse(ev.data);
         const div = document.createElement('div');
         if (data.type === 'reaction') {
           // #106: attach under the reacted message (other people's reactions included), not a
           // bubble. `id` is THIS stream's dialog — pass it so a frame can't land under a same-id
           // bubble of a previously-open dialog still lingering in the DOM (#95/#96 race).
           attachReaction(id, data.message_id, data.emoticon);
+          return;
+        }
+        if (data.type === 'deleted') {
+          // #323 slice 2: a deletion removes its bubble(s) live — no reload, no polling.
+          // Match BOTH data-dialog AND data-id (message ids collide across dialogs, the
+          // same #95/#96 guard as translations); the server already scoped the frame to
+          // this stream's dialog (chat_id rule from the issue).
+          (data.message_ids || []).forEach((mid) => {
+            document.querySelectorAll(
+              '.msg[data-dialog="' + CSS.escape(String(id)) + '"]' +
+              '[data-id="' + CSS.escape(String(mid)) + '"]'
+            ).forEach((b) => b.remove());
+          });
           return;
         }
         if (data.type === 'translation') {
