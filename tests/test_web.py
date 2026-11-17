@@ -1220,22 +1220,26 @@ async def test_stream_deleted_without_chat_id_applies_to_dm():
 async def test_stream_deleted_without_chat_id_skipped_for_channel():
     # An unnamed deletion can never concern a channel/megagroup (their ids are
     # per-channel): no deleted frame. Proven by a following incoming message of the
-    # SAME dialog arriving as the FIRST frame.
+    # SAME dialog arriving as the FIRST frame. The dialog id must be a real
+    # channel-class marked id (<= -(10**12)): a toy id like -100200 is NOT
+    # channel-classified, the skip never fires, and the assertion would hang on a
+    # frame-delivery scheduling race (seen as a KeyError under pytest-xdist).
     import asyncio
     import json
 
     from tg_messenger.web.app import sse_event_stream
 
+    channel_dialog_id = -(10**12 + 200)
     stub = WebStubClient()
-    gen = sse_event_stream(stub, dialog_id=-100200)
+    gen = sse_event_stream(stub, dialog_id=channel_dialog_id)
     task = asyncio.create_task(gen.__anext__())
     while stub.bus_deleted.subscriber_count == 0:
         await asyncio.sleep(0)
 
     stub.bus_deleted.publish(MessagesDeletedEvent(chat_id=None, message_ids=[50]))
-    msg = Message(id=51, dialog_id=-100200, sender_id=9, out=False, text="still here",
-                  date=datetime(2024, 1, 1, tzinfo=timezone.utc))
-    stub.bus.publish(IncomingEvent(dialog_id=-100200, message=msg))
+    msg = Message(id=51, dialog_id=channel_dialog_id, sender_id=9, out=False,
+                  text="still here", date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus.publish(IncomingEvent(dialog_id=channel_dialog_id, message=msg))
 
     frame = await asyncio.wait_for(task, timeout=2)
     payload = json.loads(frame.removeprefix("data: ").strip())
