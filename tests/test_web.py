@@ -8,7 +8,7 @@ from telethon.sessions import StringSession
 
 from tg_messenger.agent.outbound import get_dialog_lang, is_outbound_enabled
 from tg_messenger.core.events import EventBus
-from tg_messenger.core.models import Dialog, IncomingEvent, Message, ReactionEvent, User
+from tg_messenger.core.models import Dialog, IncomingEvent, Message, MessagesDeletedEvent, ReactionEvent, User
 from tg_messenger.web import app as web_app
 from tg_messenger.web.app import _error_response, build_app
 
@@ -18,6 +18,7 @@ class WebStubClient:
         self.bus = EventBus()
         self.bus_out = EventBus()  # own messages from another device (listen_outgoing)
         self.bus_reactions = EventBus()
+        self.bus_deleted = EventBus()  # deletions (#323 slice 2)
         self.sent = []
         self.reactions = []
         self.searched = []
@@ -97,6 +98,10 @@ class WebStubClient:
 
     async def listen_reactions(self):
         async for ev in self.bus_reactions.subscribe():
+            yield ev
+
+    async def listen_deleted(self):
+        async for ev in self.bus_deleted.subscribe():
             yield ev
 
 
@@ -1165,6 +1170,100 @@ async def test_stream_yields_reaction_frame():
     frame = await asyncio.wait_for(task, timeout=2)
     payload = json.loads(frame.removeprefix("data: ").strip())
     assert payload == {"type": "reaction", "message_id": 51, "emoticon": None}
+    await gen.aclose()
+
+
+async def test_stream_yields_deleted_frame_for_named_chat():
+    # #323 slice 2: a deletion that names its chat (channels/supergroups) reaches the
+    # stream only when it names THIS dialog — one frame with the ids, no polling.
+    import asyncio
+    import json
+
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+    gen = sse_event_stream(stub, dialog_id=-100200)
+    task = asyncio.create_task(gen.__anext__())
+    while stub.bus_deleted.subscriber_count == 0:
+        await asyncio.sleep(0)
+
+    stub.bus_deleted.publish(MessagesDeletedEvent(chat_id=-100200, message_ids=[11, 12]))
+
+    frame = await asyncio.wait_for(task, timeout=2)
+    payload = json.loads(frame.removeprefix("data: ").strip())
+    assert payload == {"type": "deleted", "message_ids": [11, 12]}
+    await gen.aclose()
+
+
+async def test_stream_deleted_without_chat_id_applies_to_dm():
+    # chat_id=None (DMs/basic groups, account-global ids): the event applies to an
+    # open DM — the same scope rule as watch._match / store.apply_deletion.
+    import asyncio
+    import json
+
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+    gen = sse_event_stream(stub, dialog_id=7)
+    task = asyncio.create_task(gen.__anext__())
+    while stub.bus_deleted.subscriber_count == 0:
+        await asyncio.sleep(0)
+
+    stub.bus_deleted.publish(MessagesDeletedEvent(chat_id=None, message_ids=[50]))
+
+    frame = await asyncio.wait_for(task, timeout=2)
+    payload = json.loads(frame.removeprefix("data: ").strip())
+    assert payload == {"type": "deleted", "message_ids": [50]}
+    await gen.aclose()
+
+
+async def test_stream_deleted_without_chat_id_skipped_for_channel():
+    # An unnamed deletion can never concern a channel/megagroup (their ids are
+    # per-channel): no deleted frame. Proven by a following incoming message of the
+    # SAME dialog arriving as the FIRST frame.
+    import asyncio
+    import json
+
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+    gen = sse_event_stream(stub, dialog_id=-100200)
+    task = asyncio.create_task(gen.__anext__())
+    while stub.bus_deleted.subscriber_count == 0:
+        await asyncio.sleep(0)
+
+    stub.bus_deleted.publish(MessagesDeletedEvent(chat_id=None, message_ids=[50]))
+    msg = Message(id=51, dialog_id=-100200, sender_id=9, out=False, text="still here",
+                  date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus.publish(IncomingEvent(dialog_id=-100200, message=msg))
+
+    frame = await asyncio.wait_for(task, timeout=2)
+    payload = json.loads(frame.removeprefix("data: ").strip())
+    assert payload["id"] == 51  # the deleted event produced no frame before it
+    await gen.aclose()
+
+
+async def test_stream_deleted_for_other_named_chat_skipped():
+    # A deletion naming a DIFFERENT chat never reaches this dialog's stream.
+    import asyncio
+    import json
+
+    from tg_messenger.web.app import sse_event_stream
+
+    stub = WebStubClient()
+    gen = sse_event_stream(stub, dialog_id=7)
+    task = asyncio.create_task(gen.__anext__())
+    while stub.bus_deleted.subscriber_count == 0:
+        await asyncio.sleep(0)
+
+    stub.bus_deleted.publish(MessagesDeletedEvent(chat_id=-100200, message_ids=[50]))
+    msg = Message(id=52, dialog_id=7, sender_id=7, out=False, text="unrelated",
+                  date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus.publish(IncomingEvent(dialog_id=7, message=msg))
+
+    frame = await asyncio.wait_for(task, timeout=2)
+    payload = json.loads(frame.removeprefix("data: ").strip())
+    assert payload["id"] == 52
     await gen.aclose()
 
 

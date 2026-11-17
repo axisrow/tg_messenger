@@ -37,7 +37,7 @@ from tg_messenger.core.auth import (
     LoginSession,
     session_store_from_env,
 )
-from tg_messenger.core.client import SendForbiddenError
+from tg_messenger.core.client import SendForbiddenError, is_channel_or_megagroup_id
 from tg_messenger.core.flood import HandledFloodWaitError
 from tg_messenger.core.search import filter_dialogs
 from tg_messenger.core.ui_strings import READ_ONLY_MESSAGE
@@ -179,11 +179,11 @@ async def sse_event_stream(
 ):
     """Yield SSE frames for one dialog: incoming messages AND our own (out) messages.
 
-    Merges listen_all() (incoming, groups too) and listen_outgoing() (our messages
-    from any device) into one stream via a shared queue. Outgoing echoes of messages
-    this server already sent (their ids in ``sent_ids``) are skipped — the POST that
-    sent them already returned the bubble. Reaction echoes work the same way through
-    ``sent_reactions``.
+    Merges listen_all() (incoming, groups too), listen_outgoing() (our messages
+    from any device), listen_reactions() and listen_deleted() (#323 slice 2) into
+    one stream via a shared queue. Outgoing echoes of messages this server already
+    sent (their ids in ``sent_ids``) are skipped — the POST that sent them already
+    returned the bubble. Reaction echoes work the same way through ``sent_reactions``.
     """
     sent_ids = sent_ids if sent_ids is not None else OrderedDict()
     sent_reactions = sent_reactions if sent_reactions is not None else OrderedDict()
@@ -199,6 +199,7 @@ async def sse_event_stream(
         "incoming": client.listen_all().__aiter__(),
         "outgoing": client.listen_outgoing().__aiter__(),
         "reaction": client.listen_reactions().__aiter__(),
+        "deleted": client.listen_deleted().__aiter__(),
     }
     # one pending __anext__ task per still-open stream
     pending = {
@@ -247,6 +248,23 @@ async def sse_event_stream(
                     return  # close the SSE stream; browser EventSource will reconnect
                 # queue the next pull from this stream right away
                 pending[asyncio.create_task(iterators[kind].__anext__())] = kind
+                if kind == "deleted":
+                    # #323 slice 2: Telegram names the chat only for channels/supergroups;
+                    # for DMs and basic groups it sends chat_id=None with account-global ids.
+                    # Same scope rule as watch._match / store.apply_deletion: an unnamed
+                    # event applies to this stream only when the open dialog is NOT a
+                    # channel/megagroup — those ids are per-channel, so an unnamed match
+                    # there could only be a coincidence, never the deleted message.
+                    if not ev.message_ids:
+                        continue
+                    if ev.chat_id is not None:
+                        if ev.chat_id != dialog_id:
+                            continue
+                    elif is_channel_or_megagroup_id(dialog_id):
+                        continue
+                    payload = {"type": "deleted", "message_ids": ev.message_ids}
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    continue
                 if ev.dialog_id != dialog_id:
                     continue
                 if kind == "reaction":

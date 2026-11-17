@@ -101,7 +101,15 @@ const document_ = {
     return null;
   },
   querySelectorAll: (sel) => {
-    if (!sel || !sel.startsWith('#messages .msg[data-id]')) return [];
+    if (!sel) return [];
+    // The deletion handler's per-id bubble selector (#323 slice 2):
+    // '.msg[data-dialog="D"][data-id="M"]'
+    const dm = /^\.msg\[data-dialog="([^"]*)"\]\[data-id="([^"]*)"\]$/.exec(sel);
+    if (dm) {
+      return messageBubbles.filter(
+        (b) => String(b.dataset.dialog) === dm[1] && String(b.dataset.id) === dm[2]);
+    }
+    if (!sel.startsWith('#messages .msg[data-id]')) return [];
     // markDialogRead scopes to a specific dialog: '#messages .msg[data-id][data-dialog="<id>"]'
     const m = /\[data-dialog="([^"]*)"\]/.exec(sel);
     if (m) return messageBubbles.filter((b) => String(b.dataset.dialog) === m[1]);
@@ -672,6 +680,37 @@ await (async () => {
 
   dialogLis.clear();
   el('dialog_id').value = '';
+}
+
+// ---- #323 slice 2: deletions remove their bubbles live (no polling) ----------
+{
+  // Open dialog 7 through the REAL openDialog path, then drive the stream's actual
+  // onmessage handler with a deleted frame. Model bubbles of the open dialog, plus a
+  // foreign-dialog bubble whose id COLLIDES with a deleted one (Telegram ids are not
+  // unique across dialogs — the #95/#96 guard) and an id outside the deletion set.
+  sandbox.openDialog({ dataset: { dialog: '7', canSend: '1' } });
+  el('dialog_id').value = '7';
+  messageBubbles = [
+    { dataset: { id: '5', dialog: '7' }, removed: false, remove() { this.removed = true; } },
+    { dataset: { id: '6', dialog: '7' }, removed: false, remove() { this.removed = true; } },
+    { dataset: { id: '7', dialog: '7' }, removed: false, remove() { this.removed = true; } },
+    { dataset: { id: '5', dialog: '8' }, removed: false, remove() { this.removed = true; } },
+  ];
+  const stream = eventSources.find((s) => s.url.startsWith('/stream/7'));
+  check('#323 s2: opening a dialog opened its per-dialog stream', !!stream);
+  check('#323 s2: the stream has a message handler wired', typeof stream.onmessage === 'function');
+
+  stream.onmessage({ data: JSON.stringify({ type: 'deleted', message_ids: [5, 6] }) });
+  check('#323 s2: deleted bubbles are removed immediately',
+        messageBubbles[0].removed && messageBubbles[1].removed);
+  check('#323 s2: a live bubble outside the deletion set stays', !messageBubbles[2].removed);
+  check('#323 s2: a colliding id of ANOTHER dialog is not removed', !messageBubbles[3].removed);
+
+  // Missing ids / malformed frames are a no-op, not a crash.
+  stream.onmessage({ data: JSON.stringify({ type: 'deleted' }) });
+  stream.onmessage({ data: 'not json' });
+  check('#323 s2: a frame without ids and a malformed frame are no-ops',
+        !messageBubbles[2].removed && !messageBubbles[3].removed);
 }
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);
