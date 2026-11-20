@@ -14,14 +14,14 @@ from tg_messenger.core.client import is_channel_or_megagroup_id
 
 
 async def _dialog_arg(client, value: str) -> int:
-    """Numeric dialog id passes through; ``@username`` resolves with one cheap RPC (#268).
+    """Numeric dialog id passes through; ``@username``/``+phone`` resolve with one cheap RPC (#268).
 
     Each CLI invocation is a fresh cold process: a bare numeric id would make
     Telethon page the whole dialog list, while the resolve also warms this
     process's entity cache for the follow-up calls. Negative ids need ``--``
     before them (click would read the minus as a flag).
     """
-    if value.startswith("@"):
+    if value.startswith("@") or value.startswith("+"):
         return (await client.resolve_username(value)).id
     return _numeric_dialog_id(value)
 
