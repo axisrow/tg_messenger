@@ -47,9 +47,16 @@ Function hooks are early access — until that changes, the installing user need
 
 ## Transport
 
-The pane drives the project's own CLI (`tg-messenger`) — no HTTP, no secrets:
+The pane drives the project's own CLI (`tg-messenger`) — no secrets:
 
-- **history** — `--profile P read --limit 50 -- <id>` on pane open;
+- **history** — on pane open the stored window paints first
+  (`--profile P read --cached --no-translate --limit 50 -- <id>`: no
+  connection, ~1 s), then `--profile P read --limit 50 --no-translate -- <id>`
+  replaces it from the network (#332);
+- **warm daemon** — one `--profile P serve` per profile on a localhost port;
+  once it answers `/api/health`, history and sends ride its HTTP API (one RPC
+  on a live connection). The poll re-probes it, adopts a late or sibling
+  session's daemon and respawns a dead one (at most 3 spawns, #332);
 - **live** — one long-running `--profile P listen --ids --out` child (incoming
   DMs + own messages from other devices), reconnected with backoff;
 - **send** — `--profile P send -- <id> <text>`, media via
@@ -61,8 +68,10 @@ text starting with `-` is a Click option otherwise (#293). A send whose stdout
 carries no `sent.` confirmation line is treated as a failure — never a silent
 message loss.
 
-`tg-messenger` must be installed and logged in for the configured profile
-(`tg-messenger login --profile P`). Without a full config the pane degrades to
+`tg-messenger` must be installed — a version with `read --no-translate` and
+`read --cached` (#332), an older CLI fails the history read — and logged in
+for the configured profile (`tg-messenger login --profile P`). Without a full
+config the pane degrades to
 a local-only scratchpad with a one-line toast. The transport lives in
 `hooks/register.tsx` (the engine follows `$` only within the file that
 declares it); every call is one child process over an argv array.
