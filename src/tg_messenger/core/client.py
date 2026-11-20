@@ -68,6 +68,8 @@ DEFAULT_DIALOGS_TTL_SEC = 30.0
 DEFAULT_HISTORY_TTL_SEC = 15.0
 _DIALOGS_CACHE_KEY = "all"  # non-archived full mapped list, dm_only filters from it
 _ARCHIVED_DIALOGS_CACHE_KEY = "archived"
+# #332: _warm_entity's first try — the lazy-loaded page every UI lists (#270)
+_WARM_DIALOGS_PAGE = 100
 _CHANNEL_ID_THRESHOLD = -1_000_000_000_000
 
 
@@ -611,13 +613,27 @@ class StandaloneTelegramClient:
         entity map, then resolution retries. This makes the documented contract
         (``Dialog.id`` accepted by history/send) true for the CLI's
         one-process-per-command pattern. Free when the cache is already warm.
+
+        One page of the most recent dialogs comes first (#332): it resolves every
+        id the UIs' lazy-loaded lists offer with ONE GetDialogs, where the full
+        crawl pages thousands of dialogs on a big account (and floods). The full
+        TTL-cached crawl stays the fallback for an older dialog.
         """
         pid = int(peer)
         try:
             await self._client.get_input_entity(pid)
+            return
         except ValueError:
-            await self.dialogs()
+            pass  # cold entity map — warm it below, the last miss raises
+        await self.dialogs(limit=_WARM_DIALOGS_PAGE)
+        try:
             await self._client.get_input_entity(pid)
+            return
+        except ValueError:
+            logger.info("peer %s is not in the %d most recent dialogs — full dialog crawl",
+                        pid, _WARM_DIALOGS_PAGE)
+        await self.dialogs()
+        await self._client.get_input_entity(pid)
 
     async def _fetch_history(self, peer, limit, offset_id) -> list[Message]:
         raw = await run_with_flood_wait_retry(
