@@ -4695,6 +4695,44 @@ async def test_collect_burst_other_chat_never_wakes():
     assert burst is None
 
 
+async def test_collect_burst_without_filter_scopes_to_first_matched_chat():
+    from tg_messenger.cli.commands.watch import _collect_burst
+
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait(_wait_event(7, 10))
+    queue.put_nowait(_wait_event(9, 99))  # another chat mid-burst: must NOT join it
+    queue.put_nowait(_wait_event(7, 11))
+    burst = await asyncio.wait_for(
+        _collect_burst(queue, None, settle_s=0.05, timeout_s=5), timeout=5)
+    assert burst is not None
+    # one record describes one chat — ids are per-chat, a mixed burst would
+    # make history_since(chat_id, min_id=last_message_id) slice wrong (review)
+    assert [ev.message.id for ev in burst] == [10, 11]
+
+
+async def test_collect_burst_restarts_settle_window_on_each_message():
+    """Timer-driven: events span MORE than one settle window (review #330).
+
+    The events are queued at ~0.12s intervals with settle_s=0.2, so the burst
+    only completes if every arrival restarts the window — a deadline set once
+    would fire at 0.2s, strictly BEFORE the third event (0.24s), and drop it.
+    """
+    from tg_messenger.cli.commands.watch import _collect_burst
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _feed():
+        for i in range(3):
+            queue.put_nowait(_wait_event(7, 10 + i))
+            await asyncio.sleep(0.12)
+
+    burst, _ = await asyncio.gather(
+        asyncio.wait_for(_collect_burst(queue, 7, settle_s=0.2, timeout_s=5), timeout=5),
+        _feed())
+    assert burst is not None
+    assert [ev.message.id for ev in burst] == [10, 11, 12]
+
+
 def test_wait_prints_burst_json(runner):
     r, stub = runner
     stub.listen_events = [_wait_event(7, 10)]

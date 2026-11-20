@@ -63,7 +63,9 @@ async def _collect_burst(queue: asyncio.Queue, chat_id: int | None,
     ``None`` = timeout elapsed with no matching message; a list = the burst.
     A message from another chat neither matches nor resets the settle timer;
     each matching message appends and restarts the settle window, so a burst
-    of rapid messages is delivered as one event, not N wake-ups.
+    of rapid messages is delivered as one event, not N wake-ups. With no
+    ``chat_id`` filter the burst is scoped to the FIRST matched dialog — one
+    record must describe one chat (message ids are per-chat).
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
@@ -77,6 +79,8 @@ async def _collect_burst(queue: asyncio.Queue, chat_id: int | None,
             return None
         if chat_id is not None and ev.dialog_id != chat_id:
             continue
+        if chat_id is None:
+            chat_id = ev.dialog_id
         break
     events = [ev]
     settle_deadline = loop.time() + settle_s
