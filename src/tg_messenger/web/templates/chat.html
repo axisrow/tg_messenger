@@ -20,6 +20,15 @@
     /* #187: a visible focus ring so a keyboard user can see which row is selected */
     #dialogs li:focus { outline: 2px solid #2481cc; outline-offset: -2px; background: #eaf4fb; }
     .unread { background: #2481cc; color: #fff; border-radius: 10px; padding: 0 6px; font-size: 12px; }
+    /* #323 slice 3: the tab totals and the bell count hide while empty */
+    .tab-badge, #notif-count { margin-left: 6px; }
+    .tab-badge:empty, #notif-count:empty { display: none; }
+    #notif-bell { border: none; background: transparent; cursor: pointer; font-size: 15px; padding: 2px 4px; }
+    #notif-list { position: absolute; right: 0; top: 100%; min-width: 180px; max-height: 40vh;
+                  overflow-y: auto; background: #323232; color: #fff; border-radius: 6px;
+                  font-size: 13px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); z-index: 1000; }
+    .notif-row { padding: 6px 10px; border-bottom: 1px solid rgba(255,255,255,0.15); }
+    .notif-row:last-child { border-bottom: none; }
     #chat { flex: 1; min-width: 0; display: flex; flex-direction: column; }
     /* #187: a compact header strip (profile / sse-status / suggest-settings / logout) */
     #chat-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px;
@@ -96,10 +105,10 @@
     <nav id="tabs" role="tablist">
       <button class="tab active" role="tab" aria-selected="true" hx-get="/dialogs?tab=dm"
               hx-target="#dialogs ul" hx-swap="innerHTML"
-              hx-on:click="document.getElementById('dialog-search').value=''" lang="en">DM</button>
+              hx-on:click="document.getElementById('dialog-search').value=''" lang="en">DM<span id="tab-badge-dm" class="tab-badge unread"></span></button>
       <button class="tab" role="tab" aria-selected="false" hx-get="/dialogs?tab=groups"
               hx-target="#dialogs ul" hx-swap="innerHTML"
-              hx-on:click="document.getElementById('dialog-search').value=''">Groups</button>
+              hx-on:click="document.getElementById('dialog-search').value=''">Groups<span id="tab-badge-groups" class="tab-badge unread"></span></button>
     </nav>
     <input type="search" id="dialog-search" name="q" placeholder="Search conversations…"
            autocomplete="off"
@@ -116,6 +125,15 @@
             title="Active account"></span>
       <span id="sse-status" role="status" aria-live="polite"></span>
       <span class="header-spacer"></span>
+      <!-- #323 slice 3: the group-message bell — appears while unseen group notifications
+           exist; a click opens the list and acknowledges the count. The wrap stays visible
+           while the dropdown is open (hiding it would hide the open list too) — applyBell
+           toggles only the button. -->
+      <span id="notif-wrap" style="position:relative">
+        <button type="button" id="notif-bell" aria-label="Notifications" aria-expanded="false"
+                style="display:none" lang="en">🔔<span id="notif-count" class="unread"></span></button>
+        <div id="notif-list" style="display:none" aria-live="polite"></div>
+      </span>
       <button type="button" id="suggest-settings-btn" title="Suggester settings"
               aria-expanded="false" lang="en">⚙ Suggest</button>
       <a id="logout-link" href="/logout" style="display:none" lang="en">Logout</a>
@@ -191,6 +209,99 @@
     // the OPEN chat doesn't (it's on screen and /read clears it — markDialogRead). A row not
     // in the current list DOM (other tab / filtered by search) is skipped — the next /dialogs
     // fetch (tab switch / search) re-renders it from the server count, re-syncing any drift.
+    // #323 slice 3: the same frames also bump the DM/Groups tab totals and ring the bell
+    // for group messages (kind === 'group'; channels/bots only badge — the issue asks for
+    // groups). Totals use the same drift model as the row badges: seeded from
+    // /api/unread-totals on load, arithmetic in between, re-synced from the visible rows
+    // whenever a /dialogs fetch re-renders the list.
+    const tabTotals = { dm: 0, groups: 0 };
+    function applyTabTotals() {
+      const dm = document.getElementById('tab-badge-dm');
+      const groups = document.getElementById('tab-badge-groups');
+      if (dm) dm.textContent = tabTotals.dm > 0 ? String(tabTotals.dm) : '';
+      if (groups) groups.textContent = tabTotals.groups > 0 ? String(tabTotals.groups) : '';
+    }
+    async function syncTabTotals() {
+      try {
+        const resp = await fetch('/api/unread-totals', { headers: { 'X-TG-Messenger-CSRF': '1' } });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        tabTotals.dm = data.dm || 0;
+        tabTotals.groups = data.groups || 0;
+        applyTabTotals();
+      } catch (err) { /* best-effort — badges stay as-is until the next sync */ }
+    }
+    syncTabTotals();
+    // Row badges re-render from the server on every /dialogs fetch (tab switch / search);
+    // the visible tab's total re-syncs from them the same way.
+    function recountVisibleTabTotal() {
+      const tab = document.getElementById('current-tab').value === 'groups' ? 'groups' : 'dm';
+      let sum = 0;
+      document.querySelectorAll('#dialogs li .unread')
+        .forEach((b) => { sum += parseInt(b.textContent, 10) || 0; });
+      tabTotals[tab] = sum;
+      applyTabTotals();
+    }
+    document.body.addEventListener('htmx:afterSettle', (evt) => {
+      const path = evt.detail && evt.detail.pathInfo && evt.detail.pathInfo.requestPath;
+      if (path && /^\/dialogs(?:\?|$)/.test(path)) recountVisibleTabTotal();
+    });
+    // #323 slice 3: the bell — count of unseen group messages; the dropdown lists one row
+    // per group with its count. Opening the list acknowledges the count.
+    let bellCount = 0;
+    const notifEntries = new Map();  // dialog_id(str) -> { title, count }
+    function renderNotifList() {
+      const list = document.getElementById('notif-list');
+      if (!list) return;
+      list.textContent = '';
+      for (const entry of notifEntries.values()) {
+        const row = document.createElement('div');
+        row.className = 'notif-row';
+        row.textContent = entry.title + (entry.count > 1 ? ' ×' + entry.count : '');
+        list.appendChild(row);
+      }
+    }
+    function applyBell() {
+      const bell = document.getElementById('notif-bell');
+      const count = document.getElementById('notif-count');
+      if (!bell || !count) return;
+      count.textContent = bellCount > 0 ? String(bellCount) : '';
+      // the BUTTON hides, never the wrap — the wrap anchors the open dropdown
+      bell.style.display = bellCount > 0 ? 'inline-block' : 'none';
+    }
+    function bumpBell(dialogId, title) {
+      bellCount++;
+      const entry = notifEntries.get(dialogId) || { title: 'Unknown chat', count: 0 };
+      entry.count++;
+      if (title) entry.title = title;
+      notifEntries.set(dialogId, entry);
+      renderNotifList();
+      applyBell();
+    }
+    (function wireBell() {
+      const bell = document.getElementById('notif-bell');
+      const list = document.getElementById('notif-list');
+      if (!bell || !list) return;
+      bell.addEventListener('click', () => {
+        if (list.style.display === 'block') {
+          list.style.display = 'none';
+          bell.setAttribute('aria-expanded', 'false');
+          return;
+        }
+        bellCount = 0;  // opening the list acknowledges the notifications
+        applyBell();
+        renderNotifList();
+        list.style.display = 'block';
+        bell.setAttribute('aria-expanded', 'true');
+      });
+      // a click anywhere outside the bell closes the dropdown
+      document.body.addEventListener('click', (e) => {
+        if (list.style.display !== 'block') return;
+        if (e.target && e.target.closest && e.target.closest('#notif-wrap')) return;
+        list.style.display = 'none';
+        bell.setAttribute('aria-expanded', 'false');
+      });
+    })();
     (function wireUnreadStream() {
       const source = new EventSource('/stream/unread');
       source.onmessage = (ev) => {
@@ -198,16 +309,22 @@
         try { data = JSON.parse(ev.data); } catch (err) { return; }
         if (!data || data.type !== 'unread') return;
         if (String(data.dialog_id) === document.getElementById('dialog_id').value) return;
+        // slice 3: bucket the badge into its tab total; group messages ring the bell
+        const bucket = data.kind === 'dm' ? 'dm' : (data.kind ? 'groups' : null);
+        if (bucket) tabTotals[bucket]++;
+        if (data.kind === 'group') bumpBell(String(data.dialog_id), data.title);
         const li = document.querySelector(
           '#dialogs li[data-dialog="' + CSS.escape(String(data.dialog_id)) + '"]');
-        if (!li) return;
-        let badge = li.querySelector('.unread');
-        if (!badge) {
-          badge = document.createElement('span');
-          badge.className = 'unread';
-          li.appendChild(badge);
+        if (li) {
+          let badge = li.querySelector('.unread');
+          if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'unread';
+            li.appendChild(badge);
+          }
+          badge.textContent = String((parseInt(badge.textContent, 10) || 0) + 1);
         }
-        badge.textContent = String((parseInt(badge.textContent, 10) || 0) + 1);
+        applyTabTotals();
       };
     })();
     function clearComposerError() {
@@ -229,7 +346,13 @@
       const li = document.querySelector('#dialogs li[data-dialog="' + CSS.escape(String(dialogId)) + '"]');
       if (!li) return;
       const badge = li.querySelector('.unread');
-      if (badge) badge.remove();
+      if (!badge) return;
+      // #323 slice 3: the row is in the VISIBLE list, so it belongs to the current tab —
+      // subtract what the badge showed so the folder total follows the read.
+      const tab = document.getElementById('current-tab').value === 'groups' ? 'groups' : 'dm';
+      tabTotals[tab] = Math.max(0, tabTotals[tab] - (parseInt(badge.textContent, 10) || 0));
+      badge.remove();
+      applyTabTotals();
     }
     // #195 round 2 (critical): the server no longer marks-read on the history GET (a stale GET for
     // a dialog the user left would have marked it read unseen). Reading now follows the actual

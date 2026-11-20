@@ -317,16 +317,31 @@ async def sse_unread_stream(client):
     """Yield SSE frames that bump the dialog list's unread badges live (#323 slice 1).
 
     Reuses the existing event stream — listen_all() — so no polling: every incoming
-    message in ANY chat becomes one typed ``{"type": "unread", "dialog_id": id}`` frame.
-    The count is incremented client-side per badge and re-synced from the server-rendered
-    count on the next /dialogs fetch. The same endpoint later carries deletions and read
-    receipts as further typed frames (the multi-stream race below mirrors sse_event_stream).
+    message in ANY chat becomes one typed ``{"type": "unread", "dialog_id": id,
+    "kind": ..., "title": ...}`` frame (#323 slice 3: the client buckets the badge
+    into the DM/Groups tab totals and rings the group-message bell from these
+    fields). kind/title resolve from the cached dialog list (#8 TTL cache — no
+    network when warm); a lookup failure degrades to nulls, the row badge still
+    bumps. The count is incremented client-side per badge and re-synced from the
+    server-rendered count on the next /dialogs fetch. The same endpoint later
+    carries deletions and read receipts as further typed frames (the multi-stream
+    race below mirrors sse_event_stream).
     """
     iterators = {"incoming": client.listen_all().__aiter__()}
     pending = {
         asyncio.create_task(it.__anext__()): kind
         for kind, it in iterators.items()
     }
+
+    async def _describe(dialog_id: int) -> tuple[str | None, str | None]:
+        try:
+            dialog = await _outbound_dialog(client, dialog_id)
+        except DialogLookupError:
+            return None, None
+        if dialog is None:
+            return None, None
+        return dialog.kind, dialog.title
+
     try:
         while pending:
             done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -340,7 +355,13 @@ async def sse_unread_stream(client):
                     logger.exception("SSE unread stream failed")
                     return  # close the SSE stream; browser EventSource will reconnect
                 pending[asyncio.create_task(iterators[kind].__anext__())] = kind
-                payload = {"type": "unread", "dialog_id": ev.dialog_id}
+                dialog_kind, title = await _describe(ev.dialog_id)
+                payload = {
+                    "type": "unread",
+                    "dialog_id": ev.dialog_id,
+                    "kind": dialog_kind,
+                    "title": title,
+                }
                 yield f"data: {json.dumps(payload)}\n\n"
     finally:
         for task in pending:
@@ -1019,6 +1040,19 @@ def build_app(
             logger.warning("invalid suggester settings: %s", exc)
             return _error_response(str(exc), 400)
         return HTMLResponse(_suggest_settings_form(await suggester.get_settings()))
+
+    @app.get("/api/unread-totals")
+    async def api_unread_totals(request: Request):
+        # #323 slice 3: seed the DM/Groups tab badges with the folder totals — the live
+        # bumps arrive client-side from /stream/unread frames, this re-syncs on load.
+        # Same lists the /dialogs tabs render, same caches (network-free when warm).
+        client = request.app.state.client
+        dms = await client.dialogs()
+        groups = await client.group_dialogs()
+        return JSONResponse({
+            "dm": sum(d.unread for d in dms),
+            "groups": sum(d.unread for d in groups),
+        })
 
     @app.get("/stream/unread")
     async def unread_stream(request: Request):

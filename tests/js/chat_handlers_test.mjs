@@ -38,7 +38,7 @@ class El {
   constructor(id) {
     this.id = id;
     this.value = '';
-    this.textContent = '';
+    this._textContent = '';
     this.innerHTML = '';
     this.style = {};
     this.dataset = {};
@@ -48,6 +48,10 @@ class El {
     this._listeners = {};
     this.children = [];
   }
+  // DOM-faithful: assigning textContent replaces the children (renderNotifList relies on
+  // `list.textContent = ''` wiping previous rows between renders).
+  get textContent() { return this._textContent; }
+  set textContent(v) { this._textContent = v; if (v === '') this.children.length = 0; }
   addEventListener(type, fn) { (this._listeners[type] ||= []).push(fn); }
   removeEventListener() {}
   dispatch(type, detail) {
@@ -102,6 +106,16 @@ const document_ = {
   },
   querySelectorAll: (sel) => {
     if (!sel) return [];
+    // The tab-total recount's row-badge scan (#323 slice 3): '#dialogs li .unread'
+    const lm = /^#dialogs li \.unread$/.exec(sel);
+    if (lm) {
+      const out = [];
+      for (const li of dialogLis.values()) {
+        const b = typeof li.querySelector === 'function' ? li.querySelector('.unread') : null;
+        if (b) out.push(b);
+      }
+      return out;
+    }
     // The deletion handler's per-id bubble selector (#323 slice 2):
     // '.msg[data-dialog="D"][data-id="M"]'
     const dm = /^\.msg\[data-dialog="([^"]*)"\]\[data-id="([^"]*)"\]$/.exec(sel);
@@ -124,6 +138,9 @@ composer.querySelector = () => ({ disabled: false });
 
 // Record every fetch (so we can assert which dialogs got a /read POST).
 const fetchCalls = [];
+// Payload served for /api/unread-totals (#323 slice 3) — the test rewrites it.
+let totalsResponse = { dm: 4, groups: 2 };
+let totalsFetchCount = 0;  // survives the fetchCalls.length = 0 resets other sections do
 // Every EventSource the page opened (unread stream #323, per-dialog streams).
 const eventSources = [];
 // Fake sidebar rows for the unread-badge handler: dialog id (string) -> li mock.
@@ -145,6 +162,14 @@ const sandbox = {
   clearTimeout: () => {},
   fetch: (url, opts) => {
     fetchCalls.push({ url, body: opts && opts.body });
+    if (String(url).includes('/api/unread-totals')) {
+      totalsFetchCount++;
+      return Promise.resolve({
+        ok: true, status: 200,
+        json: () => Promise.resolve(totalsResponse),
+        text: () => Promise.resolve(''),
+      });
+    }
     return Promise.resolve({ ok: true, status: 204, text: () => Promise.resolve('') });
   },
   FormData: FakeFormData,
@@ -712,6 +737,97 @@ await (async () => {
   check('#323 s2: a frame without ids and a malformed frame are no-ops',
         !messageBubbles[2].removed && !messageBubbles[3].removed);
 }
+
+// ---- #323 slice 3: tab totals + the group-message bell ----------------------
+// Needs real microtask drains: the page fetched /api/unread-totals at script load
+// (totalsResponse = {dm:4, groups:2}, set before the sandbox ran).
+await (async () => {
+  const drain = () => new Promise((r) => setTimeout(r, 0));
+  const stream = eventSources.find((s) => s.url === '/stream/unread');
+  const dmBadge = () => el('tab-badge-dm').textContent;
+  const groupsBadge = () => el('tab-badge-groups').textContent;
+  const bell = el('notif-bell');
+  const list = el('notif-list');
+  await drain(); await drain();
+
+  check('#323 s3: the page fetched the totals endpoint at load', totalsFetchCount > 0);
+  check('#323 s3: the load seed renders both tab badges', dmBadge() === '4' && groupsBadge() === '2');
+
+  // A DM frame bumps the DM total (row 9 is not in the list DOM here — badge no-op).
+  stream.onmessage({ data: JSON.stringify({ type: 'unread', dialog_id: 9, kind: 'dm', title: 'Ann' }) });
+  check('#323 s3: a dm frame bumps the DM total', dmBadge() === '5' && groupsBadge() === '2');
+
+  // A group frame bumps the Groups total AND rings the bell.
+  stream.onmessage({ data: JSON.stringify({ type: 'unread', dialog_id: 9, kind: 'group', title: 'Devs' }) });
+  check('#323 s3: a group frame bumps the Groups total', dmBadge() === '5' && groupsBadge() === '3');
+  check('#323 s3: a group message reveals the bell', bell.style.display === 'inline-block');
+  check('#323 s3: the bell shows its count', el('notif-count').textContent === '1');
+
+  // Channels/bots badge their tab but do NOT ring the bell (the issue asks for groups).
+  stream.onmessage({ data: JSON.stringify({ type: 'unread', dialog_id: -100123, kind: 'channel', title: 'News' }) });
+  check('#323 s3: a channel frame badges its tab without ringing the bell',
+        groupsBadge() === '4' && el('notif-count').textContent === '1');
+
+  // Unknown kind (lookup degraded): no bucket, no bell.
+  stream.onmessage({ data: JSON.stringify({ type: 'unread', dialog_id: 999, kind: null, title: null }) });
+  check('#323 s3: an unknown kind skips totals and bell',
+        dmBadge() === '5' && groupsBadge() === '4' && el('notif-count').textContent === '1');
+
+  // The OPEN dialog bumps nothing (existing slice-1 guard, totals and bell included).
+  el('dialog_id').value = '9';
+  stream.onmessage({ data: JSON.stringify({ type: 'unread', dialog_id: 9, kind: 'group', title: 'Devs' }) });
+  check('#323 s3: the open dialog bumps neither badge nor bell',
+        dmBadge() === '5' && groupsBadge() === '4' && el('notif-count').textContent === '1');
+  el('dialog_id').value = '';
+
+  // Opening the bell list acknowledges the count and lists one row per group. The
+  // dropdown stays VISIBLE after the ack (hiding the wrap would hide the open list —
+  // found in the real-browser pass; only the button hides).
+  bell.dispatch('click');
+  check('#323 s3: opening the bell list acknowledges the count',
+        bell.style.display === 'none' && el('notif-count').textContent === '');
+  check('#323 s3: the dropdown lists the notifying group',
+        list.children.length === 1 && list.children[0].textContent === 'Devs');
+  check('#323 s3: the bell is marked expanded while open', bell.attrs['aria-expanded'] === 'true');
+
+  // A second click closes the dropdown.
+  bell.dispatch('click');
+  check('#323 s3: a second click closes the dropdown', list.style.display === 'none');
+
+  // Repeated group messages accumulate ×N in the dropdown.
+  stream.onmessage({ data: JSON.stringify({ type: 'unread', dialog_id: 9, kind: 'group', title: 'Devs' }) });
+  stream.onmessage({ data: JSON.stringify({ type: 'unread', dialog_id: 9, kind: 'group', title: 'Devs' }) });
+  check('#323 s3: repeated group messages accumulate ×N in the dropdown',
+        list.children[0].textContent === 'Devs ×3' && el('notif-count').textContent === '2');
+
+  // A /dialogs fetch re-renders the rows from the server; the visible tab's total
+  // re-syncs from the row badges (drift model). A non-list path must not recount.
+  const badgeA = new El('badge-12');
+  badgeA.className = 'unread';
+  badgeA.textContent = '3';
+  const liA = new El('li-12');
+  liA.querySelector = (sel) => (sel === '.unread' ? badgeA : null);
+  dialogLis.set('12', liA);
+  el('current-tab').value = 'dm';
+  el('__body').dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs?tab=dm' } });
+  check('#323 s3: a /dialogs fetch re-syncs the visible tab total from its rows', dmBadge() === '3');
+  el('__body').dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs/7/messages' } });
+  check('#323 s3: a per-dialog settle does not recount', dmBadge() === '3');
+
+  // Reading the open dialog subtracts its badge from the visible tab's total.
+  let badgeADetached = false;
+  badgeA.remove = () => { badgeADetached = true; };
+  liA.querySelector = (sel) => (sel === '.unread' && !badgeADetached ? badgeA : null);
+  el('dialog_id').value = '12';
+  messageBubbles = [{ dataset: { id: '5', dialog: '12' } }];
+  el('messages').dispatch('htmx:afterSettle', { pathInfo: { requestPath: '/dialogs/12/messages' } });
+  check('#323 s3: reading the open dialog clears its share of the tab total',
+        dmBadge() === '' && badgeADetached);
+
+  dialogLis.clear();
+  el('dialog_id').value = '';
+  messageBubbles = [];
+})();
 
 console.log(failures === 0 ? '\nALL PASSED' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

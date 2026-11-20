@@ -1017,7 +1017,9 @@ async def test_sse_substream_failure_closes_whole_stream(caplog):
 
 async def test_sse_unread_stream_yields_frame_per_incoming():
     # #323 slice 1: synthetic events on the existing bus → one typed unread frame per
-    # incoming message, any dialog (no polling, no per-dialog filter).
+    # incoming message, any dialog (no polling, no per-dialog filter). Slice 3: each
+    # frame carries the dialog kind + title resolved from the (stub) dialog list, so the
+    # client can bucket tab totals and ring the group bell.
     import asyncio
     import json
 
@@ -1039,8 +1041,31 @@ async def test_sse_unread_stream_yields_frame_per_incoming():
     first = json.loads((await asyncio.wait_for(task, timeout=2)).removeprefix("data: ").strip())
     second = json.loads(
         (await asyncio.wait_for(gen.__anext__(), timeout=2)).removeprefix("data: ").strip())
-    assert first == {"type": "unread", "dialog_id": 7}
-    assert second == {"type": "unread", "dialog_id": -100200}
+    assert first == {"type": "unread", "dialog_id": 7, "kind": "dm", "title": "Ann"}
+    assert second == {"type": "unread", "dialog_id": -100200, "kind": "group", "title": "Devs"}
+    await gen.aclose()
+
+
+async def test_sse_unread_stream_unknown_dialog_degrades_to_nulls():
+    # a dialog missing from the list (or a failed lookup) still yields its frame —
+    # kind/title null so the row badge bumps without bucketing/bell client-side.
+    import asyncio
+    import json
+
+    from tg_messenger.web.app import sse_unread_stream
+
+    stub = WebStubClient()
+    gen = sse_unread_stream(stub)
+    task = asyncio.create_task(gen.__anext__())
+    while stub.bus.subscriber_count == 0:
+        await asyncio.sleep(0)
+
+    msg = Message(id=12, dialog_id=555, sender_id=5, out=False, text="?",
+                  date=datetime(2024, 1, 1, tzinfo=timezone.utc))
+    stub.bus.publish(IncomingEvent(dialog_id=555, message=msg))
+    frame = json.loads(
+        (await asyncio.wait_for(task, timeout=2)).removeprefix("data: ").strip())
+    assert frame == {"type": "unread", "dialog_id": 555, "kind": None, "title": None}
     await gen.aclose()
 
 
@@ -1069,6 +1094,16 @@ def test_unread_stream_route_registered():
 
     app = build_app(client=WebStubClient())
     assert "/stream/unread" in {getattr(r, "path", None) for r in app.routes}
+    assert "/api/unread-totals" in {getattr(r, "path", None) for r in app.routes}
+
+
+async def test_api_unread_totals_sums_per_tab(client_app):
+    # #323 slice 3: folder totals for the tab badges — the stub has Ann (unread=1) as
+    # the only DM and three unread=0 non-DM dialogs.
+    ac, _stub = client_app
+    r = await ac.get("/api/unread-totals")
+    assert r.status_code == 200
+    assert r.json() == {"dm": 1, "groups": 0}
 
 
 async def test_stream_yields_sse_frame():
