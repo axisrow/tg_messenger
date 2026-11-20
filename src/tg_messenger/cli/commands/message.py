@@ -111,8 +111,10 @@ def search(dialog_id: str, query: str, limit: int, session: str) -> None:
 @click.option("--limit", default=50)
 @click.option("--download", "download_dir", default=None,
               help="Download media of each message into this directory.")
+@click.option("--no-translate", "no_translate", is_flag=True,
+              help="Skip inbound translation: no LLM stack load, plain lines only.")
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
-def read(dialog_id: str, limit: int, download_dir: str | None, session: str) -> None:
+def read(dialog_id: str, limit: int, download_dir: str | None, no_translate: bool, session: str) -> None:
     """Print the message history of a dialog (and optionally download media).
 
     Get DIALOG_ID from `tg-messenger dialogs`, or pass an @username. Each printed
@@ -122,7 +124,9 @@ def read(dialog_id: str, limit: int, download_dir: str | None, session: str) -> 
     async def _do(client):
         peer = await _dialog_arg(client, dialog_id)
         store, storage = cli_main.make_message_store(client, session=session)
-        translator = cli_main.make_optional_translator(storage)
+        # #332: building the translator imports the whole LLM stack (~4 s per
+        # cold process) — the /tg pane's cold read never shows translations
+        translator = None if no_translate else cli_main.make_optional_translator(storage)
         if download_dir:
             os.makedirs(download_dir, exist_ok=True)
         try:
@@ -133,7 +137,10 @@ def read(dialog_id: str, limit: int, download_dir: str | None, session: str) -> 
                 return
             messages = await cli_main._maybe_translate_history(translator, peer, messages)
             for m in messages:
-                cli_main._print_message_with_translation(m)
+                if no_translate:  # plain, like the warm path — no stored translations either
+                    click.echo(cli_main.message_line(m))
+                else:
+                    cli_main._print_message_with_translation(m)
                 if download_dir and m.media is not None and m.media.downloadable:
                     dest = os.path.join(download_dir, f"{peer}_{m.id}")
                     saved = await client.download_message_media(peer, m.id, dest)

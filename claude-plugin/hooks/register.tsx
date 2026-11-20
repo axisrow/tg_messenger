@@ -361,12 +361,15 @@ async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
     )
     return
   }
+  // --no-translate (#332): no LLM-stack import in the cold child (~4 s), and
+  // the same plain lines the warm path shows
   const { stdout, stderr } = await runCli($, [
     '--profile',
     cfg.profile,
     'read',
     '--limit',
     '50',
+    '--no-translate',
     '--',
     peerRef(cfg),
   ])
