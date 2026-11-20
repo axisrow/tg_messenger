@@ -5,6 +5,7 @@ them. Registered onto the root ``cli`` group from main.py via the ``COMMANDS`` l
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import click
@@ -53,6 +54,137 @@ def listen(ctx: click.Context, session: str, ids: bool, out: bool) -> None:
             await client.disconnect()
 
     cli_main._run_interruptible(_do(), session=session)
+
+
+async def _collect_burst(queue: asyncio.Queue, chat_id: int | None,
+                         settle_s: float, timeout_s: float) -> list | None:
+    """Collect ONE settled burst of matching events from ``queue`` (#329).
+
+    ``None`` = timeout elapsed with no matching message; a list = the burst.
+    A message from another chat neither matches nor resets the settle timer;
+    each matching message appends and restarts the settle window, so a burst
+    of rapid messages is delivered as one event, not N wake-ups.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while True:  # first matching message, bounded by the overall deadline
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return None
+        try:
+            ev = await asyncio.wait_for(queue.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return None
+        if chat_id is not None and ev.dialog_id != chat_id:
+            continue
+        break
+    events = [ev]
+    settle_deadline = loop.time() + settle_s
+    while True:
+        remaining = settle_deadline - loop.time()
+        if remaining <= 0:
+            return events
+        try:
+            ev = await asyncio.wait_for(queue.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return events
+        if chat_id is not None and ev.dialog_id != chat_id:
+            continue
+        events.append(ev)
+        settle_deadline = loop.time() + settle_s
+
+
+@click.command()
+@click.option("--chat", "chat", default="any", show_default=True,
+              help="Wait on one DM dialog: numeric id, @username or +phone "
+                   "(get ids from `tg-messenger dialogs`); 'any' wakes on every "
+                   "incoming DM.")
+@click.option("--settle-ms", type=int, default=6000, show_default=True,
+              help="After the first matching message keep collecting; every new "
+                   "message restarts this timer, so a rapid burst arrives as ONE event.")
+@click.option("--timeout", type=float, default=60, show_default=True,
+              help="Give up after this many seconds without a matching message "
+                   "(exit code 4, JSON {\"event\": false, \"reason\": \"timeout\"}).")
+@click.option("--json", "as_json", is_flag=True, help="Print one machine-readable JSON record.")
+@click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
+@click.pass_context
+def wait(ctx: click.Context, chat: str, settle_ms: int, timeout: float,
+         as_json: bool, session: str) -> None:
+    """Block until an incoming message arrives (bounded long-poll, #329).
+
+    On event prints the burst (plain text like `listen`, or one JSON record with
+    chat_id/name/message_count/first_message_id/last_message_id/texts). The ids
+    feed incremental reads: `tg-messenger read <chat>` or, for library callers,
+    core history_since(peer, min_id=last_message_id) — no new read path.
+    """
+    session = cli_main._effective_session(ctx, session)
+    if settle_ms < 0:
+        raise click.ClickException("--settle-ms must be >= 0")
+    if timeout <= 0:
+        raise click.ClickException("--timeout must be > 0")
+    from tg_messenger.cli.commands.message import _dialog_arg
+
+    # [record] on event, [None] on timeout; empty on Ctrl+C (_run_interruptible
+    # swallows the coro's return value, so the box carries the verdict out)
+    verdict: list = []
+
+    async def _do():
+        client = cli_main.make_client(session_name=session)
+        await client.connect()
+        try:
+            await cli_main._ensure_authorized(client, session)
+            target = None if chat == "any" else await _dialog_arg(client, chat)
+            queue: asyncio.Queue = asyncio.Queue()
+            subscribed = asyncio.Event()
+
+            async def _pump():
+                async for ev in client.listen(on_subscribed=subscribed.set):
+                    queue.put_nowait(ev)
+
+            pump = asyncio.create_task(_pump())
+            try:
+                try:
+                    await asyncio.wait_for(subscribed.wait(), timeout=timeout)
+                    burst = await _collect_burst(queue, target, settle_ms / 1000, timeout)
+                except asyncio.TimeoutError:
+                    burst = None
+            finally:
+                pump.cancel()
+                await asyncio.gather(pump, return_exceptions=True)
+            if burst is None:
+                verdict.append(None)
+                return
+            try:
+                name = await client.entity_title(burst[0].dialog_id)
+            except Exception:
+                name = None  # best-effort label; JSON keeps null, ids stay authoritative
+            verdict.append({
+                "event": True,
+                "chat_id": burst[0].dialog_id,
+                "name": name,
+                "message_count": len(burst),
+                "first_message_id": burst[0].message.id,
+                "last_message_id": burst[-1].message.id,
+                "texts": [ev.message.text or "<media>" for ev in burst],
+            })
+        finally:
+            await client.disconnect()
+
+    cli_main._run_interruptible(_do(), session=session)
+    if not verdict:  # Ctrl+C — same contract as `listen`
+        return
+    result = verdict[0]
+    if result is None:
+        if as_json:
+            click.echo(json.dumps({"event": False, "reason": "timeout"}, ensure_ascii=False))
+        else:
+            click.echo(f"timeout: no matching message in {timeout:g}s", err=True)
+        ctx.exit(4)
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False))
+    else:
+        for text in result["texts"]:
+            click.echo(f"← [{result['chat_id']}] {text}")
 
 
 @click.command()
@@ -198,4 +330,4 @@ def moderate_rules_remove(ctx: click.Context, chat_id: int, name: str, session: 
     click.echo(f"rule '{name}' removed from chat {chat_id}.")
 
 
-COMMANDS = [listen, watch, moderate, moderate_rules]
+COMMANDS = [listen, wait, watch, moderate, moderate_rules]

@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import json
 import logging
 import os
 import sys
@@ -49,6 +50,7 @@ class StubClient:
         self.dialogs_limit = None  # --limit threading (#270 lazy dialog load)
         self.group_dialogs_limit = None
         self.resolved_usernames = []  # @username refs resolved through #268's cheap path
+        self.listen_events: list | None = None  # IncomingEvent list for `wait` (#329)
 
     async def resolve_username(self, username):
         # #268: the one-RPC @username resolve; maps to the single-row dialog
@@ -70,7 +72,14 @@ class StubClient:
     async def disconnect(self):
         self.connected = False
 
-    async def listen(self):
+    async def listen(self, *, on_subscribed=None):
+        if on_subscribed is not None:
+            on_subscribed()
+        if self.listen_events is not None:  # `wait` (#329): canned burst, then idle
+            for ev in self.listen_events:
+                yield ev
+            await asyncio.Event().wait()
+            return
         yield IncomingEvent(
             dialog_id=7,
             message=Message(id=10, dialog_id=7, sender_id=7, out=False, text="ping",
@@ -4652,3 +4661,102 @@ def test_serve_passes_web_pass_from_env(serve_capture, monkeypatch):
     result = CliRunner().invoke(cli_main.cli, ["serve", "--host", "0.0.0.0"])
     assert result.exit_code == 0, result.output
     assert serve_capture["build_app"][0].get("web_pass") == "hunter2"
+
+
+# --- wait (#329): bounded long-poll with settle debounce and chat filter ---
+
+def _wait_event(dialog_id: int, msg_id: int, text: str = "ping") -> IncomingEvent:
+    return IncomingEvent(
+        dialog_id=dialog_id,
+        message=Message(id=msg_id, dialog_id=dialog_id, sender_id=dialog_id, out=False,
+                        text=text, date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+    )
+
+
+async def test_collect_burst_joins_rapid_messages_into_one_event():
+    from tg_messenger.cli.commands.watch import _collect_burst
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for i in range(3):  # three rapid messages = one settled burst (AC2)
+        queue.put_nowait(_wait_event(7, 10 + i))
+    burst = await asyncio.wait_for(
+        _collect_burst(queue, 7, settle_s=0.05, timeout_s=5), timeout=5)
+    assert burst is not None  # not a timeout — three events were queued (AC2)
+    assert [ev.message.id for ev in burst] == [10, 11, 12]
+
+
+async def test_collect_burst_other_chat_never_wakes():
+    from tg_messenger.cli.commands.watch import _collect_burst
+
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait(_wait_event(9, 1))  # someone else's chat (AC3)
+    burst = await asyncio.wait_for(
+        _collect_burst(queue, 7, settle_s=0.05, timeout_s=0.1), timeout=5)
+    assert burst is None
+
+
+def test_wait_prints_burst_json(runner):
+    r, stub = runner
+    stub.listen_events = [_wait_event(7, 10)]
+    result = r.invoke(cli_main.cli, [
+        "wait", "--chat", "7", "--settle-ms", "50", "--timeout", "5", "--json"])
+    assert result.exit_code == 0, result.output
+    record = json.loads(result.output)
+    assert record["event"] is True
+    assert record["chat_id"] == 7
+    assert record["message_count"] == 1
+    assert record["first_message_id"] == 10
+    assert record["last_message_id"] == 10
+    assert record["texts"] == ["ping"]
+
+
+def test_wait_timeout_distinguishable_exit_code(runner):
+    r, stub = runner
+    stub.listen_events = []  # subscribed, then silence
+    result = r.invoke(cli_main.cli, [
+        "wait", "--chat", "7", "--settle-ms", "50", "--timeout", "0.1", "--json"])
+    assert result.exit_code == 4
+    assert json.loads(result.output) == {"event": False, "reason": "timeout"}
+
+
+def test_wait_other_chat_traffic_does_not_wake(runner):
+    r, stub = runner
+    stub.listen_events = [_wait_event(9, 1)]  # arrives while waiting on chat 7 (AC3)
+    result = r.invoke(cli_main.cli, [
+        "wait", "--chat", "7", "--settle-ms", "50", "--timeout", "0.1", "--json"])
+    assert result.exit_code == 4
+    assert json.loads(result.output) == {"event": False, "reason": "timeout"}
+
+
+def test_wait_plain_text_output(runner):
+    r, stub = runner
+    stub.listen_events = [_wait_event(7, 10, "hi"), _wait_event(7, 11, "ho")]
+    result = r.invoke(cli_main.cli, [
+        "wait", "--chat", "7", "--settle-ms", "50", "--timeout", "5"])
+    assert result.exit_code == 0, result.output
+    assert result.output == "← [7] hi\n← [7] ho\n"
+
+
+def test_wait_resolves_chat_username_and_matches_dialog(runner):
+    r, stub = runner
+    stub.listen_events = [_wait_event(7, 10)]
+    result = r.invoke(cli_main.cli, [
+        "wait", "--chat", "@ann", "--settle-ms", "50", "--timeout", "5", "--json"])
+    assert result.exit_code == 0, result.output
+    assert stub.resolved_usernames == ["@ann"]  # #268 cheap path, not a dialog-list page
+    assert json.loads(result.output)["chat_id"] == 7
+
+
+def test_wait_any_wakes_on_every_dm(runner):
+    r, stub = runner
+    stub.listen_events = [_wait_event(9, 1)]
+    result = r.invoke(cli_main.cli, ["wait", "--settle-ms", "50", "--timeout", "5", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["chat_id"] == 9
+
+
+def test_wait_rejects_non_positive_timeout_before_connecting(runner):
+    r, stub = runner
+    result = r.invoke(cli_main.cli, ["wait", "--timeout", "0"])
+    assert result.exit_code != 0
+    assert stub.connected is False  # #272 spirit: fail locally, no network
