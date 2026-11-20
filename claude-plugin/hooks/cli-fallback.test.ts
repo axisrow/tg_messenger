@@ -53,10 +53,14 @@ test('cold read passes the negative group id after --', { options: { profile: 'p
   await until(async () => (await mounted.find({ type: 'Text', text: /группа холодным путём/ })) !== undefined, 'group history drawn')
   await until(async () => (await mounted.find({ type: 'Text', text: /— p · -1001234567/ })) !== undefined, 'header shows the group target')
 
-  const read = spawns.find(s => / read /.test(s)) ?? ''
+  // the network read (the cached paint is its own `read --cached` child)
+  const read = spawns.find(s => / read /.test(s) && !/--cached/.test(s)) ?? ''
   // the whole point (#293): `-100…` must sit AFTER the `--` separator, never
   // bare where Click reads it as an option (`No such option '-1'`)
   expect(read.endsWith('-- -1001234567'), `peer rides after --: ${read}`).toBe(true)
+  // #332: the cold child must not import the LLM stack for a translator the
+  // pane never shows (~4 s per cold read)
+  expect(read.includes(' --no-translate '), `cold read skips the translator: ${read}`).toBe(true)
 })
 
 test('composer --help is sent as text; a send with no confirmation fails loudly', { options: { profile: 'p', dialog: '777', pollMs: 300 } }, async ($, on) => {

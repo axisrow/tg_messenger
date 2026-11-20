@@ -443,6 +443,66 @@ def test_read_accepts_username(runner):
     assert "hi" in result.output
 
 
+def test_read_no_translate_skips_the_translator(runner, monkeypatch):
+    # #332: the /tg pane's cold read must not pay the LLM-stack import (4.4 s
+    # measured), and it prints like the warm path — no translation lines, not
+    # even a translation already persisted in the store
+    r, stub = runner
+
+    def no_translator(storage):
+        raise AssertionError("--no-translate must not build the translator")
+
+    monkeypatch.setattr(cli_main, "make_optional_translator", no_translator)
+    stub.history_items = [
+        Message(id=1, dialog_id=7, sender_id=7, out=False, text="hi", translated_text="привет",
+                date=datetime(2024, 1, 1, tzinfo=timezone.utc)),
+    ]
+    result = r.invoke(cli_main.cli, ["read", "--no-translate", "--", "7"])
+    assert result.exit_code == 0, result.output
+    assert "← [1] hi" in result.output
+    assert "↳" not in result.output
+
+
+class _CachedStore:
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+        self.closed = False
+
+    async def cached_history(self, peer, limit=50):
+        self.calls.append((peer, limit))
+        return self.rows
+
+    async def close(self):
+        self.closed = True
+
+
+def test_read_cached_prints_the_store_window_without_connecting(runner, monkeypatch):
+    # #332: the pane's instant paint — no session load, no MTProto handshake
+    r, _ = runner
+
+    def no_client(**kw):
+        raise AssertionError("--cached must not build a client")
+
+    store = _CachedStore([Message(id=3, dialog_id=-100, sender_id=5, out=False, text="cached",
+                                  date=datetime(2024, 1, 1, tzinfo=timezone.utc))])
+    monkeypatch.setattr(cli_main, "make_client", no_client)
+    monkeypatch.setattr(cli_main, "make_message_store", lambda client, **kw: (store, object()))
+    result = r.invoke(cli_main.cli, ["read", "--cached", "--limit", "5", "--", "-100"])
+    assert result.exit_code == 0, result.output
+    assert "← [3] cached" in result.output
+    assert store.calls == [(-100, 5)]
+    assert store.closed
+
+
+def test_read_cached_rejects_a_username(runner):
+    # resolving @name needs the network — the offline read refuses it clearly
+    r, _ = runner
+    result = r.invoke(cli_main.cli, ["read", "--cached", "@ann"])
+    assert result.exit_code != 0
+    assert "numeric dialog id" in result.output
+
+
 def test_dialogs_find_username_is_one_rpc(runner):
     r, stub = runner
     result = r.invoke(cli_main.cli, ["dialogs", "--find", "@ann"])

@@ -146,6 +146,27 @@ async def test_message_store_first_load_then_cooldown_serves_db(tmp_path):
     assert client.calls == [(7, 0, 50), (7, 3, 50), (7, 0, 50)]
 
 
+async def test_cached_history_serves_the_stored_window_without_network(tmp_path):
+    # #332: the /tg pane paints the stored window the moment it opens, while the
+    # cold network read is still in flight — this read must never touch the client
+    seeded = MessageStore(client=StoreClient(), storage=await _storage(tmp_path))
+    try:
+        await seeded.history(7, limit=50)  # one synced window: [1, 2, 3]
+    finally:
+        await seeded.close()
+
+    class NoNetworkClient:
+        async def history_since(self, *a, **k):
+            raise AssertionError("cached_history must not sync")
+
+    store = MessageStore(client=NoNetworkClient(), storage=await _storage(tmp_path))
+    try:
+        assert [m.id for m in await store.cached_history(7, limit=2)] == [2, 3]
+        assert await store.cached_history(8, limit=50) == []  # never synced
+    finally:
+        await store.close()
+
+
 class SenderStoreClient(StoreClient):
     """A group history whose messages carry a resolved author."""
 

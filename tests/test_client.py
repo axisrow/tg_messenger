@@ -172,6 +172,67 @@ async def test_numeric_peer_resolves_in_fresh_process_send(session_dir):
     assert inner.dialogs_fetches == 1
 
 
+class _PagedSessionTelethon(_FreshSessionTelethon):
+    """A fresh process on a big account: only the dialogs actually FETCHED land
+    in Telethon's entity map, and ``limit`` pages from the most recent end, like
+    real iter_dialogs. Records every fetch's limit — the crawl cost."""
+
+    def __init__(self):
+        super().__init__()
+        self.fetch_limits = []
+        self.known = set()
+
+    async def get_input_entity(self, peer):
+        if int(peer) not in self.known:
+            raise ValueError(f"Could not find the input entity for {peer!r}")
+        return int(peer)
+
+    def iter_dialogs(self, *a, limit=None, **k):
+        self.dialogs_fetches += 1
+        self.fetch_limits.append(limit)
+        page = self.dialogs if limit is None else self.dialogs[:limit]
+        self.known.update(d.id for d in page)
+
+        async def gen():
+            for d in page:
+                yield d
+
+        return gen()
+
+    def iter_messages(self, peer, limit=50, ids=None, search=None, min_id=0, **k):
+        if int(peer) not in self.known:
+            return _UnresolvedIterator(int(peer))
+        return FakeMessagesIterator(self.messages.get(int(peer), [])[:limit])
+
+
+def _seed_paged(inner, count):
+    inner.dialogs = [
+        FakeDialog(FakeUser(id=1000 + i, first_name=f"U{i}"), name=f"U{i}") for i in range(count)
+    ]
+    for d in inner.dialogs:
+        inner.messages[d.id] = [FakeMessage(id=1, sender_id=d.id, text="hi")]
+
+
+async def test_warm_entity_resolves_a_recent_dialog_with_one_page(session_dir):
+    # #332: an id from the picker (the 100 most recent dialogs) must not page the
+    # WHOLE dialog list in a fresh process — one GetDialogs page covers it
+    inner = _PagedSessionTelethon()
+    _seed_paged(inner, 250)
+    client = _build(inner, session_dir=session_dir)
+    msgs = await client.history(1000 + 42, limit=5)
+    assert [m.id for m in msgs] == [1]
+    assert inner.fetch_limits == [100]
+
+
+async def test_warm_entity_falls_back_to_full_crawl_for_an_old_dialog(session_dir):
+    inner = _PagedSessionTelethon()
+    _seed_paged(inner, 250)
+    client = _build(inner, session_dir=session_dir)
+    msgs = await client.history(1000 + 200, limit=5)
+    assert [m.id for m in msgs] == [1]
+    assert inner.fetch_limits == [100, None]
+
+
 def _seed_dm(fake_client):
     ann = FakeUser(id=7, first_name="Ann", username="ann")
     bob = FakeUser(id=8, first_name="Bob")

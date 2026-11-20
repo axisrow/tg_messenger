@@ -16,6 +16,11 @@ test('pane re-reads history on the poll interval', { options: { profile: 'p', di
   reads = 0
   on('process.spawn', async function* ($, e) {
     const argv = e.argv.join(' ')
+    if (/ read --cached /.test(argv)) {
+      // the boot's stored-window paint (#332): empty here, and NOT a poll read
+      yield { stream: 'stdout', text: ' ' }
+      return { value: { code: 0, signal: null } }
+    }
     if (/ read /.test(argv)) {
       reads++
       yield { stream: 'stdout', text: reads === 1 ? DUMP1 : DUMP2 }

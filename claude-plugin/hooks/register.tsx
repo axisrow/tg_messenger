@@ -160,6 +160,16 @@ const WARM_POLL_MS = 4000
  * profiles never block each other's warm path. */
 const daemonBooting = new Set<number>()
 
+/** Ports whose `serve` child (spawned here) is still alive — a slow daemon is
+ * re-probed, never spawned twice (#332). */
+const daemonRunning = new Set<number>()
+
+/** `serve` spawns per port: a broken install must not respawn forever (#332).
+ * ponytail: a lifetime cap per realm — a daemon that served for hours and then
+ * died counts too; reset it on adoption if long sessions ever hit it. */
+const daemonSpawns = new Map<number, number>()
+const MAX_DAEMON_SPAWNS = 3
+
 /** One curl to the daemon; null = no daemon / request failed (caller falls
  * back to the CLI). `statusOnly` swaps the body for the HTTP code — a 204
  * success and a -f swallowed error are otherwise indistinguishable. */
@@ -230,17 +240,27 @@ async function ensureDaemon($: EngineInterface, cfg: ModConfig): Promise<void> {
 async function startDaemon($: EngineInterface, cfg: ModConfig): Promise<void> {
   if (!cfg.profile) return
   const port = daemonPortFor(cfg.profile)
-  if (cfg.daemonPort || daemonBooting.has(port)) return
+  if (cfg.daemonPort || daemonBooting.has(port) || daemonRunning.has(port)) return
+  const spawns = daemonSpawns.get(port) ?? 0
+  if (spawns >= MAX_DAEMON_SPAWNS) return
+  daemonSpawns.set(port, spawns + 1)
   daemonBooting.add(port)
+  daemonRunning.add(port)
   try {
     void (async () => {
-      for await (const chunk of $.process.spawn({
-        argv: ['tg-messenger', '--profile', cfg.profile, 'serve', '--host', '127.0.0.1', '--port', String(port)],
-      })) {
-        if (chunk.stream === 'stderr') continue // uvicorn logs
+      try {
+        for await (const chunk of $.process.spawn({
+          argv: ['tg-messenger', '--profile', cfg.profile, 'serve', '--host', '127.0.0.1', '--port', String(port)],
+        })) {
+          if (chunk.stream === 'stderr') continue // uvicorn logs
+        }
+      } finally {
+        daemonRunning.delete(port) // exited: the poll re-probes, then respawns
       }
     })().catch(() => {}) // teardown cancellation must not escape a detached task
-    for (let i = 0; i < 40; i++) {
+    // a child that already exited (EADDRINUSE, failed connect) ends the window
+    // early — the poll adopts a sibling's daemon or respawns on its next tick
+    for (let i = 0; i < 40 && daemonRunning.has(port); i++) {
       await waitMs($, 500)
       if (await daemonAlive($, port, cfg.profile)) {
         cfg.daemonPort = port
@@ -361,18 +381,51 @@ async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
     )
     return
   }
+  // #332: a failed warm read drops the adoption — a dead daemon (ours or a
+  // sibling session's) is no longer polled at the warm cadence with a cold
+  // read per tick; the poll re-probes and re-adopts a live one
+  cfg.daemonPort = undefined
+  // --no-translate (#332): no LLM-stack import in the cold child (~4 s), and
+  // the same plain lines the warm path shows
   const { stdout, stderr } = await runCli($, [
     '--profile',
     cfg.profile,
     'read',
     '--limit',
     '50',
+    '--no-translate',
     '--',
     peerRef(cfg),
   ])
   const err = cliError(stderr)
   if (err) throw new Error(err)
   await update($, messages, () => parseHistory(stdout) as TgMessage[])
+}
+
+/**
+ * Paints the profile's stored window at once (#332): `read --cached` loads no
+ * session and opens no connection (~1 s), while the cold network read (python
+ * boot + MTProto handshake) is still in flight. Only an EMPTY list of the SAME
+ * dialog takes it — a network result that landed first, or a switch to another
+ * dialog meanwhile, wins. Best-effort: a failure leaves the loading marker.
+ */
+async function paintCached($: EngineInterface, cfg: ModConfig): Promise<void> {
+  const id = cfg.resolvedId
+  if (!/^-?\d+$/.test(id)) return
+  const { stdout } = await runCli($, [
+    '--profile',
+    cfg.profile,
+    'read',
+    '--cached',
+    '--no-translate',
+    '--limit',
+    '50',
+    '--',
+    id,
+  ])
+  const cached = parseHistory(stdout)
+  if (cached.length && cfg.resolvedId === id)
+    await update($, messages, all => (all.length ? all : cached) as TgMessage[])
 }
 
 /**
@@ -486,6 +539,13 @@ const startPolling = ($: EngineInterface, cfg: ModConfig) => {
           return
         }
         try {
+          // #332: the boot adopts only inside its probe window — re-probe each
+          // cold tick (milliseconds) for a daemon that came up later, a
+          // sibling session's, or a respawn of a dead one (capped)
+          if (!cfg.daemonPort) {
+            await ensureDaemon($, cfg)
+            if (!cfg.daemonPort) void startDaemon($, cfg).catch(() => {})
+          }
           await loadHistory($, cfg)
         } catch (error) {
           $.ui.log(`tg-messenger: history poll failed: ${String(error)}`)
@@ -570,7 +630,9 @@ async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Pro
   void update($, paletteFor, () => -1)
   // drop the previous dialog's text at once — the loading marker replaces it,
   // stale content of another dialog must not linger while the fetch runs
-  void update($, messages, () => [] as TgMessage[])
+  await update($, messages, () => [] as TgMessage[])
+  // cold path only: the stored window of the NEW dialog bridges the cold read
+  if (!cfg.daemonPort) void paintCached($, cfg).catch(() => {})
   if (cfg.isGroup)
     $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
   await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
@@ -861,6 +923,9 @@ async function bootPane($: EngineInterface, cfg: ModConfig) {
     }))
     return
   }
+  // no warm daemon yet (every first /tg of a session): paint the stored window
+  // at once — the cold read below takes a python boot plus a full handshake
+  if (!cfg.daemonPort) void paintCached($, cfg).catch(() => {})
   // history is best-effort: a failure (e.g. Telegram unreachable) must not
   // kill the bridge — the live stream retries with backoff and self-heals
   await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
