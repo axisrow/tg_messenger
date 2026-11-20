@@ -83,6 +83,11 @@ test('pane falls back to the cold CLI when no daemon answers', { options: { prof
     }
     if (/ serve /.test(argv)) await new Promise(() => {})
     if (/ listen /.test(argv)) await new Promise(() => {})
+    if (/ read --cached /.test(argv)) {
+      // the boot's stored-window paint (#332): empty here, and NOT a cold read
+      yield { stream: 'stdout', text: ' ' }
+      return { value: { code: 0, signal: null } }
+    }
     if (/ read /.test(argv)) {
       reads++
       yield { stream: 'stdout', text: reads === 1 ? '← [1] холодный бут' : '← [2] догруз без демона' }

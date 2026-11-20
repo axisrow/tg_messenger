@@ -126,6 +126,16 @@ class MessageStore:
                 await self._sync_history(peer, limit, row)
         return await self._load_window(peer, limit)
 
+    async def cached_history(self, peer: int, limit: int = 50) -> list[Message]:
+        """The stored contiguous window as-is — no sync, never the client (#332).
+
+        The /tg pane paints it the moment it opens, while its cold network read
+        (python boot + MTProto handshake) is still in flight. It may be stale;
+        the caller replaces it with the synced ``history``.
+        """
+        await self.connect()
+        return await self._load_window(int(peer), int(limit))
+
     async def ingest(self, message: Message) -> None:
         """Persist a live message without advancing the contiguous sync window."""
         await self.connect()

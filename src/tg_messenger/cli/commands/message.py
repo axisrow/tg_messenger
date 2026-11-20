@@ -113,13 +113,46 @@ def search(dialog_id: str, query: str, limit: int, session: str) -> None:
               help="Download media of each message into this directory.")
 @click.option("--no-translate", "no_translate", is_flag=True,
               help="Skip inbound translation: no LLM stack load, plain lines only.")
+@click.option("--cached", "cached", is_flag=True,
+              help="Print the locally stored history only — no connection (may be stale).")
 @click.option("--session", default="default", help=cli_main.SESSION_OPTION_HELP)
-def read(dialog_id: str, limit: int, download_dir: str | None, no_translate: bool, session: str) -> None:
+def read(dialog_id: str, limit: int, download_dir: str | None, no_translate: bool, cached: bool,
+         session: str) -> None:
     """Print the message history of a dialog (and optionally download media).
 
     Get DIALOG_ID from `tg-messenger dialogs`, or pass an @username. Each printed
     line starts with the MESSAGE_ID that edit/react/delete take.
     """
+
+    def _print(m) -> None:
+        if no_translate:  # plain, like the pane's warm path — no stored translations either
+            click.echo(cli_main.message_line(m))
+        else:
+            cli_main._print_message_with_translation(m)
+
+    if cached:
+        # #332: the /tg pane's instant paint — the stored window, no session load
+        # and no MTProto handshake, while its network read is still in flight
+        if dialog_id.startswith(("@", "+")):
+            raise click.ClickException("--cached needs a numeric dialog id (resolving a name needs the network)")
+        if download_dir:
+            raise click.ClickException("--cached reads the local store only — drop --download")
+        peer = _numeric_dialog_id(dialog_id)
+        profile = cli_main._effective_session(click.get_current_context(silent=True), session)
+
+        async def _cached():
+            store, _storage = cli_main.make_message_store(None, session=profile)
+            try:
+                return await store.cached_history(peer, limit=limit)
+            finally:
+                await store.close()
+
+        stored = cli_main._run(_cached(), session=profile)
+        if not stored:
+            click.echo("No messages.")
+        for m in stored:
+            _print(m)
+        return
 
     async def _do(client):
         peer = await _dialog_arg(client, dialog_id)
@@ -137,10 +170,7 @@ def read(dialog_id: str, limit: int, download_dir: str | None, no_translate: boo
                 return
             messages = await cli_main._maybe_translate_history(translator, peer, messages)
             for m in messages:
-                if no_translate:  # plain, like the warm path — no stored translations either
-                    click.echo(cli_main.message_line(m))
-                else:
-                    cli_main._print_message_with_translation(m)
+                _print(m)
                 if download_dir and m.media is not None and m.media.downloadable:
                     dest = os.path.join(download_dir, f"{peer}_{m.id}")
                     saved = await client.download_message_media(peer, m.id, dest)

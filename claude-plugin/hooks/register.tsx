@@ -379,6 +379,32 @@ async function loadHistory($: EngineInterface, cfg: ModConfig): Promise<void> {
 }
 
 /**
+ * Paints the profile's stored window at once (#332): `read --cached` loads no
+ * session and opens no connection (~1 s), while the cold network read (python
+ * boot + MTProto handshake) is still in flight. Only an EMPTY list of the SAME
+ * dialog takes it — a network result that landed first, or a switch to another
+ * dialog meanwhile, wins. Best-effort: a failure leaves the loading marker.
+ */
+async function paintCached($: EngineInterface, cfg: ModConfig): Promise<void> {
+  const id = cfg.resolvedId
+  if (!/^-?\d+$/.test(id)) return
+  const { stdout } = await runCli($, [
+    '--profile',
+    cfg.profile,
+    'read',
+    '--cached',
+    '--no-translate',
+    '--limit',
+    '50',
+    '--',
+    id,
+  ])
+  const cached = parseHistory(stdout)
+  if (cached.length && cfg.resolvedId === id)
+    await update($, messages, all => (all.length ? all : cached) as TgMessage[])
+}
+
+/**
  * `listen` line with ids: `← [DIALOG] [MSG] text` (incoming, DMs only) or
  * `→ [DIALOG] [MSG] text` (own messages from any device, `--out`). Returns
  * null for preamble and unknown lines and for this mod's own send echoes.
@@ -573,7 +599,9 @@ async function switchDialog($: EngineInterface, cfg: ModConfig, id: string): Pro
   void update($, paletteFor, () => -1)
   // drop the previous dialog's text at once — the loading marker replaces it,
   // stale content of another dialog must not linger while the fetch runs
-  void update($, messages, () => [] as TgMessage[])
+  await update($, messages, () => [] as TgMessage[])
+  // cold path only: the stored window of the NEW dialog bridges the cold read
+  if (!cfg.daemonPort) void paintCached($, cfg).catch(() => {})
   if (cfg.isGroup)
     $.ui.toast('tg-messenger: group dialog — history only (live feed is DM-only in v1)')
   await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
@@ -864,6 +892,9 @@ async function bootPane($: EngineInterface, cfg: ModConfig) {
     }))
     return
   }
+  // no warm daemon yet (every first /tg of a session): paint the stored window
+  // at once — the cold read below takes a python boot plus a full handshake
+  if (!cfg.daemonPort) void paintCached($, cfg).catch(() => {})
   // history is best-effort: a failure (e.g. Telegram unreachable) must not
   // kill the bridge — the live stream retries with backoff and self-heals
   await spinWhile($, 'history', () => loadHistory($, cfg).catch(error => {
